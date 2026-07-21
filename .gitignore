@@ -1,0 +1,13 @@
+# Rust build artifacts
+myd/target/
+
+# General
+__pycache__/
+*.py[cod]
+*.pyo
+*.swp
+*.swo
+.idea/
+.vscode/
+.mypy_cache/
+.pytest_cache/
