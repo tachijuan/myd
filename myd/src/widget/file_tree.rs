@@ -136,12 +136,11 @@ fn re_sort_node(node: &mut TreeNode, cache: &SizeCache, sort_mode: SortMode, sho
         return;
     }
     // Reload children from disk (preserves expanded state).
-    if node.children.is_none() {
-        node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden));
-    } else {
-        // Re-sort existing children: repopulate sizes and sort.
-        sort_entries(node.children.as_mut().unwrap(), cache, sort_mode);
-    }
+    // Always use load_children to recompute and cache sizes — the cache may
+    // have been cleared by set_sort_mode, and sort_key_fast falls back to
+    // shallow metadata().len() for dirs when the cache is empty, which gives
+    // wrong results for Largest/Smallest sort modes.
+    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden));
     // Recurse into expanded children.
     if node.is_expanded {
         if let Some(ref mut children) = node.children {
