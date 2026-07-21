@@ -1,0 +1,187 @@
+.TH "MYD" "1" "July 2025" "myd 0.1.0" "User Commands"
+.SH NAME
+myd \- vi-like terminal file browser
+.SH SYNOPSIS
+\fBmyd\fR [\fIPATH\fR]
+.SH DESCRIPTION
+\fBmyd\fR is a terminal user interface (TUI) for browsing and managing the
+filesystem. It provides a directory tree with \fBvi\fR-style key bindings,
+a live info panel showing file metadata, and proportional size bars that
+visualize disk usage at a glance.
+.PP
+Built with \fBratatui\fR and \fBcrossterm\fR.
+.PP
+If \fIPATH\fR is provided, the browser starts at that directory. Otherwise,
+a directory picker screen is shown with common locations (home, desktop,
+downloads, etc.).
+.SH KEY BINDINGS
+.SS Navigation
+.TP
+.B j
+Move cursor down one line.
+.TP
+.B k
+Move cursor up one line.
+.TP
+.B h
+Collapse the current directory, or move the cursor to the parent entry.
+.TP
+.B l
+Expand the current directory.
+.TP
+.B gg
+Jump to the first line of the tree.
+.TP
+.B G
+Jump to the last line of the tree.
+.TP
+.B Ctrl+d
+Scroll down half a page.
+.TP
+.B Ctrl+u
+Scroll up half a page.
+.TP
+.B g u
+Move cursor to the parent directory.
+.TP
+.B g d
+Prompt for a new root directory and navigate to it.
+.TP
+.B 0
+Collapse all expanded directories.
+.TP
+.B *
+Expand all directories.
+.SS File Operations
+.TP
+.B dd
+Delete the currently selected file or directory (with confirmation dialog).
+.TP
+.B R
+Rename the currently selected file or directory.
+.TP
+.B r
+Refresh the file tree and clear the size cache.
+.SS View
+.TP
+.B s
+Cycle through sort modes: dirs-first, files-first, largest, smallest.
+.TP
+.B H
+Toggle visibility of hidden (dot) files and directories.
+.TP
+.B b
+Toggle display of proportional size bars in the tree.
+.TP
+.B /
+Search for a file or directory by name.
+.TP
+.B ? / F1
+Show/hide help.
+.SS Screen Level
+.TP
+.B q
+Quit the application (or go back to previous directory).
+.TP
+.B Esc
+Quit the application.
+.TP
+.B Ctrl+r
+Refresh the file tree.
+.TP
+.B Ctrl+b
+Toggle the info panel sidebar.
+.SH SORT MODES
+Press \fBs\fR to cycle through the available sort modes:
+.TP
+.B dirs-first
+Directories are listed before files; alphabetical order within each group.
+.TP
+.B files-first
+Files are listed before directories; alphabetical order within each group.
+.TP
+.B largest
+Items sorted by descending size. Directories are measured recursively.
+.TP
+.B smallest
+Items sorted by ascending size. Directories are measured recursively.
+.SH SIZE BARS
+Each entry in the tree displays a proportional size bar indicating the item's
+share of its parent directory's total content. The bar is color-coded:
+.TP
+.B Green
+The item occupies less than 50% of its parent's total size.
+.TP
+.B Amber
+The item occupies 50\-80% of its parent's total size.
+.TP
+.B Red
+The item occupies more than 80% of its parent's total size.
+.PP
+Toggle the size bars on and off with \fBb\fR.
+.SH INFO PANEL
+The right-hand sidebar displays detailed metadata for the currently selected
+item:
+.TP
+.B Name
+The file or directory name.
+.TP
+.B Type
+Whether the item is a file or directory.
+.TP
+.B Size
+Human-readable file size (e.g., "245 MB").
+.TP
+.B Contents
+For directories: the count of files and subdirectories.
+.TP
+.B Permissions
+Standard Unix permission string (e.g., \fBdrwxr-xr-x\fR).
+.TP
+.B Owner / Group
+The owning user and group.
+.TP
+.B Timestamps
+Creation, modification, and last access times.
+.TP
+.B Path
+The absolute path to the item.
+.PP
+Hide or show the panel with \fBCtrl+b\fR.
+.SH EXAMPLES
+.TP
+.B myd
+Start with the directory picker.
+.TP
+.B myd ~/Documents
+Start browsing at \fB~/Documents\fR.
+.TP
+.B myd /var/log
+Start browsing at \fB/var/log\fR.
+.SH REQUIREMENTS
+.TP
+.B Rust
+1.75 or later (stable).
+.TP
+.B Terminal
+A terminal with true color (256-color or 24-bit) support.
+.SH INSTALLATION
+.PP
+.RS
+.nf
+cargo install \-\-path .
+.fi
+.RE
+.PP
+Or run directly without installation:
+.PP
+.RS
+.nf
+cargo run
+cargo run \-\- ~/Documents
+.fi
+.RE
+.SH SEE ALSO
+.BR vi (1),
+.BR tree (1),
+.BR lf (1)
