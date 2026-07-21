@@ -250,7 +250,7 @@ fn get_owner_group(metadata: &std::fs::Metadata) -> (String, String) {
 fn uid_to_name(uid: u32) -> Option<String> {
     unsafe {
         let mut result = std::mem::zeroed::<libc::passwd>();
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0 as libc::c_char; 1024];
         let mut entry: *mut libc::passwd = std::ptr::null_mut();
         if libc::getpwuid_r(uid, &mut result, buffer.as_mut_ptr(), buffer.len(), &mut entry) == 0
             && !entry.is_null()
@@ -267,7 +267,7 @@ fn uid_to_name(uid: u32) -> Option<String> {
 fn gid_to_name(gid: u32) -> Option<String> {
     unsafe {
         let mut result = std::mem::zeroed::<libc::group>();
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0 as libc::c_char; 1024];
         let mut entry: *mut libc::group = std::ptr::null_mut();
         if libc::getgrgid_r(gid, &mut result, buffer.as_mut_ptr(), buffer.len(), &mut entry) == 0
             && !entry.is_null()
