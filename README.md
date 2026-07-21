@@ -27,15 +27,16 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 # Clone and install
 git clone http://umbrel:8085/juan/myd.git
 cd myd
-cargo install --path .
+cargo install --path . --locked
 ```
 
-Or run directly without installing:
+Or build and run in release mode:
 
 ```bash
 cd myd
-cargo run
-cargo run -- ~/Documents
+cargo build --release
+./target/release/myd
+./target/release/myd ~/Documents
 ```
 
 ## Usage
