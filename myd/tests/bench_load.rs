@@ -20,9 +20,9 @@ fn test_load_performance() {
     }
 
     let start = Instant::now();
-    let tree = file_browser::widget::file_tree::FileTree::new(
+    let tree = myd::widget::file_tree::FileTree::new(
         test_dir.path().to_path_buf(),
-        file_browser::screen::SortMode::Largest,
+        myd::screen::SortMode::Largest,
         true, // show hidden
         true, // show size bar
     );
@@ -61,9 +61,9 @@ fn test_render_performance() {
         std::fs::write(test_dir.path().join(format!("file_{:02}.txt", i)), "data".repeat(i * 10)).unwrap();
     }
 
-    let tree = file_browser::widget::file_tree::FileTree::new(
+    let tree = myd::widget::file_tree::FileTree::new(
         test_dir.path().to_path_buf(),
-        file_browser::screen::SortMode::Largest,
+        myd::screen::SortMode::Largest,
         true,
         true,
     );
@@ -106,9 +106,9 @@ fn test_navigate_depth_performance() {
     }
 
     let start = Instant::now();
-    let tree = file_browser::widget::file_tree::FileTree::new(
+    let tree = myd::widget::file_tree::FileTree::new(
         current.clone(),
-        file_browser::screen::SortMode::Largest,
+        myd::screen::SortMode::Largest,
         true,
         true,
     );
@@ -136,9 +136,9 @@ fn test_expanded_tree_render() {
         std::fs::write(base.path().join(format!("file_{:02}.txt", i)), "data".repeat(200)).unwrap();
     }
 
-    let mut tree = file_browser::widget::file_tree::FileTree::new(
+    let mut tree = myd::widget::file_tree::FileTree::new(
         base.path().to_path_buf(),
-        file_browser::screen::SortMode::Largest,
+        myd::screen::SortMode::Largest,
         true,
         true,
     );

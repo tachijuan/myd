@@ -10,6 +10,7 @@ pub use loading::LoadingState;
 pub use main_screen::MainScreenState;
 
 use crate::widget::file_tree::FileTree;
+use crate::widget::treemap::FocusTarget;
 
 /// Sort order for file tree entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,6 +105,7 @@ pub trait ScreenState {
     fn collapse_all(&mut self) -> bool { true }
     fn expand_all(&mut self) -> bool { true }
     fn search(&mut self, _pattern: &str) -> bool { true }
+    fn toggle_view(&mut self) -> bool { true }
     fn render(&mut self, frame: &mut Frame, area: Rect);
 }
 
@@ -239,6 +241,19 @@ impl Screen {
         match self {
             Screen::DirPicker(s) => s.search(pattern),
             Screen::Main(s) => s.search(pattern),
+            Screen::Loading(_) => true,
+        }
+    }
+    pub fn toggle_view(&mut self) -> bool {
+        match self {
+            Screen::DirPicker(_) => true,
+            Screen::Main(s) => {
+                s.focus = match s.focus {
+                    FocusTarget::Tree => FocusTarget::Treemap,
+                    FocusTarget::Treemap => FocusTarget::Tree,
+                };
+                true
+            }
             Screen::Loading(_) => true,
         }
     }

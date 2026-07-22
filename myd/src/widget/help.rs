@@ -35,6 +35,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
                 ("h / Left", "Collapse / Go back"),
                 ("l / Right", "Expand directory"),
                 ("Ctrl+O", "Go back (pop screen)"),
+                ("v", "Toggle TREE/TREEMAP view"),
             ],
         },
         HelpCategory {
@@ -47,12 +48,20 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             ],
         },
         HelpCategory {
+            title: "Treemap",
+            items: &[
+                ("v", "Toggle TREE/TREEMAP view"),
+                ("j / k / h / l", "Navigate treemap tiles"),
+                ("G / gg", "First / Last tile"),
+            ],
+        },
+        HelpCategory {
             title: "View",
             items: &[
                 ("s", "Toggle sort order"),
                 ("H", "Toggle hidden files"),
                 ("b", "Toggle size bars"),
-                ("Ctrl+B", "Toggle info panel"),
+                ("Ctrl+B / t", "Toggle info panel"),
             ],
         },
         HelpCategory {

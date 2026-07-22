@@ -41,27 +41,27 @@ fn write_string(path: &PathBuf, content: &str) {
 
 #[test]
 fn test_format_size_zero() {
-    assert_eq!(file_browser::utils::sizes::format_size(0), "   0 B");
+    assert_eq!(myd::utils::sizes::format_size(0), "   0 B");
 }
 
 #[test]
 fn test_format_size_bytes() {
-    assert_eq!(file_browser::utils::sizes::format_size(42), "  42 B");
+    assert_eq!(myd::utils::sizes::format_size(42), "  42 B");
 }
 
 #[test]
 fn test_format_size_kb() {
-    assert_eq!(file_browser::utils::sizes::format_size(1024), " 1.0KB");
+    assert_eq!(myd::utils::sizes::format_size(1024), " 1.0KB");
 }
 
 #[test]
 fn test_format_size_mb() {
-    assert_eq!(file_browser::utils::sizes::format_size(1_048_576), " 1.0MB");
+    assert_eq!(myd::utils::sizes::format_size(1_048_576), " 1.0MB");
 }
 
 #[test]
 fn test_format_size_gb() {
-    assert_eq!(file_browser::utils::sizes::format_size(1_073_741_824), " 1.0GB");
+    assert_eq!(myd::utils::sizes::format_size(1_073_741_824), " 1.0GB");
 }
 
 #[test]
@@ -69,26 +69,26 @@ fn test_get_file_size() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("test.bin");
     write_string(&f, "0123456789");
-    assert_eq!(file_browser::utils::sizes::get_file_size(&f), 10);
+    assert_eq!(myd::utils::sizes::get_file_size(&f), 10);
 }
 
 #[test]
 fn test_get_shallow_size() {
     let dir = create_test_structure();
-    let size = file_browser::utils::sizes::get_shallow_size(dir.path());
+    let size = myd::utils::sizes::get_shallow_size(dir.path());
     assert!(size >= 20);
 }
 
 #[test]
 fn test_get_dir_size() {
     let dir = create_test_structure();
-    let size = file_browser::utils::sizes::get_dir_size(dir.path());
+    let size = myd::utils::sizes::get_dir_size(dir.path());
     assert!(size >= 30);
 }
 
 #[test]
 fn test_size_cache_concurrent() {
-    let cache = file_browser::utils::sizes::SizeCache::new();
+    let cache = myd::utils::sizes::SizeCache::new();
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("x.txt");
     write_string(&f, "abc");
@@ -114,19 +114,19 @@ fn test_file_tree_root() {
 
 #[test]
 fn test_sort_mode_labels() {
-    assert_eq!(file_browser::screen::SortMode::DirsFirst.label(), "dirs-first");
-    assert_eq!(file_browser::screen::SortMode::FilesFirst.label(), "files-first");
-    assert_eq!(file_browser::screen::SortMode::Largest.label(), "largest");
-    assert_eq!(file_browser::screen::SortMode::Smallest.label(), "smallest");
+    assert_eq!(myd::screen::SortMode::DirsFirst.label(), "dirs-first");
+    assert_eq!(myd::screen::SortMode::FilesFirst.label(), "files-first");
+    assert_eq!(myd::screen::SortMode::Largest.label(), "largest");
+    assert_eq!(myd::screen::SortMode::Smallest.label(), "smallest");
 }
 
 #[test]
 fn test_sort_mode_unique_labels() {
     let labels = [
-        file_browser::screen::SortMode::DirsFirst.label(),
-        file_browser::screen::SortMode::FilesFirst.label(),
-        file_browser::screen::SortMode::Largest.label(),
-        file_browser::screen::SortMode::Smallest.label(),
+        myd::screen::SortMode::DirsFirst.label(),
+        myd::screen::SortMode::FilesFirst.label(),
+        myd::screen::SortMode::Largest.label(),
+        myd::screen::SortMode::Smallest.label(),
     ];
     for i in 0..labels.len() {
         for j in (i + 1)..labels.len() {
@@ -141,25 +141,25 @@ fn test_sort_mode_unique_labels() {
 
 #[test]
 fn test_confirm_dialog_y() {
-    let mut dialog = file_browser::widget::confirm_dialog::ConfirmDialog::new("Delete?");
+    let mut dialog = myd::widget::confirm_dialog::ConfirmDialog::new("Delete?");
     assert_eq!(dialog.handle_key('y'), Some(true));
 }
 
 #[test]
 fn test_confirm_dialog_n() {
-    let mut dialog = file_browser::widget::confirm_dialog::ConfirmDialog::new("Delete?");
+    let mut dialog = myd::widget::confirm_dialog::ConfirmDialog::new("Delete?");
     assert_eq!(dialog.handle_key('n'), Some(false));
 }
 
 #[test]
 fn test_confirm_dialog_enter() {
-    let mut dialog = file_browser::widget::confirm_dialog::ConfirmDialog::new("Delete?");
+    let mut dialog = myd::widget::confirm_dialog::ConfirmDialog::new("Delete?");
     assert_eq!(dialog.handle_key('\n'), Some(true));
 }
 
 #[test]
 fn test_confirm_dialog_unknown_key() {
-    let mut dialog = file_browser::widget::confirm_dialog::ConfirmDialog::new("Delete?");
+    let mut dialog = myd::widget::confirm_dialog::ConfirmDialog::new("Delete?");
     assert_eq!(dialog.handle_key('x'), None);
 }
 
@@ -222,20 +222,20 @@ fn test_rename_existing_fails() {
 #[test]
 fn test_cli_path_arg() {
     use clap::Parser;
-    let cli = file_browser::cli::Cli::parse_from(["file-browser", "--path", "/tmp"]);
+    let cli = myd::cli::Cli::parse_from(["file-browser", "--path", "/tmp"]);
     assert_eq!(cli.path, Some(PathBuf::from("/tmp")));
 }
 
 #[test]
 fn test_cli_no_path() {
     use clap::Parser;
-    let cli = file_browser::cli::Cli::parse_from(["file-browser"]);
+    let cli = myd::cli::Cli::parse_from(["file-browser"]);
     assert_eq!(cli.path, None);
 }
 
 #[test]
 fn test_cli_short_path() {
     use clap::Parser;
-    let cli = file_browser::cli::Cli::parse_from(["file-browser", "-p", "~/Documents"]);
+    let cli = myd::cli::Cli::parse_from(["file-browser", "-p", "~/Documents"]);
     assert_eq!(cli.path, Some(PathBuf::from("~/Documents")));
 }

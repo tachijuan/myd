@@ -371,6 +371,7 @@ impl FileBrowser {
                         }
                         true
                     }
+                    Action::ToggleView => current.toggle_view(),
                     Action::Quit | Action::PopScreen | Action::Help | Action::Confirm
                     | Action::ChangeRoot | Action::Search | Action::Collapse
                     | Action::GoDirPicker => unreachable!(),

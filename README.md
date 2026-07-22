@@ -14,6 +14,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Search** — find files by name with `/`.
 - **Rename and delete** — rename with `R`, delete with `dd` (both with confirmation dialogs).
 - **Change root** — jump to any directory with `gd` without losing your sort and view settings.
+- **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, with `~` shortcuts for home-directory paths.
 - **Progress overlay** — non-blocking directory enumeration with a progress indicator for large trees.
 
 ## Requirements
@@ -81,6 +82,7 @@ myd /var/log
 
 | Key       | Action                        |
 |-----------|-------------------------------|
+| `v`       | Toggle tree / treemap view    |
 | `s`       | Cycle sort mode               |
 | `H`       | Toggle hidden files           |
 | `b`       | Toggle size bars              |
@@ -122,6 +124,25 @@ Colors indicate the item's share of its parent directory's total size:
 - **Red** — more than 80% of parent
 
 Toggle bars on/off with `b`.
+
+## Treemap View
+
+Press `v` to toggle between the file tree and a squarified treemap. The treemap visualizes disk usage as proportional rectangular boxes — larger files and directories take up more space. Navigate with `j`/`k`/`h`/`l` to move between boxes.
+
+```
++-------------------+-----------+
+|                   |  +------+ |
+|     projects      |  | docs | |
+|     (245 MB)      |  |(52M) | |
+|                   |  |      | |
++-------------------+  +------+ |
+|           +-------------------+
+|   readme |
+|  (1.2 KB) |
++-----------+
+```
+
+Paths use `~` for the home directory and intelligently truncate long paths so the filename always takes priority when a box is narrow.
 
 ## License
 

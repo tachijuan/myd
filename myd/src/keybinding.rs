@@ -30,6 +30,7 @@ pub enum Action {
     Help,
     PopScreen,
     GoDirPicker,
+    ToggleView,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -129,6 +130,7 @@ impl KeyBindingHandler {
             '/' => Some(Action::Search),
             '?' => Some(Action::Help),
             'u' => Some(Action::GoParent),
+            'v' => Some(Action::ToggleView),
             _ => None,
         }
     }
@@ -171,6 +173,8 @@ impl KeyBindingHandler {
             KeyCode::Char('s') => Some(Action::ToggleSort),
             KeyCode::Char('H') => Some(Action::ToggleHidden),
             KeyCode::Char('b') => Some(Action::ToggleBar),
+            KeyCode::Char('v') => Some(Action::ToggleView),
+            KeyCode::Char('t') => Some(Action::ToggleInfoPanel),
             KeyCode::Char('0') => Some(Action::CollapseAll),
             KeyCode::Char('*') => Some(Action::ExpandAll),
             KeyCode::Char('/') => Some(Action::Search),
