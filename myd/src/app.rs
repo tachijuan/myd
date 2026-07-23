@@ -155,17 +155,7 @@ impl FileBrowser {
             if let Ok(true) = crossterm::event::poll(std::time::Duration::from_millis(100)) {
                 if let Ok(Event::Key(key)) = crossterm::event::read() {
                     if key.kind == KeyEventKind::Press {
-                        if matches!(self.modal, Modal::None) {
-                            running = self.handle_key(key);
-                        } else if matches!(self.modal, Modal::Help) {
-                            // Dismiss help. Don't re-process Esc to avoid exiting.
-                            self.modal = Modal::None;
-                            if !matches!(key.code, KeyCode::Esc) {
-                                running = self.handle_key(key);
-                            }
-                        } else {
-                            running = self.handle_modal_key(key);
-                        }
+                        running = self.route_key(key);
                     }
                 }
             }
@@ -265,10 +255,16 @@ impl FileBrowser {
         }
     }
 
-    /// Drive one key through the app, exactly as the event loop does.
+    /// Drive one key through the app, exactly as the event loop does —
+    /// including modal-aware routing (e.g. dismissing the help screen).
     /// Exposed so tests can exercise real key sequences end to end.
     pub fn handle_key_for_test(&mut self, key: KeyEvent) -> bool {
-        self.handle_key(key)
+        self.route_key(key)
+    }
+
+    /// Whether the help screen is currently showing (for tests).
+    pub fn is_help_open(&self) -> bool {
+        matches!(self.modal, Modal::Help)
     }
 
     /// The screen currently on top of the stack.
@@ -291,6 +287,34 @@ impl FileBrowser {
     /// (a cancelled first-screen scan).
     pub fn resolve_loading_for_test(&mut self) -> bool {
         self.resolve_loading()
+    }
+
+    /// Route a key press according to the current modal state. This is the top
+    /// of the input pipeline — the event loop and tests both go through it, so
+    /// modal-specific handling (like dismissing help) is exercised the same way.
+    /// Returns whether the app should keep running.
+    fn route_key(&mut self, key: KeyEvent) -> bool {
+        match self.modal {
+            Modal::None => self.handle_key(key),
+            Modal::Help => {
+                // Dismiss help. Keys whose only role here is to close the help
+                // screen (quit/back and the help toggles) are consumed so they
+                // don't also act on the screen behind it — e.g. q must not quit
+                // the app. Any other key both dismisses help and acts (so j
+                // moves the cursor).
+                self.modal = Modal::None;
+                let dismiss_only = matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1)
+                );
+                if dismiss_only {
+                    true
+                } else {
+                    self.handle_key(key)
+                }
+            }
+            _ => self.handle_modal_key(key),
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
