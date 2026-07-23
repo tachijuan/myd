@@ -1439,3 +1439,130 @@ async fn test_ctrl_o_also_keeps_treemap_view() {
         "Ctrl-o must also keep the treemap view"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cancelling a directory scan with q / Esc.
+// ---------------------------------------------------------------------------
+
+/// A directory large enough that its initial scan takes long enough to be
+/// cancelled mid-flight in a test.
+fn big_scan_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for d in 0..40 {
+        let sub = dir.path().join(format!("d{:03}", d));
+        std::fs::create_dir_all(sub.join("inner")).unwrap();
+        for f in 0..200 {
+            std::fs::write(sub.join(format!("f{}.bin", f)), vec![0u8; 256]).unwrap();
+            std::fs::write(sub.join("inner").join(format!("g{}.bin", f)), vec![0u8; 256]).unwrap();
+        }
+    }
+    dir
+}
+
+/// Drive the app until the loading screen resolves, returning whether the app
+/// should keep running.
+async fn drain_loading(app: &mut myd::app::FileBrowser) -> bool {
+    for _ in 0..2000 {
+        if !app.resolve_loading_for_test() {
+            return false;
+        }
+        if !matches!(app.current_screen(), myd::screen::Screen::Loading(_)) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("loading never resolved");
+}
+
+#[tokio::test]
+async fn test_q_cancels_scan_and_quits_when_first_screen() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = big_scan_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+
+    // The very first screen is the loading scan. Cancelling it quits the app,
+    // since there is nothing behind it to return to.
+    assert!(
+        matches!(app.current_screen(), Screen::Loading(_)),
+        "app should start in a loading screen"
+    );
+
+    // Still scanning (the fixture is large enough that it cannot have finished
+    // in the moment since construction).
+    assert!(
+        matches!(app.current_screen(), Screen::Loading(_)),
+        "scan should still be in progress"
+    );
+
+    // q while loading cancels rather than quitting outright.
+    let keep_running = app.handle_key_for_test(char_key('q'));
+    assert!(keep_running, "q during a scan should not quit instantly");
+
+    // The cancelled scan resolves to a quit.
+    let still_running = drain_loading(&mut app).await;
+    assert!(
+        !still_running,
+        "cancelling the first-screen scan should quit the app"
+    );
+}
+
+#[tokio::test]
+async fn test_q_cancels_scan_and_returns_to_parent_when_drilled_in() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    // Root has one big subdirectory. Enter it, then cancel its scan: we should
+    // land back on the parent directory, not quit.
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    for d in 0..40 {
+        let s = sub.join(format!("d{:03}", d));
+        std::fs::create_dir_all(&s).unwrap();
+        for f in 0..200 {
+            std::fs::write(s.join(format!("f{}.bin", f)), vec![0u8; 256]).unwrap();
+        }
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    // Settle the (small) root scan.
+    assert!(drain_loading(&mut app).await);
+    assert_eq!(app.screen_stack_depth(), 1);
+
+    // Onto "sub" and descend — pushes a loading screen.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        matches!(app.current_screen(), Screen::Loading(_)),
+        "descending should push a loading screen"
+    );
+    assert_eq!(app.screen_stack_depth(), 2);
+
+    // Cancel the subdirectory scan.
+    let keep_running = app.handle_key_for_test(char_key('q'));
+    assert!(keep_running, "q during a scan should not quit");
+
+    let still_running = drain_loading(&mut app).await;
+    assert!(still_running, "cancelling a drilled-in scan should not quit");
+    assert_eq!(
+        app.screen_stack_depth(),
+        1,
+        "cancelling should return to the parent directory"
+    );
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+}
+
+#[tokio::test]
+async fn test_scan_completes_normally_without_cancel() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    // Sanity: with no cancel, a scan resolves into a Main screen as before.
+    let dir = nav_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    assert!(drain_loading(&mut app).await);
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+    assert_eq!(app.screen_stack_depth(), 1);
+}

@@ -43,11 +43,22 @@ impl TreeNode {
 
     /// Expand this node (loads children if not loaded).
     pub fn expand(&mut self, cache: &SizeCache, sort_mode: SortMode, show_hidden: bool) {
+        self.expand_cancellable(cache, sort_mode, show_hidden, None);
+    }
+
+    /// As [`expand`], but a supplied cancel token can abort the size walk.
+    pub fn expand_cancellable(
+        &mut self,
+        cache: &SizeCache,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        cancel: Option<&sizes::CancelToken>,
+    ) {
         if !self.is_directory() {
             return;
         }
         if self.children.is_none() {
-            self.children = Some(load_children(&self.path, cache, sort_mode, show_hidden));
+            self.children = Some(load_children(&self.path, cache, sort_mode, show_hidden, cancel));
         }
         self.is_expanded = true;
     }
@@ -86,6 +97,7 @@ fn load_children(
     cache: &SizeCache,
     sort_mode: SortMode,
     show_hidden: bool,
+    cancel: Option<&sizes::CancelToken>,
 ) -> Vec<TreeNode> {
     let mut entries = Vec::new();
 
@@ -105,13 +117,20 @@ fn load_children(
     // subdirectory whose parent was already scanned. Refresh clears the cache
     // when the on-disk state actually needs re-reading.
     for entry in &mut entries {
+        // Bail out promptly if the user cancelled the scan.
+        if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+            break;
+        }
         if cache.get(&entry.resolved_path).is_some() {
             continue;
         }
         let size = if entry.is_dir {
             // Records every descendant's size too, so opening this directory
             // later is a cache hit instead of another walk.
-            sizes::get_dir_size_caching(&entry.path, cache)
+            match cancel {
+                Some(c) => sizes::get_dir_size_caching_cancellable(&entry.path, cache, c),
+                None => sizes::get_dir_size_caching(&entry.path, cache),
+            }
         } else {
             sizes::get_file_size(&entry.path)
         };
@@ -148,7 +167,7 @@ fn re_sort_node(node: &mut TreeNode, cache: &SizeCache, sort_mode: SortMode, sho
     // have been cleared by set_sort_mode, and sort_key_fast falls back to
     // shallow metadata().len() for dirs when the cache is empty, which gives
     // wrong results for Largest/Smallest sort modes.
-    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden));
+    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden, None));
     // Recurse into expanded children.
     if node.is_expanded {
         if let Some(ref mut children) = node.children {
@@ -164,7 +183,7 @@ fn reload_node(node: &mut TreeNode, cache: &SizeCache, sort_mode: SortMode, show
     if !node.is_dir {
         return;
     }
-    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden));
+    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden, None));
     if node.is_expanded {
         if let Some(ref mut children) = node.children {
             for child in children.iter_mut() {
@@ -253,8 +272,42 @@ impl FileTree {
         show_size_bar: bool,
         cache: SizeCache,
     ) -> Self {
+        // No cancel token: this path always produces a tree.
+        Self::build(path, sort_mode, show_hidden, show_size_bar, cache, None)
+            .expect("uncancelled build always yields a tree")
+    }
+
+    /// Build a tree, aborting the initial size scan if `cancel` is tripped.
+    ///
+    /// Returns `None` if the scan was cancelled before it finished, so the
+    /// caller can drop a scan the user has abandoned rather than showing a
+    /// half-measured tree.
+    pub fn with_cache_cancellable(
+        path: PathBuf,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        show_size_bar: bool,
+        cache: SizeCache,
+        cancel: &sizes::CancelToken,
+    ) -> Option<Self> {
+        Self::build(path, sort_mode, show_hidden, show_size_bar, cache, Some(cancel))
+    }
+
+    fn build(
+        path: PathBuf,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        show_size_bar: bool,
+        cache: SizeCache,
+        cancel: Option<&sizes::CancelToken>,
+    ) -> Option<Self> {
         let mut root = TreeNode::new(path.clone());
-        root.expand(&cache, sort_mode, show_hidden);
+        root.expand_cancellable(&cache, sort_mode, show_hidden, cancel);
+
+        // The scan was abandoned partway through — discard the partial tree.
+        if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+            return None;
+        }
 
         let mut tree = Self {
             root,
@@ -271,7 +324,7 @@ impl FileTree {
             cached_file_count: 0,
         };
         tree.reflatten();
-        tree
+        Some(tree)
     }
 
     /// Recompute the flat line list and all cached render data.

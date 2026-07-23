@@ -1,6 +1,32 @@
 use dashmap::DashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use walkdir::WalkDir;
+
+/// A cooperative cancellation flag shared between the UI and a background
+/// directory walk. The walk checks it periodically and bails out early, so a
+/// scan the user has abandoned stops promptly instead of running to completion.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. Any walk observing this token will stop soon after.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
 
 /// Shared, concurrent size cache: resolved Path string -> size in bytes.
 ///
@@ -136,6 +162,18 @@ pub fn get_dir_size(path: &Path) -> u64 {
 /// opening a subdirectory later is a cache hit rather than a second walk over
 /// the same bytes.
 pub fn get_dir_size_caching(path: &Path, cache: &SizeCache) -> u64 {
+    get_dir_size_caching_cancellable(path, cache, &CancelToken::new())
+}
+
+/// As [`get_dir_size_caching`], but abandons the walk when `cancel` is tripped.
+///
+/// On cancellation the partial totals gathered so far are discarded and 0 is
+/// returned — the caller is expected to throw away the whole scan.
+pub fn get_dir_size_caching_cancellable(
+    path: &Path,
+    cache: &SizeCache,
+    cancel: &CancelToken,
+) -> u64 {
     if is_virtual_fs(path) {
         return 0;
     }
@@ -147,11 +185,16 @@ pub fn get_dir_size_caching(path: &Path, cache: &SizeCache) -> u64 {
     let mut totals: HashMap<std::path::PathBuf, u64> = HashMap::new();
     let mut root_total: u64 = 0;
 
+    // Checking an atomic on every entry is cheap next to the per-entry syscalls,
+    // so cancellation is observed within a handful of directory entries.
     for entry in WalkDir::new(path)
         .contents_first(true)
         .into_iter()
         .filter_map(|e| e.ok())
     {
+        if cancel.is_cancelled() {
+            return 0;
+        }
         if is_virtual_fs(entry.path()) {
             continue;
         }
@@ -255,5 +298,36 @@ mod tests {
         assert!(cache.get(&file).is_none());
         cache.insert(&file, 3);
         assert_eq!(cache.get(&file), Some(3));
+    }
+
+    #[test]
+    fn test_cancelled_walk_returns_early() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a.bin"), vec![0u8; 1000]).unwrap();
+
+        // A token cancelled before the walk starts yields 0 and caches nothing.
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let cache = SizeCache::new();
+        assert_eq!(
+            get_dir_size_caching_cancellable(dir.path(), &cache, &cancel),
+            0
+        );
+        assert_eq!(cache.len(), 0, "a cancelled walk should record no sizes");
+    }
+
+    #[test]
+    fn test_uncancelled_cancellable_walk_matches_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/f.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("a/b/g.bin"), vec![0u8; 400]).unwrap();
+
+        let cache = SizeCache::new();
+        let cancel = CancelToken::new(); // never tripped
+        let total = get_dir_size_caching_cancellable(dir.path(), &cache, &cancel);
+        assert_eq!(total, 500);
+        assert_eq!(total, get_dir_size(dir.path()));
     }
 }

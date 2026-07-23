@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::keybinding::{Action, KeyBindingHandler};
-use crate::screen::{MainScreenState, Screen};
+use crate::screen::{LoadingOutcome, MainScreenState, Screen};
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
 use crate::widget::input_dialog::InputDialog;
@@ -171,7 +171,10 @@ impl FileBrowser {
             }
 
             // Check for completed loading tasks and replace with Main screens.
-            self.resolve_loading();
+            // A cancelled first-screen scan tells us to quit.
+            if !self.resolve_loading() {
+                running = false;
+            }
 
             // Check for completed delete tasks.
             self.resolve_deleting();
@@ -215,15 +218,34 @@ impl FileBrowser {
     }
 
     /// Check for completed loading tasks and replace Loading screens with Main.
-    fn resolve_loading(&mut self) {
+    /// Returns `false` when a cancelled scan was the only screen (nothing to go
+    /// back to), signalling the app to quit.
+    fn resolve_loading(&mut self) -> bool {
         let prefs = self.view_prefs;
-        if let Some(last) = self.screen_stack.last_mut() {
-            if let Some((path, tree)) = last.poll_loading() {
+        let outcome = match self.screen_stack.last_mut() {
+            Some(last) => last.poll_loading(),
+            None => return true,
+        };
+        match outcome {
+            LoadingOutcome::Pending => true,
+            LoadingOutcome::Done(path, tree) => {
                 let mut state = MainScreenState::from_tree(path, tree);
                 // Carry the session's view preferences onto the new screen so
                 // entering a directory doesn't silently reset them.
                 state.apply_view_prefs(prefs.info_panel_hidden, prefs.focus);
-                *last = Screen::Main(state);
+                *self.screen_stack.last_mut().expect("empty stack") = Screen::Main(state);
+                true
+            }
+            LoadingOutcome::Cancelled => {
+                // Drop the loading screen. If a screen remains beneath it we
+                // return to that directory; otherwise there is nothing to show
+                // and the app exits.
+                if self.screen_stack.len() > 1 {
+                    self.pop_screen();
+                    true
+                } else {
+                    false
+                }
             }
         }
     }
@@ -265,9 +287,10 @@ impl FileBrowser {
     }
 
     /// Resolve any pending Loading screen into a Main screen (normally driven
-    /// by the event loop each tick).
-    pub fn resolve_loading_for_test(&mut self) {
-        self.resolve_loading();
+    /// by the event loop each tick). Returns false if the app should now quit
+    /// (a cancelled first-screen scan).
+    pub fn resolve_loading_for_test(&mut self) -> bool {
+        self.resolve_loading()
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -289,7 +312,17 @@ impl FileBrowser {
     fn dispatch_action(&mut self, action: Action) -> bool {
         match action {
             Action::Quit => {
-                // Quit the app immediately, regardless of navigation history.
+                // While a directory is being scanned, q/Esc cancels that scan
+                // rather than quitting outright. The background walk stops
+                // promptly, and resolve_loading then returns to the previous
+                // directory (or quits if the scan was the very first screen).
+                if let Some(screen) = self.screen_stack.last() {
+                    if screen.is_loading() {
+                        screen.cancel_loading();
+                        return true;
+                    }
+                }
+                // Otherwise quit the app immediately, regardless of history.
                 // Use Ctrl-o (PopScreen) to step back up a directory.
                 false
             }
