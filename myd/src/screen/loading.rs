@@ -63,12 +63,20 @@ impl ScreenState for LoadingState {
             format!("{:.1}s", elapsed.as_secs_f64())
         };
 
+        // Clamp the dialog to the available area — a terminal smaller than the
+        // dialog would otherwise put it outside the buffer and panic on render.
+        let dialog_w = 50.min(area.width);
+        let dialog_h = 5.min(area.height);
         let center = Rect::new(
-            area.width.saturating_sub(50) / 2,
-            area.height.saturating_sub(5) / 2,
-            50,
-            5,
+            area.x + area.width.saturating_sub(dialog_w) / 2,
+            area.y + area.height.saturating_sub(dialog_h) / 2,
+            dialog_w,
+            dialog_h,
         );
+
+        if center.width == 0 || center.height == 0 {
+            return;
+        }
 
         frame.render_widget(Clear, center);
 

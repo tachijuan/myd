@@ -48,6 +48,17 @@ impl Screen {
     /// Start loading a directory tree asynchronously.
     /// Returns a Loading screen that spawns a background task to build the tree.
     pub fn loading(path: std::path::PathBuf) -> Self {
+        Self::loading_with_cache(path, None)
+    }
+
+    /// Start loading a directory tree, optionally reusing an existing size
+    /// cache. Passing the parent tree's cache makes drilling into a
+    /// subdirectory reuse sizes that were already computed instead of
+    /// rescanning the disk.
+    pub fn loading_with_cache(
+        path: std::path::PathBuf,
+        cache: Option<crate::utils::sizes::SizeCache>,
+    ) -> Self {
         use crate::screen::SortMode;
         use crate::widget::file_tree::FileTree;
         use tokio::sync::oneshot;
@@ -56,7 +67,8 @@ impl Screen {
         tokio::task::spawn_blocking({
             let path = path.clone();
             move || {
-                let tree = FileTree::new(path, SortMode::Largest, true, true);
+                let cache = cache.unwrap_or_default();
+                let tree = FileTree::with_cache(path, SortMode::Largest, true, true, cache);
                 let _ = tx.send(tree);
             }
         });

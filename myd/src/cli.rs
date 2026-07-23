@@ -7,6 +7,6 @@ use clap::Parser;
 #[command(name = "myd", version, about, long_about = None)]
 pub struct Cli {
     /// Starting directory (defaults to directory picker if omitted)
-    #[arg(short = 'p', long, value_hint = clap::ValueHint::DirPath)]
+    #[arg(value_hint = clap::ValueHint::DirPath)]
     pub path: Option<PathBuf>,
 }

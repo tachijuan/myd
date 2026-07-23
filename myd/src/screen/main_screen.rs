@@ -24,8 +24,14 @@ pub struct MainScreenState {
     pub info_panel_hidden: bool,
     /// Cached info panel text — only recomputed when selection changes.
     cached_info_text: Text<'static>,
-    /// Last selected name (to detect when selection changes, cheaper than PathBuf comparison).
-    last_selected_name: String,
+    /// What `cached_info_text` describes: the resolved path it was built from,
+    /// and the view that was focused at the time.
+    ///
+    /// Keyed on the full path rather than the display name because two entries
+    /// in different directories can share a basename — keying on the name alone
+    /// let one view's panel show the other's stale text. The focus is part of
+    /// the key so switching views always re-reads the newly focused cursor.
+    cached_info_key: Option<(PathBuf, FocusTarget)>,
 }
 
 impl MainScreenState {
@@ -37,9 +43,9 @@ impl MainScreenState {
             tree,
             treemap,
             focus: FocusTarget::Tree,
-            info_panel_hidden: false,
+            info_panel_hidden: true,
             cached_info_text: Text::default(),
-            last_selected_name: String::new(),
+            cached_info_key: None,
         }
     }
 
@@ -51,15 +57,26 @@ impl MainScreenState {
             tree,
             treemap,
             focus: FocusTarget::Tree,
-            info_panel_hidden: false,
+            info_panel_hidden: true,
             cached_info_text: Text::default(),
-            last_selected_name: String::new(),
+            cached_info_key: None,
         }
+    }
+
+    /// Adopt session-wide view preferences (info panel visibility, focused view).
+    /// Applied to freshly built screens so navigating into a directory preserves
+    /// how the user has set the view up.
+    pub fn apply_view_prefs(&mut self, info_panel_hidden: bool, focus: FocusTarget) {
+        self.info_panel_hidden = info_panel_hidden;
+        self.focus = focus;
     }
 
     /// Rebuild the treemap from the current tree (call after tree structure changes).
     fn rebuild_treemap(&mut self) {
         self.treemap = TreeMap::from_file_tree(&self.tree);
+        // Sizes and child counts may have changed even though the selected path
+        // did not, so the cached panel text can no longer be trusted.
+        self.cached_info_key = None;
     }
 
     pub fn cursor_down(&mut self) -> bool {
@@ -189,12 +206,18 @@ impl MainScreenState {
         true
     }
 
+    /// Manual rescan (`r`). Sizes are otherwise cached and reused across
+    /// navigation, so this is the way to pick up on-disk changes. Clearing the
+    /// shared cache invalidates it for every screen holding a handle to it, not
+    /// just this one.
     pub fn refresh(&mut self) -> bool {
-        self.tree = FileTree::new(
+        self.tree.size_cache.clear();
+        self.tree = FileTree::with_cache(
             self.root_path.clone(),
             self.tree.sort_mode,
             self.tree.show_hidden,
             self.tree.show_size_bar,
+            self.tree.size_cache.clone(),
         );
         self.rebuild_treemap();
         true
@@ -218,6 +241,25 @@ impl MainScreenState {
             }
         }
         true
+    }
+
+    /// The treemap's tiles, in layout order.
+    pub fn treemap_cells(&self) -> &[crate::widget::treemap::TreemapCell] {
+        &self.treemap.cells
+    }
+
+    /// In the treemap, whether the cursor can still move left. False on a
+    /// left-edge tile — the point at which `h` should step up to the parent
+    /// directory instead of sliding the cursor.
+    pub fn treemap_can_move_left(&self) -> bool {
+        self.treemap.can_move_left()
+    }
+
+    /// Move the treemap cursor to a specific tile.
+    pub fn set_treemap_cursor(&mut self, index: usize) {
+        if index < self.treemap.cells.len() {
+            self.treemap.cursor = index;
+        }
     }
 
     /// Get the currently selected path from whichever view is focused.
@@ -307,7 +349,9 @@ impl MainScreenState {
 
         // Calculate scroll offset so the cursor line stays visible.
         // The block has borders (top/bottom) and a title bar, reducing usable height.
-        let visible_lines = (area.height - 3).max(1) as usize;
+        // Borders and the title bar consume 3 rows; saturate so a very short
+        // terminal underflows to 1 line instead of panicking.
+        let visible_lines = area.height.saturating_sub(3).max(1) as usize;
         let scroll = if self.tree.cursor >= visible_lines {
             self.tree.cursor - visible_lines + 1
         } else {
@@ -337,32 +381,36 @@ impl MainScreenState {
     }
 
     fn render_treemap(&mut self, frame: &mut Frame, area: Rect) {
-        // Get the tree's selected path to highlight in the treemap.
-        let highlighted_path = self.tree.selected_line().map(|l| &l.path as &std::path::Path);
+        // Get the tree's selected path to highlight in the treemap. Cloned so the
+        // immutable borrow of `self.tree` ends before `self.treemap` is borrowed mutably.
+        let highlighted_path = self.tree.selected_line().map(|l| l.path.clone());
+        let cursor = self.treemap.cursor;
 
-        self.treemap.render(frame, area, self.treemap.cursor, highlighted_path);
+        self.treemap
+            .render(frame, area, cursor, highlighted_path.as_deref());
     }
 
     fn render_info(&mut self, frame: &mut Frame, area: Rect) {
         // Use whichever view is focused to determine what to show info for.
-        let (current_name, path) = match self.focus {
-            FocusTarget::Tree => {
-                self.tree.selected_line()
-                    .map(|l| (l.name.clone(), l.path.clone()))
-                    .unwrap_or((String::new(), PathBuf::from(".")))
-            }
-            FocusTarget::Treemap => {
-                self.treemap.selected_cell()
-                    .map(|c| (c.label.clone(), c.path.clone()))
-                    .unwrap_or((String::new(), PathBuf::from(".")))
-            }
+        // `resolved` identifies the entry; `path` is what gets displayed.
+        let (resolved, path) = match self.focus {
+            FocusTarget::Tree => self
+                .tree
+                .selected_line()
+                .map(|l| (l.resolved_path.clone(), l.path.clone()))
+                .unwrap_or_else(|| (PathBuf::from("."), PathBuf::from("."))),
+            FocusTarget::Treemap => self
+                .treemap
+                .selected_cell()
+                .map(|c| (c.resolved_path.clone(), c.path.clone()))
+                .unwrap_or_else(|| (PathBuf::from("."), PathBuf::from("."))),
         };
 
-        // Only recompute info text when selection changes.
-        if current_name != self.last_selected_name {
-            self.last_selected_name = current_name.clone();
-
+        // Recompute when the focused view changes or points somewhere new.
+        let key = (resolved, self.focus);
+        if self.cached_info_key.as_ref() != Some(&key) {
             self.cached_info_text = file_info::render_info_owned(&path, &self.tree.size_cache);
+            self.cached_info_key = Some(key);
         }
 
         let paragraph = Paragraph::new(self.cached_info_text.clone()).block(
@@ -376,22 +424,97 @@ impl MainScreenState {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let view_label = match self.focus {
-            FocusTarget::Tree => "TREE",
-            FocusTarget::Treemap => "TREEMAP",
-        };
-        let footer = format!(
-            " [{}]  j/k:navigate  l:expand  h:collapse/back  Enter:enter  v:toggle view  t:toggle info  ?/F1:help  q:quit ",
-            view_label
-        );
-        let line = Line::from(Span::styled(
-            footer,
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::Rgb(20, 20, 30))
-                .add_modifier(Modifier::BOLD),
-        ));
-        let paragraph = Paragraph::new(line);
-        frame.render_widget(paragraph, area);
+        let bg = Color::Rgb(20, 20, 30);
+        match self.focus {
+            // In the treemap the tile colors need explaining, and the legend is
+            // more useful there than a second copy of the keybindings.
+            FocusTarget::Treemap => {
+                // Short enough to survive on a narrow terminal; `?` opens help
+                // for the full list. The label abbreviates when space is tight.
+                const KEYS: &str = " hjkl:move  v:view  ?:help  q:quit ";
+                let prefix = if (area.width as usize) < 46 {
+                    " [TM] "
+                } else {
+                    " [TREEMAP] "
+                };
+
+                let mut spans = vec![Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                )];
+
+                // Keybindings are load-bearing, the legend is a hint — so the
+                // legend gets only the width left over and drops entries that
+                // don't fit rather than pushing the keys off the line.
+                let mut budget = (area.width as usize)
+                    .saturating_sub(prefix.len())
+                    .saturating_sub(KEYS.len());
+
+                // When the selected tile is too narrow to show its own name,
+                // the footer is the only place the user can read it — so it
+                // takes precedence over the legend swatches.
+                if let Some(name) = self.treemap.truncated_selected_label() {
+                    let text = format!(" {} ", name);
+                    if text.len() <= budget {
+                        budget -= text.len();
+                        spans.push(Span::styled(
+                            text,
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(bg)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    } else if budget > 4 {
+                        // Even the name doesn't fit; show as much as it can.
+                        let avail = budget - 4;
+                        let clipped: String = name.chars().take(avail).collect();
+                        let text = format!(" {}… ", clipped);
+                        budget -= text.chars().count();
+                        spans.push(Span::styled(
+                            text,
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(bg)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+
+                let mut used = 0usize;
+                for cat in self.treemap.categories_present() {
+                    let swatch = format!(" {} ", cat.label());
+                    let cost = swatch.len() + 1; // swatch plus its separator
+                    if used + cost > budget {
+                        break;
+                    }
+                    used += cost;
+                    spans.push(Span::styled(
+                        swatch,
+                        Style::default().fg(cat.fg_color()).bg(cat.bg_color()),
+                    ));
+                    spans.push(Span::styled(" ", Style::default().bg(bg)));
+                }
+
+                spans.push(Span::styled(
+                    KEYS,
+                    Style::default().fg(Color::Yellow).bg(bg),
+                ));
+                frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            }
+            FocusTarget::Tree => {
+                let footer = " [TREE]  j/k:navigate  l:expand  h:collapse/back  Enter:enter  v:toggle view  t:toggle info  ?/F1:help  q:quit ";
+                let line = Line::from(Span::styled(
+                    footer,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                frame.render_widget(Paragraph::new(line), area);
+            }
+        }
     }
 }

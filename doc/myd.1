@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2025" "myd 0.1.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.2.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -24,10 +24,13 @@ Move cursor down one line.
 Move cursor up one line.
 .TP
 .B h
-Collapse the current directory, or move the cursor to the parent entry.
+In the tree view, collapse the current directory or move the cursor to the
+parent entry. In the treemap view, move the cursor one tile to the left; when
+already on a left-edge tile, step up to the parent directory.
 .TP
 .B l
-Expand the current directory.
+In the tree view, expand the current directory. In the treemap view, move the
+cursor one tile to the right.
 .TP
 .B gg
 Jump to the first line of the tree.
@@ -61,8 +64,16 @@ Delete the currently selected file or directory (with confirmation dialog).
 Rename the currently selected file or directory.
 .TP
 .B r
-Refresh the file tree and clear the size cache.
+Rescan: clear the size cache and re-read sizes from disk. Sizes are otherwise
+cached and reused as you navigate, so this is how to pick up on-disk changes.
 .SS View
+.TP
+.B v
+Toggle between the tree view and the treemap view. The chosen view persists as
+you navigate between directories.
+.TP
+.B t
+Toggle the info panel sidebar. Hidden by default.
 .TP
 .B s
 Cycle through sort modes: dirs-first, files-first, largest, smallest.
@@ -81,13 +92,16 @@ Show/hide help.
 .SS Screen Level
 .TP
 .B q
-Quit the application (or go back to previous directory).
+Quit the application immediately.
 .TP
 .B Esc
 Quit the application.
 .TP
+.B Ctrl+o
+Go back to the parent directory.
+.TP
 .B Ctrl+r
-Refresh the file tree.
+Rescan the file tree.
 .TP
 .B Ctrl+b
 Toggle the info panel sidebar.
@@ -119,9 +133,21 @@ The item occupies 50\-80% of its parent's total size.
 The item occupies more than 80% of its parent's total size.
 .PP
 Toggle the size bars on and off with \fBb\fR.
+.SH TREEMAP VIEW
+Press \fBv\fR to switch between the file tree and a squarified treemap that
+visualizes disk usage as proportional rectangular tiles: larger files and
+directories occupy more area. Move between tiles with \fBh\fR, \fBj\fR,
+\fBk\fR, and \fBl\fR; press \fBl\fR or \fBEnter\fR to descend into a directory.
+.PP
+Each tile is filled with a color for its content category: code, docs, images,
+video, audio, archives, data, binaries, or other. A file's category comes from
+its extension; a directory takes the category holding most of its bytes. A
+legend in the status bar names the categories currently on screen. When a tile
+is too narrow to show its full name, the selected item's name is shown in the
+status bar.
 .SH INFO PANEL
-The right-hand sidebar displays detailed metadata for the currently selected
-item:
+The right-hand sidebar (hidden by default; toggle with \fBt\fR or \fBCtrl+b\fR)
+displays detailed metadata for the currently selected item:
 .TP
 .B Name
 The file or directory name.
@@ -147,7 +173,7 @@ Creation, modification, and last access times.
 .B Path
 The absolute path to the item.
 .PP
-Hide or show the panel with \fBCtrl+b\fR.
+Hide or show the panel with \fBt\fR or \fBCtrl+b\fR.
 .SH EXAMPLES
 .TP
 .B myd

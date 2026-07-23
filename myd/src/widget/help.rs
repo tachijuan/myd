@@ -77,7 +77,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         HelpCategory {
             title: "Exit",
             items: &[
-                ("q / Esc", "Quit (or go back in subdir)"),
+                ("q / Esc", "Quit immediately"),
             ],
         },
         HelpCategory {

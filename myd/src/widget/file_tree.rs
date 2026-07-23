@@ -99,11 +99,19 @@ fn load_children(
         }
     }
 
-    // Compute and cache sizes for all entries before sorting.
-    // Directories get recursive (du-like) size; files get metadata size.
+    // Ensure every entry has a size before sorting. Directories get recursive
+    // (du-like) size; files get metadata size. Entries already in the cache are
+    // left alone — recomputing them is the expensive part of opening a
+    // subdirectory whose parent was already scanned. Refresh clears the cache
+    // when the on-disk state actually needs re-reading.
     for entry in &mut entries {
+        if cache.get(&entry.resolved_path).is_some() {
+            continue;
+        }
         let size = if entry.is_dir {
-            sizes::get_dir_size(&entry.path)
+            // Records every descendant's size too, so opening this directory
+            // later is a cache hit instead of another walk.
+            sizes::get_dir_size_caching(&entry.path, cache)
         } else {
             sizes::get_file_size(&entry.path)
         };
@@ -230,8 +238,22 @@ pub struct FileTree {
 
 impl FileTree {
     pub fn new(path: PathBuf, sort_mode: SortMode, show_hidden: bool, show_size_bar: bool) -> Self {
+        Self::with_cache(path, sort_mode, show_hidden, show_size_bar, SizeCache::new())
+    }
+
+    /// Build a tree that reuses an existing size cache.
+    ///
+    /// Used when opening a subdirectory of a tree that has already been
+    /// scanned: the sizes are still valid, so there is no reason to walk the
+    /// disk again. A manual refresh clears the cache to pick up on-disk changes.
+    pub fn with_cache(
+        path: PathBuf,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        show_size_bar: bool,
+        cache: SizeCache,
+    ) -> Self {
         let mut root = TreeNode::new(path.clone());
-        let cache = SizeCache::new();
         root.expand(&cache, sort_mode, show_hidden);
 
         let mut tree = Self {

@@ -11,6 +11,7 @@ use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
 use crate::widget::input_dialog::InputDialog;
 use crate::widget::progress::ProgressOverlay;
+use crate::widget::treemap::FocusTarget;
 
 /// Drop guard that restores terminal state even if the app panics or is interrupted.
 /// Disables raw mode, leaves alternate screen, shows cursor, and flushes output.
@@ -55,6 +56,28 @@ pub enum ModalTarget {
 
 use tokio::task::JoinHandle;
 
+/// View preferences that belong to the session rather than to one directory.
+///
+/// Entering a directory builds a fresh `MainScreenState`, so these are held on
+/// the app and applied to each new screen — otherwise hiding the info panel or
+/// switching to the treemap would silently undo itself on every navigation.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewPrefs {
+    pub info_panel_hidden: bool,
+    pub focus: FocusTarget,
+}
+
+impl Default for ViewPrefs {
+    fn default() -> Self {
+        Self {
+            // The file listing is the reason to open the app; the info pane is
+            // detail on demand. Start with it closed and let `t` bring it up.
+            info_panel_hidden: true,
+            focus: FocusTarget::default(),
+        }
+    }
+}
+
 /// Main application state machine.
 pub struct FileBrowser {
     screen_stack: Vec<Screen>,
@@ -63,6 +86,8 @@ pub struct FileBrowser {
     modal_target: Option<ModalTarget>,
     /// Background delete task (for progress tracking).
     delete_task: Option<JoinHandle<()>>,
+    /// Carried onto every newly created main screen.
+    view_prefs: ViewPrefs,
 }
 
 impl FileBrowser {
@@ -89,6 +114,7 @@ impl FileBrowser {
             modal: Modal::None,
             modal_target: None,
             delete_task: None,
+            view_prefs: ViewPrefs::default(),
         }
     }
 
@@ -173,11 +199,31 @@ impl FileBrowser {
         Ok(())
     }
 
+    /// Pop the top screen and apply the session's view preferences to the
+    /// screen it reveals.
+    ///
+    /// A parent screen still on the stack keeps whatever focus it had when we
+    /// descended, which may be stale — e.g. we entered in tree view and later
+    /// switched the child to the treemap. Re-applying the current prefs keeps
+    /// the view consistent across a pop, just as it is across a push.
+    fn pop_screen(&mut self) {
+        self.screen_stack.pop();
+        let prefs = self.view_prefs;
+        if let Some(Screen::Main(state)) = self.screen_stack.last_mut() {
+            state.apply_view_prefs(prefs.info_panel_hidden, prefs.focus);
+        }
+    }
+
     /// Check for completed loading tasks and replace Loading screens with Main.
     fn resolve_loading(&mut self) {
+        let prefs = self.view_prefs;
         if let Some(last) = self.screen_stack.last_mut() {
             if let Some((path, tree)) = last.poll_loading() {
-                *last = Screen::Main(MainScreenState::from_tree(path, tree));
+                let mut state = MainScreenState::from_tree(path, tree);
+                // Carry the session's view preferences onto the new screen so
+                // entering a directory doesn't silently reset them.
+                state.apply_view_prefs(prefs.info_panel_hidden, prefs.focus);
+                *last = Screen::Main(state);
             }
         }
     }
@@ -195,6 +241,33 @@ impl FileBrowser {
                 }
             }
         }
+    }
+
+    /// Drive one key through the app, exactly as the event loop does.
+    /// Exposed so tests can exercise real key sequences end to end.
+    pub fn handle_key_for_test(&mut self, key: KeyEvent) -> bool {
+        self.handle_key(key)
+    }
+
+    /// The screen currently on top of the stack.
+    pub fn current_screen(&self) -> &Screen {
+        self.screen_stack.last().expect("empty stack")
+    }
+
+    /// Number of screens on the navigation stack (for tests).
+    pub fn screen_stack_depth(&self) -> usize {
+        self.screen_stack.len()
+    }
+
+    /// Mutable access to the top screen (for tests that need to render it).
+    pub fn current_screen_mut(&mut self) -> &mut Screen {
+        self.screen_stack.last_mut().expect("empty stack")
+    }
+
+    /// Resolve any pending Loading screen into a Main screen (normally driven
+    /// by the event loop each tick).
+    pub fn resolve_loading_for_test(&mut self) {
+        self.resolve_loading();
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -216,22 +289,13 @@ impl FileBrowser {
     fn dispatch_action(&mut self, action: Action) -> bool {
         match action {
             Action::Quit => {
-                // Pop back to the previous screen if there's a Main screen below us.
-                if self.screen_stack.len() > 1
-                    && !matches!(
-                        self.screen_stack.get(self.screen_stack.len().saturating_sub(2)),
-                        Some(Screen::DirPicker(_))
-                    )
-                {
-                    self.screen_stack.pop();
-                    return true;
-                }
-                // Otherwise quit the app.
+                // Quit the app immediately, regardless of navigation history.
+                // Use Ctrl-o (PopScreen) to step back up a directory.
                 false
             }
             Action::PopScreen => {
                 if self.screen_stack.len() > 1 {
-                    self.screen_stack.pop();
+                    self.pop_screen();
                 }
                 true
             }
@@ -253,16 +317,20 @@ impl FileBrowser {
                 }
                 // Enter on a directory in main screen → navigate into it.
                 // Extract the path first to avoid double borrow.
-                let path_to_push = if let Some(Screen::Main(state)) = self.screen_stack.last() {
+                let target = if let Some(Screen::Main(state)) = self.screen_stack.last() {
                     state
                         .selected_path()
                         .filter(|p| p.is_dir())
                         .cloned()
+                        // Hand down the parent's size cache: the subtree was
+                        // already measured, so reuse it instead of rescanning.
+                        .map(|p| (p, state.tree.size_cache.clone()))
                 } else {
                     None
                 };
-                if let Some(path) = path_to_push {
-                    self.screen_stack.push(Screen::loading(path));
+                if let Some((path, cache)) = target {
+                    self.screen_stack
+                        .push(Screen::loading_with_cache(path, Some(cache)));
                 }
                 true
             }
@@ -285,8 +353,22 @@ impl FileBrowser {
                 );
                 let current = self.screen_stack.last_mut().expect("empty stack");
 
-                // If on an expanded directory, collapse it in place.
                 if let Screen::Main(state) = current {
+                    // In the treemap, `h` slides the cursor left; on a left-edge
+                    // tile (nowhere further left) it steps up to the parent
+                    // directory instead, mirroring how tree `h` moves toward the
+                    // parent and pops up when it can go no further.
+                    if state.focus == FocusTarget::Treemap {
+                        if state.treemap_can_move_left() {
+                            return state.collapse();
+                        }
+                        if stack_len > 1 && !dir_picker_below {
+                            self.pop_screen();
+                        }
+                        return true;
+                    }
+
+                    // Tree view: if on an expanded directory, collapse it in place.
                     let is_expanded = state.tree.is_cursor_expanded();
                     let is_dir = state.tree.selected_line().map(|l| l.is_dir).unwrap_or(false);
                     if is_dir && is_expanded {
@@ -298,7 +380,7 @@ impl FileBrowser {
                 let at_root = { current.selected_line_depth().unwrap_or(0) == 0 };
 
                 if at_root && stack_len > 1 && !dir_picker_below {
-                    self.screen_stack.pop();
+                    self.pop_screen();
                     return true;
                 }
 
@@ -368,10 +450,18 @@ impl FileBrowser {
                     Action::ToggleInfoPanel => {
                         if let Screen::Main(state) = current {
                             state.info_panel_hidden = !state.info_panel_hidden;
+                            // Remember it for screens opened later this session.
+                            self.view_prefs.info_panel_hidden = state.info_panel_hidden;
                         }
                         true
                     }
-                    Action::ToggleView => current.toggle_view(),
+                    Action::ToggleView => {
+                        let result = current.toggle_view();
+                        if let Some(Screen::Main(state)) = self.screen_stack.last() {
+                            self.view_prefs.focus = state.focus;
+                        }
+                        result
+                    }
                     Action::Quit | Action::PopScreen | Action::Help | Action::Confirm
                     | Action::ChangeRoot | Action::Search | Action::Collapse
                     | Action::GoDirPicker => unreachable!(),
