@@ -32,6 +32,9 @@ impl ConfirmDialog {
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         let center = centered(Rect::new(0, 0, 50, 7), area);
+        if center.width == 0 || center.height == 0 {
+            return;
+        }
         frame.render_widget(Clear, center);
 
         let msg_line = Line::from(self.message.split('\n').map(|s| Span::raw(s.to_string())).collect::<Vec<_>>());
@@ -68,8 +71,15 @@ impl ConfirmDialog {
     }
 }
 
+/// Center `r` inside `area`, clamped to fit. A dialog larger than the terminal
+/// would otherwise land outside the buffer and panic on render.
 fn centered(r: Rect, area: Rect) -> Rect {
-    let x = area.width.saturating_sub(r.width) / 2;
-    let y = area.height.saturating_sub(r.height) / 2;
-    Rect::new(x, y, r.width, r.height)
+    let w = r.width.min(area.width);
+    let h = r.height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
 }

@@ -8,13 +8,16 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 
 - **vi-style navigation** — `j`/`k` to move, `h`/`l` to collapse/expand, `gg`/`G` to jump to top/bottom, `dd` to delete, and more.
 - **File tree with size visualization** — each entry shows a proportional size bar (green / amber / red) and human-readable file size.
-- **Info panel** — live sidebar displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
+- **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree.
+- **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
+- **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
+- **Info panel** — optional sidebar (toggle with `t`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **Sort modes** — cycle through *dirs first*, *files first*, *largest*, and *smallest* with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Search** — find files by name with `/`.
 - **Rename and delete** — rename with `R`, delete with `dd` (both with confirmation dialogs).
 - **Change root** — jump to any directory with `gd` without losing your sort and view settings.
-- **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, with `~` shortcuts for home-directory paths.
+- **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
 - **Progress overlay** — non-blocking directory enumeration with a progress indicator for large trees.
 
 ## Requirements
@@ -59,8 +62,8 @@ myd /var/log
 |-----------|-------------------------------|
 | `j`       | Move cursor down              |
 | `k`       | Move cursor up                |
-| `h`       | Collapse dir / Go to parent   |
-| `l`       | Expand directory              |
+| `h`       | Collapse dir / go to parent (tree); move left, or step up to parent at the left edge (treemap) |
+| `l`       | Expand directory (tree) / move right (treemap) |
 | `gg`      | Jump to top                   |
 | `G`       | Jump to bottom                |
 | `Ctrl+d`  | Page down                     |
@@ -86,6 +89,7 @@ myd /var/log
 | `s`       | Cycle sort mode               |
 | `H`       | Toggle hidden files           |
 | `b`       | Toggle size bars              |
+| `t`       | Toggle info panel             |
 | `/`       | Search by name                |
 | `?` / `F1`| Help                          |
 
@@ -93,9 +97,10 @@ myd /var/log
 
 | Key       | Action                        |
 |-----------|-------------------------------|
-| `q`       | Quit / Go back                |
+| `q`       | Quit immediately              |
 | `Esc`     | Quit                          |
-| `Ctrl+r`  | Refresh                       |
+| `Ctrl+o`  | Go back to the parent directory |
+| `r` / `Ctrl+r` | Rescan (refresh sizes from disk) |
 | `Ctrl+b`  | Toggle info panel             |
 
 ## Sort Modes
@@ -127,22 +132,22 @@ Toggle bars on/off with `b`.
 
 ## Treemap View
 
-Press `v` to toggle between the file tree and a squarified treemap. The treemap visualizes disk usage as proportional rectangular boxes — larger files and directories take up more space. Navigate with `j`/`k`/`h`/`l` to move between boxes.
+Press `v` to toggle between the file tree and a squarified treemap. The treemap visualizes disk usage as proportional rectangular boxes — larger files and directories take up more space. Navigate with `j`/`k`/`h`/`l` to move between boxes, `l`/Enter to descend into a directory, and `h` to move left (stepping up to the parent directory when already on a left-edge tile).
 
 ```
 +-------------------+-----------+
 |                   |  +------+ |
 |     projects      |  | docs | |
-|     (245 MB)      |  |(52M) | |
+|                   |  |      | |
 |                   |  |      | |
 +-------------------+  +------+ |
-|           +-------------------+
-|   readme |
-|  (1.2 KB) |
-+-----------+
+|          +--------------------+
+|  readme  |
+|          |
++----------+
 ```
 
-Paths use `~` for the home directory and intelligently truncate long paths so the filename always takes priority when a box is narrow.
+Each tile is filled with a color for its content category — **code**, **docs**, **images**, **video**, **audio**, **archives**, **data**, **binaries**, or **other**. A file's color comes from its extension; a directory takes the color of the category holding most of its bytes. A legend in the status bar names the categories currently on screen. When a tile is too narrow to show its full name, the selected item's name appears in the status bar instead.
 
 ## License
 
