@@ -10,13 +10,17 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 use super::ScreenState;
+use crate::utils::sizes::CancelToken;
 use crate::widget::file_tree::FileTree;
 
 /// State for a loading screen shown while a directory tree is being built.
 pub struct LoadingState {
     pub path: PathBuf,
-    /// Channel to receive the built tree.
-    pub rx: oneshot::Receiver<FileTree>,
+    /// Channel to receive the built tree. `None` arrives if the scan was
+    /// cancelled before finishing.
+    pub rx: oneshot::Receiver<Option<FileTree>>,
+    /// Tripped to abort the background scan when the user cancels.
+    cancel: CancelToken,
     /// When loading started (for elapsed time display).
     pub started: Instant,
     /// Spinner frame index (0-based, incremented each render).
@@ -24,26 +28,50 @@ pub struct LoadingState {
 }
 
 impl LoadingState {
-    pub fn new(path: PathBuf, rx: oneshot::Receiver<FileTree>) -> Self {
+    pub fn new(path: PathBuf, rx: oneshot::Receiver<Option<FileTree>>, cancel: CancelToken) -> Self {
         Self {
             path,
             rx,
+            cancel,
             started: Instant::now(),
             spinner: 0,
         }
     }
 
-    /// Check if the background task has completed.
-    /// Returns `Some(tree)` if done, `None` if still loading.
-    pub fn poll(&mut self) -> Option<FileTree> {
-        if let Ok(tree) = self.rx.try_recv() {
-            self.spinner = 0;
-            Some(tree)
-        } else {
-            self.spinner += 1;
-            None
+    /// Signal the background scan to stop. The walk observes this cooperatively
+    /// and abandons its work within a few directory entries.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Advance the loading state, reporting whether the scan is still running,
+    /// finished with a tree, or was cancelled.
+    pub fn poll(&mut self) -> LoadingPoll {
+        match self.rx.try_recv() {
+            Ok(Some(tree)) => {
+                self.spinner = 0;
+                LoadingPoll::Done(tree)
+            }
+            Ok(None) => {
+                self.spinner = 0;
+                LoadingPoll::Cancelled
+            }
+            Err(_) => {
+                self.spinner += 1;
+                LoadingPoll::Pending
+            }
         }
     }
+}
+
+/// Outcome of polling a [`LoadingState`].
+pub enum LoadingPoll {
+    /// Still scanning.
+    Pending,
+    /// Scan finished; here is the tree.
+    Done(FileTree),
+    /// Scan was cancelled before finishing.
+    Cancelled,
 }
 
 impl ScreenState for LoadingState {
@@ -95,7 +123,7 @@ impl ScreenState for LoadingState {
                 self.path.display(),
                 time_str
             ))]),
-            Line::from(vec![Span::raw("    Press Esc to cancel")]),
+            Line::from(vec![Span::raw("    Press q or Esc to cancel")]),
             Line::from(""),
         ];
 

@@ -12,6 +12,16 @@ pub use main_screen::MainScreenState;
 use crate::widget::file_tree::FileTree;
 use crate::widget::treemap::FocusTarget;
 
+/// Result of polling a loading screen.
+pub enum LoadingOutcome {
+    /// Still scanning.
+    Pending,
+    /// Scan finished; carries the scanned path and its tree.
+    Done(std::path::PathBuf, FileTree),
+    /// The user cancelled the scan.
+    Cancelled,
+}
+
 /// Sort order for file tree entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
@@ -60,34 +70,53 @@ impl Screen {
         cache: Option<crate::utils::sizes::SizeCache>,
     ) -> Self {
         use crate::screen::SortMode;
+        use crate::utils::sizes::CancelToken;
         use crate::widget::file_tree::FileTree;
         use tokio::sync::oneshot;
 
         let (tx, rx) = oneshot::channel();
+        let cancel = CancelToken::new();
         tokio::task::spawn_blocking({
             let path = path.clone();
+            let cancel = cancel.clone();
             move || {
                 let cache = cache.unwrap_or_default();
-                let tree = FileTree::with_cache(path, SortMode::Largest, true, true, cache);
+                let tree = FileTree::with_cache_cancellable(
+                    path,
+                    SortMode::Largest,
+                    true,
+                    true,
+                    cache,
+                    &cancel,
+                );
                 let _ = tx.send(tree);
             }
         });
-        Screen::Loading(LoadingState::new(path, rx))
+        Screen::Loading(LoadingState::new(path, rx, cancel))
     }
 
     pub fn main(path: std::path::PathBuf) -> Self {
         Screen::Main(MainScreenState::new(path))
     }
 
-    /// Poll a loading screen for completion. Returns `Some(tree)` if done.
-    pub fn poll_loading(&mut self) -> Option<(std::path::PathBuf, FileTree)> {
+    /// Poll a loading screen for completion.
+    pub fn poll_loading(&mut self) -> LoadingOutcome {
+        use loading::LoadingPoll;
         if let Screen::Loading(state) = self {
-            if let Some(tree) = state.poll() {
-                let path = state.path.clone();
-                return Some((path, tree));
-            }
+            return match state.poll() {
+                LoadingPoll::Done(tree) => LoadingOutcome::Done(state.path.clone(), tree),
+                LoadingPoll::Cancelled => LoadingOutcome::Cancelled,
+                LoadingPoll::Pending => LoadingOutcome::Pending,
+            };
         }
-        None
+        LoadingOutcome::Pending
+    }
+
+    /// Signal a loading screen to stop scanning, if that's what this screen is.
+    pub fn cancel_loading(&self) {
+        if let Screen::Loading(state) = self {
+            state.cancel();
+        }
     }
 
     /// Check if this screen is a Loading screen.
