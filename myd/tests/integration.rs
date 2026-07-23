@@ -1566,3 +1566,82 @@ async fn test_scan_completes_normally_without_cancel() {
     assert!(matches!(app.current_screen(), Screen::Main(_)));
     assert_eq!(app.screen_stack_depth(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// The help screen: dismissal keys close help without acting on the app.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_q_in_help_closes_help_without_quitting() {
+    use myd::app::FileBrowser;
+
+    let dir = nav_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    settle(&mut app).await;
+
+    // Open help with '?'.
+    app.handle_key_for_test(char_key('?'));
+    assert!(app.is_help_open(), "'?' should open the help screen");
+
+    // q closes help and must NOT quit the app.
+    let keep_running = app.handle_key_for_test(char_key('q'));
+    assert!(keep_running, "q in help must not quit the app");
+    assert!(!app.is_help_open(), "q should close the help screen");
+}
+
+#[tokio::test]
+async fn test_esc_and_toggles_close_help_without_acting() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::app::FileBrowser;
+
+    // Esc, ?, and F1 each close help and are consumed (no side effect).
+    for close_key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+    ] {
+        let dir = nav_fixture();
+        let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+        settle(&mut app).await;
+
+        app.handle_key_for_test(char_key('?'));
+        assert!(app.is_help_open());
+
+        let keep_running = app.handle_key_for_test(close_key);
+        assert!(keep_running, "{:?} in help must not quit", close_key.code);
+        assert!(!app.is_help_open(), "{:?} should close help", close_key.code);
+    }
+}
+
+#[tokio::test]
+async fn test_other_key_in_help_dismisses_and_acts() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    // A non-dismissal key (j) both closes help and moves the cursor, so help
+    // isn't a dead end for ordinary navigation.
+    let dir = nav_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    settle(&mut app).await;
+
+    let cursor_before = match app.current_screen() {
+        Screen::Main(s) => s.tree.cursor,
+        _ => panic!("expected main screen"),
+    };
+
+    app.handle_key_for_test(char_key('?'));
+    assert!(app.is_help_open());
+
+    let keep_running = app.handle_key_for_test(char_key('j'));
+    assert!(keep_running);
+    assert!(!app.is_help_open(), "j should dismiss help");
+    let cursor_after = match app.current_screen() {
+        Screen::Main(s) => s.tree.cursor,
+        _ => panic!("expected main screen"),
+    };
+    assert_eq!(
+        cursor_after,
+        cursor_before + 1,
+        "j should also move the cursor down after dismissing help"
+    );
+}
