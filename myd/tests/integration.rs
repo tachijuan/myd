@@ -886,7 +886,7 @@ async fn test_info_panel_state_survives_entering_a_directory() {
     use myd::widget::treemap::FocusTarget;
 
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
     // The pane starts closed.
     assert_eq!(view_state(&app), (true, FocusTarget::Tree));
@@ -910,7 +910,7 @@ async fn test_view_focus_survives_entering_a_directory() {
     use myd::widget::treemap::FocusTarget;
 
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     // Switch to the treemap, then descend. Entering from the treemap should not
@@ -934,7 +934,7 @@ async fn test_both_view_prefs_survive_navigation_round_trip() {
     use myd::widget::treemap::FocusTarget;
 
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     app.handle_key_for_test(char_key('t'));
@@ -961,7 +961,7 @@ async fn test_toggling_prefs_back_also_persists() {
 
     // The preference is whatever the user last chose — including the default.
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     app.handle_key_for_test(char_key('t')); // show
@@ -1248,7 +1248,7 @@ async fn test_q_quits_immediately_from_a_subdirectory() {
     // Enter a subdirectory, then press q. It should quit outright, not pop back
     // to the parent screen.
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
     assert_eq!(app.screen_stack_depth(), 1);
 
@@ -1267,7 +1267,7 @@ async fn test_ctrl_o_still_pops_back_up() {
 
     // The going-back behavior q used to have now lives solely on Ctrl-o.
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1288,7 +1288,7 @@ async fn test_treemap_h_moves_left_then_steps_up_at_edge() {
     use myd::widget::treemap::FocusTarget;
 
     let dir = deep_nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     // Move onto "sub" (the root line is selected initially), descend into it,
@@ -1381,7 +1381,7 @@ async fn test_treemap_stays_in_treemap_when_stepping_up_with_h() {
     // up with h. The parent screen must be shown in treemap view, not reset to
     // the tree it was in when we descended.
     let dir = deep_nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
     assert_eq!(view_state(&app).1, FocusTarget::Tree, "starts in tree view");
 
@@ -1422,7 +1422,7 @@ async fn test_ctrl_o_also_keeps_treemap_view() {
     use myd::widget::treemap::FocusTarget;
 
     let dir = deep_nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     app.handle_key_for_test(char_key('j'));
@@ -1480,7 +1480,7 @@ async fn test_q_cancels_scan_and_quits_when_first_screen() {
     use myd::screen::Screen;
 
     let dir = big_scan_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
 
     // The very first screen is the loading scan. Cancelling it quits the app,
     // since there is nothing behind it to return to.
@@ -1526,7 +1526,7 @@ async fn test_q_cancels_scan_and_returns_to_parent_when_drilled_in() {
         }
     }
 
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     // Settle the (small) root scan.
     assert!(drain_loading(&mut app).await);
     assert_eq!(app.screen_stack_depth(), 1);
@@ -1561,7 +1561,7 @@ async fn test_scan_completes_normally_without_cancel() {
 
     // Sanity: with no cancel, a scan resolves into a Main screen as before.
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     assert!(drain_loading(&mut app).await);
     assert!(matches!(app.current_screen(), Screen::Main(_)));
     assert_eq!(app.screen_stack_depth(), 1);
@@ -1576,7 +1576,7 @@ async fn test_q_in_help_closes_help_without_quitting() {
     use myd::app::FileBrowser;
 
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     // Open help with '?'.
@@ -1601,7 +1601,7 @@ async fn test_esc_and_toggles_close_help_without_acting() {
         KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
     ] {
         let dir = nav_fixture();
-        let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+        let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
         settle(&mut app).await;
 
         app.handle_key_for_test(char_key('?'));
@@ -1621,7 +1621,7 @@ async fn test_other_key_in_help_dismisses_and_acts() {
     // A non-dismissal key (j) both closes help and moves the cursor, so help
     // isn't a dead end for ordinary navigation.
     let dir = nav_fixture();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()));
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
     let cursor_before = match app.current_screen() {
@@ -1644,4 +1644,221 @@ async fn test_other_key_in_help_dismisses_and_acts() {
         cursor_before + 1,
         "j should also move the cursor down after dismissing help"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Dual-panel mode: split, switch, and cross-panel copy.
+// ---------------------------------------------------------------------------
+
+/// Drive the app until every panel is rooted at a directory (a Main screen).
+/// Only valid when all panels were given real directory paths.
+async fn settle_all(app: &mut myd::app::FileBrowser) {
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if (0..app.panel_count()).all(|i| app.panel_current_dir(i).is_some()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("dual-panel loading never resolved");
+}
+
+fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+#[tokio::test]
+async fn test_two_positional_paths_start_dual() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    assert_eq!(app.panel_count(), 2, "two paths should open two panels");
+    assert_eq!(app.active_panel_index(), 0, "left panel starts active");
+    assert_eq!(
+        app.panel_current_dir(0).unwrap().canonicalize().unwrap(),
+        left.path().canonicalize().unwrap()
+    );
+    assert_eq!(
+        app.panel_current_dir(1).unwrap().canonicalize().unwrap(),
+        right.path().canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_dual_flag_starts_split_single_path() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let mut app =
+        FileBrowser::new(Some(left.path().to_path_buf()), None, true);
+    // The left panel loads its directory; the right opens a dir picker (no
+    // path), so only the active panel is expected to settle to a Main screen.
+    settle(&mut app).await;
+    assert_eq!(app.panel_count(), 2, "--dual should open two panels");
+    assert!(
+        app.panel_current_dir(0).is_some(),
+        "left panel is rooted at the given directory"
+    );
+    assert!(
+        app.panel_current_dir(1).is_none(),
+        "right panel opens a directory picker when no path is given"
+    );
+}
+
+#[tokio::test]
+async fn test_tab_switches_active_panel() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    assert_eq!(app.active_panel_index(), 0);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert_eq!(app.active_panel_index(), 1, "Tab moves to right panel");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert_eq!(app.active_panel_index(), 0, "Tab moves back to left");
+}
+
+#[tokio::test]
+async fn test_tab_is_noop_in_single_panel() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert_eq!(app.panel_count(), 1);
+    assert_eq!(app.active_panel_index(), 0);
+}
+
+#[tokio::test]
+async fn test_pipe_toggles_split_and_back() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    assert_eq!(app.panel_count(), 1);
+
+    // Split: opens a second panel rooted at the active panel's dir.
+    app.handle_key_for_test(char_key('|'));
+    assert_eq!(app.panel_count(), 2, "| should split into two panels");
+    settle_all(&mut app).await;
+    assert_eq!(
+        app.active_panel_index(),
+        1,
+        "the new panel becomes active on split"
+    );
+
+    // Unsplit: drops the inactive panel, keeps the active one.
+    app.handle_key_for_test(char_key('|'));
+    assert_eq!(app.panel_count(), 1, "| should collapse back to one panel");
+    assert_eq!(app.active_panel_index(), 0);
+}
+
+#[tokio::test]
+async fn test_copy_places_file_in_other_panel_dir() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("payload.bin"), vec![7u8; 128]).unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    // Move the cursor onto the file in the active (left) panel. The root line
+    // is index 0; the first child is the file.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+
+    // Let the background copy finish and the destination panel refresh.
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if right.path().join("payload.bin").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        right.path().join("payload.bin").exists(),
+        "c should copy the selected file into the right panel's directory"
+    );
+}
+
+#[tokio::test]
+async fn test_copy_collision_prompts_confirm() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("dup.txt"), b"new").unwrap();
+    std::fs::write(right.path().join("dup.txt"), b"old").unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    app.handle_key_for_test(char_key('j')); // onto dup.txt
+    app.handle_key_for_test(char_key('c')); // collision -> confirm modal
+
+    // The destination file is unchanged until we confirm.
+    assert_eq!(
+        std::fs::read(right.path().join("dup.txt")).unwrap(),
+        b"old",
+        "copy must not overwrite before confirmation"
+    );
+
+    // Confirm overwrite with 'y', then let the copy complete.
+    app.handle_key_for_test(char_key('y'));
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if std::fs::read(right.path().join("dup.txt")).unwrap() == b"new" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        std::fs::read(right.path().join("dup.txt")).unwrap(),
+        b"new",
+        "confirming overwrite should replace the destination file"
+    );
+
+    // Sanity: we're back to a normal main screen with no modal blocking.
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+}
+
+#[tokio::test]
+async fn test_copy_is_noop_in_single_panel() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("only.txt"), b"x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+    // Should not panic or create anything; simply nothing to copy into.
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.panel_count(), 1);
 }

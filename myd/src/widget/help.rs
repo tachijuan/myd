@@ -75,6 +75,14 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             ],
         },
         HelpCategory {
+            title: "Panels",
+            items: &[
+                ("|", "Toggle single / dual panels"),
+                ("Tab", "Switch active panel"),
+                ("c", "Copy selection to other panel"),
+            ],
+        },
+        HelpCategory {
             title: "Exit",
             items: &[
                 ("q / Esc", "Quit immediately"),

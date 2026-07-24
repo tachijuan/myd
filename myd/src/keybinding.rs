@@ -31,6 +31,12 @@ pub enum Action {
     PopScreen,
     GoDirPicker,
     ToggleView,
+    /// Switch focus to the other panel (dual mode).
+    SwitchPanel,
+    /// Toggle between single and dual panel layouts.
+    ToggleSplit,
+    /// Copy the active panel's selection into the other panel's directory.
+    Copy,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -131,6 +137,8 @@ impl KeyBindingHandler {
             '?' => Some(Action::Help),
             'u' => Some(Action::GoParent),
             'v' => Some(Action::ToggleView),
+            'c' => Some(Action::Copy),
+            '|' => Some(Action::ToggleSplit),
             _ => None,
         }
     }
@@ -174,6 +182,9 @@ impl KeyBindingHandler {
             KeyCode::Char('H') => Some(Action::ToggleHidden),
             KeyCode::Char('b') => Some(Action::ToggleBar),
             KeyCode::Char('v') => Some(Action::ToggleView),
+            KeyCode::Char('c') => Some(Action::Copy),
+            KeyCode::Char('|') => Some(Action::ToggleSplit),
+            KeyCode::Tab => Some(Action::SwitchPanel),
             KeyCode::Char('t') => Some(Action::ToggleInfoPanel),
             KeyCode::Char('0') => Some(Action::CollapseAll),
             KeyCode::Char('*') => Some(Action::ExpandAll),
