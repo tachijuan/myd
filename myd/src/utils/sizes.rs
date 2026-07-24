@@ -165,6 +165,17 @@ pub fn get_dir_size_caching(path: &Path, cache: &SizeCache) -> u64 {
     get_dir_size_caching_cancellable(path, cache, &CancelToken::new())
 }
 
+/// As [`get_dir_size_caching_cancellable`], but also reports each visited entry
+/// to `progress` (files, dirs, and bytes) so a scan can show a live count.
+pub fn get_dir_size_caching_cancellable_progress(
+    path: &Path,
+    cache: &SizeCache,
+    cancel: &CancelToken,
+    progress: Option<&crate::widget::progress::OpProgress>,
+) -> u64 {
+    get_dir_size_inner(path, cache, cancel, progress)
+}
+
 /// As [`get_dir_size_caching`], but abandons the walk when `cancel` is tripped.
 ///
 /// On cancellation the partial totals gathered so far are discarded and 0 is
@@ -173,6 +184,15 @@ pub fn get_dir_size_caching_cancellable(
     path: &Path,
     cache: &SizeCache,
     cancel: &CancelToken,
+) -> u64 {
+    get_dir_size_inner(path, cache, cancel, None)
+}
+
+fn get_dir_size_inner(
+    path: &Path,
+    cache: &SizeCache,
+    cancel: &CancelToken,
+    progress: Option<&crate::widget::progress::OpProgress>,
 ) -> u64 {
     if is_virtual_fs(path) {
         return 0;
@@ -203,10 +223,16 @@ pub fn get_dir_size_caching_cancellable(
             // Children have already contributed their totals.
             let total = totals.remove(entry.path()).unwrap_or(0);
             cache.insert(entry.path(), total);
+            if let Some(p) = progress {
+                p.add_dir();
+            }
             total
         } else if entry.file_type().is_file() {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             cache.insert(entry.path(), size);
+            if let Some(p) = progress {
+                p.add_file(size);
+            }
             size
         } else {
             // Symlinks and other node types contribute nothing.

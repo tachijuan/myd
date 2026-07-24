@@ -255,6 +255,74 @@ impl MainScreenState {
         true
     }
 
+    /// Toggle the tag on the tree cursor's file. Tree-only (no-op in treemap).
+    pub fn toggle_tag(&mut self) -> bool {
+        if self.focus == FocusTarget::Tree {
+            self.tree.toggle_tag();
+        }
+        true
+    }
+
+    /// Remove every tag.
+    pub fn untag_all(&mut self) -> bool {
+        self.tree.untag_all();
+        true
+    }
+
+    /// Toggle visual (range-tag) mode. Tree-only.
+    pub fn toggle_visual(&mut self) -> bool {
+        if self.focus == FocusTarget::Tree {
+            self.tree.toggle_visual();
+        }
+        true
+    }
+
+    /// Exit visual mode without clearing tags (called before non-motion actions).
+    pub fn exit_visual(&mut self) {
+        self.tree.exit_visual();
+    }
+
+    /// Whether visual mode is currently active.
+    pub fn in_visual_mode(&self) -> bool {
+        self.tree.in_visual_mode()
+    }
+
+    /// Snapshot of tagged paths for a copy.
+    pub fn tagged_paths(&self) -> Vec<PathBuf> {
+        self.tree.tagged_paths()
+    }
+
+    /// Number of tagged files (for the footer indicator).
+    pub fn tagged_count(&self) -> usize {
+        self.tree.tagged.len()
+    }
+
+    /// Filter the cursor's current directory by regex. An empty pattern clears
+    /// the filter; an invalid pattern is ignored. The "current directory" is the
+    /// cursor line itself if it's a directory, otherwise its parent.
+    pub fn filter(&mut self, pattern: &str) -> bool {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            self.tree.clear_filter();
+            return true;
+        }
+        let re = match regex::Regex::new(pattern) {
+            Ok(re) => re,
+            Err(_) => return true, // ignore bad patterns
+        };
+        let dir = match self.tree.selected_line() {
+            Some(line) if line.is_dir => line.resolved_path.clone(),
+            Some(line) => line
+                .resolved_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.root_path.clone()),
+            None => self.root_path.clone(),
+        };
+        self.tree.set_filter(dir, re);
+        true
+    }
+
     /// The treemap's tiles, in layout order.
     pub fn treemap_cells(&self) -> &[crate::widget::treemap::TreemapCell] {
         &self.treemap.cells
@@ -528,15 +596,37 @@ impl MainScreenState {
                 frame.render_widget(Paragraph::new(Line::from(spans)), area);
             }
             FocusTarget::Tree => {
-                let footer = " [TREE]  j/k:navigate  l:expand  h:collapse/back  Enter:enter  v:toggle view  t:toggle info  ?/F1:help  q:quit ";
-                let line = Line::from(Span::styled(
+                let mut spans = Vec::new();
+                // A tagged/visual indicator takes precedence — it's transient
+                // state the user needs to see. Prefix it before the keybindings.
+                let tagged = self.tree.tagged.len();
+                if self.tree.in_visual_mode() {
+                    spans.push(Span::styled(
+                        " [VISUAL] ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if tagged > 0 {
+                    spans.push(Span::styled(
+                        format!(" {} tagged ", tagged),
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Rgb(60, 60, 90))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let footer = " [TREE]  j/k:move  l/h:expand/collapse  t:tag  V:visual  U:untag  f:filter  c:copy  ?:help  q:quit ";
+                spans.push(Span::styled(
                     footer,
                     Style::default()
                         .fg(Color::Yellow)
                         .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 ));
-                frame.render_widget(Paragraph::new(line), area);
+                frame.render_widget(Paragraph::new(Line::from(spans)), area);
             }
         }
     }

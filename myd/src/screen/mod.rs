@@ -72,27 +72,31 @@ impl Screen {
         use crate::screen::SortMode;
         use crate::utils::sizes::CancelToken;
         use crate::widget::file_tree::FileTree;
+        use crate::widget::progress::OpProgress;
         use tokio::sync::oneshot;
 
         let (tx, rx) = oneshot::channel();
         let cancel = CancelToken::new();
+        let progress = OpProgress::new();
         tokio::task::spawn_blocking({
             let path = path.clone();
             let cancel = cancel.clone();
+            let progress = progress.clone();
             move || {
                 let cache = cache.unwrap_or_default();
-                let tree = FileTree::with_cache_cancellable(
+                let tree = FileTree::with_cache_cancellable_progress(
                     path,
                     SortMode::Largest,
                     true,
                     true,
                     cache,
                     &cancel,
+                    &progress,
                 );
                 let _ = tx.send(tree);
             }
         });
-        Screen::Loading(LoadingState::new(path, rx, cancel))
+        Screen::Loading(LoadingState::new(path, rx, cancel, progress))
     }
 
     pub fn main(path: std::path::PathBuf) -> Self {
@@ -283,6 +287,48 @@ impl Screen {
             Screen::DirPicker(s) => s.search(pattern),
             Screen::Main(s) => s.search(pattern),
             Screen::Loading(_) => true,
+        }
+    }
+    pub fn filter(&mut self, pattern: &str) -> bool {
+        match self {
+            Screen::Main(s) => s.filter(pattern),
+            _ => true,
+        }
+    }
+    pub fn toggle_tag(&mut self) -> bool {
+        match self {
+            Screen::Main(s) => s.toggle_tag(),
+            _ => true,
+        }
+    }
+    pub fn untag_all(&mut self) -> bool {
+        match self {
+            Screen::Main(s) => s.untag_all(),
+            _ => true,
+        }
+    }
+    pub fn toggle_visual(&mut self) -> bool {
+        match self {
+            Screen::Main(s) => s.toggle_visual(),
+            _ => true,
+        }
+    }
+    pub fn exit_visual(&mut self) {
+        if let Screen::Main(s) = self {
+            s.exit_visual();
+        }
+    }
+    /// Snapshot of tagged paths from the top Main screen (empty otherwise).
+    pub fn tagged_paths(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Screen::Main(s) => s.tagged_paths(),
+            _ => Vec::new(),
+        }
+    }
+    /// Clear all tags on the top Main screen (no-op otherwise).
+    pub fn clear_tags(&mut self) {
+        if let Screen::Main(s) = self {
+            s.untag_all();
         }
     }
     pub fn toggle_view(&mut self) -> bool {

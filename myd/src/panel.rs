@@ -37,9 +37,9 @@ pub struct Panel {
     /// Background delete task for this panel (for progress tracking). Each panel
     /// resolves its own so a delete in one doesn't block the other.
     pub delete_task: Option<JoinHandle<()>>,
-    /// Path being deleted, mirroring `delete_task`. Removed from the tree once
-    /// the task finishes.
-    pub deleting_path: Option<PathBuf>,
+    /// Paths being deleted, mirroring `delete_task`. All are removed from the
+    /// tree once the task finishes (a delete may target many tagged files).
+    pub deleting_paths: Vec<PathBuf>,
 }
 
 impl Panel {
@@ -62,7 +62,7 @@ impl Panel {
             screen_stack: vec![screen],
             view_prefs: ViewPrefs::default(),
             delete_task: None,
-            deleting_path: None,
+            deleting_paths: Vec::new(),
         }
     }
 
@@ -122,13 +122,13 @@ impl Panel {
         }
     }
 
-    /// Check for a completed delete task and remove the deleted path from the
+    /// Check for a completed delete task and remove every deleted path from the
     /// tree in place.
     pub fn resolve_deleting(&mut self) {
         if let Some(ref task) = self.delete_task {
             if task.is_finished() {
                 self.delete_task.take();
-                if let Some(path) = self.deleting_path.take() {
+                for path in std::mem::take(&mut self.deleting_paths) {
                     self.current_screen_mut().remove_path(&path);
                 }
             }
@@ -156,6 +156,44 @@ impl Panel {
         match self.current_screen() {
             Screen::Main(state) => state.selected_resolved_path().cloned(),
             _ => None,
+        }
+    }
+
+    /// This panel's shared size cache, if it is showing a directory. Cloning the
+    /// cache shares the same underlying map (it is `Arc<DashMap>`), so handing it
+    /// to a second panel opened on the same tree lets that panel reuse every
+    /// already-measured size instead of re-walking the disk.
+    pub fn size_cache(&self) -> Option<crate::utils::sizes::SizeCache> {
+        match self.current_screen() {
+            Screen::Main(state) => Some(state.tree.size_cache.clone()),
+            _ => None,
+        }
+    }
+
+    /// As [`new`], but seed the tree build with an existing size cache so a
+    /// panel opened on an already-scanned directory is a cache hit rather than a
+    /// full rescan.
+    pub fn new_with_cache(
+        start: Option<PathBuf>,
+        cache: Option<crate::utils::sizes::SizeCache>,
+    ) -> Self {
+        let screen = match start {
+            Some(path) => {
+                let resolved = expand_user(&path).canonicalize().unwrap_or(path);
+                if resolved.is_dir() {
+                    Screen::loading_with_cache(resolved, cache)
+                } else {
+                    Screen::dir_picker()
+                }
+            }
+            None => Screen::dir_picker(),
+        };
+
+        Self {
+            screen_stack: vec![screen],
+            view_prefs: ViewPrefs::default(),
+            delete_task: None,
+            deleting_paths: Vec::new(),
         }
     }
 }
