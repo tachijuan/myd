@@ -295,6 +295,24 @@ impl Screen {
             _ => true,
         }
     }
+    pub fn create_dir(&mut self, name: &str) -> bool {
+        match self {
+            Screen::Main(s) => s.create_dir(name),
+            _ => true,
+        }
+    }
+    pub fn search_next(&mut self) -> bool {
+        match self {
+            Screen::Main(s) => s.search_next(),
+            _ => true,
+        }
+    }
+    pub fn search_prev(&mut self) -> bool {
+        match self {
+            Screen::Main(s) => s.search_prev(),
+            _ => true,
+        }
+    }
     pub fn toggle_tag(&mut self) -> bool {
         match self {
             Screen::Main(s) => s.toggle_tag(),

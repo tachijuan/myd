@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 use crate::screen::SortMode;
 use crate::utils::sizes::{self, SizeCache};
 
+/// Highlight color for tagged rows — a vivid amber that reads clearly against
+/// the default background and stands apart from the blue directories and the
+/// reversed cursor. Shared with the footer's "N tagged" badge.
+pub const TAG_COLOR: Color = Color::Rgb(255, 170, 40);
+
 /// A single node in the file tree.
 #[derive(Debug, Clone)]
 pub struct TreeNode {
@@ -532,6 +537,24 @@ impl FileTree {
         removed
     }
 
+    /// Reload just the direct children of the directory at `resolved_path`,
+    /// re-reading that one directory from disk while keeping the size cache and
+    /// the rest of the tree untouched. Used after creating a directory: far
+    /// cheaper than a full `refresh()` (which clears the cache and rescans the
+    /// whole tree). If the directory isn't loaded/expanded in the tree yet,
+    /// nothing changes on screen and this is a no-op.
+    pub fn reload_dir(&mut self, resolved_path: &Path) {
+        if reload_children_by_path(
+            &mut self.root,
+            resolved_path,
+            &self.size_cache,
+            self.sort_mode,
+            self.show_hidden,
+        ) {
+            self.reflatten();
+        }
+    }
+
     /// Navigate into the selected directory (in-place expand if already loaded,
     /// or push a new FileTree for the subdirectory — caller handles screen push).
     pub fn navigate(&mut self) {
@@ -716,6 +739,21 @@ impl FileTree {
             spans.extend(bar);
         }
 
+        // Tag marker column: a bright chevron on tagged rows, a space otherwise,
+        // so tagged files are obvious even under the cursor and keep alignment
+        // with untagged rows.
+        if is_tagged {
+            spans.push(Span::styled(
+                "▶ ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(TAG_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+
         // Indentation: two spaces per level.
         for _ in 0..line.depth {
             spans.push(Span::raw("  "));
@@ -749,11 +787,16 @@ impl FileTree {
             style = style.fg(c);
         }
         style = style.add_modifier(modifier);
-        // Tagged rows carry a distinct background so their staged state is
-        // visible. The cursor's REVERSED highlight already stands out, so the
-        // tag background is only applied when the row isn't the cursor.
-        if is_tagged && !is_selected {
-            style = style.bg(Color::Rgb(60, 60, 90));
+        // Tagged rows get a bright, high-contrast fill so their staged state is
+        // unmistakable. On the cursor row the REVERSED highlight would fight the
+        // fill, so there we drop REVERSED and rely on the tag color plus a bold
+        // marker to show both "selected" and "tagged" at once.
+        if is_tagged {
+            style = style
+                .remove_modifier(Modifier::REVERSED)
+                .fg(Color::Black)
+                .bg(TAG_COLOR)
+                .add_modifier(Modifier::BOLD);
         }
         spans.push(Span::styled(&line.name, style));
 
@@ -898,6 +941,35 @@ fn expand_node_by_path(
             expand_node_by_path(child, target, cache, sort_mode, show_hidden);
         }
     }
+}
+
+/// Find the directory node at `target` and reload only its direct children from
+/// disk (preserving deeper expansion state). Returns whether the node was found
+/// and reloaded. Only reloads a node whose children are already loaded, so a
+/// collapsed/unloaded directory is left alone.
+fn reload_children_by_path(
+    node: &mut TreeNode,
+    target: &Path,
+    cache: &SizeCache,
+    sort_mode: SortMode,
+    show_hidden: bool,
+) -> bool {
+    if node.resolved_path == target {
+        if node.is_dir && node.children.is_some() {
+            // Reload this level; children already in the cache are skipped, so a
+            // newly created (uncached) entry is the only real work.
+            reload_node(node, cache, sort_mode, show_hidden);
+        }
+        return true;
+    }
+    if let Some(ref mut children) = node.children {
+        for child in children {
+            if reload_children_by_path(child, target, cache, sort_mode, show_hidden) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Collapse a node by its resolved path.

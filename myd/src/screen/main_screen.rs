@@ -36,6 +36,9 @@ pub struct MainScreenState {
     /// let one view's panel show the other's stale text. The focus is part of
     /// the key so switching views always re-reads the newly focused cursor.
     cached_info_key: Option<(PathBuf, FocusTarget)>,
+    /// The most recent search regex, so `n` / `p` can repeat it to the next /
+    /// previous match without re-prompting.
+    last_search: Option<regex::Regex>,
 }
 
 impl MainScreenState {
@@ -51,6 +54,7 @@ impl MainScreenState {
             active: true,
             cached_info_text: Text::default(),
             cached_info_key: None,
+            last_search: None,
         }
     }
 
@@ -66,6 +70,7 @@ impl MainScreenState {
             active: true,
             cached_info_text: Text::default(),
             cached_info_key: None,
+            last_search: None,
         }
     }
 
@@ -236,22 +241,123 @@ impl MainScreenState {
     }
 
     /// Search through tree lines and move cursor to first match.
+    /// Search line names with the regex engine and move the cursor to the first
+    /// match. The pattern is treated as a case-insensitive regex; an invalid
+    /// pattern is ignored (cursor stays put).
     pub fn search(&mut self, pattern: &str) -> bool {
-        let pattern = pattern.trim().to_lowercase();
+        let pattern = pattern.trim();
         if pattern.is_empty() {
             return true;
         }
-        for (i, line) in self.tree.lines.iter().enumerate() {
-            let name = line
-                .path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if name.contains(&pattern) {
+        // Case-insensitive by default so search stays forgiving; a bad regex is
+        // a no-op rather than an error.
+        let re = match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(re) => re,
+            Err(_) => return true,
+        };
+        // Remember the pattern so `n` / `p` can repeat it.
+        self.last_search = Some(re.clone());
+        // Jump to the first match at or after the current cursor, wrapping.
+        self.jump_to_match(&re, true);
+        true
+    }
+
+    /// Move the cursor to the next match of the last search (down the tree,
+    /// wrapping to the top). No-op if nothing has been searched yet.
+    pub fn search_next(&mut self) -> bool {
+        if let Some(re) = self.last_search.clone() {
+            self.step_to_match(&re, true);
+        }
+        true
+    }
+
+    /// Move the cursor to the previous match of the last search (up the tree,
+    /// wrapping to the bottom). No-op if nothing has been searched yet.
+    pub fn search_prev(&mut self) -> bool {
+        if let Some(re) = self.last_search.clone() {
+            self.step_to_match(&re, false);
+        }
+        true
+    }
+
+    /// Jump to the first match at or after (forward) / at or before the cursor,
+    /// wrapping around the whole list. Used by the initial search.
+    fn jump_to_match(&mut self, re: &regex::Regex, forward: bool) {
+        let n = self.tree.lines.len();
+        if n == 0 {
+            return;
+        }
+        let start = self.tree.cursor;
+        for offset in 0..n {
+            let i = if forward {
+                (start + offset) % n
+            } else {
+                (start + n - offset) % n
+            };
+            if re.is_match(&self.tree.lines[i].name) {
                 self.tree.cursor = i;
-                return true;
+                return;
             }
         }
+    }
+
+    /// Step to the next/previous match strictly past the current cursor,
+    /// wrapping around. Used by `n` / `p`.
+    fn step_to_match(&mut self, re: &regex::Regex, forward: bool) {
+        let n = self.tree.lines.len();
+        if n == 0 {
+            return;
+        }
+        let start = self.tree.cursor;
+        // offsets 1..=n so we skip the current line and can wrap back to it.
+        for offset in 1..=n {
+            let i = if forward {
+                (start + offset) % n
+            } else {
+                (start + n - offset) % n
+            };
+            if re.is_match(&self.tree.lines[i].name) {
+                self.tree.cursor = i;
+                return;
+            }
+        }
+    }
+
+    /// The directory a "create here" or "filter here" action targets: the
+    /// cursor line itself when it's a directory, otherwise its parent, falling
+    /// back to the pane root.
+    fn target_dir(&self) -> PathBuf {
+        match self.tree.selected_line() {
+            Some(line) if line.is_dir => line.resolved_path.clone(),
+            Some(line) => line
+                .resolved_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.root_path.clone()),
+            None => self.root_path.clone(),
+        }
+    }
+
+    /// Create a subdirectory named `name` in the cursor's current directory.
+    /// A blank name is a no-op. Only the affected directory level is reloaded
+    /// (not the whole tree), so this stays fast even in a large tree.
+    pub fn create_dir(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return true;
+        }
+        let parent = self.target_dir();
+        let dir = parent.join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Create directory failed: {}", e);
+        }
+        // Reload just the parent level so the new directory appears, keeping the
+        // size cache and the rest of the tree intact.
+        self.tree.reload_dir(&parent);
+        self.rebuild_treemap();
         true
     }
 
@@ -310,15 +416,7 @@ impl MainScreenState {
             Ok(re) => re,
             Err(_) => return true, // ignore bad patterns
         };
-        let dir = match self.tree.selected_line() {
-            Some(line) if line.is_dir => line.resolved_path.clone(),
-            Some(line) => line
-                .resolved_path
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| self.root_path.clone()),
-            None => self.root_path.clone(),
-        };
+        let dir = self.target_dir();
         self.tree.set_filter(dir, re);
         true
     }
@@ -611,10 +709,10 @@ impl MainScreenState {
                 }
                 if tagged > 0 {
                     spans.push(Span::styled(
-                        format!(" {} tagged ", tagged),
+                        format!(" ▶ {} tagged ", tagged),
                         Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Rgb(60, 60, 90))
+                            .fg(Color::Black)
+                            .bg(crate::widget::file_tree::TAG_COLOR)
                             .add_modifier(Modifier::BOLD),
                     ));
                 }

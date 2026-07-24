@@ -45,6 +45,12 @@ pub enum Action {
     UntagAll,
     /// Filter the cursor's directory by a regex pattern.
     Filter,
+    /// Create a new directory in the active pane's current directory.
+    CreateDir,
+    /// Jump to the next match of the last search (down the tree).
+    SearchNext,
+    /// Jump to the previous match of the last search (up the tree).
+    SearchPrev,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -151,6 +157,9 @@ impl KeyBindingHandler {
             'V' => Some(Action::VisualMode),
             'U' => Some(Action::UntagAll),
             'f' => Some(Action::Filter),
+            'N' => Some(Action::CreateDir),
+            'n' => Some(Action::SearchNext),
+            'p' => Some(Action::SearchPrev),
             _ => None,
         }
     }
@@ -201,6 +210,9 @@ impl KeyBindingHandler {
             KeyCode::Char('V') => Some(Action::VisualMode),
             KeyCode::Char('U') => Some(Action::UntagAll),
             KeyCode::Char('f') => Some(Action::Filter),
+            KeyCode::Char('N') => Some(Action::CreateDir),
+            KeyCode::Char('n') => Some(Action::SearchNext),
+            KeyCode::Char('p') => Some(Action::SearchPrev),
             KeyCode::Char('0') => Some(Action::CollapseAll),
             KeyCode::Char('*') => Some(Action::ExpandAll),
             KeyCode::Char('/') => Some(Action::Search),

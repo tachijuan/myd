@@ -57,6 +57,8 @@ pub enum ModalTarget {
     Search,
     /// Regex filter prompt for the cursor's directory.
     Filter,
+    /// New-directory-name prompt; created in the cursor's current directory.
+    CreateDir,
     /// Single-panel copy: prompt for a destination directory, then copy `srcs`
     /// into it (with per-collision confirmation).
     CopyDest { srcs: Vec<PathBuf> },
@@ -457,6 +459,16 @@ impl FileBrowser {
                 ));
                 true
             }
+            Action::CreateDir => {
+                self.modal_target = Some(ModalTarget::CreateDir);
+                self.modal = Modal::Input(InputDialog::new(
+                    "New directory name:",
+                    "name",
+                ));
+                true
+            }
+            Action::SearchNext => self.active_panel_mut().current_screen_mut().search_next(),
+            Action::SearchPrev => self.active_panel_mut().current_screen_mut().search_prev(),
             Action::PopScreen => {
                 if self.active_panel().depth() > 1 {
                     self.pop_screen();
@@ -507,7 +519,7 @@ impl FileBrowser {
             }
             Action::Search => {
                 self.modal_target = Some(ModalTarget::Search);
-                self.modal = Modal::Input(InputDialog::new("Search files:", "/pattern/"));
+                self.modal = Modal::Input(InputDialog::new("Search (regex):", "pattern"));
                 true
             }
             Action::Delete => {
@@ -669,7 +681,8 @@ impl FileBrowser {
                     | Action::GoDirPicker | Action::SwitchPanel | Action::ToggleSplit
                     | Action::Copy | Action::Delete | Action::Rename
                     | Action::ToggleTag | Action::UntagAll | Action::VisualMode
-                    | Action::Filter => unreachable!(),
+                    | Action::Filter | Action::CreateDir | Action::SearchNext
+                    | Action::SearchPrev => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -733,6 +746,11 @@ impl FileBrowser {
                             ModalTarget::Filter => {
                                 // Empty pattern clears the filter (handled downstream).
                                 self.active_panel_mut().current_screen_mut().filter(&value);
+                            }
+                            ModalTarget::CreateDir => {
+                                self.active_panel_mut()
+                                    .current_screen_mut()
+                                    .create_dir(&value);
                             }
                             ModalTarget::CopyDest { srcs } => {
                                 let dir = PathBuf::from(&value)

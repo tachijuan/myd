@@ -6,20 +6,22 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 
 ## Features
 
-- **vi-style navigation** — `j`/`k` to move, `h`/`l` to collapse/expand, `gg`/`G` to jump to top/bottom, `dd` to delete, and more.
+- **vi-style navigation** — `j`/`k` to move, `h`/`l` to collapse/expand, `gg`/`G` to jump to top/bottom, and more.
 - **File tree with size visualization** — each entry shows a proportional size bar (green / amber / red) and human-readable file size.
 - **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree.
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
-- **Info panel** — optional sidebar (toggle with `t`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
+- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
+- **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the current directory to a regex, masking everything that doesn't match.
+- **Create directories** — make a new directory in the current location with `N`.
+- **Info panel** — optional sidebar (toggle with `Ctrl+b`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **Sort modes** — cycle through *dirs first*, *files first*, *largest*, and *smallest* with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
-- **Search** — find files by name with `/`.
-- **Rename and delete** — rename with `R`, delete with `dd` (both with confirmation dialogs).
+- **Rename and delete** — rename with `R`, delete with `D` (both with confirmation dialogs).
 - **Change root** — jump to any directory with `gd` without losing your sort and view settings.
-- **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy the selected item into the other panel's directory with `c`. Toggle the split on and off any time with `|`.
+- **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy tagged/selected files into the other panel's directory with `c`. Toggle the split on and off any time with `|`.
 - **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
-- **Progress overlay** — non-blocking directory enumeration with a progress indicator for large trees.
+- **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
 
 ## Requirements
 
@@ -81,11 +83,35 @@ myd ~/Documents ~/Downloads   # two paths implies dual: left and right roots
 
 ### File Operations
 
-| Key       | Action                        |
-|-----------|-------------------------------|
-| `dd`      | Delete (with confirmation)    |
-| `R`       | Rename                        |
-| `r`       | Refresh tree                  |
+| Key       | Action                                 |
+|-----------|----------------------------------------|
+| `D`       | Delete tagged / selected (confirmation)|
+| `R`       | Rename                                  |
+| `N`       | Create a new directory here            |
+| `r`       | Refresh tree                            |
+
+### Tagging & Selection
+
+| Key       | Action                                        |
+|-----------|-----------------------------------------------|
+| `t`       | Tag / untag the file under the cursor          |
+| `V`       | Visual mode — sweep `j`/`k` to tag a range     |
+| `U`       | Untag everything                               |
+| `c`       | Copy tagged / selected files                   |
+| `D`       | Delete tagged / selected files                 |
+
+Tagged files are highlighted; `c` and `D` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
+
+### Search & Filter
+
+| Key       | Action                                     |
+|-----------|--------------------------------------------|
+| `/`       | Search names by regex (case-insensitive)   |
+| `n`       | Jump to the next match (down the tree)     |
+| `p`       | Jump to the previous match (up the tree)   |
+| `f`       | Filter the current directory by regex      |
+
+Search wraps around at the ends. Filtering masks non-matching entries in the cursor's directory; an empty pattern (or `Esc`) clears it.
 
 ### View
 
@@ -95,17 +121,16 @@ myd ~/Documents ~/Downloads   # two paths implies dual: left and right roots
 | `s`       | Cycle sort mode               |
 | `H`       | Toggle hidden files           |
 | `b`       | Toggle size bars              |
-| `t`       | Toggle info panel             |
-| `/`       | Search by name                |
+| `Ctrl+b`  | Toggle info panel             |
 | `?` / `F1`| Help                          |
 
 ### Panels
 
-| Key       | Action                                        |
-|-----------|-----------------------------------------------|
-| `\|`      | Toggle single / dual-panel layout             |
-| `Tab`     | Switch the active panel                        |
-| `c`       | Copy selection into the other panel's directory |
+| Key       | Action                                          |
+|-----------|-------------------------------------------------|
+| `\|`      | Toggle single / dual-panel layout               |
+| `Tab`     | Switch the active panel                          |
+| `c`       | Copy tagged / selected into the other panel      |
 
 ### Screen-level
 
@@ -163,6 +188,24 @@ Press `v` to toggle between the file tree and a squarified treemap. The treemap 
 
 Each tile is filled with a color for its content category — **code**, **docs**, **images**, **video**, **audio**, **archives**, **data**, **binaries**, or **other**. A file's color comes from its extension; a directory takes the color of the category holding most of its bytes. A legend in the status bar names the categories currently on screen. When a tile is too narrow to show its full name, the selected item's name appears in the status bar instead.
 
+## Tagging & Multi-File Operations
+
+Most operations act on a single file — the one under the cursor. To act on several at once, **tag** them first:
+
+- Press **`t`** to tag (or untag) the file under the cursor. Tagged rows are highlighted with a bright marker so their staged state is obvious.
+- Press **`V`** to enter **visual mode**, then move with `j`/`k` to sweep-tag a whole range. Leaving visual mode keeps the tags, so you can re-enter it elsewhere to tag files that aren't next to each other.
+- Press **`U`** to clear every tag.
+
+Once files are tagged, **`c`** (copy) and **`D`** (delete) operate on the entire tagged set instead of just the cursor. Copying tagged files into another directory prompts once per name collision; deleting asks for a single confirmation. Tags are cleared automatically when the operation completes. When nothing is tagged, `c` and `D` fall back to the file under the cursor.
+
+Large copies and deletes show a progress overlay with an item-by-item count and bar.
+
+## Search & Filter
+
+Press **`/`** to search entry names with a regular expression (case-insensitive). The cursor jumps to the first match; **`n`** and **`p`** then step to the next and previous matches, wrapping around at the ends.
+
+Press **`f`** to *filter* the cursor's current directory: enter a regex and only the entries whose names match remain visible. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing.
+
 ## Dual-Panel Mode
 
 Run `myd` with `--dual` (or pass two directory paths) to view two independent trees side by side. Each panel keeps its own root, cursor, expansion state, and navigation history — everything you do (navigate, sort, toggle hidden, switch to the treemap) applies only to the active panel.
@@ -178,7 +221,7 @@ Run `myd` with `--dual` (or pass two directory paths) to view two independent tr
 
 - **`Tab`** switches which panel is active; the active panel has a bright border, the inactive one a dimmed border.
 - **`|`** toggles the split. Splitting opens the new panel at the active panel's current directory and focuses it; unsplitting drops the inactive panel and keeps the one you were on.
-- **`c`** copies the item selected in the active panel into the **directory the other panel is currently viewing**. If a file or directory of the same name already exists there, you're asked to confirm the overwrite. Directories are copied recursively, and the destination panel refreshes automatically when the copy completes.
+- **`c`** copies the tagged files (or, if none are tagged, the item under the cursor) in the active panel into the **directory the other panel is currently viewing**. Each name collision is confirmed individually. Directories are copied recursively, and the destination panel refreshes automatically when the copy completes.
 
 Each panel can independently change its root (`gd`), so you can, for example, browse a backup on one side and your working tree on the other, then copy files across with a single `c`.
 
