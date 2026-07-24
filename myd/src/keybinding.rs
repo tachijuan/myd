@@ -37,6 +37,14 @@ pub enum Action {
     ToggleSplit,
     /// Copy the active panel's selection into the other panel's directory.
     Copy,
+    /// Toggle a tag on the file under the cursor.
+    ToggleTag,
+    /// Toggle visual (range-tag) mode.
+    VisualMode,
+    /// Remove all tags.
+    UntagAll,
+    /// Filter the cursor's directory by a regex pattern.
+    Filter,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -139,6 +147,10 @@ impl KeyBindingHandler {
             'v' => Some(Action::ToggleView),
             'c' => Some(Action::Copy),
             '|' => Some(Action::ToggleSplit),
+            't' => Some(Action::ToggleTag),
+            'V' => Some(Action::VisualMode),
+            'U' => Some(Action::UntagAll),
+            'f' => Some(Action::Filter),
             _ => None,
         }
     }
@@ -185,7 +197,10 @@ impl KeyBindingHandler {
             KeyCode::Char('c') => Some(Action::Copy),
             KeyCode::Char('|') => Some(Action::ToggleSplit),
             KeyCode::Tab => Some(Action::SwitchPanel),
-            KeyCode::Char('t') => Some(Action::ToggleInfoPanel),
+            KeyCode::Char('t') => Some(Action::ToggleTag),
+            KeyCode::Char('V') => Some(Action::VisualMode),
+            KeyCode::Char('U') => Some(Action::UntagAll),
+            KeyCode::Char('f') => Some(Action::Filter),
             KeyCode::Char('0') => Some(Action::CollapseAll),
             KeyCode::Char('*') => Some(Action::ExpandAll),
             KeyCode::Char('/') => Some(Action::Search),

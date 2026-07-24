@@ -61,7 +61,17 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
                 ("s", "Toggle sort order"),
                 ("H", "Toggle hidden files"),
                 ("b", "Toggle size bars"),
-                ("Ctrl+B / t", "Toggle info panel"),
+                ("Ctrl+B", "Toggle info panel"),
+                ("f", "Filter directory (regex)"),
+            ],
+        },
+        HelpCategory {
+            title: "Tagging & selection",
+            items: &[
+                ("t", "Tag / untag file under cursor"),
+                ("V", "Visual mode: tag a range as you move"),
+                ("U", "Untag all files"),
+                ("c", "Copy tagged files (or selection)"),
             ],
         },
         HelpCategory {
@@ -79,7 +89,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             items: &[
                 ("|", "Toggle single / dual panels"),
                 ("Tab", "Switch active panel"),
-                ("c", "Copy selection to other panel"),
+                ("c", "Copy tagged/selected to other panel"),
             ],
         },
         HelpCategory {

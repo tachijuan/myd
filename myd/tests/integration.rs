@@ -861,6 +861,11 @@ fn char_key(c: char) -> crossterm::event::KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
 
+fn ctrl_key(c: char) -> crossterm::event::KeyEvent {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
 /// (info_panel_hidden, focus) of the current main screen.
 fn view_state(app: &myd::app::FileBrowser) -> (bool, myd::widget::treemap::FocusTarget) {
     use myd::screen::Screen;
@@ -892,8 +897,8 @@ async fn test_info_panel_state_survives_entering_a_directory() {
     assert_eq!(view_state(&app), (true, FocusTarget::Tree));
 
     // Open the info panel, then descend into "sub".
-    app.handle_key_for_test(char_key('t'));
-    assert!(!view_state(&app).0, "'t' should show the panel");
+    app.handle_key_for_test(ctrl_key('b'));
+    assert!(!view_state(&app).0, "Ctrl+b should show the panel");
 
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     settle(&mut app).await;
@@ -937,7 +942,7 @@ async fn test_both_view_prefs_survive_navigation_round_trip() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(ctrl_key('b'));
     app.handle_key_for_test(char_key('v'));
     let want = (false, FocusTarget::Treemap);
     assert_eq!(view_state(&app), want);
@@ -964,8 +969,8 @@ async fn test_toggling_prefs_back_also_persists() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    app.handle_key_for_test(char_key('t')); // show
-    app.handle_key_for_test(char_key('t')); // hide again
+    app.handle_key_for_test(ctrl_key('b')); // show
+    app.handle_key_for_test(ctrl_key('b')); // hide again
     app.handle_key_for_test(char_key('v')); // treemap
     app.handle_key_for_test(char_key('v')); // back to tree
 
@@ -1861,4 +1866,504 @@ async fn test_copy_is_noop_in_single_panel() {
     // Should not panic or create anything; simply nothing to copy into.
     app.handle_key_for_test(char_key('c'));
     assert_eq!(app.panel_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-file operations: tagging, visual mode, filter, tagged copy.
+// ---------------------------------------------------------------------------
+
+/// Number of tagged paths on the active panel's screen.
+fn tag_count(app: &myd::app::FileBrowser) -> usize {
+    app.current_screen().tagged_paths().len()
+}
+
+/// A flat directory with several files to tag/filter.
+fn flat_files_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.log"), b"a").unwrap();
+    std::fs::write(dir.path().join("beta.log"), b"b").unwrap();
+    std::fs::write(dir.path().join("gamma.txt"), b"g").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn test_t_tags_and_untags_file() {
+    use myd::app::FileBrowser;
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Move onto the first child and tag it.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 1, "t should tag the file under the cursor");
+
+    // t again on the same file untags it.
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 0, "t again should untag it");
+}
+
+#[tokio::test]
+async fn test_shift_u_untags_all() {
+    use myd::app::FileBrowser;
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 2);
+
+    app.handle_key_for_test(char_key('U'));
+    assert_eq!(tag_count(&app), 0, "U should clear every tag");
+}
+
+#[tokio::test]
+async fn test_visual_mode_sweep_tags_range() {
+    use myd::app::FileBrowser;
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Anchor on the first child, sweep down over the other two.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('V'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(tag_count(&app), 3, "visual sweep should tag the whole range");
+
+    // A non-motion action exits visual mode but keeps the tags.
+    app.handle_key_for_test(char_key('s')); // toggle sort — not a motion
+    assert_eq!(tag_count(&app), 3, "tags persist after leaving visual mode");
+}
+
+#[tokio::test]
+async fn test_filter_narrows_then_clears() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let line_count = |app: &FileBrowser| match app.current_screen() {
+        Screen::Main(s) => s.tree.lines.len(),
+        _ => 0,
+    };
+    let before = line_count(&app);
+    assert_eq!(before, 4, "root + 3 files");
+
+    // f -> type a regex matching only the .log files -> Enter.
+    app.handle_key_for_test(char_key('f'));
+    for c in r"\.log$".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(line_count(&app), 3, "root + 2 matching .log files");
+
+    // f -> empty pattern -> Enter clears the filter.
+    app.handle_key_for_test(char_key('f'));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(line_count(&app), before, "empty pattern restores full view");
+}
+
+#[tokio::test]
+async fn test_dual_panel_copies_tagged_files() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    // Distinct sizes so the default Largest sort gives a deterministic order:
+    // one.bin, two.bin, skip.bin. The first two get tagged.
+    std::fs::write(left.path().join("one.bin"), vec![1u8; 300]).unwrap();
+    std::fs::write(left.path().join("two.bin"), vec![2u8; 200]).unwrap();
+    std::fs::write(left.path().join("skip.bin"), vec![3u8; 100]).unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    // Tag two of the three files in the active (left) panel.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 2);
+
+    // Copy the tagged set into the right panel.
+    app.handle_key_for_test(char_key('c'));
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        let both = right.path().join("one.bin").exists()
+            && right.path().join("two.bin").exists();
+        if both {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Exactly the two tagged files landed; the untagged one did not.
+    let names: std::collections::HashSet<String> = std::fs::read_dir(right.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(names.contains("one.bin") && names.contains("two.bin"));
+    assert!(!names.contains("skip.bin"), "untagged file must not copy");
+
+    // Tags are cleared once the copy completes.
+    assert_eq!(tag_count(&app), 0, "copy consumes the tags");
+}
+
+#[tokio::test]
+async fn test_tagged_copy_collision_prompts_then_overwrites() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("dup.bin"), b"new").unwrap();
+    std::fs::write(right.path().join("dup.bin"), b"old").unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t')); // tag dup.bin
+    app.handle_key_for_test(char_key('c')); // collision -> confirm
+
+    // Not overwritten until confirmed.
+    assert_eq!(std::fs::read(right.path().join("dup.bin")).unwrap(), b"old");
+
+    app.handle_key_for_test(char_key('y'));
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if std::fs::read(right.path().join("dup.bin")).unwrap() == b"new" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        std::fs::read(right.path().join("dup.bin")).unwrap(),
+        b"new",
+        "confirming overwrite replaces the destination"
+    );
+}
+
+#[tokio::test]
+async fn test_single_panel_copy_prompts_for_destination() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("movable.bin"), vec![9u8; 16]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t')); // tag it
+    app.handle_key_for_test(char_key('c')); // single-panel -> dest prompt
+
+    // Type the destination directory and confirm.
+    for c in dest.path().to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if dest.path().join("movable.bin").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        dest.path().join("movable.bin").exists(),
+        "single-panel copy should place the file in the prompted directory"
+    );
+}
+
+#[tokio::test]
+async fn test_copy_reproduces_deep_directory_structure() {
+    use myd::app::FileBrowser;
+
+    // Build a nested tree under "payload/":
+    //   payload/top.txt
+    //   payload/sub/inner.txt
+    //   payload/sub/deep/leaf.bin
+    //   payload/empty/            (an empty directory)
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let payload = left.path().join("payload");
+    std::fs::create_dir_all(payload.join("sub/deep")).unwrap();
+    std::fs::create_dir_all(payload.join("empty")).unwrap();
+    std::fs::write(payload.join("top.txt"), b"top").unwrap();
+    std::fs::write(payload.join("sub/inner.txt"), b"inner").unwrap();
+    std::fs::write(payload.join("sub/deep/leaf.bin"), vec![7u8; 64]).unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    // Cursor onto "payload" (the only child), tag it, copy to the right panel.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('c'));
+
+    let copied_root = right.path().join("payload");
+    for _ in 0..300 {
+        app.resolve_loading_for_test();
+        if copied_root.join("sub/deep/leaf.bin").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Every file is reproduced with its content.
+    assert_eq!(std::fs::read(copied_root.join("top.txt")).unwrap(), b"top");
+    assert_eq!(
+        std::fs::read(copied_root.join("sub/inner.txt")).unwrap(),
+        b"inner"
+    );
+    assert_eq!(
+        std::fs::read(copied_root.join("sub/deep/leaf.bin")).unwrap(),
+        vec![7u8; 64]
+    );
+    // Directories (including the empty one) are reproduced.
+    assert!(copied_root.join("sub/deep").is_dir());
+    assert!(
+        copied_root.join("empty").is_dir(),
+        "an empty subdirectory should be recreated by the copy"
+    );
+}
+
+#[tokio::test]
+async fn test_split_reuses_cache_without_rescan() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/f1.bin"), vec![0u8; 1000]).unwrap();
+    std::fs::write(dir.path().join("top.txt"), b"hi").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Snapshot the active panel's populated cache handle.
+    let (cache_len_before, cache_handle) = match app.current_screen() {
+        Screen::Main(s) => (s.tree.size_cache.len(), s.tree.size_cache.clone()),
+        _ => panic!("expected main screen"),
+    };
+    assert!(cache_len_before > 0, "root scan should have cached sizes");
+
+    // Split. The new pane opens on the same directory.
+    app.handle_key_for_test(char_key('|'));
+    assert_eq!(app.panel_count(), 2);
+    settle_all(&mut app).await;
+
+    // The new (now active) pane must share the SAME underlying cache map, so its
+    // build was cache hits, not a fresh rescan. Cloned SizeCache handles compare
+    // equal by pointer via Arc; assert the shared map has not shrunk and that
+    // the new tree's cache observes entries inserted through the old handle.
+    match app.current_screen() {
+        Screen::Main(s) => {
+            assert!(
+                s.tree.size_cache.len() >= cache_len_before,
+                "split pane should reuse the cache, not rebuild an empty one"
+            );
+            // Insert through the original handle; the new pane sees it → same map.
+            let probe = std::path::PathBuf::from("/__cache_probe__");
+            cache_handle.insert(&probe, 42);
+            assert_eq!(
+                s.tree.size_cache.get(&probe),
+                Some(42),
+                "both panes must share one size cache after a split"
+            );
+        }
+        _ => panic!("expected main screen after split"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue fixes: h-at-root pops immediately; delete operates on tags.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_h_at_root_pops_back_immediately() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::app::FileBrowser;
+
+    // Enter a subdirectory, then a single `h` on the (auto-expanded) root line
+    // should step back up — not merely collapse the root, which used to require
+    // a second press.
+    let dir = nav_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Move onto "sub" and descend.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+    assert_eq!(app.screen_stack_depth(), 2, "descended into sub");
+
+    // A single h pops back to the parent.
+    let keep_running = app.handle_key_for_test(char_key('h'));
+    assert!(keep_running);
+    assert_eq!(
+        app.screen_stack_depth(),
+        1,
+        "the first h at the root should pop back up"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_operates_on_tagged_files() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Distinct sizes for a deterministic Largest sort: big, mid, small.
+    std::fs::write(dir.path().join("big.bin"), vec![0u8; 3000]).unwrap();
+    std::fs::write(dir.path().join("mid.bin"), vec![0u8; 2000]).unwrap();
+    std::fs::write(dir.path().join("small.bin"), vec![0u8; 1000]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag the two largest (big, mid).
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+
+    // Delete → confirm with 'y'.
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('y'));
+
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if !dir.path().join("big.bin").exists() && !dir.path().join("mid.bin").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    assert!(!dir.path().join("big.bin").exists(), "tagged file deleted");
+    assert!(!dir.path().join("mid.bin").exists(), "tagged file deleted");
+    assert!(
+        dir.path().join("small.bin").exists(),
+        "untagged file must survive the delete"
+    );
+    // Tags cleared after the delete.
+    assert_eq!(tag_count(&app), 0);
+}
+
+#[tokio::test]
+async fn test_delete_falls_back_to_cursor_when_no_tags() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("only.bin"), vec![0u8; 500]).unwrap();
+    std::fs::write(dir.path().join("keep.bin"), vec![0u8; 400]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // No tags; cursor onto the first child, delete it.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('y'));
+
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if !dir.path().join("only.bin").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!dir.path().join("only.bin").exists(), "cursor file deleted");
+    assert!(dir.path().join("keep.bin").exists(), "other file untouched");
+}
+
+// ---------------------------------------------------------------------------
+// Progress overlays render live counts (issues 3 & 4).
+// ---------------------------------------------------------------------------
+
+/// Flatten a TestBackend buffer to a single string for substring assertions.
+fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+    s
+}
+
+#[test]
+fn test_operation_overlay_shows_item_counts() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.set_total(10);
+    for _ in 0..3 {
+        progress.inc_done();
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            let overlay = ProgressOverlay::for_operation("Copying", &progress);
+            overlay.render(f, f.area());
+        })
+        .unwrap();
+
+    let text = buffer_to_string(&terminal.backend().buffer().clone());
+    assert!(text.contains("Copying"), "overlay shows the verb:\n{}", text);
+    assert!(
+        text.contains("3 / 10 items"),
+        "overlay shows the running count:\n{}",
+        text
+    );
+}
+
+#[test]
+fn test_scan_overlay_shows_files_dirs_and_size() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.add_dir();
+    progress.add_file(1024);
+    progress.add_file(1024);
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            let overlay = ProgressOverlay::for_scan(&progress);
+            overlay.render(f, f.area());
+        })
+        .unwrap();
+
+    let text = buffer_to_string(&terminal.backend().buffer().clone());
+    assert!(text.contains("2 files"), "scan shows file count:\n{}", text);
+    assert!(text.contains("1 dirs"), "scan shows dir count:\n{}", text);
+    // 2048 bytes → "2.0 KB" (or similar) — assert the KB unit shows up.
+    assert!(
+        text.contains("KB") || text.contains("2048"),
+        "scan shows combined size:\n{}",
+        text
+    );
 }

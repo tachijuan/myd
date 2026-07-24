@@ -54,11 +54,27 @@ impl TreeNode {
         show_hidden: bool,
         cancel: Option<&sizes::CancelToken>,
     ) {
+        self.expand_cancellable_progress(cache, sort_mode, show_hidden, cancel, None);
+    }
+
+    /// As [`expand_cancellable`], but reports each scanned entry to `progress`.
+    /// Used by the initial full scan so the loading overlay can show a live
+    /// files / dirs / size count.
+    pub fn expand_cancellable_progress(
+        &mut self,
+        cache: &SizeCache,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        cancel: Option<&sizes::CancelToken>,
+        progress: Option<&crate::widget::progress::OpProgress>,
+    ) {
         if !self.is_directory() {
             return;
         }
         if self.children.is_none() {
-            self.children = Some(load_children(&self.path, cache, sort_mode, show_hidden, cancel));
+            self.children = Some(load_children(
+                &self.path, cache, sort_mode, show_hidden, cancel, progress,
+            ));
         }
         self.is_expanded = true;
     }
@@ -98,6 +114,7 @@ fn load_children(
     sort_mode: SortMode,
     show_hidden: bool,
     cancel: Option<&sizes::CancelToken>,
+    progress: Option<&crate::widget::progress::OpProgress>,
 ) -> Vec<TreeNode> {
     let mut entries = Vec::new();
 
@@ -128,11 +145,17 @@ fn load_children(
             // Records every descendant's size too, so opening this directory
             // later is a cache hit instead of another walk.
             match cancel {
-                Some(c) => sizes::get_dir_size_caching_cancellable(&entry.path, cache, c),
+                Some(c) => sizes::get_dir_size_caching_cancellable_progress(
+                    &entry.path, cache, c, progress,
+                ),
                 None => sizes::get_dir_size_caching(&entry.path, cache),
             }
         } else {
-            sizes::get_file_size(&entry.path)
+            let size = sizes::get_file_size(&entry.path);
+            if let Some(p) = progress {
+                p.add_file(size);
+            }
+            size
         };
         cache.insert(&entry.resolved_path, size);
     }
@@ -167,7 +190,7 @@ fn re_sort_node(node: &mut TreeNode, cache: &SizeCache, sort_mode: SortMode, sho
     // have been cleared by set_sort_mode, and sort_key_fast falls back to
     // shallow metadata().len() for dirs when the cache is empty, which gives
     // wrong results for Largest/Smallest sort modes.
-    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden, None));
+    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden, None, None));
     // Recurse into expanded children.
     if node.is_expanded {
         if let Some(ref mut children) = node.children {
@@ -183,7 +206,7 @@ fn reload_node(node: &mut TreeNode, cache: &SizeCache, sort_mode: SortMode, show
     if !node.is_dir {
         return;
     }
-    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden, None));
+    node.children = Some(load_children(&node.path, cache, sort_mode, show_hidden, None, None));
     if node.is_expanded {
         if let Some(ref mut children) = node.children {
             for child in children.iter_mut() {
@@ -253,6 +276,16 @@ pub struct FileTree {
     /// Cached dir/file counts (excluding root) — recomputed on reflatten.
     cached_dir_count: usize,
     cached_file_count: usize,
+    /// Resolved paths the user has tagged for multi-file operations. Keyed on
+    /// the canonical path so tags survive reflatten (sort, filter, expand).
+    pub tagged: HashSet<PathBuf>,
+    /// Visual-mode anchor: `Some(cursor_index)` while `V` is active. Motion keys
+    /// then tag every line between the anchor and the cursor.
+    visual_anchor: Option<usize>,
+    /// Active regex filter as `(directory, pattern)`. Only entries whose parent
+    /// is `directory` and whose name fails to match are hidden; other levels are
+    /// untouched. Applied as a retain step in `reflatten`.
+    filter: Option<(PathBuf, regex::Regex)>,
 }
 
 impl FileTree {
@@ -273,7 +306,7 @@ impl FileTree {
         cache: SizeCache,
     ) -> Self {
         // No cancel token: this path always produces a tree.
-        Self::build(path, sort_mode, show_hidden, show_size_bar, cache, None)
+        Self::build(path, sort_mode, show_hidden, show_size_bar, cache, None, None)
             .expect("uncancelled build always yields a tree")
     }
 
@@ -290,7 +323,29 @@ impl FileTree {
         cache: SizeCache,
         cancel: &sizes::CancelToken,
     ) -> Option<Self> {
-        Self::build(path, sort_mode, show_hidden, show_size_bar, cache, Some(cancel))
+        Self::build(path, sort_mode, show_hidden, show_size_bar, cache, Some(cancel), None)
+    }
+
+    /// As [`with_cache_cancellable`], but reports scan progress (files / dirs /
+    /// bytes) into `progress` so the loading overlay can show a live count.
+    pub fn with_cache_cancellable_progress(
+        path: PathBuf,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        show_size_bar: bool,
+        cache: SizeCache,
+        cancel: &sizes::CancelToken,
+        progress: &crate::widget::progress::OpProgress,
+    ) -> Option<Self> {
+        Self::build(
+            path,
+            sort_mode,
+            show_hidden,
+            show_size_bar,
+            cache,
+            Some(cancel),
+            Some(progress),
+        )
     }
 
     fn build(
@@ -300,9 +355,10 @@ impl FileTree {
         show_size_bar: bool,
         cache: SizeCache,
         cancel: Option<&sizes::CancelToken>,
+        progress: Option<&crate::widget::progress::OpProgress>,
     ) -> Option<Self> {
         let mut root = TreeNode::new(path.clone());
-        root.expand_cancellable(&cache, sort_mode, show_hidden, cancel);
+        root.expand_cancellable_progress(&cache, sort_mode, show_hidden, cancel, progress);
 
         // The scan was abandoned partway through — discard the partial tree.
         if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
@@ -322,6 +378,9 @@ impl FileTree {
             cached_expanded: Vec::new(),
             cached_dir_count: 0,
             cached_file_count: 0,
+            tagged: HashSet::new(),
+            visual_anchor: None,
+            filter: None,
         };
         tree.reflatten();
         Some(tree)
@@ -331,10 +390,27 @@ impl FileTree {
     pub fn reflatten(&mut self) {
         self.lines.clear();
         flatten_node(&self.root, 0, &mut self.lines, self.show_hidden);
+        self.apply_filter();
         if self.cursor >= self.lines.len() {
             self.cursor = self.lines.len().saturating_sub(1);
         }
         self.recompute_cache();
+    }
+
+    /// Drop lines masked by the active regex filter: entries whose parent is the
+    /// filter directory and whose name doesn't match. Ancestors, the filter
+    /// directory itself, and entries in other directories are always kept, so
+    /// the mask stays scoped to the one level the user filtered.
+    fn apply_filter(&mut self) {
+        if let Some((ref dir, ref re)) = self.filter {
+            self.lines.retain(|line| {
+                if line.resolved_path.parent() == Some(dir.as_path()) {
+                    re.is_match(&line.name)
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     /// Recompute cached render data (sizes, sibling totals, expanded status).
@@ -508,12 +584,85 @@ impl FileTree {
         if self.cursor < self.lines.len().saturating_sub(1) {
             self.cursor += 1;
         }
+        self.tag_visual_span();
     }
 
     /// Move cursor up.
     pub fn cursor_up(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
+        }
+        self.tag_visual_span();
+    }
+
+    /// Toggle the tag on the line under the cursor.
+    pub fn toggle_tag(&mut self) {
+        if let Some(line) = self.lines.get(self.cursor) {
+            let path = line.resolved_path.clone();
+            if !self.tagged.remove(&path) {
+                self.tagged.insert(path);
+            }
+        }
+    }
+
+    /// Remove every tag.
+    pub fn untag_all(&mut self) {
+        self.tagged.clear();
+    }
+
+    /// Whether visual (range-tag) mode is active.
+    pub fn in_visual_mode(&self) -> bool {
+        self.visual_anchor.is_some()
+    }
+
+    /// Toggle visual mode. Entering anchors at the cursor and tags it; exiting
+    /// leaves the accumulated tags in place.
+    pub fn toggle_visual(&mut self) {
+        if self.visual_anchor.is_some() {
+            self.visual_anchor = None;
+        } else {
+            self.visual_anchor = Some(self.cursor);
+            self.tag_visual_span();
+        }
+    }
+
+    /// Exit visual mode without clearing tags (called when a non-motion action
+    /// runs, so `V` then some command doesn't keep extending the range).
+    pub fn exit_visual(&mut self) {
+        self.visual_anchor = None;
+    }
+
+    /// While in visual mode, tag every line between the anchor and the cursor.
+    fn tag_visual_span(&mut self) {
+        if let Some(anchor) = self.visual_anchor {
+            let (lo, hi) = if anchor <= self.cursor {
+                (anchor, self.cursor)
+            } else {
+                (self.cursor, anchor)
+            };
+            for line in &self.lines[lo..=hi.min(self.lines.len().saturating_sub(1))] {
+                self.tagged.insert(line.resolved_path.clone());
+            }
+        }
+    }
+
+    /// Snapshot of tagged paths for a copy operation.
+    pub fn tagged_paths(&self) -> Vec<PathBuf> {
+        self.tagged.iter().cloned().collect()
+    }
+
+    /// Apply a regex filter scoped to `dir`; only entries directly under `dir`
+    /// whose names match survive. Replaces any previous filter.
+    pub fn set_filter(&mut self, dir: PathBuf, re: regex::Regex) {
+        self.filter = Some((dir, re));
+        self.reflatten();
+    }
+
+    /// Clear the active filter, restoring the full view.
+    pub fn clear_filter(&mut self) {
+        if self.filter.is_some() {
+            self.filter = None;
+            self.reflatten();
         }
     }
 
@@ -554,6 +703,7 @@ impl FileTree {
         line: &'a TreeLine,
         is_selected: bool,
         is_expanded: bool,
+        is_tagged: bool,
         my_size: u64,
         sibling_total: u64,
     ) -> Line<'a> {
@@ -599,6 +749,12 @@ impl FileTree {
             style = style.fg(c);
         }
         style = style.add_modifier(modifier);
+        // Tagged rows carry a distinct background so their staged state is
+        // visible. The cursor's REVERSED highlight already stands out, so the
+        // tag background is only applied when the row isn't the cursor.
+        if is_tagged && !is_selected {
+            style = style.bg(Color::Rgb(60, 60, 90));
+        }
         spans.push(Span::styled(&line.name, style));
 
         Line::from(spans)
@@ -630,6 +786,7 @@ impl FileTree {
                     line,
                     i == self.cursor,
                     self.cached_expanded.get(i).copied().unwrap_or(false),
+                    self.tagged.contains(&line.resolved_path),
                     if self.show_size_bar { self.cached_sizes.get(i).copied().unwrap_or(0) } else { 0 },
                     if self.show_size_bar { self.cached_siblings.get(i).copied().unwrap_or(0) } else { 0 },
                 )
@@ -879,6 +1036,91 @@ mod tests {
         let line_sub = tree.lines.iter().find(|l| l.path.file_name().map(|n| n == "subdir").unwrap_or(false)).unwrap();
         let sub_size = tree.size_cache.get(&line_sub.resolved_path).unwrap();
         assert!(sub_size >= 3, "subdir should have shallow size >= 3, got {}", sub_size);
+    }
+
+    #[test]
+    fn test_toggle_tag_and_untag_all() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "y").unwrap();
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, false);
+
+        tree.cursor_down(); // onto first child
+        tree.toggle_tag();
+        assert_eq!(tree.tagged.len(), 1);
+        let tagged_path = tree.lines[tree.cursor].resolved_path.clone();
+        assert!(tree.tagged.contains(&tagged_path));
+
+        // Toggling again untags it.
+        tree.toggle_tag();
+        assert!(tree.tagged.is_empty());
+
+        // Tag both, then untag_all clears everything.
+        tree.cursor = 1;
+        tree.toggle_tag();
+        tree.cursor = 2;
+        tree.toggle_tag();
+        assert_eq!(tree.tagged.len(), 2);
+        tree.untag_all();
+        assert!(tree.tagged.is_empty());
+    }
+
+    #[test]
+    fn test_visual_mode_tags_span() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(n), "x").unwrap();
+        }
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, false);
+
+        // Anchor at line 1, sweep down to line 3 → all three tagged.
+        tree.cursor = 1;
+        tree.toggle_visual();
+        assert!(tree.in_visual_mode());
+        tree.cursor_down();
+        tree.cursor_down();
+        assert_eq!(tree.tagged.len(), 3);
+
+        // Exiting visual keeps tags; a second sweep elsewhere would add more.
+        tree.toggle_visual();
+        assert!(!tree.in_visual_mode());
+        assert_eq!(tree.tagged.len(), 3);
+    }
+
+    #[test]
+    fn test_tags_survive_reflatten() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![0u8; 5000]).unwrap();
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, true);
+
+        tree.cursor = 1;
+        tree.toggle_tag();
+        let tagged = tree.tagged.iter().next().cloned().unwrap();
+
+        // Changing sort mode reflattens; the tag (keyed on resolved_path) stays.
+        tree.set_sort_mode(SortMode::Largest);
+        assert!(tree.tagged.contains(&tagged));
+    }
+
+    #[test]
+    fn test_filter_hides_nonmatching_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.log"), "x").unwrap();
+        std::fs::write(dir.path().join("keep2.log"), "x").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "x").unwrap();
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, false);
+        let before = tree.lines.len();
+        assert_eq!(before, 4); // root + 3
+
+        let re = regex::Regex::new(r"\.log$").unwrap();
+        tree.set_filter(tree.root.resolved_path.clone(), re);
+        // root + 2 matching = 3
+        assert_eq!(tree.lines.len(), 3);
+        assert!(tree.lines.iter().all(|l| l.depth == 0 || l.name.ends_with(".log")));
+
+        tree.clear_filter();
+        assert_eq!(tree.lines.len(), before);
     }
 
     #[test]

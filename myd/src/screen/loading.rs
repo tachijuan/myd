@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use super::ScreenState;
 use crate::utils::sizes::CancelToken;
 use crate::widget::file_tree::FileTree;
+use crate::widget::progress::OpProgress;
 
 /// State for a loading screen shown while a directory tree is being built.
 pub struct LoadingState {
@@ -21,6 +22,8 @@ pub struct LoadingState {
     pub rx: oneshot::Receiver<Option<FileTree>>,
     /// Tripped to abort the background scan when the user cancels.
     cancel: CancelToken,
+    /// Live scan counts (files / dirs / bytes) updated by the background walk.
+    progress: OpProgress,
     /// When loading started (for elapsed time display).
     pub started: Instant,
     /// Spinner frame index (0-based, incremented each render).
@@ -28,11 +31,17 @@ pub struct LoadingState {
 }
 
 impl LoadingState {
-    pub fn new(path: PathBuf, rx: oneshot::Receiver<Option<FileTree>>, cancel: CancelToken) -> Self {
+    pub fn new(
+        path: PathBuf,
+        rx: oneshot::Receiver<Option<FileTree>>,
+        cancel: CancelToken,
+        progress: OpProgress,
+    ) -> Self {
         Self {
             path,
             rx,
             cancel,
+            progress,
             started: Instant::now(),
             spinner: 0,
         }
@@ -93,8 +102,8 @@ impl ScreenState for LoadingState {
 
         // Clamp the dialog to the available area — a terminal smaller than the
         // dialog would otherwise put it outside the buffer and panic on render.
-        let dialog_w = 50.min(area.width);
-        let dialog_h = 5.min(area.height);
+        let dialog_w = 54.min(area.width);
+        let dialog_h = 7.min(area.height);
         let center = Rect::new(
             area.x + area.width.saturating_sub(dialog_w) / 2,
             area.y + area.height.saturating_sub(dialog_h) / 2,
@@ -108,21 +117,26 @@ impl ScreenState for LoadingState {
 
         frame.render_widget(Clear, center);
 
+        // Live scan tally: files, directories, and combined size so far.
+        let files = self.progress.files();
+        let dirs = self.progress.dirs();
+        let used = crate::utils::sizes::format_size(self.progress.bytes());
+
         let lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    format!(" {} Loading...", spin_char),
+                    format!(" {} Scanning... ({})", spin_char, time_str),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(vec![Span::raw(format!(
-                "    Scanning: {} ({})",
-                self.path.display(),
-                time_str
-            ))]),
+            Line::from(vec![Span::raw(format!("    {}", self.path.display()))]),
+            Line::from(vec![Span::styled(
+                format!("    {} files   {} dirs   {} used", files, dirs, used),
+                Style::default().fg(Color::White),
+            )]),
             Line::from(vec![Span::raw("    Press q or Esc to cancel")]),
             Line::from(""),
         ];

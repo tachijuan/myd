@@ -13,7 +13,7 @@ use crate::widget::treemap::FocusTarget;
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
 use crate::widget::input_dialog::InputDialog;
-use crate::widget::progress::ProgressOverlay;
+use crate::widget::progress::{OpProgress, ProgressOverlay};
 
 /// Drop guard that restores terminal state even if the app panics or is interrupted.
 /// Disables raw mode, leaves alternate screen, shows cursor, and flushes output.
@@ -43,21 +43,25 @@ pub enum Modal {
     None,
     Confirm(ConfirmDialog),
     Input(InputDialog),
-    Progress(ProgressOverlay),
-    /// A cross-panel copy is running in the background.
-    Copying,
+    /// A background copy or delete is running. The verb ("Copying"/"Deleting")
+    /// titles the overlay; live counts come from `FileBrowser::op_progress`.
+    Operation { verb: &'static str },
     Help,
 }
 
 /// Context for modal operations.
 pub enum ModalTarget {
-    Delete { path: PathBuf },
+    Delete { paths: Vec<PathBuf> },
     Rename { old_path: PathBuf },
     ChangeRoot,
     Search,
-    /// Overwrite confirmation for a cross-panel copy. `dest_panel` is the panel
-    /// to refresh once the copy lands.
-    Copy { src: PathBuf, dest: PathBuf, dest_panel: usize },
+    /// Regex filter prompt for the cursor's directory.
+    Filter,
+    /// Single-panel copy: prompt for a destination directory, then copy `srcs`
+    /// into it (with per-collision confirmation).
+    CopyDest { srcs: Vec<PathBuf> },
+    /// Per-file overwrite confirmation while draining `pending_copies`.
+    CopyOverwrite { src: PathBuf, dest: PathBuf },
 }
 
 /// Main application state machine.
@@ -73,6 +77,16 @@ pub struct FileBrowser {
     copy_task: Option<tokio::task::JoinHandle<()>>,
     /// Panel to refresh when `copy_task` finishes.
     copy_dest_panel: usize,
+    /// Colliding (src, dest) pairs awaiting a per-file overwrite confirmation.
+    pending_copies: Vec<(PathBuf, PathBuf)>,
+    /// (src, dest) pairs cleared to copy — spawned as one batch once every
+    /// collision has been resolved.
+    approved_copies: Vec<(PathBuf, PathBuf)>,
+    /// Panel whose tags to clear when the current copy batch completes.
+    copy_source_panel: usize,
+    /// Live progress for the in-flight copy or delete batch, shared with its
+    /// background task and read by the render loop.
+    op_progress: Option<OpProgress>,
 }
 
 impl FileBrowser {
@@ -92,6 +106,10 @@ impl FileBrowser {
             modal_target: None,
             copy_task: None,
             copy_dest_panel: 0,
+            op_progress: None,
+            pending_copies: Vec::new(),
+            approved_copies: Vec::new(),
+            copy_source_panel: 0,
         }
     }
 
@@ -195,15 +213,22 @@ impl FileBrowser {
                 match &self.modal {
                     Modal::Confirm(d) => d.render(f, area),
                     Modal::Input(d) => d.render(f, area),
-                    Modal::Progress(p) => p.render(f, area),
-                    Modal::Copying => {
-                        let overlay = ProgressOverlay::new().with_message("  Copying...");
+                    Modal::Operation { verb } => {
+                        let overlay = match &self.op_progress {
+                            Some(p) => ProgressOverlay::for_operation(verb, p),
+                            None => ProgressOverlay::new().with_message(*verb),
+                        };
                         overlay.render(f, area);
                     }
                     Modal::Help => render_help(f, area),
                     Modal::None => {
+                        // A delete that started from the confirm dialog also runs
+                        // in the background; show its overlay when no modal is up.
                         if deleting {
-                            let overlay = ProgressOverlay::new().with_message("  Deleting...");
+                            let overlay = match &self.op_progress {
+                                Some(p) => ProgressOverlay::for_operation("Deleting", p),
+                                None => ProgressOverlay::new().with_message("Deleting"),
+                            };
                             overlay.render(f, area);
                         }
                     }
@@ -245,20 +270,31 @@ impl FileBrowser {
     }
 
     /// Resolve completed delete tasks across all panels (each removes its own
-    /// deleted path from its tree).
+    /// deleted paths from its tree).
     fn resolve_deleting(&mut self) {
+        let was_deleting = self.panels.iter().any(|p| p.is_deleting());
         for panel in &mut self.panels {
             panel.resolve_deleting();
         }
+        // Once the last delete finished, drop its progress so the overlay clears.
+        if was_deleting && !self.panels.iter().any(|p| p.is_deleting()) {
+            self.op_progress = None;
+        }
     }
 
-    /// Resolve a completed cross-panel copy: clear the overlay and refresh the
-    /// destination panel so the copied entry appears.
+    /// Resolve a completed copy batch: clear the overlay, clear the source
+    /// panel's tags (the copy consumed them), and refresh the destination panel
+    /// so the copied entries appear.
     fn resolve_copying(&mut self) {
         if let Some(ref task) = self.copy_task {
             if task.is_finished() {
                 self.copy_task.take();
+                self.op_progress = None;
                 self.modal = Modal::None;
+                // Tags are staged input to the copy — clear them once it lands.
+                if let Some(panel) = self.panels.get_mut(self.copy_source_panel) {
+                    panel.current_screen_mut().clear_tags();
+                }
                 if let Some(panel) = self.panels.get_mut(self.copy_dest_panel) {
                     panel.current_screen_mut().refresh();
                 }
@@ -312,6 +348,11 @@ impl FileBrowser {
     /// by the event loop each tick). Returns false if the app should now quit
     /// (a cancelled first-screen scan).
     pub fn resolve_loading_for_test(&mut self) -> bool {
+        // Mirror the event loop's per-tick resolution so tests observe copy and
+        // delete completion (tag clearing, dest refresh) the same way the app
+        // does, not just the loading transitions.
+        self.resolve_deleting();
+        self.resolve_copying();
         self.resolve_loading()
     }
 
@@ -360,6 +401,15 @@ impl FileBrowser {
     }
 
     fn dispatch_action(&mut self, action: Action) -> bool {
+        // Visual mode only survives motion and its own toggle; any other command
+        // ends the range-tag gesture (tags already made are kept).
+        if !matches!(
+            action,
+            Action::CursorUp | Action::CursorDown | Action::VisualMode
+        ) {
+            self.active_panel_mut().current_screen_mut().exit_visual();
+        }
+
         match action {
             Action::Quit => {
                 // While a directory is being scanned, q/Esc cancels that scan
@@ -388,6 +438,23 @@ impl FileBrowser {
             }
             Action::Copy => {
                 self.start_copy();
+                true
+            }
+            Action::ToggleTag => {
+                self.active_panel_mut().current_screen_mut().toggle_tag()
+            }
+            Action::UntagAll => {
+                self.active_panel_mut().current_screen_mut().untag_all()
+            }
+            Action::VisualMode => {
+                self.active_panel_mut().current_screen_mut().toggle_visual()
+            }
+            Action::Filter => {
+                self.modal_target = Some(ModalTarget::Filter);
+                self.modal = Modal::Input(InputDialog::new(
+                    "Filter (regex, empty to clear):",
+                    "/pattern/",
+                ));
                 true
             }
             Action::PopScreen => {
@@ -444,19 +511,29 @@ impl FileBrowser {
                 true
             }
             Action::Delete => {
-                // Extract the target from the active panel before touching the
-                // modal fields, so the panel borrow ends first.
-                let target = match self.active_panel().current_screen() {
-                    Screen::Main(state) => state.selected_resolved_path().cloned(),
-                    _ => None,
-                };
-                if let Some(resolved) = target {
-                    let name = resolved
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    self.modal_target = Some(ModalTarget::Delete { path: resolved });
-                    self.modal = Modal::Confirm(ConfirmDialog::new(format!("Delete '{}'?", name)));
+                // Tagged files are the operation set; fall back to the cursor
+                // selection when nothing is tagged. Extract before touching the
+                // modal fields so the panel borrow ends first.
+                let mut targets = self.active_panel().current_screen().tagged_paths();
+                if targets.is_empty() {
+                    if let Screen::Main(state) = self.active_panel().current_screen() {
+                        if let Some(p) = state.selected_resolved_path() {
+                            targets.push(p.clone());
+                        }
+                    }
+                }
+                if !targets.is_empty() {
+                    let prompt = if targets.len() == 1 {
+                        let name = targets[0]
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        format!("Delete '{}'?", name)
+                    } else {
+                        format!("Delete {} tagged items?", targets.len())
+                    };
+                    self.modal_target = Some(ModalTarget::Delete { paths: targets });
+                    self.modal = Modal::Confirm(ConfirmDialog::new(prompt));
                 }
                 true
             }
@@ -502,11 +579,23 @@ impl FileBrowser {
                         return true;
                     }
 
-                    // Tree view: if on an expanded directory, collapse it in place.
-                    let is_expanded = state.tree.is_cursor_expanded();
-                    let is_dir = state.tree.selected_line().map(|l| l.is_dir).unwrap_or(false);
-                    if is_dir && is_expanded {
-                        return state.collapse();
+                    // Tree view. The root line is auto-expanded, so a plain
+                    // in-place collapse here would eat the first `h` after
+                    // entering a directory — the user expects `h` at the root to
+                    // step back up. So when the cursor is on the root (depth 0)
+                    // and there's a screen to return to, fall through to the pop
+                    // below instead of collapsing the root.
+                    let at_root_line =
+                        state.tree.selected_line().map(|l| l.depth == 0).unwrap_or(false);
+                    let can_pop = stack_len > 1 && !dir_picker_below;
+                    if !(at_root_line && can_pop) {
+                        // Otherwise: on an expanded directory, collapse in place.
+                        let is_expanded = state.tree.is_cursor_expanded();
+                        let is_dir =
+                            state.tree.selected_line().map(|l| l.is_dir).unwrap_or(false);
+                        if is_dir && is_expanded {
+                            return state.collapse();
+                        }
                     }
                 }
 
@@ -578,7 +667,9 @@ impl FileBrowser {
                     Action::Quit | Action::PopScreen | Action::Help | Action::Confirm
                     | Action::ChangeRoot | Action::Search | Action::Collapse
                     | Action::GoDirPicker | Action::SwitchPanel | Action::ToggleSplit
-                    | Action::Copy | Action::Delete | Action::Rename => unreachable!(),
+                    | Action::Copy | Action::Delete | Action::Rename
+                    | Action::ToggleTag | Action::UntagAll | Action::VisualMode
+                    | Action::Filter => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -591,19 +682,17 @@ impl FileBrowser {
                 if let Some(result) = dialog.handle_key(key_code_char(&key)) {
                     self.modal = Modal::None;
                     match self.modal_target.take() {
-                        Some(ModalTarget::Delete { path }) if result => {
-                            // Run the delete on the active panel so its tree is
-                            // the one refreshed when the task finishes.
-                            let p = path.clone();
-                            let task = tokio::spawn(async move {
-                                let _ = delete_path(&p);
-                            });
-                            let panel = self.active_panel_mut();
-                            panel.delete_task = Some(task);
-                            panel.deleting_path = Some(path);
+                        Some(ModalTarget::Delete { paths }) if result => {
+                            self.spawn_delete_batch(paths);
                         }
-                        Some(ModalTarget::Copy { src, dest, dest_panel }) if result => {
-                            self.spawn_copy(src, dest, dest_panel);
+                        Some(ModalTarget::CopyOverwrite { src, dest }) => {
+                            // Confirmed collisions join the approved batch; a
+                            // declined one is simply skipped. Either way we move
+                            // on to the next pending collision (or spawn).
+                            if result {
+                                self.approved_copies.push((src, dest));
+                            }
+                            self.prompt_next_copy();
                         }
                         _ => {}
                     }
@@ -641,14 +730,30 @@ impl FileBrowser {
                                     self.active_panel_mut().current_screen_mut().search(&value);
                                 }
                             }
-                            ModalTarget::Delete { .. } | ModalTarget::Copy { .. } => {}
+                            ModalTarget::Filter => {
+                                // Empty pattern clears the filter (handled downstream).
+                                self.active_panel_mut().current_screen_mut().filter(&value);
+                            }
+                            ModalTarget::CopyDest { srcs } => {
+                                let dir = PathBuf::from(&value)
+                                    .expand_user()
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| PathBuf::from(&value));
+                                if dir.is_dir() {
+                                    // Copy into the chosen directory, refreshing
+                                    // the active panel (single-panel mode).
+                                    let active = self.active;
+                                    self.begin_copy_batch(srcs, dir, active, active);
+                                }
+                            }
+                            ModalTarget::Delete { .. }
+                            | ModalTarget::CopyOverwrite { .. } => {}
                         }
                     }
                 }
                 true
             }
-            Modal::Progress(_) => true,
-            Modal::Copying => true,
+            Modal::Operation { .. } => true,
             Modal::Help => {
                 // Dismiss help — the real key is handled by handle_key.
                 self.modal = Modal::None;
@@ -673,77 +778,208 @@ impl FileBrowser {
             self.active = 0;
         } else {
             let start = self.active_panel().current_dir();
-            self.panels.push(Panel::new(start));
+            // The new pane opens on the active panel's current directory, which
+            // has already been scanned — hand down its size cache so the split
+            // is a cache hit instead of a full disk rescan.
+            let cache = self.active_panel().size_cache();
+            self.panels.push(Panel::new_with_cache(start, cache));
             // Focus the freshly opened panel.
             self.active = 1;
         }
     }
 
-    /// Begin a cross-panel copy of the active panel's selection into the other
-    /// panel's current directory. Pops an overwrite confirmation on collision;
-    /// otherwise starts the copy immediately. No-op outside dual mode.
+    /// Copy the active panel's tagged files (or the single cursor selection when
+    /// nothing is tagged). In dual mode the destination is the other panel's
+    /// directory; in single-panel mode the user is prompted for one.
     fn start_copy(&mut self) {
-        let Some(other) = self.other_index() else {
-            return;
-        };
-        let Some(src) = self.active_panel().selected_resolved_path() else {
-            return;
-        };
-        let Some(dest_dir) = self.panels[other].current_dir() else {
-            return;
-        };
-        let Some(name) = src.file_name() else {
-            return;
-        };
-        let dest = dest_dir.join(name);
-
-        // Don't let a copy silently consume itself (same file both sides).
-        if src == dest {
+        // The tag set is the source of truth; fall back to the cursor selection.
+        let mut srcs = self.active_panel().current_screen().tagged_paths();
+        if srcs.is_empty() {
+            if let Some(p) = self.active_panel().selected_resolved_path() {
+                srcs.push(p);
+            }
+        }
+        if srcs.is_empty() {
             return;
         }
 
-        if dest.exists() {
-            let display = name.to_string_lossy().to_string();
-            self.modal_target = Some(ModalTarget::Copy {
-                src,
-                dest,
-                dest_panel: other,
-            });
+        match self.other_index() {
+            Some(other) => {
+                // Dual mode: copy into the other panel's current directory.
+                let Some(dest_dir) = self.panels[other].current_dir() else {
+                    return;
+                };
+                let source = self.active;
+                self.begin_copy_batch(srcs, dest_dir, other, source);
+            }
+            None => {
+                // Single-panel: prompt for a destination directory first.
+                self.modal_target = Some(ModalTarget::CopyDest { srcs });
+                self.modal = Modal::Input(InputDialog::new(
+                    "Copy to directory:",
+                    "Enter path...",
+                ));
+            }
+        }
+    }
+
+    /// Plan a copy of `srcs` into `dest_dir`: non-colliding files are approved
+    /// immediately, colliding ones are queued for a per-file overwrite prompt.
+    /// `dest_panel` is refreshed and `source_panel`'s tags cleared on completion.
+    fn begin_copy_batch(
+        &mut self,
+        srcs: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        dest_panel: usize,
+        source_panel: usize,
+    ) {
+        self.copy_dest_panel = dest_panel;
+        self.copy_source_panel = source_panel;
+        self.approved_copies.clear();
+        self.pending_copies.clear();
+
+        for src in srcs {
+            let Some(name) = src.file_name() else { continue };
+            let dest = dest_dir.join(name);
+            // Never copy a file onto itself.
+            if src == dest {
+                continue;
+            }
+            if dest.exists() {
+                self.pending_copies.push((src, dest));
+            } else {
+                self.approved_copies.push((src, dest));
+            }
+        }
+
+        self.prompt_next_copy();
+    }
+
+    /// Drain the next colliding file into an overwrite prompt; once none remain,
+    /// spawn the approved batch (or clear state if nothing was approved).
+    fn prompt_next_copy(&mut self) {
+        if let Some((src, dest)) = self.pending_copies.pop() {
+            let name = dest
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.modal_target = Some(ModalTarget::CopyOverwrite { src, dest });
             self.modal = Modal::Confirm(ConfirmDialog::new(format!(
                 "'{}' exists. Overwrite?",
-                display
+                name
             )));
         } else {
-            self.spawn_copy(src, dest, other);
+            self.spawn_copy_batch();
         }
     }
 
-    /// Spawn the background copy task and show the copying overlay. When it
-    /// finishes, `resolve_copying` refreshes `dest_panel`.
-    fn spawn_copy(&mut self, src: PathBuf, dest: PathBuf, dest_panel: usize) {
+    /// Spawn one background task that copies every approved (src, dest) pair and
+    /// show the copying overlay. `resolve_copying` finishes the bookkeeping.
+    fn spawn_copy_batch(&mut self) {
+        let batch = std::mem::take(&mut self.approved_copies);
+        if batch.is_empty() {
+            // Nothing survived the collision prompts; just close the overlay.
+            self.modal = Modal::None;
+            return;
+        }
+
+        // Count the total entries (files + dirs) across every source so the
+        // overlay can show N / M. This is a shallow metadata walk, far cheaper
+        // than the copy itself.
+        let progress = OpProgress::new();
+        let total: u64 = batch.iter().map(|(src, _)| count_entries(src)).sum();
+        progress.set_total(total);
+        self.op_progress = Some(progress.clone());
+
         let task = tokio::spawn(async move {
-            let _ = copy_path(&src, &dest);
+            for (src, dest) in &batch {
+                let _ = copy_path(src, dest, Some(&progress));
+            }
+            progress.finish();
         });
         self.copy_task = Some(task);
-        self.copy_dest_panel = dest_panel;
-        self.modal = Modal::Copying;
+        self.modal = Modal::Operation { verb: "Copying" };
+    }
+
+    /// Delete `paths` in the background, tracking progress, then remove them from
+    /// the active panel's tree and clear its tags when the task completes.
+    fn spawn_delete_batch(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let progress = OpProgress::new();
+        let total: u64 = paths.iter().map(|p| count_entries(p)).sum();
+        progress.set_total(total);
+        self.op_progress = Some(progress.clone());
+
+        let to_delete = paths.clone();
+        let task = tokio::spawn(async move {
+            for p in &to_delete {
+                let _ = delete_path(p, Some(&progress));
+            }
+            progress.finish();
+        });
+
+        let panel = self.active_panel_mut();
+        panel.delete_task = Some(task);
+        panel.deleting_paths = paths;
+        // Deleted files were the tags' whole point — clear them now so the UI
+        // doesn't keep highlighting rows that are about to vanish.
+        panel.current_screen_mut().clear_tags();
     }
 }
 
-/// Recursively delete a path.
-fn delete_path(path: &Path) -> std::io::Result<()> {
+/// Count the entries (files + directories) rooted at `path`, for progress
+/// totals. A single file counts as 1.
+fn count_entries(path: &Path) -> u64 {
     if path.is_dir() {
-        std::fs::remove_dir_all(path)
+        walkdir::WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .count() as u64
     } else {
-        std::fs::remove_file(path)
+        1
     }
 }
 
-/// Copy `src` to `dest`, recursing into directories. Existing files at the
-/// destination are overwritten (`std::fs::copy` semantics); the overwrite
-/// decision is made by the caller before this runs. Directories are recreated
-/// and their contents copied via `walkdir`, which is already a dependency.
-fn copy_path(src: &Path, dest: &Path) -> std::io::Result<()> {
+/// Recursively delete a path, bumping `progress` once per entry removed so a
+/// large tree reports live progress. Directories are walked deepest-first so
+/// children are gone before their parent is removed.
+fn delete_path(path: &Path, progress: Option<&OpProgress>) -> std::io::Result<()> {
+    if path.is_dir() {
+        // contents_first yields children before their parent directory.
+        for entry in walkdir::WalkDir::new(path)
+            .contents_first(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_dir() {
+                let _ = std::fs::remove_dir(entry.path());
+            } else {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            if let Some(p) = progress {
+                p.inc_done();
+            }
+        }
+        // The root directory itself (walkdir with contents_first still yields it
+        // last, so the loop above already removed it — but guard just in case).
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    } else {
+        let res = std::fs::remove_file(path);
+        if let Some(p) = progress {
+            p.inc_done();
+        }
+        res
+    }
+}
+
+/// Copy `src` to `dest`, recursing into directories and bumping `progress` once
+/// per entry copied. Existing files at the destination are overwritten
+/// (`std::fs::copy` semantics); the overwrite decision is made by the caller
+/// before this runs.
+fn copy_path(src: &Path, dest: &Path, progress: Option<&OpProgress>) -> std::io::Result<()> {
     if src.is_dir() {
         for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
             // Re-root each entry from `src` onto `dest`.
@@ -760,13 +996,20 @@ fn copy_path(src: &Path, dest: &Path) -> std::io::Result<()> {
                 }
                 std::fs::copy(entry.path(), &target)?;
             }
+            if let Some(p) = progress {
+                p.inc_done();
+            }
         }
         Ok(())
     } else {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(src, dest).map(|_| ())
+        let res = std::fs::copy(src, dest).map(|_| ());
+        if let Some(p) = progress {
+            p.inc_done();
+        }
+        res
     }
 }
 
