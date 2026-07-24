@@ -77,10 +77,12 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         HelpCategory {
             title: "Actions",
             items: &[
-                ("D", "Delete selected"),
+                ("D", "Delete tagged / selected"),
                 ("R", "Rename selected"),
+                ("N", "New directory here"),
                 ("r", "Refresh"),
-                ("/", "Search files"),
+                ("/", "Search by name (regex)"),
+                ("n / p", "Next / previous search match"),
                 ("gd", "Go to directory picker"),
             ],
         },

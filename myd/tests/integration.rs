@@ -2367,3 +2367,230 @@ fn test_scan_overlay_shows_files_dirs_and_size() {
         text
     );
 }
+
+// ---------------------------------------------------------------------------
+// N creates a directory; search uses regex; tagged rows render a marker.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_n_creates_directory_in_current_pane() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // N -> type a name -> Enter.
+    app.handle_key_for_test(char_key('N'));
+    for c in "newdir".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert!(
+        dir.path().join("newdir").is_dir(),
+        "N should create the directory in the pane's current dir"
+    );
+}
+
+#[tokio::test]
+async fn test_n_creates_inside_directory_under_cursor() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("parent")).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Cursor onto "parent" (a directory), then create inside it.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('N'));
+    for c in "child".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert!(
+        dir.path().join("parent/child").is_dir(),
+        "N with the cursor on a directory should create inside it"
+    );
+}
+
+#[tokio::test]
+async fn test_search_uses_regex() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("report2024.log"), b"x").unwrap();
+    std::fs::write(dir.path().join("notes.md"), b"x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // A regex that only the .log file matches (digits before .log).
+    app.handle_key_for_test(char_key('/'));
+    for c in r"\d+\.log$".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    // The cursor should land on the matching file.
+    let name = match app.current_screen() {
+        Screen::Main(s) => s
+            .tree
+            .selected_line()
+            .map(|l| l.name.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    assert_eq!(name, "report2024.log", "regex search should find the .log file");
+}
+
+#[tokio::test]
+async fn test_tagged_row_renders_marker() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag the first child, then move the cursor off it so the tag marker isn't
+    // hidden by the cursor row.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(tag_count(&app), 1);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            if let Screen::Main(s) = app.current_screen_mut() {
+                s.active = true;
+                myd::screen::ScreenState::render(s, f, f.area());
+            }
+        })
+        .unwrap();
+
+    let text = buffer_to_string(&terminal.backend().buffer().clone());
+    assert!(
+        text.contains('▶'),
+        "a tagged row should show the ▶ marker:\n{}",
+        text
+    );
+}
+
+// ---------------------------------------------------------------------------
+// n / p step through search matches.
+// ---------------------------------------------------------------------------
+
+/// Name of the line under the cursor on the active panel.
+fn cursor_name(app: &myd::app::FileBrowser) -> String {
+    use myd::screen::Screen;
+    match app.current_screen() {
+        Screen::Main(s) => s
+            .tree
+            .selected_line()
+            .map(|l| l.name.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+#[tokio::test]
+async fn test_n_and_p_step_through_matches() {
+    use myd::app::FileBrowser;
+
+    // Three .log files of distinct sizes so the Largest sort is deterministic:
+    // a.log (biggest), b.log, c.log, plus a non-matching file.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.log"), vec![0u8; 3000]).unwrap();
+    std::fs::write(dir.path().join("b.log"), vec![0u8; 2000]).unwrap();
+    std::fs::write(dir.path().join("c.log"), vec![0u8; 1000]).unwrap();
+    std::fs::write(dir.path().join("skip.txt"), vec![0u8; 500]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Search lands on the first match (a.log, the largest → first child).
+    app.handle_key_for_test(char_key('/'));
+    for c in r"\.log$".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(cursor_name(&app), "a.log", "search lands on first match");
+
+    // n advances down the matches.
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(cursor_name(&app), "b.log", "n -> next match");
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(cursor_name(&app), "c.log", "n -> next match");
+
+    // n wraps around back to the first match.
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(cursor_name(&app), "a.log", "n wraps to the top");
+
+    // p walks back up (wrapping to the bottom first).
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(cursor_name(&app), "c.log", "p wraps to the bottom");
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(cursor_name(&app), "b.log", "p -> previous match");
+}
+
+#[tokio::test]
+async fn test_n_is_noop_without_prior_search() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("only.txt"), b"x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // No search yet: n / p must not move the cursor or panic.
+    let before = cursor_name(&app);
+    app.handle_key_for_test(char_key('n'));
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(cursor_name(&app), before, "n/p do nothing before a search");
+}
+
+#[tokio::test]
+async fn test_create_dir_preserves_size_cache() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    // A tree with content so the initial scan populates the size cache.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a/deep")).unwrap();
+    std::fs::write(dir.path().join("a/deep/f.bin"), vec![0u8; 4000]).unwrap();
+    std::fs::write(dir.path().join("top.txt"), vec![0u8; 100]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let cache_before = match app.current_screen() {
+        Screen::Main(s) => s.tree.size_cache.len(),
+        _ => 0,
+    };
+    assert!(cache_before > 0);
+
+    // Create a directory. The old code called refresh(), which clears the cache
+    // and rescans the whole tree; the fast path keeps the cache intact.
+    app.handle_key_for_test(char_key('N'));
+    for c in "fresh".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert!(dir.path().join("fresh").is_dir(), "directory created");
+    let cache_after = match app.current_screen() {
+        Screen::Main(s) => s.tree.size_cache.len(),
+        _ => 0,
+    };
+    assert!(
+        cache_after >= cache_before,
+        "create-dir must not clear the size cache (was {}, now {})",
+        cache_before,
+        cache_after
+    );
+}
