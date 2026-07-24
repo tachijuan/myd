@@ -17,6 +17,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Search** — find files by name with `/`.
 - **Rename and delete** — rename with `R`, delete with `dd` (both with confirmation dialogs).
 - **Change root** — jump to any directory with `gd` without losing your sort and view settings.
+- **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy the selected item into the other panel's directory with `c`. Toggle the split on and off any time with `|`.
 - **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
 - **Progress overlay** — non-blocking directory enumeration with a progress indicator for large trees.
 
@@ -52,6 +53,11 @@ myd
 # Start at a specific path
 myd ~/Documents
 myd /var/log
+
+# Dual-panel mode — two independent views side by side
+myd --dual                    # split; left panel picks a directory
+myd ~/Documents --dual        # left panel at ~/Documents, right picks a directory
+myd ~/Documents ~/Downloads   # two paths implies dual: left and right roots
 ```
 
 ## Key Bindings
@@ -92,6 +98,14 @@ myd /var/log
 | `t`       | Toggle info panel             |
 | `/`       | Search by name                |
 | `?` / `F1`| Help                          |
+
+### Panels
+
+| Key       | Action                                        |
+|-----------|-----------------------------------------------|
+| `\|`      | Toggle single / dual-panel layout             |
+| `Tab`     | Switch the active panel                        |
+| `c`       | Copy selection into the other panel's directory |
 
 ### Screen-level
 
@@ -148,6 +162,25 @@ Press `v` to toggle between the file tree and a squarified treemap. The treemap 
 ```
 
 Each tile is filled with a color for its content category — **code**, **docs**, **images**, **video**, **audio**, **archives**, **data**, **binaries**, or **other**. A file's color comes from its extension; a directory takes the color of the category holding most of its bytes. A legend in the status bar names the categories currently on screen. When a tile is too narrow to show its full name, the selected item's name appears in the status bar instead.
+
+## Dual-Panel Mode
+
+Run `myd` with `--dual` (or pass two directory paths) to view two independent trees side by side. Each panel keeps its own root, cursor, expansion state, and navigation history — everything you do (navigate, sort, toggle hidden, switch to the treemap) applies only to the active panel.
+
+```
++---------------------------+---------------------------+
+| File Tree (~/Documents)   | File Tree (~/Downloads)   |  <- active panel:
+|   projects                |   installers              |     bright border
+| > report.pdf              |   archive.zip             |     (other: dimmed)
+|   notes.txt               |   photo.jpg               |
++---------------------------+---------------------------+
+```
+
+- **`Tab`** switches which panel is active; the active panel has a bright border, the inactive one a dimmed border.
+- **`|`** toggles the split. Splitting opens the new panel at the active panel's current directory and focuses it; unsplitting drops the inactive panel and keeps the one you were on.
+- **`c`** copies the item selected in the active panel into the **directory the other panel is currently viewing**. If a file or directory of the same name already exists there, you're asked to confirm the overwrite. Directories are copied recursively, and the destination panel refreshes automatically when the copy completes.
+
+Each panel can independently change its root (`gd`), so you can, for example, browse a backup on one side and your working tree on the other, then copy files across with a single `c`.
 
 ## License
 

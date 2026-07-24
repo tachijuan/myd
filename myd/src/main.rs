@@ -7,6 +7,6 @@ use myd::cli::Cli;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut browser = FileBrowser::new(cli.path);
+    let mut browser = FileBrowser::new(cli.path, cli.right, cli.dual);
     browser.run().await
 }

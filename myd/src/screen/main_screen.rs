@@ -22,6 +22,10 @@ pub struct MainScreenState {
     /// Which view has focus: file tree or treemap.
     pub focus: FocusTarget,
     pub info_panel_hidden: bool,
+    /// Render hint: whether this screen belongs to the active panel. In
+    /// single-panel mode it is always the active one; in dual mode the app sets
+    /// it before drawing each panel so the active panel's border stands out.
+    pub active: bool,
     /// Cached info panel text — only recomputed when selection changes.
     cached_info_text: Text<'static>,
     /// What `cached_info_text` describes: the resolved path it was built from,
@@ -44,6 +48,7 @@ impl MainScreenState {
             treemap,
             focus: FocusTarget::Tree,
             info_panel_hidden: true,
+            active: true,
             cached_info_text: Text::default(),
             cached_info_key: None,
         }
@@ -58,9 +63,16 @@ impl MainScreenState {
             treemap,
             focus: FocusTarget::Tree,
             info_panel_hidden: true,
+            active: true,
             cached_info_text: Text::default(),
             cached_info_key: None,
         }
+    }
+
+    /// The directory this screen is rooted at — the copy destination when this
+    /// screen is the *other* panel.
+    pub fn root_path(&self) -> &PathBuf {
+        &self.root_path
     }
 
     /// Adopt session-wide view preferences (info panel visibility, focused view).
@@ -363,7 +375,7 @@ impl MainScreenState {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Plain)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(self.border_color()))
                     .title(title),
             )
             .scroll((scroll as u16, 0));
@@ -417,10 +429,21 @@ impl MainScreenState {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(self.border_color()))
                 .title(" Info "),
         );
         frame.render_widget(paragraph, area);
+    }
+
+    /// Border color for this screen's panels — bright cyan when active, dim gray
+    /// when it belongs to the inactive panel. In single-panel mode `active` is
+    /// always true, so the appearance is unchanged.
+    fn border_color(&self) -> Color {
+        if self.active {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
