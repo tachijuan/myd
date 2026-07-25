@@ -14,6 +14,9 @@ use crate::widget::treemap::FocusTarget;
 pub struct ViewPrefs {
     pub info_panel_hidden: bool,
     pub focus: FocusTarget,
+    /// Sort order, carried across screens so drilling into a directory keeps
+    /// whatever order the user chose rather than snapping back to the default.
+    pub sort_mode: crate::screen::SortMode,
 }
 
 impl Default for ViewPrefs {
@@ -23,6 +26,7 @@ impl Default for ViewPrefs {
             // detail on demand. Start with it closed and let `t` bring it up.
             info_panel_hidden: true,
             focus: FocusTarget::default(),
+            sort_mode: crate::screen::SortMode::default(),
         }
     }
 }
