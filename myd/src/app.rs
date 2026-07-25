@@ -68,6 +68,12 @@ pub enum ModalTarget {
     CopyDest { srcs: Vec<PathBuf> },
     /// Per-file overwrite confirmation while draining `pending_copies`.
     CopyOverwrite { src: PathBuf, dest: PathBuf },
+    /// Per-file overwrite/skip/cancel choice while draining `pending_moves`.
+    MoveOverwrite {
+        src: PathBuf,
+        dest: PathBuf,
+        is_dir: bool,
+    },
     /// Remote host prompt, e.g. `sftp://user@host/path` or an ssh config alias.
     Connect,
     /// Masked prompt for a key passphrase or account password, feeding a
@@ -109,6 +115,17 @@ pub struct FileBrowser {
         Arc<std::sync::Mutex<Vec<PathBuf>>>,
         Arc<std::sync::Mutex<Vec<String>>>,
     )>,
+    /// Colliding moves awaiting an overwrite/skip/cancel answer, and the ones
+    /// cleared to run. `(src, dest, is_dir)` — the kind is carried so a queued
+    /// cross-backend move draws the right ghost icon.
+    #[allow(clippy::type_complexity)]
+    pending_moves: Vec<(PathBuf, PathBuf, bool)>,
+    #[allow(clippy::type_complexity)]
+    approved_moves: Vec<(PathBuf, PathBuf, bool)>,
+    /// Panels and destination directory for the move batch being assembled.
+    move_source_panel: usize,
+    move_dest_panel: usize,
+    move_dest_dir: PathBuf,
     /// Live filesystem backends. Index 0 is always the local filesystem.
     backends: BackendRegistry,
     /// Queued and running transfers, drained by the event loop each tick.
@@ -181,6 +198,11 @@ impl FileBrowser {
             op_progress: None,
             op_cancel: None,
             move_results: None,
+            pending_moves: Vec::new(),
+            approved_moves: Vec::new(),
+            move_source_panel: 0,
+            move_dest_panel: 0,
+            move_dest_dir: PathBuf::new(),
             pending_copies: Vec::new(),
             approved_copies: Vec::new(),
             copy_source_panel: 0,
@@ -1092,7 +1114,16 @@ impl FileBrowser {
     fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
         match &mut self.modal {
             Modal::Confirm(dialog) => {
-                if let Some(result) = dialog.handle_key(key_code_char(&key)) {
+                use crate::widget::confirm_dialog::Answer;
+                // Esc backs out of a multi-choice prompt as "cancel the batch",
+                // the only reading that can't lose data.
+                let answer = if key.code == KeyCode::Esc {
+                    Some(Answer::Choice('c'))
+                } else {
+                    dialog.handle_key_answer(key_code_char(&key))
+                };
+                if let Some(answer) = answer {
+                    let result = answer == Answer::Yes;
                     self.modal = Modal::None;
                     match self.modal_target.take() {
                         Some(ModalTarget::Delete { paths }) if result => {
@@ -1106,6 +1137,26 @@ impl FileBrowser {
                                 self.approved_copies.push((src, dest));
                             }
                             self.prompt_next_copy();
+                        }
+                        Some(ModalTarget::MoveOverwrite { src, dest, is_dir }) => {
+                            match answer {
+                                // Overwrite: the batch clears the destination
+                                // just before renaming into it.
+                                Answer::Choice('o') => {
+                                    self.approved_moves.push((src, dest, is_dir));
+                                    self.prompt_next_move();
+                                }
+                                // Skip this one, keep going.
+                                Answer::Choice('s') => self.prompt_next_move(),
+                                // Cancel: abandon everything still pending *and*
+                                // everything already approved — the user asked to
+                                // stop the move, not just this file.
+                                _ => {
+                                    self.pending_moves.clear();
+                                    self.approved_moves.clear();
+                                    self.modal = Modal::None;
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -1181,7 +1232,10 @@ impl FileBrowser {
                                     self.retry_connect_with_secret(value);
                                 }
                             }
-                            ModalTarget::Delete { .. } | ModalTarget::CopyOverwrite { .. } => {}
+                            // Confirm-modal targets; unreachable from an input.
+                            ModalTarget::Delete { .. }
+                            | ModalTarget::CopyOverwrite { .. }
+                            | ModalTarget::MoveOverwrite { .. } => {}
                         }
                     }
                 }
@@ -1647,45 +1701,147 @@ impl FileBrowser {
         let src_panel = self.active;
         let src_backend = self.panels[src_panel].backend;
         let dest_backend = self.panels[other].backend;
-        let src_fs = self.backends.get(src_backend);
-        let dest_fs = self.backends.get(dest_backend);
 
+        self.move_source_panel = src_panel;
+        self.move_dest_panel = other;
+        self.move_dest_dir = dest_dir.clone();
+        self.approved_moves.clear();
+        self.pending_moves.clear();
+
+        // Split the sources into ones that can go straight through and ones
+        // whose destination name is taken. Directory-ness comes from the tree
+        // (no I/O), so the queued ghost draws the right icon.
+        for src in srcs {
+            let Some(name) = src.file_name().map(|n| n.to_owned()) else {
+                continue;
+            };
+            let dest = dest_dir.join(&name);
+            // Moving something onto itself is a no-op, not a collision.
+            if src == dest && src_backend == dest_backend {
+                continue;
+            }
+            let is_dir = if let Screen::Main(state) = self.panels[src_panel].current_screen() {
+                state.is_dir_of(&src).unwrap_or(false)
+            } else {
+                false
+            };
+            let dest_vpath = VPath::new(dest_backend, dest.clone());
+            let dest_fs = self.backends.get(dest_backend);
+            let taken =
+                futures::executor::block_on(async { dest_fs.symlink_stat(&dest_vpath).await })
+                    .is_ok();
+            if taken {
+                self.pending_moves.push((src, dest, is_dir));
+            } else {
+                self.approved_moves.push((src, dest, is_dir));
+            }
+        }
+
+        self.prompt_next_move();
+    }
+
+    /// Ask what to do about the next colliding move, then run the batch.
+    ///
+    /// Three answers, matching what a conflict actually calls for: overwrite
+    /// this one, skip it and carry on, or abandon the whole move. Copy only
+    /// offers overwrite/skip, but a move destroys the source too, so being able
+    /// to stop the entire sequence matters more here.
+    fn prompt_next_move(&mut self) {
+        if let Some((src, dest, is_dir)) = self.pending_moves.pop() {
+            let name = dest
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.modal_target = Some(ModalTarget::MoveOverwrite { src, dest, is_dir });
+            self.modal = Modal::Confirm(
+                ConfirmDialog::new(format!(
+                    "'{}' exists. [o]verwrite, [s]kip, or [c]ancel the move?",
+                    name
+                ))
+                .with_choices(&['o', 's', 'c']),
+            );
+        } else {
+            self.spawn_move_batch();
+        }
+    }
+
+    /// Dispatch the approved moves.
+    ///
+    /// Same-backend moves are renames — instant, so they run inline. Moves that
+    /// cross backends have to copy the bytes, so they go through the transfer
+    /// queue exactly as a cross-backend copy does: bounded parallelism, a live
+    /// progress bar and rate in the transfer panel, and the interface stays
+    /// interactive instead of sitting behind a modal overlay.
+    fn spawn_move_batch(&mut self) {
+        let batch = std::mem::take(&mut self.approved_moves);
+        if batch.is_empty() {
+            self.modal = Modal::None;
+            return;
+        }
+
+        let src_panel = self.move_source_panel;
+        let dest_panel = self.move_dest_panel;
+        let src_backend = self.panels[src_panel].backend;
+        let dest_backend = self.panels[dest_panel].backend;
+
+        if src_backend != dest_backend {
+            // Cross-backend: hand every item to the transfer queue, flagged so
+            // its source is removed once its copy has fully landed.
+            for (src, dest, is_dir) in batch {
+                self.transfers.enqueue_move(
+                    VPath::new(src_backend, src),
+                    VPath::new(dest_backend, dest),
+                    0,
+                    is_dir,
+                );
+            }
+            self.panels[src_panel].current_screen_mut().clear_tags();
+            // Surface the queue even if the panel was previously pinned hidden —
+            // the user just started work they should be able to watch.
+            self.transfer_panel_override = None;
+            self.modal = Modal::None;
+            return;
+        }
+
+        // Same backend: renames only, so this finishes almost immediately.
+        let fs = self.backends.get(src_backend);
         let progress = OpProgress::new();
-        progress.set_total(srcs.len() as u64);
+        progress.set_total(batch.len() as u64);
         self.op_progress = Some(progress.clone());
         let cancel = CancelToken::new();
         self.op_cancel = Some(cancel.clone());
 
-        let jobs: Vec<(VPath, VPath)> = srcs
+        let jobs: Vec<(VPath, VPath)> = batch
             .iter()
-            .map(|src| {
-                let name = src
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
+            .map(|(src, dest, _)| {
                 (
                     VPath::new(src_backend, src.clone()),
-                    VPath::new(dest_backend, dest_dir.join(name)),
+                    VPath::new(dest_backend, dest.clone()),
                 )
             })
             .collect();
 
-        // Records which sources actually left, so a move that failed (a name
-        // already taken at the destination, a permission error) doesn't have its
-        // entry removed from the tree as though it had succeeded.
+        // Records which sources actually left, so a move that failed doesn't
+        // have its entry removed from the tree as though it had succeeded.
         let moved = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
         let failures = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let task = tokio::spawn({
             let moved = moved.clone();
             let failures = failures.clone();
+            let fs = fs.clone();
             async move {
                 for (from, to) in &jobs {
                     if cancel.is_cancelled() {
                         break;
                     }
+                    // An approved overwrite means the destination is expected to
+                    // be there; clear it so the rename can land.
+                    if fs.symlink_stat(to).await.is_ok() {
+                        let _ = crate::vfs::ops::delete_recursive(&fs, to, None, &cancel).await;
+                    }
                     match crate::vfs::ops::move_path(
-                        &src_fs,
-                        &dest_fs,
+                        &fs,
+                        &fs,
                         from,
                         to,
                         Some(&progress),
@@ -1709,7 +1865,7 @@ impl FileBrowser {
         // failed must leave its source visible.
         self.panels[src_panel].deleting_paths = Vec::new();
         self.panels[src_panel].current_screen_mut().clear_tags();
-        self.copy_dest_panel = other;
+        self.copy_dest_panel = dest_panel;
         self.modal = Modal::Operation { verb: "Moving" };
     }
 

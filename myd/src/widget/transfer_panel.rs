@@ -108,7 +108,7 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
             Color::Cyan,
         ));
         for t in &active {
-            lines.push(name_line(&t.name, width, Color::White));
+            lines.push(name_line(&transfer_label(t), width, Color::White));
             lines.push(bar_line(t.progress.fraction(), width));
             lines.push(stats_line(t, width));
         }
@@ -123,7 +123,7 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
             Color::Yellow,
         ));
         for t in &queued {
-            lines.push(name_line(&t.name, width, Color::Gray));
+            lines.push(name_line(&transfer_label(t), width, Color::Gray));
         }
     }
 
@@ -173,6 +173,16 @@ fn section_header(text: String, color: Color) -> Line<'static> {
         format!("▼ {}", text),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     ))
+}
+
+/// A transfer's display name, marked when it is the copy half of a move — the
+/// source is about to be deleted, which is worth seeing before it happens.
+fn transfer_label(t: &crate::transfer::Transfer) -> String {
+    if t.remove_source {
+        format!("{} (move)", t.name)
+    } else {
+        t.name.clone()
+    }
 }
 
 fn name_line(name: &str, width: usize, color: Color) -> Line<'static> {

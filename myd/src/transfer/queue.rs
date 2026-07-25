@@ -80,6 +80,26 @@ impl TransferQueue {
         id
     }
 
+    /// Enqueue the copy half of a cross-backend move.
+    ///
+    /// Identical to [`enqueue_kind`](Self::enqueue_kind) except that the source
+    /// is deleted once the copy has fully succeeded — so a move gets the same
+    /// queueing, parallelism and transfer-panel progress as a copy.
+    pub fn enqueue_move(
+        &mut self,
+        src: VPath,
+        dest: VPath,
+        total_bytes: u64,
+        is_dir: bool,
+    ) -> TransferId {
+        let id = TransferId(self.next_id);
+        self.next_id += 1;
+        self.transfers.push(
+            Transfer::with_kind(id, src, dest, total_bytes, is_dir).removing_source(),
+        );
+        id
+    }
+
     /// Destinations of transfers still queued or running — the "ghosts" the
     /// destination tree overlays until each real entry lands.
     pub fn pending_destinations(&self) -> Vec<PendingDest> {
@@ -244,16 +264,44 @@ impl TransferQueue {
             let src_fs: Arc<dyn Vfs> = registry.get(t.src.backend);
             let dest_fs: Arc<dyn Vfs> = registry.get(t.dest.backend);
 
-            let handle = tokio::spawn(run_worker(TransferJob {
-                id: t.id,
-                src_fs,
-                dest_fs,
-                src: t.src.clone(),
-                dest: t.dest.clone(),
-                progress: t.progress.clone(),
-                cancel: t.cancel.clone(),
-                config,
-            }));
+            let remove_source = t.remove_source;
+            let move_src = t.src.clone();
+            let move_fs = src_fs.clone();
+            let move_cancel = t.cancel.clone();
+            let (t_id, t_src, t_dest) = (t.id, t.src.clone(), t.dest.clone());
+            let (t_progress, t_cancel) = (t.progress.clone(), t.cancel.clone());
+            let handle = tokio::spawn(async move {
+                let completion = run_worker(TransferJob {
+                    id: t_id,
+                    src_fs,
+                    dest_fs,
+                    src: t_src,
+                    dest: t_dest,
+                    progress: t_progress,
+                    cancel: t_cancel,
+                    config,
+                })
+                .await;
+                // The delete half of a move, and only on a clean success:
+                // removing the source after a partial or cancelled copy would
+                // destroy the only complete copy of the data.
+                if remove_source && matches!(completion, Completion::Done) {
+                    if let Err(e) = crate::vfs::ops::delete_recursive(
+                        &move_fs,
+                        &move_src,
+                        None,
+                        &move_cancel,
+                    )
+                    .await
+                    {
+                        return Completion::Failed(format!(
+                            "copied, but could not remove the source: {}",
+                            e
+                        ));
+                    }
+                }
+                completion
+            });
 
             self.running.insert(t.id, handle);
             t.state = TransferState::Active;
