@@ -30,6 +30,12 @@ pub enum SortMode {
     #[default]
     Largest,
     Smallest,
+    /// Newest modification time first.
+    Newest,
+    /// Oldest modification time first.
+    Oldest,
+    /// Most recently accessed first.
+    RecentlyAccessed,
 }
 
 impl SortMode {
@@ -39,6 +45,9 @@ impl SortMode {
             SortMode::FilesFirst => "files-first",
             SortMode::Largest => "largest",
             SortMode::Smallest => "smallest",
+            SortMode::Newest => "newest",
+            SortMode::Oldest => "oldest",
+            SortMode::RecentlyAccessed => "recently-accessed",
         }
     }
 }
@@ -85,6 +94,48 @@ impl Screen {
             move || {
                 let cache = cache.unwrap_or_default();
                 let tree = FileTree::with_cache_cancellable_progress(
+                    path,
+                    SortMode::Largest,
+                    true,
+                    true,
+                    cache,
+                    &cancel,
+                    &progress,
+                );
+                let _ = tx.send(tree);
+            }
+        });
+        Screen::Loading(LoadingState::new(path, rx, cancel, progress))
+    }
+
+    /// Start loading a *remote* directory tree from a [`Source`].
+    ///
+    /// Mirrors [`loading_with_cache`] but builds the tree through the source's
+    /// backend. The source carries its own runtime, so building on the blocking
+    /// pool turns the async `Vfs` calls into synchronous ones without making the
+    /// tree async.
+    pub fn loading_remote(
+        source: crate::widget::source::Source,
+        path: std::path::PathBuf,
+        cache: Option<crate::utils::sizes::SizeCache>,
+    ) -> Self {
+        use crate::screen::SortMode;
+        use crate::utils::sizes::CancelToken;
+        use crate::widget::file_tree::FileTree;
+        use crate::widget::progress::OpProgress;
+        use tokio::sync::oneshot;
+
+        let (tx, rx) = oneshot::channel();
+        let cancel = CancelToken::new();
+        let progress = OpProgress::new();
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            let cancel = cancel.clone();
+            let progress = progress.clone();
+            move || {
+                let cache = cache.unwrap_or_default();
+                let tree = FileTree::with_source_cancellable_progress(
+                    source,
                     path,
                     SortMode::Largest,
                     true,

@@ -39,6 +39,10 @@ pub struct MainScreenState {
     /// The most recent search regex, so `n` / `p` can repeat it to the next /
     /// previous match without re-prompting.
     last_search: Option<regex::Regex>,
+    /// In-progress transfer destinations that fall inside this panel's tree,
+    /// drawn as "ghost" rows. Set by the app each frame before rendering (like
+    /// `active`); empty when nothing is being transferred here.
+    pub pending_ghosts: Vec<crate::transfer::PendingDest>,
 }
 
 impl MainScreenState {
@@ -55,6 +59,7 @@ impl MainScreenState {
             cached_info_text: Text::default(),
             cached_info_key: None,
             last_search: None,
+            pending_ghosts: Vec::new(),
         }
     }
 
@@ -71,6 +76,7 @@ impl MainScreenState {
             cached_info_text: Text::default(),
             cached_info_key: None,
             last_search: None,
+            pending_ghosts: Vec::new(),
         }
     }
 
@@ -192,6 +198,9 @@ impl MainScreenState {
             SortMode::Smallest,
             SortMode::DirsFirst,
             SortMode::FilesFirst,
+            SortMode::Newest,
+            SortMode::Oldest,
+            SortMode::RecentlyAccessed,
         ];
         let current_idx = modes.iter().position(|m| *m == self.tree.sort_mode).unwrap_or(0);
         let next_idx = (current_idx + 1) % modes.len();
@@ -361,6 +370,15 @@ impl MainScreenState {
         true
     }
 
+    /// Reload just one directory level (re-listing it, reusing the size cache),
+    /// then rebuild the treemap. Used to reflect a completed transfer landing in
+    /// this directory without a full rescan. A no-op if the directory isn't in
+    /// the tree.
+    pub fn reload_dir_public(&mut self, resolved_path: &std::path::Path) {
+        self.tree.reload_dir(resolved_path);
+        self.rebuild_treemap();
+    }
+
     /// Toggle the tag on the tree cursor's file. Tree-only (no-op in treemap).
     pub fn toggle_tag(&mut self) -> bool {
         if self.focus == FocusTarget::Tree {
@@ -396,6 +414,17 @@ impl MainScreenState {
     /// Snapshot of tagged paths for a copy.
     pub fn tagged_paths(&self) -> Vec<PathBuf> {
         self.tree.tagged_paths()
+    }
+
+    /// Whether a path currently shown in this tree is a directory, read from the
+    /// already-loaded lines so it costs no I/O (a remote stat would be a round
+    /// trip). `None` if the path isn't in the visible tree.
+    pub fn is_dir_of(&self, resolved_path: &std::path::Path) -> Option<bool> {
+        self.tree
+            .lines
+            .iter()
+            .find(|l| l.resolved_path == resolved_path || l.path == resolved_path)
+            .map(|l| l.is_dir)
     }
 
     /// Number of tagged files (for the footer indicator).
@@ -510,7 +539,11 @@ impl ScreenState for MainScreenState {
 
 impl MainScreenState {
     fn render_tree(&mut self, frame: &mut Frame, area: Rect) {
-        let text = self.tree.render_text();
+        let text = if self.pending_ghosts.is_empty() {
+            self.tree.render_text()
+        } else {
+            self.tree.render_text_with_ghosts(&self.pending_ghosts)
+        };
 
         // Build status bar subtitle — uses cached counts, no iteration.
         let total = self.tree.lines.len().saturating_sub(1); // subtract root

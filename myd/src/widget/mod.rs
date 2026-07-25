@@ -5,4 +5,6 @@ pub mod help;
 pub mod input_dialog;
 pub mod progress;
 pub mod size_bar;
+pub mod source;
+pub mod transfer_panel;
 pub mod treemap;

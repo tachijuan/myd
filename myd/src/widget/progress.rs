@@ -1,8 +1,8 @@
 use ratatui::{
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
-    layout::Rect,
     Frame,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -176,7 +176,9 @@ impl ProgressOverlay {
 
         let mut lines = vec![Line::from(Span::styled(
             self.title.clone(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ))];
         if !self.body.is_empty() {
             lines.push(Line::from(""));
@@ -200,14 +202,21 @@ impl ProgressOverlay {
 
 /// A 20-cell text progress bar for a done/total ratio.
 fn progress_bar(done: u64, total: u64) -> String {
-    let width = 20usize;
     let ratio = if total > 0 {
         (done as f64 / total as f64).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let filled = (ratio * width as f64) as usize;
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+    format!("[{}]", ratio_bar(ratio, 20))
+}
+
+/// Render `ratio` (0.0..=1.0) as a `width`-cell bar of block glyphs, without
+/// surrounding brackets. Shared with the transfer panel, which sizes its own
+/// bars to the available column width.
+pub fn ratio_bar(ratio: f64, width: usize) -> String {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 /// Center `r` inside `area`, clamped to fit. A box larger than the terminal

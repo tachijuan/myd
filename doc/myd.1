@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.2.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.5.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -72,11 +72,13 @@ cached and reused as you navigate, so this is how to pick up on-disk changes.
 Toggle between the tree view and the treemap view. The chosen view persists as
 you navigate between directories.
 .TP
-.B t
+.B Ctrl+b
 Toggle the info panel sidebar. Hidden by default.
 .TP
 .B s
-Cycle through sort modes: dirs-first, files-first, largest, smallest.
+Cycle through sort modes: largest, smallest, dirs-first, files-first, newest
+(modification time), oldest (modification time), and recently accessed (access
+time).
 .TP
 .B H
 Toggle visibility of hidden (dot) files and directories.
@@ -105,6 +107,39 @@ Rescan the file tree.
 .TP
 .B Ctrl+b
 Toggle the info panel sidebar.
+.TP
+.B gr
+Connect to a remote host over SFTP and open it in the active panel, replacing
+whatever it was showing. Prompts for an
+\fBsftp://[user@]host[:port][/path]\fR target (or an ssh config alias).
+.TP
+.B Ctrl+t
+Show or hide the transfer panel.
+.TP
+.B gx
+Cancel all queued and in-flight transfers.
+.SH REMOTE BROWSING
+myd can browse and transfer files over SFTP. Connect with \fBgr\fR, or launch
+with a remote target:
+.PP
+.RS
+.nf
+myd sftp://prod
+myd sftp://user@host:2222/var/log
+.fi
+.RE
+.PP
+Authentication reuses your existing SSH setup: the ssh-agent, then keys under
+\fB~/.ssh\fR (prompting for a passphrase if a key is encrypted), then a password
+as a last resort. \fB~/.ssh/config\fR host aliases and \fB~/.ssh/known_hosts\fR
+are honored. Credentials are never written to disk.
+.PP
+Copying (\fBc\fR) between a remote and a local panel runs as a background
+transfer rather than blocking the interface. Up to four transfers run at once
+and further requests stack up. The transfer panel appears once you start a copy
+(toggle it any time with \fBCtrl+t\fR) and shows each transfer's progress, rate,
+and ETA. Large files download through many concurrent pipelined reads for high
+throughput.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes:
 .TP
@@ -119,6 +154,27 @@ Items sorted by descending size. Directories are measured recursively.
 .TP
 .B smallest
 Items sorted by ascending size. Directories are measured recursively.
+.TP
+.B newest
+Items sorted by modification time, most recent first.
+.TP
+.B oldest
+Items sorted by modification time, least recent first.
+.TP
+.B recently-accessed
+Items sorted by access time, most recent first.
+.PP
+The time-based sorts use the timestamps from the directory listing, so they work
+identically on local and remote (SFTP) trees with no extra latency.
+.SH SYMLINKS
+Symbolic links are shown with a distinct link icon, a cyan italic name, and a
+trailing \fB@\fR (\fB@/\fR when the link points at a directory), so they remain
+distinguishable on terminals without color.
+.PP
+A symlink to a directory can be entered and expanded exactly like a real
+directory, on both local and remote (SFTP) trees. Sizes and timestamps shown for
+a link are those of its target. A broken link keeps the values reported by the
+directory listing.
 .SH SIZE BARS
 Each entry in the tree displays a proportional size bar indicating the item's
 share of its parent directory's total content. The bar is color-coded:

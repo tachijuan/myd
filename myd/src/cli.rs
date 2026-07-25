@@ -18,3 +18,30 @@ pub struct Cli {
     #[arg(long, short = '2')]
     pub dual: bool,
 }
+
+/// Whether a path-like argument is actually a remote target (`sftp://…` or
+/// `ssh://…`) rather than a local path.
+pub fn is_remote_arg(arg: &std::path::Path) -> bool {
+    arg.to_str()
+        .map(|s| s.starts_with("sftp://") || s.starts_with("ssh://"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn recognises_remote_targets() {
+        assert!(is_remote_arg(Path::new("sftp://host/path")));
+        assert!(is_remote_arg(Path::new("ssh://user@host")));
+    }
+
+    #[test]
+    fn treats_local_paths_as_local() {
+        assert!(!is_remote_arg(Path::new("/home/user")));
+        assert!(!is_remote_arg(Path::new("./relative")));
+        assert!(!is_remote_arg(Path::new("sftp-not-a-url")));
+    }
+}

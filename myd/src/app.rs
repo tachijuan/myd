@@ -9,11 +9,14 @@ use std::sync::Arc;
 use crate::keybinding::{Action, KeyBindingHandler};
 use crate::panel::Panel;
 use crate::screen::Screen;
-use crate::widget::treemap::FocusTarget;
+use crate::transfer::TransferQueue;
+use crate::vfs::BackendRegistry;
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
 use crate::widget::input_dialog::InputDialog;
 use crate::widget::progress::{OpProgress, ProgressOverlay};
+use crate::widget::transfer_panel;
+use crate::widget::treemap::FocusTarget;
 
 /// Drop guard that restores terminal state even if the app panics or is interrupted.
 /// Disables raw mode, leaves alternate screen, shows cursor, and flushes output.
@@ -64,6 +67,11 @@ pub enum ModalTarget {
     CopyDest { srcs: Vec<PathBuf> },
     /// Per-file overwrite confirmation while draining `pending_copies`.
     CopyOverwrite { src: PathBuf, dest: PathBuf },
+    /// Remote host prompt, e.g. `sftp://user@host/path` or an ssh config alias.
+    Connect,
+    /// Masked prompt for a key passphrase or account password, feeding a
+    /// connection retry.
+    Password,
 }
 
 /// Main application state machine.
@@ -89,6 +97,56 @@ pub struct FileBrowser {
     /// Live progress for the in-flight copy or delete batch, shared with its
     /// background task and read by the render loop.
     op_progress: Option<OpProgress>,
+    /// Live filesystem backends. Index 0 is always the local filesystem.
+    backends: BackendRegistry,
+    /// Queued and running transfers, drained by the event loop each tick.
+    transfers: TransferQueue,
+    /// Manual override for the transfer sidebar's visibility.
+    ///
+    /// `None` is the default: the panel shows itself only once the queue has a
+    /// transfer and stays up while any remain — it isn't clutter before you've
+    /// started a copy. `Some(true)`/`Some(false)` is a user toggle (`Ctrl+t`)
+    /// that pins it open or closed regardless. App-global rather than per-panel
+    /// `ViewPrefs`, since the queue itself is app-global.
+    transfer_panel_override: Option<bool>,
+    /// In-flight SFTP connection attempt, if any. Polled each tick; on success
+    /// it registers a backend and opens a remote panel.
+    connect_task: Option<ConnectTask>,
+    /// Connection details being retried after a credential prompt.
+    pending_connect: Option<PendingConnect>,
+}
+
+/// A connection attempt running in the background, with a channel for its result.
+struct ConnectTask {
+    rx: tokio::sync::oneshot::Receiver<ConnectResult>,
+    /// The panel that was active when the connect was issued — the remote opens
+    /// here on success, so `gr` replaces the pane the user was looking at.
+    target_panel: usize,
+}
+
+/// What a connection attempt produced.
+enum ConnectResult {
+    /// Connected: the backend and the directory to open it on.
+    Connected(std::sync::Arc<dyn crate::vfs::Vfs>, PathBuf),
+    /// A credential is needed; carries the retry context and what to ask for.
+    NeedsCredential(
+        crate::vfs::sftp::SftpTarget,
+        crate::vfs::sftp::Credentials,
+        crate::vfs::sftp::AuthNeed,
+    ),
+    /// The attempt failed.
+    Failed(String),
+}
+
+/// Connection details preserved across a credential prompt, so the retry keeps
+/// the target and any credentials already gathered.
+struct PendingConnect {
+    target: crate::vfs::sftp::SftpTarget,
+    creds: crate::vfs::sftp::Credentials,
+    need: crate::vfs::sftp::AuthNeed,
+    /// The panel the remote should open in — carried across credential prompts
+    /// so a retry still lands in the pane the user started from.
+    target_panel: usize,
 }
 
 impl FileBrowser {
@@ -112,6 +170,11 @@ impl FileBrowser {
             pending_copies: Vec::new(),
             approved_copies: Vec::new(),
             copy_source_panel: 0,
+            backends: BackendRegistry::new(),
+            transfers: TransferQueue::default(),
+            transfer_panel_override: None,
+            connect_task: None,
+            pending_connect: None,
         }
     }
 
@@ -185,62 +248,104 @@ impl FileBrowser {
             // Check for completed delete and copy tasks.
             self.resolve_deleting();
             self.resolve_copying();
+            // Promote queued transfers, reap finished ones, and refresh the
+            // destination of any that just completed. Non-blocking, so the UI
+            // stays responsive while transfers run.
+            self.advance_transfers();
+            // Advance any in-flight connection attempt.
+            self.resolve_connect();
 
-            let active = self.active;
-            let panel_count = self.panels.len();
-            let deleting = self.panels.iter().any(|p| p.is_deleting());
-            terminal.draw(|f| {
-                let area = f.area();
-                if panel_count == 2 {
-                    let cols = Layout::horizontal([
-                        Constraint::Percentage(50),
-                        Constraint::Percentage(50),
-                    ])
-                    .split(area);
-                    for (i, panel) in self.panels.iter_mut().enumerate() {
-                        // Tell the top Main screen whether it's the active panel
-                        // so its border can stand out.
-                        if let Screen::Main(state) = panel.current_screen_mut() {
-                            state.active = i == active;
-                        }
-                        panel.current_screen_mut().render(f, cols[i]);
-                    }
-                } else {
-                    if let Screen::Main(state) = self.panels[0].current_screen_mut() {
-                        state.active = true;
-                    }
-                    self.panels[0].current_screen_mut().render(f, area);
-                }
-
-                match &self.modal {
-                    Modal::Confirm(d) => d.render(f, area),
-                    Modal::Input(d) => d.render(f, area),
-                    Modal::Operation { verb } => {
-                        let overlay = match &self.op_progress {
-                            Some(p) => ProgressOverlay::for_operation(verb, p),
-                            None => ProgressOverlay::new().with_message(*verb),
-                        };
-                        overlay.render(f, area);
-                    }
-                    Modal::Help => render_help(f, area),
-                    Modal::None => {
-                        // A delete that started from the confirm dialog also runs
-                        // in the background; show its overlay when no modal is up.
-                        if deleting {
-                            let overlay = match &self.op_progress {
-                                Some(p) => ProgressOverlay::for_operation("Deleting", p),
-                                None => ProgressOverlay::new().with_message("Deleting"),
-                            };
-                            overlay.render(f, area);
-                        }
-                    }
-                }
-            })?;
+            terminal.draw(|f| self.draw(f))?;
         }
 
         // Guard's Drop will handle cleanup, but explicitly clear the flag so
         // the guard doesn't double-restore if called before drop.
         Ok(())
+    }
+
+    /// Draw one frame: the transfer sidebar, the panel(s), then any modal.
+    ///
+    /// Shared by the event loop and `render_for_test`, so tests exercise the
+    /// real layout instead of a copy that could drift from it.
+    fn draw(&mut self, f: &mut ratatui::Frame) {
+        let active = self.active;
+        let panel_count = self.panels.len();
+        let deleting = self.panels.iter().any(|p| p.is_deleting());
+        let show_transfers = self.transfer_panel_visible();
+        let full = f.area();
+
+        // Carve the transfer sidebar off the right edge before the panels divide
+        // what's left, so it spans full height and is independent of
+        // single/dual mode. It yields entirely on a narrow terminal.
+        let (area, transfer_area) = match show_transfers
+            .then(|| transfer_panel::desired_width(full.width))
+            .flatten()
+        {
+            Some(w) => {
+                let cols =
+                    Layout::horizontal([Constraint::Min(1), Constraint::Length(w)]).split(full);
+                (cols[0], Some(cols[1]))
+            }
+            None => (full, None),
+        };
+
+        // Draw the sidebar first: it borrows the queue, while the panel loop
+        // below needs `self.panels` mutably.
+        if let Some(ta) = transfer_area {
+            transfer_panel::render(f, ta, &self.transfers);
+        }
+
+        // In-progress transfer destinations, to overlay as ghost rows on the
+        // panel(s) they land in.
+        let pending = self.transfers.pending_destinations();
+
+        if panel_count == 2 {
+            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            for (i, panel) in self.panels.iter_mut().enumerate() {
+                let backend = panel.backend;
+                // Tell the top Main screen whether it's the active panel so its
+                // border can stand out.
+                if let Screen::Main(state) = panel.current_screen_mut() {
+                    state.active = i == active;
+                    state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
+                }
+                panel.current_screen_mut().render(f, cols[i]);
+            }
+        } else {
+            let backend = self.panels[0].backend;
+            if let Screen::Main(state) = self.panels[0].current_screen_mut() {
+                state.active = true;
+                state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
+            }
+            self.panels[0].current_screen_mut().render(f, area);
+        }
+
+        // Modals center on the whole terminal, not the tree column, so toggling
+        // the sidebar doesn't shift a dialog under the cursor.
+        match &self.modal {
+            Modal::Confirm(d) => d.render(f, full),
+            Modal::Input(d) => d.render(f, full),
+            Modal::Operation { verb } => {
+                let overlay = match &self.op_progress {
+                    Some(p) => ProgressOverlay::for_operation(verb, p),
+                    None => ProgressOverlay::new().with_message(*verb),
+                };
+                overlay.render(f, full);
+            }
+            Modal::Help => render_help(f, full),
+            Modal::None => {
+                // A delete that started from the confirm dialog also runs in the
+                // background; show its overlay when no modal is up.
+                if deleting {
+                    let overlay = match &self.op_progress {
+                        Some(p) => ProgressOverlay::for_operation("Deleting", p),
+                        None => ProgressOverlay::new().with_message("Deleting"),
+                    };
+                    overlay.render(f, full);
+                }
+            }
+        }
     }
 
     /// Pop the top screen of the active panel.
@@ -304,6 +409,49 @@ impl FileBrowser {
         }
     }
 
+    /// Advance the transfer queue and apply targeted updates for any transfer
+    /// that just completed.
+    ///
+    /// Rather than a full rescan, each completed destination triggers a
+    /// single-level reload of its *parent* directory in whichever panel shows
+    /// it — so a copied file (or directory) appears immediately and its ghost
+    /// clears, touching only the affected directory level.
+    fn advance_transfers(&mut self) {
+        self.transfers.tick(&self.backends);
+        let completed = self.transfers.take_completed_destinations();
+        for dest in completed {
+            self.apply_completed_transfer(&dest);
+        }
+    }
+
+    /// Refresh the one directory level a completed transfer landed in.
+    ///
+    /// Reloads the destination's parent directory in every panel on the same
+    /// backend whose tree already has that directory loaded — a `reload_dir`,
+    /// which re-lists just that level and reuses the size cache, not a full
+    /// `refresh`. If the directory isn't currently shown, there's nothing to
+    /// update and this is a no-op.
+    fn apply_completed_transfer(&mut self, dest: &crate::vfs::VPath) {
+        let Some(parent) = dest.path.parent() else {
+            return;
+        };
+        for panel in &mut self.panels {
+            if panel.backend != dest.backend {
+                continue;
+            }
+            if let Screen::Main(state) = panel.current_screen_mut() {
+                // Only reload if this panel's tree actually contains the parent
+                // directory (cheap check against the loaded lines), so unrelated
+                // panels aren't disturbed.
+                let has_parent = state.root_path() == parent
+                    || state.tree.lines.iter().any(|l| l.path == parent);
+                if has_parent {
+                    state.reload_dir_public(parent);
+                }
+            }
+        }
+    }
+
     /// Drive one key through the app, exactly as the event loop does —
     /// including modal-aware routing (e.g. dismissing the help screen).
     /// Exposed so tests can exercise real key sequences end to end.
@@ -314,6 +462,67 @@ impl FileBrowser {
     /// Whether the help screen is currently showing (for tests).
     pub fn is_help_open(&self) -> bool {
         matches!(self.modal, Modal::Help)
+    }
+
+    /// Whether the transfer sidebar should be drawn.
+    ///
+    /// With no explicit toggle, it appears only once the queue holds a transfer
+    /// (and stays while any remain) — so it's absent at startup and until the
+    /// first copy. A `Ctrl+t` toggle pins it open or closed regardless.
+    fn transfer_panel_visible(&self) -> bool {
+        self.transfer_panel_override
+            .unwrap_or_else(|| !self.transfers.is_empty())
+    }
+
+    /// Whether the transfer sidebar is showing (for tests).
+    pub fn is_transfer_panel_visible(&self) -> bool {
+        self.transfer_panel_visible()
+    }
+
+    /// Read-only view of the transfer queue (for tests).
+    pub fn transfer_queue(&self) -> &TransferQueue {
+        &self.transfers
+    }
+
+    /// Queue a transfer through the app, as a copy action would (for tests).
+    /// Mirrors the real copy path, which clears any hidden override so the panel
+    /// surfaces the queue.
+    pub fn enqueue_transfer_for_test(
+        &mut self,
+        src: crate::vfs::VPath,
+        dest: crate::vfs::VPath,
+    ) -> crate::transfer::TransferId {
+        let id = self.transfers.enqueue(src, dest, 0);
+        self.transfer_panel_override = None;
+        id
+    }
+
+    /// Advance the transfer queue one scheduling step, applying targeted
+    /// destination refreshes just like the event loop (for tests).
+    pub fn tick_transfers_for_test(&mut self) {
+        self.advance_transfers();
+    }
+
+    /// Render the whole app into `frame`, exactly as the event loop does — so
+    /// tests exercise the real three-column layout rather than a reconstruction.
+    pub fn render_for_test(&mut self, frame: &mut ratatui::Frame) {
+        self.draw(frame);
+    }
+
+    /// Advance the background-task machinery one tick, as the event loop does
+    /// (connection attempts, loading, transfers). For tests driving the remote
+    /// connect + browse flow headlessly.
+    pub fn tick_for_test(&mut self) {
+        self.resolve_connect();
+        self.resolve_loading();
+        self.resolve_deleting();
+        self.resolve_copying();
+        self.advance_transfers();
+    }
+
+    /// Whether a connection attempt is in flight (for tests).
+    pub fn is_connecting_for_test(&self) -> bool {
+        self.is_connecting()
     }
 
     /// The screen currently on top of the active panel's stack.
@@ -363,6 +572,19 @@ impl FileBrowser {
     /// modal-specific handling (like dismissing help) is exercised the same way.
     /// Returns whether the app should keep running.
     fn route_key(&mut self, key: KeyEvent) -> bool {
+        // Ctrl-C is an unconditional exit, checked before any modal or screen
+        // routing can swallow it — the guaranteed way out, whatever the app is
+        // doing (a remote connect, a modal, a load). Background tasks are
+        // abandoned; the terminal guard restores the screen on the way out.
+        if key.code == KeyCode::Char('c')
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            self.abort_remote_work();
+            return false;
+        }
+
         match self.modal {
             Modal::None => self.handle_key(key),
             Modal::Help => {
@@ -388,7 +610,11 @@ impl FileBrowser {
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         // Let the current screen handle raw keys first (e.g., dir picker input).
-        if let Some(result) = self.active_panel_mut().current_screen_mut().handle_raw_key(key) {
+        if let Some(result) = self
+            .active_panel_mut()
+            .current_screen_mut()
+            .handle_raw_key(key)
+        {
             return result;
         }
 
@@ -438,19 +664,24 @@ impl FileBrowser {
                 self.toggle_split();
                 true
             }
+            Action::ToggleTransferPanel => {
+                // Pin the panel to the opposite of what's currently shown. This
+                // works whether the current visibility came from the auto rule
+                // (queue non-empty) or a previous toggle.
+                self.transfer_panel_override = Some(!self.transfer_panel_visible());
+                true
+            }
+            Action::CancelTransfers => {
+                self.transfers.cancel_all();
+                true
+            }
             Action::Copy => {
                 self.start_copy();
                 true
             }
-            Action::ToggleTag => {
-                self.active_panel_mut().current_screen_mut().toggle_tag()
-            }
-            Action::UntagAll => {
-                self.active_panel_mut().current_screen_mut().untag_all()
-            }
-            Action::VisualMode => {
-                self.active_panel_mut().current_screen_mut().toggle_visual()
-            }
+            Action::ToggleTag => self.active_panel_mut().current_screen_mut().toggle_tag(),
+            Action::UntagAll => self.active_panel_mut().current_screen_mut().untag_all(),
+            Action::VisualMode => self.active_panel_mut().current_screen_mut().toggle_visual(),
             Action::Filter => {
                 self.modal_target = Some(ModalTarget::Filter);
                 self.modal = Modal::Input(InputDialog::new(
@@ -461,10 +692,7 @@ impl FileBrowser {
             }
             Action::CreateDir => {
                 self.modal_target = Some(ModalTarget::CreateDir);
-                self.modal = Modal::Input(InputDialog::new(
-                    "New directory name:",
-                    "name",
-                ));
+                self.modal = Modal::Input(InputDialog::new("New directory name:", "name"));
                 true
             }
             Action::SearchNext => self.active_panel_mut().current_screen_mut().search_next(),
@@ -493,28 +721,57 @@ impl FileBrowser {
                     return true;
                 }
                 // Enter on a directory in main screen → navigate into it.
-                // Extract the path first to avoid double borrow.
+                // Extract the path first to avoid double borrow. Use the tree
+                // line's own `is_dir` (from the listing) rather than a local
+                // `Path::is_dir()`, which is always false for a remote path.
                 let target = if let Screen::Main(state) = panel.current_screen() {
-                    state
-                        .selected_path()
-                        .filter(|p| p.is_dir())
-                        .cloned()
-                        // Hand down the parent's size cache: the subtree was
-                        // already measured, so reuse it instead of rescanning.
-                        .map(|p| (p, state.tree.size_cache.clone()))
+                    let is_dir = state
+                        .tree
+                        .selected_line()
+                        .map(|l| l.is_dir)
+                        .unwrap_or(false);
+                    if is_dir {
+                        state.selected_path().cloned().map(|p| {
+                            (
+                                p,
+                                state.tree.size_cache.clone(),
+                                state.tree.source.clone(),
+                            )
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
-                if let Some((path, cache)) = target {
-                    panel
-                        .screen_stack
-                        .push(Screen::loading_with_cache(path, Some(cache)));
+                if let Some((path, cache, source)) = target {
+                    // A remote directory loads through its backend on the
+                    // blocking pool; expanding it in place would run the network
+                    // round trips on the event-loop thread and freeze the UI.
+                    if source.is_remote() {
+                        panel
+                            .screen_stack
+                            .push(Screen::loading_remote(source, path, Some(cache)));
+                    } else {
+                        panel
+                            .screen_stack
+                            .push(Screen::loading_with_cache(path, Some(cache)));
+                    }
                 }
+                true
+            }
+            Action::Connect => {
+                self.modal_target = Some(ModalTarget::Connect);
+                self.modal = Modal::Input(InputDialog::new(
+                    "Connect to (sftp://[user@]host[:port][/path]):",
+                    "sftp://host/path",
+                ));
                 true
             }
             Action::ChangeRoot => {
                 self.modal_target = Some(ModalTarget::ChangeRoot);
-                self.modal = Modal::Input(InputDialog::new("Change root directory:", "Enter path..."));
+                self.modal =
+                    Modal::Input(InputDialog::new("Change root directory:", "Enter path..."));
                 true
             }
             Action::Search => {
@@ -597,14 +854,20 @@ impl FileBrowser {
                     // step back up. So when the cursor is on the root (depth 0)
                     // and there's a screen to return to, fall through to the pop
                     // below instead of collapsing the root.
-                    let at_root_line =
-                        state.tree.selected_line().map(|l| l.depth == 0).unwrap_or(false);
+                    let at_root_line = state
+                        .tree
+                        .selected_line()
+                        .map(|l| l.depth == 0)
+                        .unwrap_or(false);
                     let can_pop = stack_len > 1 && !dir_picker_below;
                     if !(at_root_line && can_pop) {
                         // Otherwise: on an expanded directory, collapse in place.
                         let is_expanded = state.tree.is_cursor_expanded();
-                        let is_dir =
-                            state.tree.selected_line().map(|l| l.is_dir).unwrap_or(false);
+                        let is_dir = state
+                            .tree
+                            .selected_line()
+                            .map(|l| l.is_dir)
+                            .unwrap_or(false);
                         if is_dir && is_expanded {
                             return state.collapse();
                         }
@@ -642,12 +905,62 @@ impl FileBrowser {
                 }
                 true
             }
+            Action::Expand => {
+                // On a remote panel, expanding a directory in place would run
+                // the SFTP round trips on the event-loop thread and lock the UI.
+                // Route it through the async loading screen instead, exactly as
+                // Enter does. Local panels keep the cheap in-place expand.
+                let remote_dir = if let Screen::Main(state) = self.active_panel().current_screen() {
+                    if state.tree.source.is_remote() {
+                        let is_dir = state
+                            .tree
+                            .selected_line()
+                            .map(|l| l.is_dir)
+                            .unwrap_or(false);
+                        if is_dir {
+                            state.selected_path().cloned().map(|p| {
+                                (p, state.tree.size_cache.clone(), state.tree.source.clone())
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match remote_dir {
+                    Some((path, cache, source)) => {
+                        self.active_panel_mut()
+                            .screen_stack
+                            .push(Screen::loading_remote(source, path, Some(cache)));
+                    }
+                    None => {
+                        self.active_panel_mut().current_screen_mut().expand();
+                    }
+                }
+                true
+            }
+            // Refresh and expand-all re-list directories from scratch. On a
+            // remote panel that means SFTP round trips that would block the event
+            // loop in place (and trap the user); refresh would also wrongly
+            // rebuild the remote tree as a *local* one. So for remote panels these
+            // rebuild through the async loading screen.
+            //
+            // Sort and hidden toggles do NOT re-list: sort reorders the nodes
+            // already in memory, and a remote tree already has every entry loaded
+            // so hiding is a pure reflatten. Both are handled below in place.
+            Action::Refresh | Action::ExpandAll if self.active_panel_is_remote() => {
+                self.remote_rebuild(matches!(action, Action::Refresh));
+                true
+            }
             _ => {
                 let current = self.active_panel_mut().current_screen_mut();
                 match action {
                     Action::CursorDown => current.cursor_down(),
                     Action::CursorUp => current.cursor_up(),
-                    Action::Expand => current.expand(),
+                    Action::Expand => unreachable!("handled above"),
                     Action::ToTop => current.to_top(),
                     Action::ToBottom => current.to_bottom(),
                     Action::PageDown => current.page_down(),
@@ -676,13 +989,29 @@ impl FileBrowser {
                         }
                         result
                     }
-                    Action::Quit | Action::PopScreen | Action::Help | Action::Confirm
-                    | Action::ChangeRoot | Action::Search | Action::Collapse
-                    | Action::GoDirPicker | Action::SwitchPanel | Action::ToggleSplit
-                    | Action::Copy | Action::Delete | Action::Rename
-                    | Action::ToggleTag | Action::UntagAll | Action::VisualMode
-                    | Action::Filter | Action::CreateDir | Action::SearchNext
-                    | Action::SearchPrev => unreachable!(),
+                    Action::Quit
+                    | Action::PopScreen
+                    | Action::Help
+                    | Action::Confirm
+                    | Action::ChangeRoot
+                    | Action::Search
+                    | Action::Collapse
+                    | Action::GoDirPicker
+                    | Action::SwitchPanel
+                    | Action::ToggleSplit
+                    | Action::Copy
+                    | Action::Delete
+                    | Action::Rename
+                    | Action::ToggleTag
+                    | Action::UntagAll
+                    | Action::VisualMode
+                    | Action::Filter
+                    | Action::CreateDir
+                    | Action::SearchNext
+                    | Action::SearchPrev
+                    | Action::ToggleTransferPanel
+                    | Action::CancelTransfers
+                    | Action::Connect => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -729,8 +1058,10 @@ impl FileBrowser {
                             }
                             ModalTarget::ChangeRoot => {
                                 if !value.is_empty() {
-                                    let path = PathBuf::from(&value).expand_user()
-                                        .canonicalize().unwrap_or(PathBuf::from(&value));
+                                    let path = PathBuf::from(&value)
+                                        .expand_user()
+                                        .canonicalize()
+                                        .unwrap_or(PathBuf::from(&value));
                                     if path.is_dir() {
                                         self.active_panel_mut()
                                             .screen_stack
@@ -764,14 +1095,37 @@ impl FileBrowser {
                                     self.begin_copy_batch(srcs, dir, active, active);
                                 }
                             }
-                            ModalTarget::Delete { .. }
-                            | ModalTarget::CopyOverwrite { .. } => {}
+                            ModalTarget::Connect => {
+                                if !value.is_empty() {
+                                    self.start_connect(&value);
+                                }
+                            }
+                            ModalTarget::Password => {
+                                if value.is_empty() {
+                                    // An empty entry cancels the whole attempt.
+                                    self.pending_connect = None;
+                                } else {
+                                    self.retry_connect_with_secret(value);
+                                }
+                            }
+                            ModalTarget::Delete { .. } | ModalTarget::CopyOverwrite { .. } => {}
                         }
                     }
                 }
                 true
             }
-            Modal::Operation { .. } => true,
+            Modal::Operation { .. } => {
+                // A connection attempt can be abandoned with q/Esc so a slow or
+                // dead host doesn't trap the user behind the "Connecting..."
+                // overlay. (Copy/delete operations also use this modal but finish
+                // on their own; only the connect attempt is cancellable here.)
+                if self.is_connecting()
+                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                {
+                    self.cancel_connect();
+                }
+                true
+            }
             Modal::Help => {
                 // Dismiss help — the real key is handled by handle_key.
                 self.modal = Modal::None;
@@ -779,6 +1133,215 @@ impl FileBrowser {
             }
             Modal::None => true,
         }
+    }
+
+    /// Kick off a connection at startup from a CLI `sftp://` argument. The
+    /// connect runs in the background once the event loop starts.
+    pub fn connect_on_start(&mut self, target: &str) {
+        self.start_connect(target);
+    }
+
+    /// Begin connecting to a remote host named by `target` (e.g.
+    /// `sftp://user@host/path` or an ssh config alias).
+    ///
+    /// Parses the target and kicks off the async connection; `resolve_connect`
+    /// finishes the job when the attempt completes.
+    fn start_connect(&mut self, target: &str) {
+        // Remember which panel is active now — the remote opens here on success,
+        // so `gr` takes over the pane the user was looking at.
+        let target_panel = self.active;
+        match crate::vfs::sftp::SftpTarget::parse(target) {
+            Ok(t) => {
+                self.spawn_connect(t, crate::vfs::sftp::Credentials::default(), target_panel)
+            }
+            Err(e) => {
+                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    "Invalid remote target: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    /// Spawn the connection attempt in the background so the UI stays responsive
+    /// while the handshake and authentication happen. `target_panel` is the pane
+    /// the remote will open in once connected.
+    fn spawn_connect(
+        &mut self,
+        target: crate::vfs::sftp::SftpTarget,
+        creds: crate::vfs::sftp::Credentials,
+        target_panel: usize,
+    ) {
+        use crate::vfs::sftp::{ConnectOutcome, SftpFs};
+        use std::sync::Arc;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // A host key that isn't recorded is accepted here; a proper prompt
+            // is a later refinement. A *changed* key is still refused inside
+            // connect().
+            let result = match SftpFs::connect(&target, &creds, true).await {
+                Ok(ConnectOutcome::Connected(fs)) => {
+                    let home = fs.home().to_path_buf();
+                    ConnectResult::Connected(Arc::new(fs), home)
+                }
+                Ok(ConnectOutcome::NeedsCredential(need)) => {
+                    ConnectResult::NeedsCredential(target, creds, need)
+                }
+                Err(e) => ConnectResult::Failed(e.to_string()),
+            };
+            let _ = tx.send(result);
+        });
+
+        self.connect_task = Some(ConnectTask { rx, target_panel });
+        self.modal = Modal::Operation { verb: "Connecting" };
+    }
+
+    /// Whether the active panel is showing a remote (non-local) tree.
+    fn active_panel_is_remote(&self) -> bool {
+        matches!(
+            self.active_panel().current_screen(),
+            Screen::Main(state) if state.tree.source.is_remote()
+        )
+    }
+
+    /// Rebuild the active remote panel's current directory through the async
+    /// loading screen, so the SFTP round trips run off the event-loop thread.
+    /// `clear_cache` forces a full re-list (refresh); otherwise cached sizes are
+    /// reused. A no-op if the panel isn't a remote Main screen.
+    fn remote_rebuild(&mut self, clear_cache: bool) {
+        let panel = self.active_panel_mut();
+        let (path, cache, source) = match panel.current_screen() {
+            Screen::Main(state) => (
+                state.root_path().clone(),
+                state.tree.size_cache.clone(),
+                state.tree.source.clone(),
+            ),
+            _ => return,
+        };
+        if clear_cache {
+            cache.clear();
+        }
+        // Replace the current screen with a fresh async load of the same
+        // directory rather than pushing, so refresh doesn't deepen the stack.
+        *panel.current_screen_mut() = Screen::loading_remote(source, path, Some(cache));
+    }
+
+    /// Whether a connection attempt is in progress (its overlay is up).
+    fn is_connecting(&self) -> bool {
+        self.connect_task.is_some()
+    }
+
+    /// Abandon an in-flight connection attempt and return to browsing.
+    ///
+    /// Dropping the task's receiver detaches it; the background connect task
+    /// runs to completion on its own and its result is discarded. Cheaper and
+    /// simpler than trying to interrupt a russh handshake mid-flight.
+    fn cancel_connect(&mut self) {
+        self.connect_task = None;
+        self.pending_connect = None;
+        self.modal = Modal::None;
+    }
+
+    /// Everything needed to bail out of remote work immediately, for Ctrl-C:
+    /// drop any connection attempt and signal every in-flight scan to stop.
+    fn abort_remote_work(&mut self) {
+        self.connect_task = None;
+        self.pending_connect = None;
+        for panel in &self.panels {
+            let screen = panel.current_screen();
+            if screen.is_loading() {
+                screen.cancel_loading();
+            }
+        }
+        self.transfers.cancel_all();
+    }
+
+    /// Poll the in-flight connection. On success, register the backend and open
+    /// a remote panel; on a credential request, prompt; on failure, report it.
+    fn resolve_connect(&mut self) {
+        let Some(task) = self.connect_task.as_mut() else {
+            return;
+        };
+        let (result, target_panel) = match task.rx.try_recv() {
+            Ok(r) => (r, task.target_panel),
+            // Still connecting, or the task vanished.
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.connect_task = None;
+                self.modal = Modal::None;
+                return;
+            }
+        };
+        self.connect_task = None;
+
+        match result {
+            ConnectResult::Connected(vfs, home) => {
+                self.modal = Modal::None;
+                self.pending_connect = None;
+                let backend = self.backends.register(vfs.clone());
+                let source = match crate::widget::source::RemoteSource::new(backend, vfs) {
+                    Ok(s) => crate::widget::source::Source::Remote(s),
+                    Err(e) => {
+                        self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                            "Could not start remote browser: {}",
+                            e
+                        )));
+                        return;
+                    }
+                };
+                // Open the remote in the panel that was active when `gr` was
+                // issued, replacing whatever it was showing. Guard the index in
+                // case the panel layout changed while connecting.
+                let panel = target_panel.min(self.panels.len().saturating_sub(1));
+                self.panels[panel] = Panel::new_remote(source, home);
+                self.active = panel;
+            }
+            ConnectResult::NeedsCredential(target, creds, need) => {
+                self.prompt_for_credential(target, creds, need, target_panel);
+            }
+            ConnectResult::Failed(msg) => {
+                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    "Connection failed: {}",
+                    msg
+                )));
+                self.pending_connect = None;
+            }
+        }
+    }
+
+    /// Put up a masked prompt for whatever credential the connection needs, and
+    /// remember the retry context.
+    fn prompt_for_credential(
+        &mut self,
+        target: crate::vfs::sftp::SftpTarget,
+        creds: crate::vfs::sftp::Credentials,
+        need: crate::vfs::sftp::AuthNeed,
+        target_panel: usize,
+    ) {
+        let prompt = credential_prompt(&need);
+        self.pending_connect = Some(PendingConnect {
+            target,
+            creds,
+            need,
+            target_panel,
+        });
+        self.modal_target = Some(ModalTarget::Password);
+        self.modal = Modal::Input(InputDialog::new(prompt, "").masked());
+    }
+
+    /// Retry a connection with a freshly entered credential.
+    fn retry_connect_with_secret(&mut self, secret: String) {
+        let Some(pending) = self.pending_connect.take() else {
+            return;
+        };
+        use crate::vfs::sftp::AuthNeed;
+        let mut creds = pending.creds;
+        match pending.need {
+            AuthNeed::Passphrase { .. } => creds.passphrase = Some(secret),
+            AuthNeed::Password { .. } => creds.password = Some(secret),
+        }
+        self.spawn_connect(pending.target, creds, pending.target_panel);
     }
 
     /// Toggle between single and dual panel layouts.
@@ -828,17 +1391,75 @@ impl FileBrowser {
                     return;
                 };
                 let source = self.active;
+
+                // If either endpoint is remote, this is a transfer: it goes
+                // through the non-blocking queue and the transfer panel, not the
+                // modal copy overlay.
+                let src_backend = self.panels[source].backend;
+                let dest_backend = self.panels[other].backend;
+                if !src_backend.is_local() || !dest_backend.is_local() {
+                    // Look up each source's directory-ness from the source panel's
+                    // tree (no I/O), so the destination ghost draws the right icon.
+                    let kinds: Vec<bool> = if let Screen::Main(state) =
+                        self.panels[source].current_screen()
+                    {
+                        srcs.iter()
+                            .map(|p| state.is_dir_of(p).unwrap_or(false))
+                            .collect()
+                    } else {
+                        vec![false; srcs.len()]
+                    };
+                    self.enqueue_cross_backend_copy(
+                        srcs,
+                        kinds,
+                        src_backend,
+                        dest_dir,
+                        dest_backend,
+                        source,
+                    );
+                    return;
+                }
+
                 self.begin_copy_batch(srcs, dest_dir, other, source);
             }
             None => {
                 // Single-panel: prompt for a destination directory first.
                 self.modal_target = Some(ModalTarget::CopyDest { srcs });
-                self.modal = Modal::Input(InputDialog::new(
-                    "Copy to directory:",
-                    "Enter path...",
-                ));
+                self.modal = Modal::Input(InputDialog::new("Copy to directory:", "Enter path..."));
             }
         }
+    }
+
+    /// Queue a copy where at least one side is remote. Each source becomes one
+    /// transfer on the queue; directories are enqueued as a whole and expanded
+    /// by the worker. The source panel's tags are cleared since they were the
+    /// operation's input.
+    fn enqueue_cross_backend_copy(
+        &mut self,
+        srcs: Vec<PathBuf>,
+        kinds: Vec<bool>,
+        src_backend: crate::vfs::BackendId,
+        dest_dir: PathBuf,
+        dest_backend: crate::vfs::BackendId,
+        source_panel: usize,
+    ) {
+        use crate::vfs::VPath;
+        for (i, src) in srcs.into_iter().enumerate() {
+            let Some(name) = src.file_name().map(|n| n.to_owned()) else {
+                continue;
+            };
+            let is_dir = kinds.get(i).copied().unwrap_or(false);
+            let src_vpath = VPath::new(src_backend, src);
+            let dest_vpath = VPath::new(dest_backend, dest_dir.join(name));
+            // Total is unknown here; the worker re-stats the source and fills it
+            // in, so the panel shows a real percentage once it starts.
+            self.transfers.enqueue_kind(src_vpath, dest_vpath, 0, is_dir);
+        }
+        // Tags were the operation's input; clear them. The panel now reveals
+        // itself automatically (the queue is non-empty) — drop any prior "hidden"
+        // override so a copy always surfaces the queue the user just created.
+        self.panels[source_panel].current_screen_mut().clear_tags();
+        self.transfer_panel_override = None;
     }
 
     /// Plan a copy of `srcs` into `dest_dir`: non-colliding files are approved
@@ -857,7 +1478,9 @@ impl FileBrowser {
         self.pending_copies.clear();
 
         for src in srcs {
-            let Some(name) = src.file_name() else { continue };
+            let Some(name) = src.file_name() else {
+                continue;
+            };
             let dest = dest_dir.join(name);
             // Never copy a file onto itself.
             if src == dest {
@@ -882,10 +1505,8 @@ impl FileBrowser {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             self.modal_target = Some(ModalTarget::CopyOverwrite { src, dest });
-            self.modal = Modal::Confirm(ConfirmDialog::new(format!(
-                "'{}' exists. Overwrite?",
-                name
-            )));
+            self.modal =
+                Modal::Confirm(ConfirmDialog::new(format!("'{}' exists. Overwrite?", name)));
         } else {
             self.spawn_copy_batch();
         }
@@ -947,6 +1568,54 @@ impl FileBrowser {
     }
 }
 
+/// The prompt text for a credential the connection is waiting on.
+///
+/// A rejected password reads differently from the first ask: it states that
+/// authentication failed and that Esc cancels, so a repeated prompt can't be
+/// mistaken for a dropped keystroke.
+fn credential_prompt(need: &crate::vfs::sftp::AuthNeed) -> String {
+    use crate::vfs::sftp::AuthNeed;
+    match need {
+        AuthNeed::Passphrase { key_path } => {
+            let name = key_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "key".to_string());
+            format!("Passphrase for {}:", name)
+        }
+        AuthNeed::Password { user, host, retry } => {
+            if *retry {
+                format!(
+                    "Authentication failed for {}@{}. Enter password to try again, or press Esc to cancel:",
+                    user, host
+                )
+            } else {
+                format!("Password for {}@{}:", user, host)
+            }
+        }
+    }
+}
+
+/// Test hook for [`credential_prompt`], so the retry wording is covered.
+pub fn credential_prompt_for_test(need: &crate::vfs::sftp::AuthNeed) -> String {
+    credential_prompt(need)
+}
+
+/// The subset of pending transfer destinations that belong in one panel's tree:
+/// those on the panel's backend whose target sits under the panel's root. So a
+/// ghost only appears in the panel that is actually receiving the file.
+fn ghosts_for_panel(
+    pending: &[crate::transfer::PendingDest],
+    backend: crate::vfs::BackendId,
+    root: &Path,
+) -> Vec<crate::transfer::PendingDest> {
+    pending
+        .iter()
+        .filter(|d| d.path.backend == backend && d.path.path.starts_with(root))
+        .cloned()
+        .collect()
+}
+
 /// Count the entries (files + directories) rooted at `path`, for progress
 /// totals. A single file counts as 1.
 fn count_entries(path: &Path) -> u64 {
@@ -999,7 +1668,10 @@ fn delete_path(path: &Path, progress: Option<&OpProgress>) -> std::io::Result<()
 /// before this runs.
 fn copy_path(src: &Path, dest: &Path, progress: Option<&OpProgress>) -> std::io::Result<()> {
     if src.is_dir() {
-        for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(src)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             // Re-root each entry from `src` onto `dest`.
             let rel = match entry.path().strip_prefix(src) {
                 Ok(rel) => rel,
