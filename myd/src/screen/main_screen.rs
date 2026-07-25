@@ -360,6 +360,13 @@ impl MainScreenState {
         }
         let parent = self.target_dir();
         let dir = parent.join(name);
+        // Callers must not reach here with a remote tree: `std::fs` would create
+        // the directory on the LOCAL machine. `FileBrowser` refuses the action
+        // before opening the prompt (see `Action::CreateDir`).
+        debug_assert!(
+            !self.tree.source.is_remote(),
+            "create_dir must not run against a remote tree"
+        );
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!("Create directory failed: {}", e);
         }
@@ -620,7 +627,26 @@ impl MainScreenState {
         // Recompute when the focused view changes or points somewhere new.
         let key = (resolved, self.focus);
         if self.cached_info_key.as_ref() != Some(&key) {
-            self.cached_info_text = file_info::render_info_owned(&path, &self.tree.size_cache);
+            // A remote entry is described from the directory listing the tree
+            // already holds. Inspecting it with `std::fs` would read the local
+            // machine — showing an unrelated file's metadata whenever the path
+            // happens to exist on both.
+            self.cached_info_text = if self.tree.source.is_remote() {
+                let line = self.tree.selected_line();
+                let size = line
+                    .and_then(|l| self.tree.size_cache.get(&l.resolved_path))
+                    .unwrap_or(0);
+                file_info::render_remote_info_owned(
+                    &path,
+                    line.map(|l| l.is_dir).unwrap_or(false),
+                    line.map(|l| l.is_symlink).unwrap_or(false),
+                    size,
+                    line.and_then(|l| l.mtime),
+                    line.and_then(|l| l.atime),
+                )
+            } else {
+                file_info::render_info_owned(&path, &self.tree.size_cache)
+            };
             self.cached_info_key = Some(key);
         }
 

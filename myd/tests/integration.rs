@@ -3715,3 +3715,91 @@ async fn test_remote_resort_never_hits_the_network() {
         "no sort mode may reach the network"
     );
 }
+
+/// Reflattening a remote tree must not walk the local disk.
+///
+/// `recompute_cache` runs on every reflatten — every sort, filter and hidden
+/// toggle — and called `get_dir_size`/`get_file_size` on a cache miss. Those
+/// take *local* paths, so on a remote tree they measured either nothing or, for
+/// a path like /usr/share that exists on both machines, an unrelated local
+/// directory. Measured at ~793ms for a 2651-line tree before the fix.
+#[tokio::test]
+async fn test_remote_reflatten_does_not_walk_the_local_disk() {
+    use myd::screen::SortMode;
+    use myd::utils::sizes::{CancelToken, SizeCache};
+    use myd::widget::file_tree::FileTree;
+    use myd::widget::progress::OpProgress;
+    use myd::widget::source::Source;
+
+    // Root at a path that really exists locally — the dangerous case, where a
+    // local walk silently succeeds against the wrong filesystem.
+    let local_root = std::path::PathBuf::from("/usr/share");
+    if !local_root.is_dir() {
+        eprintln!("/usr/share missing; skipping");
+        return;
+    }
+
+    // A minimal remote backend; this test only cares that nothing walks the
+    // local disk, so the listing content is arbitrary.
+    struct Wide;
+    #[async_trait::async_trait]
+    impl myd::vfs::Vfs for Wide {
+        fn scheme(&self) -> &'static str { "sftp" }
+        async fn read_dir(&self, p: &myd::vfs::VPath) -> anyhow::Result<Vec<myd::vfs::VEntry>> {
+            let depth = p.path.components().count();
+            let mut v = Vec::new();
+            if depth < 5 {
+                for i in 0..15 { v.push(myd::vfs::VEntry::new(format!("d{:03}", i), true)); }
+            }
+            for i in 0..10 {
+                let mut e = myd::vfs::VEntry::new(format!("f{:03}.txt", i), false);
+                e.len = 1000 + i as u64;
+                v.push(e);
+            }
+            Ok(v)
+        }
+        async fn stat(&self, p: &myd::vfs::VPath) -> anyhow::Result<myd::vfs::VMetadata> {
+            let n = p.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            Ok(myd::vfs::VMetadata { is_dir: !n.contains('.'), is_symlink: false, len: 4096,
+                mode: None, uid: None, gid: None, mtime: None, atime: None, ctime: None })
+        }
+        async fn create_dir_all(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> { Ok(()) }
+        async fn remove_file(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> { Ok(()) }
+        async fn remove_dir(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> { Ok(()) }
+        async fn rename(&self, _f: &myd::vfs::VPath, _t: &myd::vfs::VPath) -> anyhow::Result<()> { Ok(()) }
+        async fn open_read(&self, _p: &myd::vfs::VPath) -> anyhow::Result<Box<dyn myd::vfs::VRead>> { anyhow::bail!("unused") }
+        async fn open_write(&self, _p: &myd::vfs::VPath, _l: Option<u64>) -> anyhow::Result<Box<dyn myd::vfs::VWrite>> { anyhow::bail!("unused") }
+        async fn dir_size(&self, _p: &myd::vfs::VPath, _c: &SizeCache, _ct: &CancelToken,
+            _pr: Option<&OpProgress>) -> u64 { 0 }
+        fn has_recursive_sizes(&self) -> bool { false }
+    }
+    let vfs: std::sync::Arc<dyn myd::vfs::Vfs> = std::sync::Arc::new(Wide);
+    let source = Source::Remote(
+        myd::widget::source::RemoteSource::new(myd::vfs::BackendId(1), vfs).unwrap());
+    let cancel = CancelToken::new();
+    let progress = OpProgress::new();
+    let mut tree = FileTree::with_source_cancellable_progress(
+        source,
+        local_root,
+        SortMode::Largest,
+        true,
+        false,
+        SizeCache::new(),
+        &cancel,
+        &progress,
+    )
+    .expect("remote tree should build");
+    tree.expand_all();
+    assert!(tree.lines.len() > 500, "need a big tree, got {}", tree.lines.len());
+
+    tree.size_cache.clear();
+    let started = std::time::Instant::now();
+    tree.reflatten();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "reflatten walked the local disk: took {:?}",
+        elapsed
+    );
+}

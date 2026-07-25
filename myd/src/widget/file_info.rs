@@ -113,6 +113,90 @@ pub fn render_info_panel(frame: &mut Frame, area: Rect, path: &Path, size_cache:
     frame.render_widget(paragraph, area);
 }
 
+/// Info for an entry on a remote backend.
+///
+/// A remote path must not be inspected with `std::fs`: it names a file on the
+/// server, so local metadata is either missing ("Cannot access") or — for a
+/// path like `/var/log` that exists on both machines — silently describes an
+/// unrelated local file. Everything here comes from the directory listing the
+/// tree already holds.
+///
+/// Fields the listing doesn't carry (owner, group, creation time) are reported
+/// as unavailable rather than guessed at.
+pub fn render_remote_info_owned(
+    path: &Path,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    atime: Option<std::time::SystemTime>,
+) -> Text<'static> {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let type_str = if is_symlink {
+        "Symlink"
+    } else if is_dir {
+        "Directory"
+    } else {
+        "File"
+    };
+    let type_color = if is_dir { Color::Blue } else { Color::Cyan };
+
+    let unknown = || Span::styled(String::from("—"), Style::default().fg(Color::DarkGray));
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::raw(format!("  {}", name))),
+        Line::from(""),
+        Line::from("Type:"),
+        Line::from(Span::styled(
+            String::from(type_str),
+            Style::default().fg(type_color),
+        )),
+        Line::from(""),
+        Line::from("Size:"),
+        Line::from(Span::styled(
+            format_size(size),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from("Modified:"),
+        Line::from(Span::styled(
+            format_time(mtime),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from("Accessed:"),
+        Line::from(Span::styled(
+            format_time(atime),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from("Owner:"),
+        Line::from(unknown()),
+        Line::from(""),
+        Line::from("Path:"),
+        Line::from(Span::styled(
+            path.to_string_lossy().to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    if is_dir {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                String::from("Remote directory sizes are shallow"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+    }
+
+    Text::from(lines)
+}
+
 /// Like `render_info` but returns fully owned `Text<'static>` with no borrows from `path`.
 pub fn render_info_owned(path: &Path, size_cache: &crate::utils::sizes::SizeCache) -> Text<'static> {
     let metadata = match std::fs::metadata(path) {
