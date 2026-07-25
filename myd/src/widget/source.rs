@@ -180,6 +180,12 @@ impl RemoteSource {
         self.block(async move { vfs.stat(&path).await })
     }
 
+    /// Create a directory (and any missing parents).
+    fn create_dir_all(&self, path: VPath) -> anyhow::Result<()> {
+        let vfs = self.vfs.clone();
+        self.block(async move { vfs.create_dir_all(&path).await })
+    }
+
     /// Directory size (shallow for SFTP).
     fn dir_size(
         &self,
@@ -285,6 +291,18 @@ impl Source {
         match self {
             Source::Local => path.is_dir(),
             Source::Remote(r) => r.stat(self.vpath(path)).map(|m| m.is_dir).unwrap_or(false),
+        }
+    }
+
+    /// Create a directory (with any missing parents) on whichever backend this
+    /// source represents.
+    ///
+    /// Blocking, but bounded: one mkdir is a single round trip, unlike the
+    /// per-entry walks that must stay off the event loop.
+    pub fn create_dir_all(&self, path: &Path) -> anyhow::Result<()> {
+        match self {
+            Source::Local => Ok(std::fs::create_dir_all(path)?),
+            Source::Remote(r) => r.create_dir_all(self.vpath(path)),
         }
     }
 

@@ -6,6 +6,7 @@
 //! protocol means writing one `impl Vfs` and registering it; no widget changes.
 
 mod local;
+pub mod ops;
 mod path;
 pub mod sftp;
 
@@ -109,7 +110,19 @@ pub trait Vfs: Send + Sync {
     }
 
     async fn read_dir(&self, path: &VPath) -> Result<Vec<VEntry>>;
+    /// Metadata for `path`, following symlinks — so a link to a directory
+    /// reports `is_dir`, which is what browsing wants.
     async fn stat(&self, path: &VPath) -> Result<VMetadata>;
+
+    /// Metadata for the link *itself*, without following it.
+    ///
+    /// Needed wherever following a link would be destructive: deleting a
+    /// symlinked directory must unlink it, not recurse into whatever it points
+    /// at. Defaults to [`stat`](Self::stat) for backends that don't distinguish
+    /// the two.
+    async fn symlink_stat(&self, path: &VPath) -> Result<VMetadata> {
+        self.stat(path).await
+    }
     async fn create_dir_all(&self, path: &VPath) -> Result<()>;
     async fn remove_file(&self, path: &VPath) -> Result<()>;
     async fn remove_dir(&self, path: &VPath) -> Result<()>;

@@ -72,6 +72,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
                 ("V", "Visual mode: tag a range as you move"),
                 ("U", "Untag all files"),
                 ("c", "Copy tagged files (or selection)"),
+                ("m", "Move tagged files (or selection)"),
             ],
         },
         HelpCategory {
@@ -92,6 +93,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
                 ("|", "Toggle single / dual panels"),
                 ("Tab", "Switch active panel"),
                 ("c", "Copy tagged/selected to other panel"),
+                ("m", "Move tagged/selected to other panel"),
             ],
         },
         HelpCategory {

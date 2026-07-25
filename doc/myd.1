@@ -57,11 +57,26 @@ Collapse all expanded directories.
 Expand all directories.
 .SS File Operations
 .TP
-.B dd
-Delete the currently selected file or directory (with confirmation dialog).
+.B D
+Delete the tagged files, or the selected one when nothing is tagged (with a
+confirmation dialog). Directories are removed recursively.
 .TP
 .B R
-Rename the currently selected file or directory.
+Rename the currently selected file or directory. An existing name is never
+overwritten.
+.TP
+.B N
+Create a new directory in the current location.
+.TP
+.B c
+Copy the tagged files, or the selected one, into the other panel's directory.
+.TP
+.B m
+Move the tagged files, or the selected one, into the other panel's directory.
+Within a single filesystem this is a rename, so it completes instantly whatever
+the size; between two different hosts the bytes are copied and the source is
+removed only after the copy succeeds. A move never overwrites an existing entry
+at the destination; the conflict is reported and both files are left alone.
 .TP
 .B r
 Rescan: clear the size cache and re-read sizes from disk. Sizes are otherwise
@@ -142,10 +157,9 @@ and ETA. Large files download through many concurrent pipelined reads, and the
 files and subdirectories within a directory copy transfer concurrently, so a
 tree of small files is not paced by round-trip latency.
 .PP
-Remote panels are read-only apart from copying. Browsing, sorting, filtering,
-tagging and transferring all work; creating directories (\fBN\fR), renaming
-(\fBR\fR) and deleting (\fBD\fR) are not yet implemented for remote hosts and
-are refused on a remote panel rather than being applied to the local machine.
+Creating directories (\fBN\fR), renaming (\fBR\fR), deleting (\fBD\fR) and
+moving (\fBm\fR) are all routed through the backend the panel is browsing, so
+they act on the remote host rather than the local machine.
 .PP
 Remote directory sizes are shallow \(em the directory's own size rather than a
 recursive total \(em because a \fBdu\fR-style walk over SFTP costs one round

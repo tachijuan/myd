@@ -10,7 +10,8 @@ use crate::keybinding::{Action, KeyBindingHandler};
 use crate::panel::Panel;
 use crate::screen::Screen;
 use crate::transfer::TransferQueue;
-use crate::vfs::BackendRegistry;
+use crate::utils::sizes::CancelToken;
+use crate::vfs::{BackendRegistry, VPath};
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
 use crate::widget::input_dialog::InputDialog;
@@ -97,6 +98,17 @@ pub struct FileBrowser {
     /// Live progress for the in-flight copy or delete batch, shared with its
     /// background task and read by the render loop.
     op_progress: Option<OpProgress>,
+    /// Cancels the in-flight copy/delete batch. A remote delete is one round
+    /// trip per entry, so a large tree must be abandonable from the overlay.
+    op_cancel: Option<CancelToken>,
+    /// Outcome of the in-flight move: which sources actually left, and any
+    /// failures to report. Only the ones that truly moved are dropped from the
+    /// source tree.
+    #[allow(clippy::type_complexity)]
+    move_results: Option<(
+        Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    )>,
     /// Live filesystem backends. Index 0 is always the local filesystem.
     backends: BackendRegistry,
     /// Queued and running transfers, drained by the event loop each tick.
@@ -167,6 +179,8 @@ impl FileBrowser {
             copy_task: None,
             copy_dest_panel: 0,
             op_progress: None,
+            op_cancel: None,
+            move_results: None,
             pending_copies: Vec::new(),
             approved_copies: Vec::new(),
             copy_source_panel: 0,
@@ -380,12 +394,58 @@ impl FileBrowser {
     /// deleted paths from its tree).
     fn resolve_deleting(&mut self) {
         let was_deleting = self.panels.iter().any(|p| p.is_deleting());
+
+        // A finished move reports which sources actually left; hand those to the
+        // panel so only they disappear from the tree.
+        if let Some((moved, _)) = &self.move_results {
+            let finished = self
+                .panels
+                .iter()
+                .any(|p| p.delete_task.as_ref().is_some_and(|t| t.is_finished()));
+            if finished {
+                let gone = moved.lock().unwrap().clone();
+                for panel in &mut self.panels {
+                    if panel.delete_task.as_ref().is_some_and(|t| t.is_finished()) {
+                        panel.deleting_paths = gone.clone();
+                    }
+                }
+            }
+        }
+
         for panel in &mut self.panels {
             panel.resolve_deleting();
         }
         // Once the last delete finished, drop its progress so the overlay clears.
         if was_deleting && !self.panels.iter().any(|p| p.is_deleting()) {
             self.op_progress = None;
+            self.op_cancel = None;
+            // A move runs on this same path, and it lands entries in the *other*
+            // panel — re-list that directory so they appear. Harmless for a
+            // plain delete, where the destination panel is the active one.
+            let dest = self.copy_dest_panel;
+            if let Some(panel) = self.panels.get_mut(dest) {
+                if let Some(dir) = panel.current_dir() {
+                    if let Screen::Main(state) = panel.current_screen_mut() {
+                        state.reload_dir_public(&dir);
+                    }
+                }
+            }
+            // Dismiss the "Deleting"/"Moving" overlay.
+            if matches!(self.modal, Modal::Operation { .. }) {
+                self.modal = Modal::None;
+            }
+            // Report anything the move couldn't do — a silently skipped file
+            // would look like it moved.
+            if let Some((_, failures)) = self.move_results.take() {
+                let failures = failures.lock().unwrap().clone();
+                if !failures.is_empty() {
+                    let detail = failures.join("; ");
+                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                        "Move failed: {}",
+                        detail
+                    )));
+                }
+            }
         }
     }
 
@@ -397,6 +457,7 @@ impl FileBrowser {
             if task.is_finished() {
                 self.copy_task.take();
                 self.op_progress = None;
+                self.op_cancel = None;
                 self.modal = Modal::None;
                 // Tags are staged input to the copy — clear them once it lands.
                 if let Some(panel) = self.panels.get_mut(self.copy_source_panel) {
@@ -521,6 +582,11 @@ impl FileBrowser {
     }
 
     /// Whether a connection attempt is in flight (for tests).
+    /// Whether a background copy/delete/move batch is still running.
+    pub fn is_operation_running_for_test(&self) -> bool {
+        self.panels.iter().any(|p| p.is_deleting()) || self.copy_task.is_some()
+    }
+
     pub fn is_connecting_for_test(&self) -> bool {
         self.is_connecting()
     }
@@ -679,6 +745,10 @@ impl FileBrowser {
                 self.start_copy();
                 true
             }
+            Action::Move => {
+                self.start_move();
+                true
+            }
             Action::ToggleTag => self.active_panel_mut().current_screen_mut().toggle_tag(),
             Action::UntagAll => self.active_panel_mut().current_screen_mut().untag_all(),
             Action::VisualMode => self.active_panel_mut().current_screen_mut().toggle_visual(),
@@ -688,26 +758,6 @@ impl FileBrowser {
                     "Filter (regex, empty to clear):",
                     "/pattern/",
                 ));
-                true
-            }
-            // Create, rename and delete all go through `std::fs`, which would act
-            // on the LOCAL machine while the panel is showing a server — quietly
-            // creating, renaming or DELETING the wrong file, and for a path that
-            // exists on both, a plausible-looking one. None of the three are
-            // wired through the VFS yet, so say so rather than destroying data
-            // on the wrong host.
-            Action::CreateDir | Action::Rename | Action::Delete
-                if self.active_panel_is_remote() =>
-            {
-                let what = match action {
-                    Action::CreateDir => "Creating directories",
-                    Action::Rename => "Renaming",
-                    _ => "Deleting",
-                };
-                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
-                    "{} on a remote host isn't supported yet.",
-                    what
-                )));
                 true
             }
             Action::CreateDir => {
@@ -1020,6 +1070,7 @@ impl FileBrowser {
                     | Action::SwitchPanel
                     | Action::ToggleSplit
                     | Action::Copy
+                    | Action::Move
                     | Action::Delete
                     | Action::Rename
                     | Action::ToggleTag
@@ -1069,12 +1120,10 @@ impl FileBrowser {
                         match target {
                             ModalTarget::Rename { old_path } => {
                                 if !value.is_empty() {
-                                    let new_path = old_path.parent().unwrap().join(&value);
-                                    if let Err(e) = std::fs::rename(&old_path, &new_path) {
-                                        eprintln!("Rename failed: {}", e);
+                                    if let Some(msg) = self.rename_path(&old_path, &value) {
+                                        self.modal = Modal::Confirm(ConfirmDialog::new(msg));
                                     }
                                 }
-                                self.active_panel_mut().current_screen_mut().refresh();
                             }
                             ModalTarget::ChangeRoot => {
                                 if !value.is_empty() {
@@ -1099,9 +1148,13 @@ impl FileBrowser {
                                 self.active_panel_mut().current_screen_mut().filter(&value);
                             }
                             ModalTarget::CreateDir => {
-                                self.active_panel_mut()
+                                let failure = self
+                                    .active_panel_mut()
                                     .current_screen_mut()
                                     .create_dir(&value);
+                                if let Some(msg) = failure {
+                                    self.modal = Modal::Confirm(ConfirmDialog::new(msg));
+                                }
                             }
                             ModalTarget::CopyDest { srcs } => {
                                 let dir = PathBuf::from(&value)
@@ -1135,14 +1188,16 @@ impl FileBrowser {
                 true
             }
             Modal::Operation { .. } => {
-                // A connection attempt can be abandoned with q/Esc so a slow or
-                // dead host doesn't trap the user behind the "Connecting..."
-                // overlay. (Copy/delete operations also use this modal but finish
-                // on their own; only the connect attempt is cancellable here.)
-                if self.is_connecting()
-                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                {
-                    self.cancel_connect();
+                // q/Esc abandons whatever this overlay is covering, so a slow
+                // host can never trap the user behind it: a hanging connection
+                // attempt, or a delete/copy that is one round trip per entry
+                // against a distant server.
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    if self.is_connecting() {
+                        self.cancel_connect();
+                    } else if let Some(cancel) = self.op_cancel.take() {
+                        cancel.cancel();
+                    }
                 }
                 true
             }
@@ -1560,25 +1615,190 @@ impl FileBrowser {
         self.modal = Modal::Operation { verb: "Copying" };
     }
 
+    /// Move the active panel's tagged files (or the cursor selection) into the
+    /// other panel's directory.
+    ///
+    /// Like `mv`: within one backend this is a rename, so it completes instantly
+    /// no matter how large the files are; across backends the bytes are copied
+    /// and the sources removed only once their copies have landed.
+    fn start_move(&mut self) {
+        let mut srcs = self.active_panel().current_screen().tagged_paths();
+        if srcs.is_empty() {
+            if let Some(p) = self.active_panel().selected_resolved_path() {
+                srcs.push(p);
+            }
+        }
+        if srcs.is_empty() {
+            return;
+        }
+
+        // A move needs somewhere to move *to*. With one panel there is no
+        // destination, so say that rather than silently doing nothing.
+        let Some(other) = self.other_index() else {
+            self.modal = Modal::Confirm(ConfirmDialog::new(
+                "Move needs two panels — split with | first.".to_string(),
+            ));
+            return;
+        };
+        let Some(dest_dir) = self.panels[other].current_dir() else {
+            return;
+        };
+
+        let src_panel = self.active;
+        let src_backend = self.panels[src_panel].backend;
+        let dest_backend = self.panels[other].backend;
+        let src_fs = self.backends.get(src_backend);
+        let dest_fs = self.backends.get(dest_backend);
+
+        let progress = OpProgress::new();
+        progress.set_total(srcs.len() as u64);
+        self.op_progress = Some(progress.clone());
+        let cancel = CancelToken::new();
+        self.op_cancel = Some(cancel.clone());
+
+        let jobs: Vec<(VPath, VPath)> = srcs
+            .iter()
+            .map(|src| {
+                let name = src
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (
+                    VPath::new(src_backend, src.clone()),
+                    VPath::new(dest_backend, dest_dir.join(name)),
+                )
+            })
+            .collect();
+
+        // Records which sources actually left, so a move that failed (a name
+        // already taken at the destination, a permission error) doesn't have its
+        // entry removed from the tree as though it had succeeded.
+        let moved = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let failures = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let task = tokio::spawn({
+            let moved = moved.clone();
+            let failures = failures.clone();
+            async move {
+                for (from, to) in &jobs {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    match crate::vfs::ops::move_path(
+                        &src_fs,
+                        &dest_fs,
+                        from,
+                        to,
+                        Some(&progress),
+                        &cancel,
+                    )
+                    .await
+                    {
+                        Ok(_) => moved.lock().unwrap().push(from.path.clone()),
+                        Err(e) => failures.lock().unwrap().push(e.to_string()),
+                    }
+                }
+                progress.finish();
+            }
+        });
+        self.move_results = Some((moved, failures));
+
+        // A move empties the sources, so it resolves through the same path as a
+        // delete: the moved entries leave the source panel's tree.
+        self.panels[src_panel].delete_task = Some(task);
+        // Filled in from `move_results` when the task finishes; a move that
+        // failed must leave its source visible.
+        self.panels[src_panel].deleting_paths = Vec::new();
+        self.panels[src_panel].current_screen_mut().clear_tags();
+        self.copy_dest_panel = other;
+        self.modal = Modal::Operation { verb: "Moving" };
+    }
+
+    /// Rename `old_path` to `new_name` within its own directory.
+    ///
+    /// Goes through the active panel's backend, so a remote panel renames on the
+    /// server. Returns an error message to surface, or `None` on success.
+    ///
+    /// A rename is one round trip, so it runs to completion here rather than as
+    /// a background task — unlike delete, which is one round trip per entry.
+    fn rename_path(&mut self, old_path: &Path, new_name: &str) -> Option<String> {
+        let Some(parent) = old_path.parent() else {
+            return Some("Cannot rename the filesystem root".to_string());
+        };
+        let new_path = parent.join(new_name);
+        if new_path == old_path {
+            return None;
+        }
+
+        let backend = self.active_panel().backend;
+        let fs = self.backends.get(backend);
+        let from = VPath::new(backend, old_path.to_path_buf());
+        let to = VPath::new(backend, new_path);
+
+        let result = futures::executor::block_on(async {
+            // Refuse to clobber an existing entry: rename silently replaces the
+            // destination on both backends, and losing a file to a mistyped name
+            // is not recoverable.
+            if fs.stat(&to).await.is_ok() {
+                return Err(anyhow::anyhow!("'{}' already exists", new_name));
+            }
+            fs.rename(&from, &to).await
+        });
+
+        if let Err(e) = result {
+            return Some(format!("Rename failed: {}", e));
+        }
+
+        // Re-list just the containing directory so the new name appears, keeping
+        // the rest of the tree and the size cache intact. A full refresh would
+        // re-scan everything — and on a remote panel would rebuild it as local.
+        if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+            state.reload_dir_public(parent);
+        }
+        None
+    }
+
     /// Delete `paths` in the background, tracking progress, then remove them from
     /// the active panel's tree and clear its tags when the task completes.
     fn spawn_delete_batch(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
         }
+        // Route through the panel's backend so a remote panel deletes on the
+        // server. `delete_recursive` empties directories depth-first, which both
+        // backends require, and never follows a symlink out of the tree.
+        let backend = self.active_panel().backend;
+        let fs = self.backends.get(backend);
         let progress = OpProgress::new();
-        let total: u64 = paths.iter().map(|p| count_entries(p)).sum();
-        progress.set_total(total);
         self.op_progress = Some(progress.clone());
+        let cancel = CancelToken::new();
+        self.op_cancel = Some(cancel.clone());
 
-        let to_delete = paths.clone();
+        let to_delete: Vec<VPath> = paths
+            .iter()
+            .map(|p| VPath::new(backend, p.clone()))
+            .collect();
         let task = tokio::spawn(async move {
+            // Size the job first so the overlay shows a real fraction. On a
+            // remote tree this is itself round trips, so it runs inside the task
+            // rather than blocking the key press that started it.
+            let mut total = 0u64;
             for p in &to_delete {
-                let _ = delete_path(p, Some(&progress));
+                total += crate::vfs::ops::count_entries(&fs, p, &cancel).await;
+            }
+            progress.set_total(total);
+
+            for p in &to_delete {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let _ = crate::vfs::ops::delete_recursive(&fs, p, Some(&progress), &cancel).await;
             }
             progress.finish();
         });
 
+        // Nothing lands anywhere else, so point the post-op refresh at this panel
+        // rather than leaving it aimed at a previous copy's destination.
+        self.copy_dest_panel = self.active;
         let panel = self.active_panel_mut();
         panel.delete_task = Some(task);
         panel.deleting_paths = paths;
@@ -1646,39 +1866,6 @@ fn count_entries(path: &Path) -> u64 {
             .count() as u64
     } else {
         1
-    }
-}
-
-/// Recursively delete a path, bumping `progress` once per entry removed so a
-/// large tree reports live progress. Directories are walked deepest-first so
-/// children are gone before their parent is removed.
-fn delete_path(path: &Path, progress: Option<&OpProgress>) -> std::io::Result<()> {
-    if path.is_dir() {
-        // contents_first yields children before their parent directory.
-        for entry in walkdir::WalkDir::new(path)
-            .contents_first(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_dir() {
-                let _ = std::fs::remove_dir(entry.path());
-            } else {
-                let _ = std::fs::remove_file(entry.path());
-            }
-            if let Some(p) = progress {
-                p.inc_done();
-            }
-        }
-        // The root directory itself (walkdir with contents_first still yields it
-        // last, so the loop above already removed it — but guard just in case).
-        let _ = std::fs::remove_dir_all(path);
-        Ok(())
-    } else {
-        let res = std::fs::remove_file(path);
-        if let Some(p) = progress {
-            p.inc_done();
-        }
-        res
     }
 }
 

@@ -136,6 +136,16 @@ impl Vfs for LocalFs {
         .await?
     }
 
+    async fn symlink_stat(&self, path: &VPath) -> Result<VMetadata> {
+        let p = path.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let meta = std::fs::symlink_metadata(&p)
+                .with_context(|| format!("failed to stat {}", p.display()))?;
+            Ok(vmetadata_from(&meta))
+        })
+        .await?
+    }
+
     async fn create_dir_all(&self, path: &VPath) -> Result<()> {
         let p = path.path.clone();
         tokio::task::spawn_blocking(move || {
