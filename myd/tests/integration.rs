@@ -3973,3 +3973,217 @@ async fn test_move_refuses_to_overwrite_an_existing_file() {
         "a refused move must leave the source in place"
     );
 }
+
+/// A move collision offers overwrite, skip, or cancel — and each does what it
+/// says.
+///
+/// Copy only offers overwrite/skip; a move also destroys the source, so being
+/// able to stop the whole sequence matters more here.
+#[tokio::test]
+async fn test_move_collision_offers_overwrite_skip_and_cancel() {
+    use myd::app::FileBrowser;
+
+    // Helper: two panels, `left` holding `names`, `right` already holding a
+    // colliding "taken.txt".
+    async fn setup(
+        names: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        FileBrowser,
+    ) {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for n in names {
+            std::fs::write(left.path().join(n), format!("SRC:{}", n)).unwrap();
+        }
+        std::fs::write(right.path().join("taken.txt"), "DEST-ORIGINAL").unwrap();
+        let mut app = FileBrowser::new(
+            Some(left.path().to_path_buf()),
+            Some(right.path().to_path_buf()),
+            true,
+        );
+        for _ in 0..400 {
+            app.resolve_loading_for_test();
+            if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        (left, right, app)
+    }
+
+    async fn settle_ops(app: &mut FileBrowser) {
+        for _ in 0..600 {
+            app.resolve_loading_for_test();
+            if !app.is_operation_running_for_test() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+    }
+
+    // --- The prompt names all three options. ---
+    let (_l, _r, mut app) = setup(&["taken.txt"]).await;
+    app.handle_key_for_test(char_key('j')); // step onto the file
+    app.handle_key_for_test(char_key('m'));
+    let prompt = app_screen_text(&mut app, 110, 20);
+    assert!(
+        prompt.contains("[o]verwrite") && prompt.contains("[s]kip") && prompt.contains("[c]ancel"),
+        "the collision prompt should offer all three: {}",
+        prompt
+    );
+
+    // --- Overwrite replaces the destination. ---
+    let (left, right, mut app) = setup(&["taken.txt"]).await;
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('m'));
+    app.handle_key_for_test(char_key('o'));
+    settle_ops(&mut app).await;
+    assert_eq!(
+        std::fs::read_to_string(right.path().join("taken.txt")).unwrap(),
+        "SRC:taken.txt",
+        "overwrite should replace the destination"
+    );
+    assert!(
+        !left.path().join("taken.txt").exists(),
+        "an overwriting move still removes the source"
+    );
+
+    // --- Skip leaves both sides alone. ---
+    let (left, right, mut app) = setup(&["taken.txt"]).await;
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('m'));
+    app.handle_key_for_test(char_key('s'));
+    settle_ops(&mut app).await;
+    assert_eq!(
+        std::fs::read_to_string(right.path().join("taken.txt")).unwrap(),
+        "DEST-ORIGINAL",
+        "skip must not touch the destination"
+    );
+    assert!(
+        left.path().join("taken.txt").exists(),
+        "skip must leave the source in place"
+    );
+
+    // --- Cancel abandons the whole batch, including non-colliding files. ---
+    let (left, right, mut app) = setup(&["taken.txt", "clean.txt"]).await;
+    app.handle_key_for_test(char_key('*')); // expand so both are visible
+    // Tag every file in the panel.
+    for _ in 0..6 {
+        app.handle_key_for_test(char_key('j'));
+        app.handle_key_for_test(char_key('t'));
+    }
+    app.handle_key_for_test(char_key('m'));
+    app.handle_key_for_test(char_key('c'));
+    settle_ops(&mut app).await;
+    assert_eq!(
+        std::fs::read_to_string(right.path().join("taken.txt")).unwrap(),
+        "DEST-ORIGINAL",
+        "cancel must not overwrite"
+    );
+    assert!(
+        left.path().join("clean.txt").exists(),
+        "cancel abandons the entire move, not just the colliding file"
+    );
+    assert!(
+        !right.path().join("clean.txt").exists(),
+        "the non-colliding file must not have been moved either"
+    );
+}
+
+/// A cross-backend move rides the transfer queue, like a cross-backend copy.
+///
+/// It used to run as a sequential background task behind a modal overlay, so a
+/// move between hosts showed no rate, no ETA and no per-file progress. Queuing
+/// it gives it the same bounded parallelism and transfer-panel reporting as a
+/// copy — and the source is removed only once its copy has landed.
+#[tokio::test]
+async fn test_cross_backend_move_uses_the_transfer_queue() {
+    use myd::transfer::TransferState;
+    use myd::vfs::VPath;
+
+    let src_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let payload = vec![5u8; 96 * 1024];
+    std::fs::write(src_dir.path().join("cargo.bin"), &payload).unwrap();
+
+    // Two backend ids over the same local filesystem: enough to exercise the
+    // cross-backend path, which routes on the id.
+    let mut queue = myd::transfer::TransferQueue::default();
+    let mut registry = myd::vfs::BackendRegistry::new();
+    let second = registry.register(std::sync::Arc::new(myd::vfs::LocalFs::new()));
+
+    queue.enqueue_move(
+        VPath::new(myd::vfs::BackendId::LOCAL, src_dir.path().join("cargo.bin")),
+        VPath::new(second, dest_dir.path().join("cargo.bin")),
+        0,
+        false,
+    );
+    assert_eq!(queue.queued_count(), 1, "the move should be queued, not run inline");
+
+    for _ in 0..3000 {
+        queue.tick(&registry);
+        if !queue.has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    assert_eq!(queue.finished_count(), 1);
+    assert!(
+        queue
+            .transfers()
+            .iter()
+            .all(|t| t.state == TransferState::Done),
+        "the queued move should complete: {:?}",
+        queue.transfers().iter().map(|t| &t.state).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        std::fs::read(dest_dir.path().join("cargo.bin")).unwrap(),
+        payload,
+        "the bytes should arrive intact"
+    );
+    assert!(
+        !src_dir.path().join("cargo.bin").exists(),
+        "a queued move removes the source once its copy has landed"
+    );
+}
+
+/// A queued move whose copy fails must not delete the source.
+#[tokio::test]
+async fn test_failed_cross_backend_move_keeps_the_source() {
+    use myd::vfs::VPath;
+
+    let src_dir = tempfile::tempdir().unwrap();
+    std::fs::write(src_dir.path().join("keep.bin"), b"important").unwrap();
+
+    let mut queue = myd::transfer::TransferQueue::default();
+    let mut registry = myd::vfs::BackendRegistry::new();
+    let second = registry.register(std::sync::Arc::new(myd::vfs::LocalFs::new()));
+
+    // Destination under a path that can't be created (a file, not a directory),
+    // so the copy fails.
+    let blocker = src_dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    queue.enqueue_move(
+        VPath::new(myd::vfs::BackendId::LOCAL, src_dir.path().join("keep.bin")),
+        VPath::new(second, blocker.join("sub/keep.bin")),
+        0,
+        false,
+    );
+
+    for _ in 0..3000 {
+        queue.tick(&registry);
+        if !queue.has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    assert!(
+        src_dir.path().join("keep.bin").exists(),
+        "a move whose copy failed must leave the source alone"
+    );
+}

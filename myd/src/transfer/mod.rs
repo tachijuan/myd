@@ -250,6 +250,10 @@ pub struct Transfer {
     pub state: TransferState,
     pub progress: Arc<TransferProgress>,
     pub cancel: CancelToken,
+    /// Delete the source once the copy has fully succeeded — this transfer is
+    /// the copy half of a cross-backend *move*. Never set for a plain copy, and
+    /// never acted on unless the transfer completes cleanly.
+    pub remove_source: bool,
 }
 
 impl Transfer {
@@ -277,7 +281,15 @@ impl Transfer {
             state: TransferState::Queued,
             progress: Arc::new(TransferProgress::new(total_bytes)),
             cancel: CancelToken::new(),
+            remove_source: false,
         }
+    }
+
+    /// Mark this transfer as the copy half of a move, so its source is deleted
+    /// once the copy has fully succeeded.
+    pub fn removing_source(mut self) -> Self {
+        self.remove_source = true;
+        self
     }
 
     /// Ask this transfer to stop. The worker observes the token between chunks.

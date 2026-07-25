@@ -75,8 +75,12 @@ Copy the tagged files, or the selected one, into the other panel's directory.
 Move the tagged files, or the selected one, into the other panel's directory.
 Within a single filesystem this is a rename, so it completes instantly whatever
 the size; between two different hosts the bytes are copied and the source is
-removed only after the copy succeeds. A move never overwrites an existing entry
-at the destination; the conflict is reported and both files are left alone.
+removed only after that file's copy succeeds. A cross-host move is queued and
+reported in the transfer panel exactly like a copy.
+.IP
+When a name is already taken at the destination, myd asks what to do: overwrite
+it, skip that file and continue, or cancel the whole move. Cancelling abandons
+every remaining file, including ones that would not have collided.
 .TP
 .B r
 Rescan: clear the size cache and re-read sizes from disk. Sizes are otherwise
