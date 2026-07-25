@@ -717,6 +717,19 @@ impl FileBrowser {
     }
 
     fn dispatch_action(&mut self, action: Action) -> bool {
+        // Opt-in timing for diagnosing slow keys on network filesystems. Set
+        // MYD_TRACE=1 and the app appends one line per action to
+        // ~/.cache/myd-trace.log, so a stall can be attributed to a specific
+        // step rather than guessed at.
+        let trace_started = trace_enabled().then(std::time::Instant::now);
+        let result = self.dispatch_action_inner(action);
+        if let Some(started) = trace_started {
+            trace_action(action, started.elapsed());
+        }
+        result
+    }
+
+    fn dispatch_action_inner(&mut self, action: Action) -> bool {
         // Visual mode only survives motion and its own toggle; any other command
         // ends the range-tag gesture (tags already made are kept).
         if !matches!(
@@ -1979,6 +1992,47 @@ impl FileBrowser {
         // Deleted files were the tags' whole point — clear them now so the UI
         // doesn't keep highlighting rows that are about to vanish.
         panel.current_screen_mut().clear_tags();
+    }
+}
+
+/// Whether `MYD_TRACE` asked for key-timing diagnostics. Read once.
+pub fn trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MYD_TRACE").is_ok_and(|v| v != "0"))
+}
+
+/// Append one timing line for a dispatched action.
+///
+/// Writing to a file rather than stderr because the alternate screen is active;
+/// anything printed to the terminal would corrupt the display.
+pub fn trace_note(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_path())
+    {
+        let _ = writeln!(f, "{}", args);
+    }
+}
+
+/// Where trace output goes.
+fn trace_path() -> String {
+    std::env::var("MYD_TRACE_FILE").unwrap_or_else(|_| {
+        let base = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{}/.cache/myd-trace.log", base)
+    })
+}
+
+fn trace_action(action: Action, elapsed: std::time::Duration) {
+    use std::io::Write as _;
+    let path = trace_path();
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{:?}\t{:.1}ms", action, elapsed.as_secs_f64() * 1000.0);
     }
 }
 

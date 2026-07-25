@@ -94,11 +94,27 @@ impl MainScreenState {
         self.focus = focus;
     }
 
+    /// Whether the info panel's text is currently cached. Test hook: sorting
+    /// must not invalidate it, since rebuilding costs filesystem calls.
+    pub fn info_cache_key_for_test(&self) -> bool {
+        self.cached_info_key.is_some()
+    }
+
     /// Rebuild the treemap from the current tree (call after tree structure changes).
     fn rebuild_treemap(&mut self) {
         self.treemap = TreeMap::from_file_tree(&self.tree);
-        // Sizes and child counts may have changed even though the selected path
-        // did not, so the cached panel text can no longer be trusted.
+    }
+
+    /// Rebuild the treemap *and* drop the cached info-panel text.
+    ///
+    /// Only for changes that alter what the panel would say about the selected
+    /// entry — a reload or refresh, where sizes and child counts may differ.
+    /// Re-sorting is not such a change: it reorders rows without altering any
+    /// of them, and rebuilding the panel means a stat, a canonicalize and a
+    /// `read_dir` of the selected directory. On a network filesystem that is
+    /// several round trips, paid on every press of `s`.
+    fn rebuild_treemap_and_info(&mut self) {
+        self.rebuild_treemap();
         self.cached_info_key = None;
     }
 
@@ -204,8 +220,22 @@ impl MainScreenState {
         ];
         let current_idx = modes.iter().position(|m| *m == self.tree.sort_mode).unwrap_or(0);
         let next_idx = (current_idx + 1) % modes.len();
+
+        // Timed in three parts so a slow sort can be attributed to reordering,
+        // reflattening, or the treemap rebuild rather than guessed at.
+        let trace = crate::app::trace_enabled();
+        let t0 = trace.then(std::time::Instant::now);
         self.tree.set_sort_mode(modes[next_idx]);
+        let after_sort = trace.then(std::time::Instant::now);
         self.rebuild_treemap();
+        if let (Some(t0), Some(after_sort)) = (t0, after_sort) {
+            crate::app::trace_note(format_args!(
+                "  toggle_sort: reorder+reflatten={:.1}ms treemap={:.1}ms lines={}",
+                after_sort.duration_since(t0).as_secs_f64() * 1000.0,
+                after_sort.elapsed().as_secs_f64() * 1000.0,
+                self.tree.lines.len(),
+            ));
+        }
         true
     }
 
@@ -245,7 +275,7 @@ impl MainScreenState {
             self.tree.show_size_bar,
             self.tree.size_cache.clone(),
         );
-        self.rebuild_treemap();
+        self.rebuild_treemap_and_info();
         true
     }
 
@@ -371,7 +401,7 @@ impl MainScreenState {
         // Reload just the parent level so the new directory appears, keeping the
         // size cache and the rest of the tree intact.
         self.tree.reload_dir(&parent);
-        self.rebuild_treemap();
+        self.rebuild_treemap_and_info();
         None
     }
 
@@ -381,7 +411,7 @@ impl MainScreenState {
     /// the tree.
     pub fn reload_dir_public(&mut self, resolved_path: &std::path::Path) {
         self.tree.reload_dir(resolved_path);
-        self.rebuild_treemap();
+        self.rebuild_treemap_and_info();
     }
 
     /// Toggle the tag on the tree cursor's file. Tree-only (no-op in treemap).
@@ -501,7 +531,7 @@ impl MainScreenState {
     /// Remove a path from the tree in-place (preserves expanded state).
     pub fn remove_path(&mut self, path: &std::path::Path) {
         self.tree.remove_path(path);
-        self.rebuild_treemap();
+        self.rebuild_treemap_and_info();
     }
 }
 
@@ -629,6 +659,7 @@ impl MainScreenState {
             // already holds. Inspecting it with `std::fs` would read the local
             // machine — showing an unrelated file's metadata whenever the path
             // happens to exist on both.
+            let info_started = crate::app::trace_enabled().then(std::time::Instant::now);
             self.cached_info_text = if self.tree.source.is_remote() {
                 let line = self.tree.selected_line();
                 let size = line
@@ -646,6 +677,12 @@ impl MainScreenState {
                 file_info::render_info_owned(&path, &self.tree.size_cache)
             };
             self.cached_info_key = Some(key);
+            if let Some(started) = info_started {
+                crate::app::trace_note(format_args!(
+                    "  info_panel rebuild={:.1}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
         }
 
         let paragraph = Paragraph::new(self.cached_info_text.clone()).block(

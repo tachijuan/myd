@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.6.2" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.6.3" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -170,6 +170,13 @@ recursive total \(em because a \fBdu\fR-style walk over SFTP costs one round
 trip per directory. The info panel likewise shows only what the directory
 listing carries (size and timestamps); owner, group and creation time are not
 part of it.
+.SH DIAGNOSTICS
+Setting \fBMYD_TRACE=1\fR makes myd append one timing line per keypress to
+\fB~/.cache/myd\-trace.log\fR (override the location with \fBMYD_TRACE_FILE\fR).
+Sorting additionally logs how long reordering, reflattening and the treemap
+rebuild each took. This is for diagnosing sluggishness on slow or network
+filesystems, where the cause is otherwise hard to attribute; it is off by
+default and costs nothing when unset.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes:
 .TP
