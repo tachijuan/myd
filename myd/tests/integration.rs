@@ -4395,3 +4395,65 @@ async fn test_sorting_does_not_rebuild_the_info_panel() {
         "sorting invalidated the info panel, forcing a filesystem re-read"
     );
 }
+
+/// Rebuilding the treemap must not touch the filesystem.
+///
+/// This was the real cause of multi-second sorts on a CIFS mount: the treemap
+/// is rebuilt on every sort, and it derived each directory tile's colour by
+/// walking that directory — a `readdir` plus a `stat` per file, per tile. A
+/// trace from a 1,895-line CIFS tree showed reorder+reflatten at 2.2ms and the
+/// treemap rebuild at 9,686ms.
+///
+/// Proves absence of I/O rather than speed: the tree is loaded, then the files
+/// are deleted from disk. A rebuild that still reports the right sizes and
+/// colours cannot have gone back to the filesystem.
+#[tokio::test]
+async fn test_treemap_rebuild_does_no_filesystem_io() {
+    use myd::screen::SortMode;
+    use myd::utils::filetype::FileCategory;
+    use myd::widget::file_tree::FileTree;
+    use myd::widget::treemap::TreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("code")).unwrap();
+    std::fs::write(dir.path().join("code/main.rs"), vec![0u8; 90_000]).unwrap();
+    std::fs::create_dir_all(dir.path().join("media")).unwrap();
+    std::fs::write(dir.path().join("media/clip.mp4"), vec![0u8; 50_000]).unwrap();
+
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, true);
+    let before = TreeMap::from_file_tree(&tree);
+    let colour_of = |tm: &TreeMap, name: &str| {
+        tm.cells
+            .iter()
+            .find(|c| c.label == name)
+            .unwrap_or_else(|| panic!("no tile named {}", name))
+            .category
+    };
+    assert_eq!(colour_of(&before, "code"), FileCategory::Code);
+    assert_eq!(colour_of(&before, "media"), FileCategory::Video);
+
+    // Pull the disk out from under it.
+    std::fs::remove_dir_all(dir.path().join("code")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("media")).unwrap();
+
+    let started = std::time::Instant::now();
+    let after = TreeMap::from_file_tree(&tree);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "treemap rebuild took {:?} — it is doing I/O",
+        elapsed
+    );
+    assert_eq!(
+        after.cells.len(),
+        before.cells.len(),
+        "rebuild lost tiles — it re-read the (now empty) directory"
+    );
+    assert_eq!(
+        colour_of(&after, "code"),
+        FileCategory::Code,
+        "tile colour must come from cached data, not the filesystem"
+    );
+    assert_eq!(colour_of(&after, "media"), FileCategory::Video);
+}

@@ -7,13 +7,8 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
-use crate::utils::filetype::{self, FileCategory};
+use crate::utils::filetype::FileCategory;
 use crate::widget::file_tree::FileTree;
-
-/// Cap on entries walked when deciding a directory's dominant category.
-/// A sample this size settles the answer for any realistic directory without
-/// making the treemap rebuild pay for a full recursive walk per tile.
-const CATEGORY_SAMPLE_LIMIT: usize = 2_000;
 
 /// A single cell in the treemap, representing a directory or file.
 #[derive(Debug, Clone)]
@@ -65,13 +60,9 @@ impl TreeMap {
             .into_iter()
             .map(|(info, size)| {
                 let label = truncate_path(&info.path, info.depth);
-                // A directory takes the color of whatever content dominates it;
-                // a file is classified directly by its extension.
-                let category = if info.is_dir {
-                    filetype::dominant_category(&info.path, CATEGORY_SAMPLE_LIMIT)
-                } else {
-                    filetype::categorize(&info.path)
-                };
+                // Decided in `collect_items` from the tree's own data — never by
+                // touching the filesystem, since this runs on every sort.
+                let category = info.category;
                 TreemapCell {
                     rect: Rect::default(),
                     path: info.path,
@@ -385,6 +376,43 @@ struct TreeItemInfo {
     resolved_path: PathBuf,
     depth: usize,
     is_dir: bool,
+    /// Content category, decided from the tree's own loaded children rather than
+    /// by walking the disk (see `category_of_node`).
+    category: crate::utils::filetype::FileCategory,
+}
+
+/// A directory's category, from the children the tree already holds.
+///
+/// The tree loaded these when the directory was opened, so classifying them is
+/// pure computation. Walking the filesystem here instead cost a `readdir` plus a
+/// `stat` per file, per directory tile, on every treemap rebuild — and the
+/// treemap is rebuilt on every sort. On a CIFS mount that turned a 2ms sort into
+/// a 10-16 second freeze.
+///
+/// An unloaded directory has nothing to classify, so it takes the neutral
+/// colour until it is expanded.
+fn category_of_node(node: &crate::widget::file_tree::TreeNode, tree: &FileTree) -> FileCategory {
+    use crate::utils::filetype::dominant_category_of;
+
+    // Preferred: the tally the size walk recorded, which covers the whole
+    // subtree including directories the user has not expanded.
+    if let Some(totals) = tree.size_cache.category_totals(&node.resolved_path) {
+        if let Some(cat) = FileCategory::dominant_of_totals(&totals) {
+            return cat;
+        }
+    }
+
+    // Fallback for a tree whose sizes came from a listing rather than a walk
+    // (a remote backend): classify the children that are loaded.
+    match node.children.as_ref() {
+        Some(children) => dominant_category_of(children.iter().filter(|c| !c.is_dir).map(|c| {
+            (
+                c.path.as_path(),
+                tree.size_cache.get(&c.resolved_path).unwrap_or(0),
+            )
+        })),
+        None => FileCategory::Other,
+    }
 }
 
 /// Recursively collect directories (and file leaves) from the tree.
@@ -418,6 +446,7 @@ fn collect_items(
                         resolved_path: child.resolved_path.clone(),
                         depth: depth + 1,
                         is_dir: child.is_dir,
+                        category: category_of_node(child, tree),
                     },
                     size,
                 ));
@@ -436,6 +465,8 @@ fn collect_items(
                         resolved_path: child.resolved_path.clone(),
                         depth: depth + 1,
                         is_dir: child.is_dir,
+                        // A file is classified by its extension alone.
+                        category: crate::utils::filetype::categorize(&child.path),
                     },
                     size,
                 ));

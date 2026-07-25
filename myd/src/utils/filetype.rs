@@ -17,6 +17,52 @@ pub enum FileCategory {
 }
 
 impl FileCategory {
+    /// Stable index into a per-directory byte tally.
+    ///
+    /// Lets the size walk accumulate category totals without the cache layer
+    /// depending on this enum.
+    pub fn slot(self) -> usize {
+        match self {
+            FileCategory::Code => 0,
+            FileCategory::Document => 1,
+            FileCategory::Image => 2,
+            FileCategory::Video => 3,
+            FileCategory::Audio => 4,
+            FileCategory::Archive => 5,
+            FileCategory::Data => 6,
+            FileCategory::Binary => 7,
+            FileCategory::Other => 8,
+        }
+    }
+
+    /// Inverse of [`slot`](Self::slot).
+    pub fn from_slot(slot: usize) -> Self {
+        match slot {
+            0 => FileCategory::Code,
+            1 => FileCategory::Document,
+            2 => FileCategory::Image,
+            3 => FileCategory::Video,
+            4 => FileCategory::Audio,
+            5 => FileCategory::Archive,
+            6 => FileCategory::Data,
+            7 => FileCategory::Binary,
+            _ => FileCategory::Other,
+        }
+    }
+
+    /// The heaviest category in a per-directory tally, or `None` if empty.
+    ///
+    /// Ties break on category order so the colour is deterministic rather than
+    /// dependent on iteration order.
+    pub fn dominant_of_totals(totals: &crate::utils::sizes::CategoryTotals) -> Option<Self> {
+        totals
+            .iter()
+            .enumerate()
+            .filter(|(_, bytes)| **bytes > 0)
+            .max_by_key(|(slot, bytes)| (**bytes, std::cmp::Reverse(*slot)))
+            .map(|(slot, _)| Self::from_slot(slot))
+    }
+
     /// Human-readable name, used in the legend and info panel.
     pub fn label(self) -> &'static str {
         match self {
@@ -111,33 +157,22 @@ pub fn categorize(path: &Path) -> FileCategory {
     }
 }
 
-/// Determine which category accounts for the most bytes under `dir`.
+/// The heaviest category among already-known `(path, size)` pairs.
 ///
-/// Walks the directory recursively, summing file sizes per category. Returns
-/// `Other` for an empty or unreadable directory, so a tile always has a color.
-/// `max_entries` bounds the walk: a huge tree only needs a representative
-/// sample to decide which category dominates, and the treemap redraws often.
-pub fn dominant_category(dir: &Path, max_entries: usize) -> FileCategory {
+/// Prefer this over [`dominant_category`] wherever the caller already holds the
+/// directory's contents: it is pure computation, where the walking version
+/// costs a `readdir` plus a `stat` per file. The treemap rebuilds on every sort,
+/// so doing that per directory made changing the sort order take *seconds* on a
+/// network filesystem.
+pub fn dominant_category_of<'a>(
+    entries: impl Iterator<Item = (&'a Path, u64)>,
+) -> FileCategory {
     use std::collections::HashMap;
-    use walkdir::WalkDir;
 
     let mut totals: HashMap<FileCategory, u64> = HashMap::new();
-    let mut seen = 0usize;
-
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if seen >= max_entries {
-            break;
-        }
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        seen += 1;
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        *totals.entry(categorize(entry.path())).or_insert(0) += size;
+    for (path, size) in entries {
+        *totals.entry(categorize(path)).or_insert(0) += size;
     }
-
-    // Pick the heaviest category. Ties break on the category order so the
-    // result is deterministic rather than dependent on hash iteration order.
     totals
         .into_iter()
         .max_by_key(|(cat, bytes)| (*bytes, std::cmp::Reverse(*cat)))
@@ -196,29 +231,37 @@ mod tests {
         assert_eq!(before, colors.len(), "tile colors must be distinguishable");
     }
 
+    /// Bytes decide the category, not file count.
     #[test]
     fn test_dominant_category_picks_heaviest_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        // Many small code files, one huge video: bytes decide, not file count.
-        for i in 0..10 {
-            std::fs::write(dir.path().join(format!("f{}.rs", i)), vec![0u8; 100]).unwrap();
-        }
-        std::fs::write(dir.path().join("movie.mp4"), vec![0u8; 500_000]).unwrap();
-        assert_eq!(dominant_category(dir.path(), 10_000), FileCategory::Video);
+        let files: Vec<(std::path::PathBuf, u64)> = (0..10)
+            .map(|i| (std::path::PathBuf::from(format!("f{}.rs", i)), 100))
+            .chain(std::iter::once((
+                std::path::PathBuf::from("movie.mp4"),
+                500_000,
+            )))
+            .collect();
+        assert_eq!(
+            dominant_category_of(files.iter().map(|(p, s)| (p.as_path(), *s))),
+            FileCategory::Video
+        );
     }
 
     #[test]
-    fn test_dominant_category_recurses() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("deep/deeper")).unwrap();
-        std::fs::write(dir.path().join("deep/deeper/a.rs"), vec![0u8; 9_000]).unwrap();
-        std::fs::write(dir.path().join("small.png"), vec![0u8; 10]).unwrap();
-        assert_eq!(dominant_category(dir.path(), 10_000), FileCategory::Code);
+    fn test_dominant_category_of_nothing_is_other() {
+        assert_eq!(
+            dominant_category_of(std::iter::empty()),
+            FileCategory::Other
+        );
     }
 
+    /// Ties break deterministically rather than on hash iteration order.
     #[test]
-    fn test_dominant_category_of_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(dominant_category(dir.path(), 10_000), FileCategory::Other);
+    fn test_dominant_category_ties_are_stable() {
+        let a = std::path::PathBuf::from("x.rs");
+        let b = std::path::PathBuf::from("y.png");
+        let first = dominant_category_of([(a.as_path(), 100), (b.as_path(), 100)].into_iter());
+        let second = dominant_category_of([(b.as_path(), 100), (a.as_path(), 100)].into_iter());
+        assert_eq!(first, second, "a tie must not depend on iteration order");
     }
 }
