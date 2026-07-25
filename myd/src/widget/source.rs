@@ -164,8 +164,23 @@ impl RemoteSource {
         self.driver.handle.spawn(async move {
             let _ = tx.send(fut.await);
         });
-        rx.recv()
-            .expect("sftp runtime dropped a request without completing it")
+        // Every remote round trip funnels through here. Timing it attributes a
+        // freeze to the network rather than to the UI, which is otherwise very
+        // hard to tell apart from the outside.
+        let started = crate::app::trace_enabled().then(std::time::Instant::now);
+        let out = rx
+            .recv()
+            .expect("sftp runtime dropped a request without completing it");
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            if elapsed > std::time::Duration::from_millis(100) {
+                crate::app::trace_note(format_args!(
+                    "  remote blocking call took {:.1}ms",
+                    elapsed.as_secs_f64() * 1000.0
+                ));
+            }
+        }
+        out
     }
 
     /// List a remote directory (owned inputs, so the future is `'static`).

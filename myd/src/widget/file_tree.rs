@@ -408,6 +408,11 @@ pub struct TreeLine {
 }
 
 /// The main FileTree widget state.
+///
+/// `Clone` is cheap relative to rebuilding: the nodes and flattened lines are
+/// copied, but the size cache is shared (it is `Arc`-backed). Splitting the view
+/// clones the tree rather than re-listing the directory.
+#[derive(Clone)]
 pub struct FileTree {
     /// Root node.
     pub root: TreeNode,

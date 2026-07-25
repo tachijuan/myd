@@ -178,7 +178,7 @@ impl super::ScreenState for DirPickerState {
 
         // Title.
         let title = Paragraph::new(Span::styled(
-            "Select a directory (Esc to quit)",
+            "Select a directory (Esc to go back)",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(title, vertical[0]);

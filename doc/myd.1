@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.6.4" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.6.5" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -48,7 +48,8 @@ Scroll up half a page.
 Move cursor to the parent directory.
 .TP
 .B g d
-Prompt for a new root directory and navigate to it.
+Prompt for a new root directory and navigate to it. The picker opens over the
+current view; \fBEsc\fR dismisses it and returns to where you were.
 .TP
 .B 0
 Collapse all expanded directories.
@@ -174,7 +175,8 @@ part of it.
 Setting \fBMYD_TRACE=1\fR makes myd append one timing line per keypress to
 \fB~/.cache/myd\-trace.log\fR (override the location with \fBMYD_TRACE_FILE\fR).
 Sorting additionally logs how long reordering, reflattening and the treemap
-rebuild each took. This is for diagnosing sluggishness on slow or network
+rebuild each took; slow event-loop ticks and remote round trips over 100ms are
+logged too. This is for diagnosing sluggishness on slow or network
 filesystems, where the cause is otherwise hard to attribute; it is off by
 default and costs nothing when unset.
 .SH SORT MODES
