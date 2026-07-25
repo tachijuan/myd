@@ -3803,3 +3803,173 @@ async fn test_remote_reflatten_does_not_walk_the_local_disk() {
         elapsed
     );
 }
+
+/// `m` moves the selection into the other panel's directory.
+///
+/// Within one backend a move is a rename — the bytes never move — so this also
+/// confirms the file arrives intact and the source is gone.
+#[tokio::test]
+async fn test_move_relocates_files_between_panels() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let payload = vec![42u8; 128 * 1024];
+    std::fs::write(left.path().join("cargo.bin"), &payload).unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    // Put the cursor on the file and move it to the right panel.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('m'));
+
+    for _ in 0..600 {
+        app.resolve_loading_for_test();
+        if right.path().join("cargo.bin").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    assert_eq!(
+        std::fs::read(right.path().join("cargo.bin")).unwrap(),
+        payload,
+        "the file should arrive intact"
+    );
+    assert!(
+        !left.path().join("cargo.bin").exists(),
+        "the source must be gone after a move"
+    );
+}
+
+/// A move with only one panel open explains itself instead of doing nothing.
+#[tokio::test]
+async fn test_move_without_a_destination_panel_explains_why() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('m'));
+    let text = app_screen_text(&mut app, 100, 20);
+    assert!(
+        text.contains("two panels"),
+        "a single-panel move should say what's missing: {}",
+        text
+    );
+    assert!(dir.path().join("a.txt").exists(), "nothing should be moved");
+}
+
+/// Deleting still works after moving to the VFS, including a whole directory.
+#[tokio::test]
+async fn test_delete_removes_files_and_directories_through_the_vfs() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim_dir");
+    std::fs::create_dir_all(victim.join("nested")).unwrap();
+    std::fs::write(victim.join("nested/deep.txt"), "gone").unwrap();
+    std::fs::write(dir.path().join("keep.txt"), "stay").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Select the directory and delete it (confirming the dialog).
+    let mut found = false;
+    for _ in 0..20 {
+        if let myd::screen::Screen::Main(s) = app.current_screen() {
+            if s.tree
+                .selected_line()
+                .map(|l| l.name == "victim_dir")
+                .unwrap_or(false)
+            {
+                found = true;
+                break;
+            }
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert!(found, "could not put the cursor on victim_dir");
+
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    for _ in 0..600 {
+        app.resolve_loading_for_test();
+        if !victim.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    assert!(!victim.exists(), "the directory tree should be deleted");
+    assert!(
+        dir.path().join("keep.txt").exists(),
+        "unrelated files must survive"
+    );
+}
+
+/// A move must never destroy an existing file at the destination.
+///
+/// `rename` replaces the destination silently on both backends, so without a
+/// guard a move onto a taken name would overwrite it with no confirmation and
+/// no way back. The source stays put and the failure is reported.
+#[tokio::test]
+async fn test_move_refuses_to_overwrite_an_existing_file() {
+    use myd::app::FileBrowser;
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("report.txt"), "NEW").unwrap();
+    std::fs::write(right.path().join("report.txt"), "PRECIOUS").unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('m'));
+    for _ in 0..600 {
+        app.resolve_loading_for_test();
+        if !app.is_operation_running_for_test() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(right.path().join("report.txt")).unwrap(),
+        "PRECIOUS",
+        "the existing destination file must survive"
+    );
+    assert!(
+        left.path().join("report.txt").exists(),
+        "a refused move must leave the source in place"
+    );
+}

@@ -346,10 +346,11 @@ impl Screen {
             _ => true,
         }
     }
-    pub fn create_dir(&mut self, name: &str) -> bool {
+    /// Create a directory; returns an error message to surface, or `None`.
+    pub fn create_dir(&mut self, name: &str) -> Option<String> {
         match self {
             Screen::Main(s) => s.create_dir(name),
-            _ => true,
+            _ => None,
         }
     }
     pub fn search_next(&mut self) -> bool {

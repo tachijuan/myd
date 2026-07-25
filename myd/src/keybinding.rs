@@ -37,6 +37,9 @@ pub enum Action {
     ToggleSplit,
     /// Copy the active panel's selection into the other panel's directory.
     Copy,
+    /// Move the active panel's selection into the other panel's directory.
+    /// Within one backend this is a rename; across backends a copy then delete.
+    Move,
     /// Toggle a tag on the file under the cursor.
     ToggleTag,
     /// Toggle visual (range-tag) mode.
@@ -162,6 +165,7 @@ impl KeyBindingHandler {
             'u' => Some(Action::GoParent),
             'v' => Some(Action::ToggleView),
             'c' => Some(Action::Copy),
+            'm' => Some(Action::Move),
             '|' => Some(Action::ToggleSplit),
             't' => Some(Action::ToggleTag),
             'V' => Some(Action::VisualMode),
@@ -220,6 +224,7 @@ impl KeyBindingHandler {
             KeyCode::Char('b') => Some(Action::ToggleBar),
             KeyCode::Char('v') => Some(Action::ToggleView),
             KeyCode::Char('c') => Some(Action::Copy),
+            KeyCode::Char('m') => Some(Action::Move),
             KeyCode::Char('|') => Some(Action::ToggleSplit),
             KeyCode::Tab => Some(Action::SwitchPanel),
             KeyCode::Char('t') => Some(Action::ToggleTag),

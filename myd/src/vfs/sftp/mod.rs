@@ -513,6 +513,15 @@ impl Vfs for SftpFs {
         Ok(to_vmetadata(&meta))
     }
 
+    async fn symlink_stat(&self, path: &VPath) -> Result<VMetadata> {
+        let mut fs = self.sftp.fs();
+        let meta = fs
+            .symlink_metadata(&path.path)
+            .await
+            .with_context(|| format!("could not lstat {}", path.path.display()))?;
+        Ok(to_vmetadata(&meta))
+    }
+
     async fn create_dir_all(&self, path: &VPath) -> Result<()> {
         // Already known to exist (we created or checked it earlier in this
         // session)? Then this costs nothing. A directory copy calls this for

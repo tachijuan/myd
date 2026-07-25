@@ -11,16 +11,16 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree.
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
-- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
+- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the current directory to a regex, masking everything that doesn't match.
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+b`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
-- **Rename and delete** — rename with `R`, delete with `D` (both with confirmation dialogs).
+- **Rename, move and delete** — rename with `R`, move to the other panel with `m`, delete with `D`. Like `mv`, a move within one filesystem is a rename (instant, whatever the file size); a move between two different hosts copies the bytes and removes the source only once the copy has landed. A move never overwrites an existing file at the destination — it reports the conflict and leaves both in place. All of these work on remote panels too.
 - **Change root** — jump to any directory with `gd` without losing your sort and view settings.
-- **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy tagged/selected files into the other panel's directory with `c`. Toggle the split on and off any time with `|`.
+- **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy (`c`) or move (`m`) tagged/selected files into the other panel's directory. Toggle the split on and off any time with `|`.
 - **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
 - **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
 - **Remote browsing over SFTP** — connect to a remote host with `gr` (or launch with `myd sftp://[user@]host[:port][/path]`) and browse it in the active panel. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
@@ -108,9 +108,10 @@ myd sftp://user@host:2222/var/log     # explicit user, port, and starting path
 | `V`       | Visual mode — sweep `j`/`k` to tag a range     |
 | `U`       | Untag everything                               |
 | `c`       | Copy tagged / selected files                   |
+| `m`       | Move tagged / selected files to the other panel |
 | `D`       | Delete tagged / selected files                 |
 
-Tagged files are highlighted; `c` and `D` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
+Tagged files are highlighted; `c`, `m` and `D` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
 
 ### Search & Filter
 
@@ -154,7 +155,7 @@ A copy where one panel is remote runs as a background **transfer** instead of a 
 
 The transfer panel appears once you start a copy and lists queued, active, and finished transfers with per-transfer progress, rate, and ETA. Up to 16 transfers run at once; the rest wait their turn. Within a directory copy, files and subdirectories are also transferred concurrently, so a deep tree of small files is not paced by round-trip latency. The interface stays interactive throughout, so you can keep browsing and queue more. Toggle the panel any time with `Ctrl+t`.
 
-Remote panels are currently **read-only plus copy**: you can browse, sort, filter, tag, and transfer files, but creating directories (`N`), renaming (`R`), and deleting (`D`) are not yet wired through to the server and are refused on a remote panel rather than acting on your local machine. The info panel shows what the directory listing provides — size and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes are shallow (the entry's own size, not a recursive total) because a `du`-style walk would be one round trip per directory.
+Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all work on remote panels too, routed through the same backend the panel is browsing. The info panel shows what the directory listing provides — size and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes are shallow (the entry's own size, not a recursive total) because a `du`-style walk would be one round trip per directory.
 
 ### Screen-level
 

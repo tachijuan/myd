@@ -606,3 +606,79 @@ sftp_test!(create_dir_all_is_cached_across_calls, env, {
 
     let _ = std::fs::remove_dir_all(env.remote_dir.join("cachetest"));
 });
+
+sftp_test!(remote_mkdir_rename_and_delete, env, {
+    // The three mutating operations, end to end against a real sshd. The
+    // harness server shares this filesystem, so the results can be checked
+    // directly rather than through another SFTP round trip.
+    let fs: Arc<dyn Vfs> = Arc::new(connect(&env).await);
+    let backend = myd::vfs::BackendId(1);
+    let base = env.remote_dir.join("mutate_test");
+    let _ = std::fs::remove_dir_all(&base);
+
+    // create_dir_all builds the whole chain.
+    let deep = VPath::new(backend, base.join("a/b/c"));
+    fs.create_dir_all(&deep).await.expect("remote mkdir failed");
+    assert!(base.join("a/b/c").is_dir(), "the chain should exist on the server");
+
+    // rename moves an entry within the remote filesystem.
+    std::fs::write(base.join("a/original.txt"), "contents").unwrap();
+    let from = VPath::new(backend, base.join("a/original.txt"));
+    let to = VPath::new(backend, base.join("a/renamed.txt"));
+    fs.rename(&from, &to).await.expect("remote rename failed");
+    assert!(!base.join("a/original.txt").exists(), "old name should be gone");
+    assert_eq!(
+        std::fs::read_to_string(base.join("a/renamed.txt")).unwrap(),
+        "contents",
+        "renamed file keeps its contents"
+    );
+
+    // Recursive delete empties a populated tree — SFTP's RMDIR only removes an
+    // empty directory, so this exercises the depth-first walk.
+    std::fs::write(base.join("a/b/c/leaf.txt"), "x").unwrap();
+    let cancel = myd::utils::sizes::CancelToken::new();
+    let count = myd::vfs::ops::count_entries(&fs, &VPath::new(backend, base.clone()), &cancel).await;
+    assert!(count >= 5, "expected to count the whole tree, got {}", count);
+
+    myd::vfs::ops::delete_recursive(&fs, &VPath::new(backend, base.clone()), None, &cancel)
+        .await
+        .expect("remote recursive delete failed");
+    assert!(!base.exists(), "the whole remote tree should be gone");
+});
+
+sftp_test!(remote_move_within_the_server_is_a_rename, env, {
+    // A move inside one backend must relink rather than copy: that is what makes
+    // `mv` instant on a large file, and over SFTP it is the difference between
+    // one round trip and streaming every byte twice.
+    let fs: Arc<dyn Vfs> = Arc::new(connect(&env).await);
+    let backend = myd::vfs::BackendId(1);
+    let base = env.remote_dir.join("move_test");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("dest")).unwrap();
+
+    // Big enough that a copy would be measurably slower than a relink.
+    let payload = vec![7u8; 4 * 1024 * 1024];
+    std::fs::write(base.join("big.bin"), &payload).unwrap();
+
+    let cancel = myd::utils::sizes::CancelToken::new();
+    let kind = myd::vfs::ops::move_path(
+        &fs,
+        &fs,
+        &VPath::new(backend, base.join("big.bin")),
+        &VPath::new(backend, base.join("dest/big.bin")),
+        None,
+        &cancel,
+    )
+    .await
+    .expect("remote move failed");
+
+    assert_eq!(kind, myd::vfs::ops::MoveKind::Rename, "same-host move must relink");
+    assert!(!base.join("big.bin").exists(), "source should be gone");
+    assert_eq!(
+        std::fs::read(base.join("dest/big.bin")).unwrap(),
+        payload,
+        "moved file must be intact"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+});

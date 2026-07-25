@@ -353,28 +353,26 @@ impl MainScreenState {
     /// Create a subdirectory named `name` in the cursor's current directory.
     /// A blank name is a no-op. Only the affected directory level is reloaded
     /// (not the whole tree), so this stays fast even in a large tree.
-    pub fn create_dir(&mut self, name: &str) -> bool {
+    /// Returns an error message for the caller to surface, or `None` on success.
+    pub fn create_dir(&mut self, name: &str) -> Option<String> {
         let name = name.trim();
         if name.is_empty() {
-            return true;
+            return None;
         }
         let parent = self.target_dir();
         let dir = parent.join(name);
-        // Callers must not reach here with a remote tree: `std::fs` would create
-        // the directory on the LOCAL machine. `FileBrowser` refuses the action
-        // before opening the prompt (see `Action::CreateDir`).
-        debug_assert!(
-            !self.tree.source.is_remote(),
-            "create_dir must not run against a remote tree"
-        );
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("Create directory failed: {}", e);
+        // Goes through the tree's own source, so a remote panel creates the
+        // directory on the server rather than on this machine. A remote failure
+        // (permissions, a name that already exists) has to reach the user —
+        // silently doing nothing would look like the key press was dropped.
+        if let Err(e) = self.tree.source.create_dir_all(&dir) {
+            return Some(format!("Could not create '{}': {}", name, e));
         }
         // Reload just the parent level so the new directory appears, keeping the
         // size cache and the rest of the tree intact.
         self.tree.reload_dir(&parent);
         self.rebuild_treemap();
-        true
+        None
     }
 
     /// Reload just one directory level (re-listing it, reusing the size cache),
