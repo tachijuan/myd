@@ -274,6 +274,11 @@ impl FileBrowser {
                 }
             }
 
+            // Per-phase timing so a stall between keypresses can be attributed
+            // to the resolve pass or the draw, not just observed. Off unless
+            // MYD_TRACE is set.
+            let tick_started = trace_enabled().then(std::time::Instant::now);
+
             // Check for completed loading tasks and replace with Main screens.
             // A cancelled scan in the active panel with nothing to fall back to
             // tells us to quit.
@@ -291,7 +296,21 @@ impl FileBrowser {
             // Advance any in-flight connection attempt.
             self.resolve_connect();
 
+            let after_resolve = trace_started_now(tick_started);
             terminal.draw(|f| self.draw(f))?;
+
+            // Only log slow ticks: an idle loop runs at 10Hz and would otherwise
+            // bury the interesting entries.
+            if let (Some(start), Some(mid)) = (tick_started, after_resolve) {
+                let total = start.elapsed();
+                if total > std::time::Duration::from_millis(150) {
+                    trace_note(format_args!(
+                        "  tick: resolve={:.1}ms draw={:.1}ms",
+                        mid.duration_since(start).as_secs_f64() * 1000.0,
+                        mid.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                }
+            }
         }
 
         // Guard's Drop will handle cleanup, but explicitly clear the flag so
@@ -750,6 +769,16 @@ impl FileBrowser {
                     screen.cancel_loading();
                     return true;
                 }
+                // The directory picker is a prompt, not a place: `q` backs out
+                // of it and returns to whatever was underneath, the same way Esc
+                // dismisses any other prompt. Quitting the app from it was a
+                // surprise, since `gd` was a question the user could decline.
+                // With nothing underneath there is nothing to return to, so it
+                // quits as before.
+                if matches!(screen, Screen::DirPicker(_)) && self.active_panel().depth() > 1 {
+                    self.pop_screen();
+                    return true;
+                }
                 // Otherwise quit the app immediately, regardless of history.
                 // Use Ctrl-o (PopScreen) to step back up a directory.
                 false
@@ -1013,8 +1042,11 @@ impl FileBrowser {
                         panel.screen_stack.pop();
                     }
                 } else {
-                    // No DirPicker: replace current screen with a fresh one.
-                    *panel.current_screen_mut() = Screen::dir_picker();
+                    // Push rather than replace, so the picker sits *over* the
+                    // current view. Replacing discarded the tree underneath,
+                    // which left `q` nothing to return to — declining `gd` then
+                    // had to quit the app.
+                    panel.screen_stack.push(Screen::dir_picker());
                 }
                 true
             }
@@ -1518,12 +1550,34 @@ impl FileBrowser {
             self.panels.push(keep);
             self.active = 0;
         } else {
-            let start = self.active_panel().current_dir();
-            // The new pane opens on the active panel's current directory, which
-            // has already been scanned — hand down its size cache so the split
-            // is a cache hit instead of a full disk rescan.
-            let cache = self.active_panel().size_cache();
-            self.panels.push(Panel::new_with_cache(start, cache));
+            // The active panel already holds a fully built tree for this
+            // directory. Clone it rather than re-listing: a rescan showed a
+            // loading screen for something already in memory, and on a remote or
+            // network-mounted directory that meant a real wait. Cloning also
+            // keeps a remote split remote — rebuilding went through the local
+            // filesystem regardless of the backend.
+            let cloned = match self.active_panel().current_screen() {
+                Screen::Main(state) => Some((
+                    state.root_path().clone(),
+                    state.tree.clone(),
+                    self.active_panel().backend,
+                )),
+                _ => None,
+            };
+            match cloned {
+                Some((path, tree, backend)) => {
+                    let mut panel = Panel::from_tree(path, tree);
+                    panel.backend = backend;
+                    self.panels.push(panel);
+                }
+                // Not showing a tree yet (a picker or still loading) — fall back
+                // to opening the directory the normal way.
+                None => {
+                    let start = self.active_panel().current_dir();
+                    let cache = self.active_panel().size_cache();
+                    self.panels.push(Panel::new_with_cache(start, cache));
+                }
+            }
             // Focus the freshly opened panel.
             self.active = 1;
         }
@@ -1993,6 +2047,11 @@ impl FileBrowser {
         // doesn't keep highlighting rows that are about to vanish.
         panel.current_screen_mut().clear_tags();
     }
+}
+
+/// `Instant::now()` when tracing is on, mirroring an existing `Option` marker.
+fn trace_started_now(marker: Option<std::time::Instant>) -> Option<std::time::Instant> {
+    marker.map(|_| std::time::Instant::now())
 }
 
 /// Whether `MYD_TRACE` asked for key-timing diagnostics. Read once.

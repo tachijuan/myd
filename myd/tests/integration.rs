@@ -4457,3 +4457,89 @@ async fn test_treemap_rebuild_does_no_filesystem_io() {
     );
     assert_eq!(colour_of(&after, "media"), FileCategory::Video);
 }
+
+/// Splitting reuses the tree already on screen instead of re-listing.
+///
+/// `|` showed a loading screen for a directory the active panel had already
+/// scanned. On a network mount that meant a real wait to see something the app
+/// was already displaying.
+#[tokio::test]
+async fn test_split_clones_the_tree_without_rescanning() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("f{}.txt", i)), vec![b'x'; 100]).unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    let before = match app.current_screen() {
+        Screen::Main(s) => s.tree.lines.len(),
+        _ => panic!("expected a main screen"),
+    };
+
+    // Delete the contents: a rescan would come back empty, a clone cannot.
+    for i in 0..5 {
+        std::fs::remove_file(dir.path().join(format!("f{}.txt", i))).unwrap();
+    }
+
+    app.handle_key_for_test(char_key('|'));
+    assert_eq!(app.panel_count(), 2, "split should open a second panel");
+
+    // The new panel is immediately usable — not a loading screen.
+    match app.current_screen() {
+        Screen::Main(s) => assert_eq!(
+            s.tree.lines.len(),
+            before,
+            "the split panel should mirror the tree, not re-read the directory"
+        ),
+        Screen::Loading(_) => panic!("split showed a loading screen instead of cloning the tree"),
+        _ => panic!("unexpected screen after split"),
+    }
+}
+
+/// Backing out of the directory picker returns to the tree rather than quitting.
+///
+/// `gd` asks a question; declining it should return you to where you were, the
+/// way Esc dismisses any other prompt — not exit the app. (Esc, not `q`: the
+/// picker has a text field, and a path may legitimately contain a `q`.)
+#[tokio::test]
+async fn test_leaving_the_dir_picker_does_not_quit() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // `gd` opens the picker.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    assert!(
+        matches!(app.current_screen(), Screen::DirPicker(_)),
+        "gd should open the directory picker"
+    );
+
+    // Esc dismisses it and keeps the app running.
+    let still_running = app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(
+        still_running,
+        "leaving the directory picker must not quit the whole app"
+    );
+    assert!(
+        matches!(app.current_screen(), Screen::Main(_)),
+        "dismissing the picker should reveal the tree that was underneath"
+    );
+
+    // From the tree itself, q still quits.
+    assert!(
+        !app.handle_key_for_test(char_key('q')),
+        "q on the main screen should still quit"
+    );
+}

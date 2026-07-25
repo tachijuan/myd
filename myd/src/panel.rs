@@ -201,6 +201,22 @@ impl Panel {
     /// As [`new`], but seed the tree build with an existing size cache so a
     /// panel opened on an already-scanned directory is a cache hit rather than a
     /// full rescan.
+    /// A panel showing an already-built tree.
+    ///
+    /// Used by the split, which copies the active panel's tree instead of
+    /// re-listing the directory it is already displaying.
+    pub fn from_tree(root: PathBuf, tree: crate::widget::file_tree::FileTree) -> Self {
+        Self {
+            screen_stack: vec![Screen::Main(
+                crate::screen::MainScreenState::from_tree(root, tree),
+            )],
+            view_prefs: ViewPrefs::default(),
+            delete_task: None,
+            deleting_paths: Vec::new(),
+            backend: crate::vfs::BackendId::LOCAL,
+        }
+    }
+
     pub fn new_with_cache(
         start: Option<PathBuf>,
         cache: Option<crate::utils::sizes::SizeCache>,
