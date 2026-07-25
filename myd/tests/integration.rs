@@ -2,6 +2,11 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
+/// The process working directory is global, so tests that change it (to exercise
+/// the "default to cwd" behavior) must not run concurrently — one setting the cwd
+/// while another reads it would race. They lock this for their duration.
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Helper to create a temp directory with a known file structure.
 fn create_test_structure() -> tempfile::TempDir {
     let dir = tempfile::TempDir::with_prefix("file-browser-test").unwrap();
@@ -292,13 +297,80 @@ fn test_sort_smallest_is_reverse_of_largest() {
     );
 }
 
+/// Three files with distinct, known modification times (old / mid / new).
+fn mtime_fixture() -> tempfile::TempDir {
+    use std::time::{Duration, SystemTime};
+    let dir = tempfile::tempdir().unwrap();
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    for (name, offset) in [("old.txt", 0), ("mid.txt", 100_000), ("new.txt", 200_000)] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"x").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_modified(base + Duration::from_secs(offset)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn test_sort_newest_orders_by_mtime_descending() {
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+
+    let dir = mtime_fixture();
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Newest, true, true);
+    assert_eq!(
+        names_at_depth(&tree, 1),
+        vec!["new.txt", "mid.txt", "old.txt"],
+        "newest sort should list the most recently modified first"
+    );
+}
+
+#[test]
+fn test_sort_oldest_orders_by_mtime_ascending() {
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+
+    let dir = mtime_fixture();
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Oldest, true, true);
+    assert_eq!(
+        names_at_depth(&tree, 1),
+        vec!["old.txt", "mid.txt", "new.txt"],
+        "oldest sort should list the least recently modified first"
+    );
+}
+
+#[tokio::test]
+async fn test_sort_mode_cycles_through_time_orders() {
+    // Cycling with `s` reaches the time-based modes.
+    let dir = mtime_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let sort_label = |app: &FileBrowser| match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode.label().to_string(),
+        _ => String::new(),
+    };
+
+    // From the default (largest), press `s` until every new time mode appears.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..7 {
+        seen.insert(sort_label(&app));
+        app.handle_key_for_test(char_key('s'));
+    }
+    seen.insert(sort_label(&app));
+    for expected in ["newest", "oldest", "recently-accessed"] {
+        assert!(seen.contains(expected), "cycle never reached {}", expected);
+    }
+}
+
 #[test]
 fn test_sort_correct_after_switching_mode() {
     use myd::screen::SortMode;
     use myd::widget::file_tree::FileTree;
 
-    // set_sort_mode clears the size cache; sizes must be recomputed, not read
-    // back as shallow metadata lengths.
+    // set_sort_mode reorders in place using the recursive directory sizes
+    // already in the cache — a directory sorts by its total size, not its
+    // shallow metadata length.
     let dir = sorting_fixture();
     let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, true);
     tree.set_sort_mode(SortMode::Largest);
@@ -319,7 +391,8 @@ fn test_sort_correct_after_toggle_hidden() {
     use myd::screen::SortMode;
     use myd::widget::file_tree::FileTree;
 
-    // toggle_hidden also clears the cache and reloads every expanded level.
+    // On a local tree, toggle_hidden reloads expanded levels to pick up hidden
+    // entries that were skipped while hidden was off, then re-sorts.
     let dir = sorting_fixture();
     let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, false, true);
     tree.toggle_hidden();
@@ -339,7 +412,11 @@ fn test_sort_applies_at_nested_levels() {
     std::fs::write(dir.path().join("parent/a_small/f.bin"), vec![0u8; 100]).unwrap();
     // b_huge's weight is nested two levels down, so only a recursive walk finds it.
     std::fs::create_dir_all(dir.path().join("parent/b_huge/deep")).unwrap();
-    std::fs::write(dir.path().join("parent/b_huge/deep/f.bin"), vec![0u8; 90_000]).unwrap();
+    std::fs::write(
+        dir.path().join("parent/b_huge/deep/f.bin"),
+        vec![0u8; 90_000],
+    )
+    .unwrap();
     std::fs::create_dir_all(dir.path().join("parent/c_mid")).unwrap();
     std::fs::write(dir.path().join("parent/c_mid/f.bin"), vec![0u8; 5_000]).unwrap();
 
@@ -375,7 +452,7 @@ fn test_treemap_from_real_directory() {
     use myd::screen::SortMode;
     use myd::widget::file_tree::FileTree;
     use myd::widget::treemap::TreeMap;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     let dir = tempfile::tempdir().unwrap();
     for (name, sz) in [
@@ -430,7 +507,7 @@ fn test_treemap_survives_degenerate_area() {
     use myd::screen::SortMode;
     use myd::widget::file_tree::FileTree;
     use myd::widget::treemap::TreeMap;
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     let dir = sorting_fixture();
     let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, true);
@@ -458,7 +535,7 @@ fn test_treemap_survives_degenerate_area() {
 fn test_screens_render_at_tiny_terminal_sizes() {
     use myd::screen::{Screen, SortMode};
     use myd::widget::file_tree::FileTree;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     // Fixed-size dialogs and the treemap must clamp to the available area rather
     // than indexing outside the buffer.
@@ -489,8 +566,8 @@ fn test_screens_render_at_tiny_terminal_sizes() {
 
 #[test]
 fn test_tiles_colored_by_file_category() {
-    use myd::utils::filetype::FileCategory;
     use myd::screen::SortMode;
+    use myd::utils::filetype::FileCategory;
     use myd::widget::file_tree::FileTree;
     use myd::widget::treemap::TreeMap;
 
@@ -540,8 +617,8 @@ fn test_tiles_colored_by_file_category() {
 
 #[test]
 fn test_directory_tiles_take_dominant_content_color() {
-    use myd::utils::filetype::FileCategory;
     use myd::screen::SortMode;
+    use myd::utils::filetype::FileCategory;
     use myd::widget::file_tree::FileTree;
     use myd::widget::treemap::TreeMap;
 
@@ -578,7 +655,7 @@ fn test_render_fills_tiles_with_category_color() {
     use myd::screen::SortMode;
     use myd::widget::file_tree::FileTree;
     use myd::widget::treemap::TreeMap;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), vec![0u8; 100_000]).unwrap();
@@ -600,7 +677,11 @@ fn test_render_fills_tiles_with_category_color() {
     // Every interior cell of a tile carries that tile's category background.
     for cell in &tm.cells {
         let r = cell.rect;
-        assert!(r.width >= 3 && r.height >= 3, "tile too small to check: {:?}", r);
+        assert!(
+            r.width >= 3 && r.height >= 3,
+            "tile too small to check: {:?}",
+            r
+        );
         let want = cell.category.bg_color();
         for y in (r.y + 1)..(r.y + r.height - 1) {
             for x in (r.x + 1)..(r.x + r.width - 1) {
@@ -619,8 +700,8 @@ fn test_render_fills_tiles_with_category_color() {
 
 #[test]
 fn test_legend_lists_visible_categories_by_size() {
-    use myd::utils::filetype::FileCategory;
     use myd::screen::SortMode;
+    use myd::utils::filetype::FileCategory;
     use myd::widget::file_tree::FileTree;
     use myd::widget::treemap::TreeMap;
 
@@ -644,7 +725,7 @@ fn test_legend_lists_visible_categories_by_size() {
 fn test_footer_keeps_keybindings_when_legend_does_not_fit() {
     use myd::screen::{ScreenState, SortMode};
     use myd::widget::file_tree::FileTree;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     let dir = tempfile::tempdir().unwrap();
     for (name, sz) in [
@@ -687,7 +768,7 @@ fn test_footer_keeps_keybindings_when_legend_does_not_fit() {
 /// Read the info panel (right 30% of the screen) as text.
 fn info_panel_text(st: &mut myd::screen::MainScreenState, w: u16, h: u16) -> String {
     use myd::screen::ScreenState;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| st.render(f, f.area())).unwrap();
@@ -784,7 +865,11 @@ fn test_info_panel_updates_after_refresh() {
     st.tree.cursor = 1;
 
     let before = info_panel_text(&mut st, 100, 20);
-    assert!(before.contains("1000 B"), "expected initial size: {}", before);
+    assert!(
+        before.contains("1000 B"),
+        "expected initial size: {}",
+        before
+    );
 
     std::fs::write(dir.path().join("grow/b.bin"), vec![0u8; 500_000]).unwrap();
     st.refresh();
@@ -815,7 +900,11 @@ fn test_info_panel_visibility_persists_across_view_switches() {
 
     // Hiding the panel in one view keeps it hidden in the other, and vice versa.
     st.info_panel_hidden = true;
-    for focus in [FocusTarget::Treemap, FocusTarget::Tree, FocusTarget::Treemap] {
+    for focus in [
+        FocusTarget::Treemap,
+        FocusTarget::Tree,
+        FocusTarget::Treemap,
+    ] {
         st.focus = focus;
         let text = info_panel_text(&mut st, 100, 20);
         assert!(
@@ -1019,7 +1108,10 @@ fn test_dir_scan_caches_every_descendant() {
 
     let cache = SizeCache::new();
     let total = get_dir_size_caching(&dir.path().join("a"), &cache);
-    assert_eq!(total, 1500, "caching walk must total the same as a plain walk");
+    assert_eq!(
+        total, 1500,
+        "caching walk must total the same as a plain walk"
+    );
     assert_eq!(total, get_dir_size(&dir.path().join("a")));
 
     // Every nested directory is recorded with its own recursive size, so
@@ -1027,7 +1119,12 @@ fn test_dir_scan_caches_every_descendant() {
     for (rel, want) in [("a", 1500u64), ("a/b", 600), ("a/b/c", 400), ("a/d", 800)] {
         let p = dir.path().join(rel);
         assert_eq!(cache.get(&p), Some(want), "wrong cached size for {}", rel);
-        assert_eq!(cache.get(&p), Some(get_dir_size(&p)), "cache disagrees for {}", rel);
+        assert_eq!(
+            cache.get(&p),
+            Some(get_dir_size(&p)),
+            "cache disagrees for {}",
+            rel
+        );
     }
 }
 
@@ -1042,7 +1139,11 @@ fn test_opening_subdirectory_reuses_cached_sizes() {
         std::fs::create_dir_all(sub.join("inner")).unwrap();
         for f in 0..20 {
             std::fs::write(sub.join(format!("f{}.bin", f)), vec![0u8; 512]).unwrap();
-            std::fs::write(sub.join("inner").join(format!("g{}.bin", f)), vec![0u8; 512]).unwrap();
+            std::fs::write(
+                sub.join("inner").join(format!("g{}.bin", f)),
+                vec![0u8; 512],
+            )
+            .unwrap();
         }
     }
 
@@ -1083,7 +1184,7 @@ fn test_opening_subdirectory_reuses_cached_sizes() {
 async fn test_refresh_forces_a_rescan() {
     use myd::screen::{ScreenState, SortMode};
     use myd::widget::file_tree::FileTree;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     // Sizes are cached, so a file added behind the app's back stays invisible
     // until the user asks for a rescan with `r`.
@@ -1140,7 +1241,7 @@ fn long_name_screen() -> (tempfile::TempDir, myd::screen::MainScreenState) {
 
 fn footer_text(st: &mut myd::screen::MainScreenState, w: u16, h: u16) -> String {
     use myd::screen::ScreenState;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| st.render(f, f.area())).unwrap();
@@ -1259,7 +1360,11 @@ async fn test_q_quits_immediately_from_a_subdirectory() {
 
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     settle(&mut app).await;
-    assert_eq!(app.screen_stack_depth(), 2, "should have descended into sub");
+    assert_eq!(
+        app.screen_stack_depth(),
+        2,
+        "should have descended into sub"
+    );
 
     let keep_running = app.handle_key_for_test(char_key('q'));
     assert!(!keep_running, "q must quit the app, not pop a screen");
@@ -1329,14 +1434,21 @@ async fn test_treemap_h_moves_left_then_steps_up_at_edge() {
         }
         let before = selected_name(&app);
         app.handle_key_for_test(char_key('h'));
-        assert_eq!(app.screen_stack_depth(), 2, "h should not pop while moving left");
+        assert_eq!(
+            app.screen_stack_depth(),
+            2,
+            "h should not pop while moving left"
+        );
         assert_ne!(selected_name(&app), before, "h should move the cursor left");
         moved = true;
     }
     assert!(moved, "should have moved left at least once from {}", start);
 
     // Now on the left-edge tile: h steps up to the parent directory.
-    assert!(!treemap_can_move_left(&app), "cursor should be at the left edge");
+    assert!(
+        !treemap_can_move_left(&app),
+        "cursor should be at the left edge"
+    );
     let keep_running = app.handle_key_for_test(char_key('h'));
     assert!(keep_running, "h should not quit");
     assert_eq!(
@@ -1348,7 +1460,7 @@ async fn test_treemap_h_moves_left_then_steps_up_at_edge() {
 
 fn render_once(app: &mut myd::app::FileBrowser) {
     use myd::screen::ScreenState;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     // Render the current screen so the treemap lays out its tiles.
     if let myd::screen::Screen::Main(s) = app.current_screen_mut() {
@@ -1412,7 +1524,11 @@ async fn test_treemap_stays_in_treemap_when_stepping_up_with_h() {
     assert!(!treemap_can_move_left(&app));
     app.handle_key_for_test(char_key('h'));
 
-    assert_eq!(app.screen_stack_depth(), 1, "h should step up to the parent");
+    assert_eq!(
+        app.screen_stack_depth(),
+        1,
+        "h should step up to the parent"
+    );
     assert_eq!(
         view_state(&app).1,
         FocusTarget::Treemap,
@@ -1458,7 +1574,11 @@ fn big_scan_fixture() -> tempfile::TempDir {
         std::fs::create_dir_all(sub.join("inner")).unwrap();
         for f in 0..200 {
             std::fs::write(sub.join(format!("f{}.bin", f)), vec![0u8; 256]).unwrap();
-            std::fs::write(sub.join("inner").join(format!("g{}.bin", f)), vec![0u8; 256]).unwrap();
+            std::fs::write(
+                sub.join("inner").join(format!("g{}.bin", f)),
+                vec![0u8; 256],
+            )
+            .unwrap();
         }
     }
     dir
@@ -1550,7 +1670,10 @@ async fn test_q_cancels_scan_and_returns_to_parent_when_drilled_in() {
     assert!(keep_running, "q during a scan should not quit");
 
     let still_running = drain_loading(&mut app).await;
-    assert!(still_running, "cancelling a drilled-in scan should not quit");
+    assert!(
+        still_running,
+        "cancelling a drilled-in scan should not quit"
+    );
     assert_eq!(
         app.screen_stack_depth(),
         1,
@@ -1614,7 +1737,11 @@ async fn test_esc_and_toggles_close_help_without_acting() {
 
         let keep_running = app.handle_key_for_test(close_key);
         assert!(keep_running, "{:?} in help must not quit", close_key.code);
-        assert!(!app.is_help_open(), "{:?} should close help", close_key.code);
+        assert!(
+            !app.is_help_open(),
+            "{:?} should close help",
+            close_key.code
+        );
     }
 }
 
@@ -1702,20 +1829,35 @@ async fn test_two_positional_paths_start_dual() {
 async fn test_dual_flag_starts_split_single_path() {
     use myd::app::FileBrowser;
 
+    // Serialize with other cwd-mutating tests (the cwd is process-global).
+    let _cwd_lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Point the cwd at a small temp dir so the right panel (which defaults to the
+    // current directory) settles quickly instead of scanning a large real cwd.
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join("c.txt"), "c").unwrap();
+    std::env::set_current_dir(cwd.path()).unwrap();
+
     let left = tempfile::tempdir().unwrap();
-    let mut app =
-        FileBrowser::new(Some(left.path().to_path_buf()), None, true);
-    // The left panel loads its directory; the right opens a dir picker (no
-    // path), so only the active panel is expected to settle to a Main screen.
+    let mut app = FileBrowser::new(Some(left.path().to_path_buf()), None, true);
+    // The left panel loads the given directory; the right panel, with no path,
+    // defaults to the current directory (the dir picker is reserved for `gd`).
     settle(&mut app).await;
+    // Let the right panel's load settle too.
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
     assert_eq!(app.panel_count(), 2, "--dual should open two panels");
     assert!(
         app.panel_current_dir(0).is_some(),
         "left panel is rooted at the given directory"
     );
     assert!(
-        app.panel_current_dir(1).is_none(),
-        "right panel opens a directory picker when no path is given"
+        app.panel_current_dir(1).is_some(),
+        "right panel defaults to the current directory when no path is given"
     );
 }
 
@@ -1935,7 +2077,11 @@ async fn test_visual_mode_sweep_tags_range() {
     app.handle_key_for_test(char_key('V'));
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('j'));
-    assert_eq!(tag_count(&app), 3, "visual sweep should tag the whole range");
+    assert_eq!(
+        tag_count(&app),
+        3,
+        "visual sweep should tag the whole range"
+    );
 
     // A non-motion action exits visual mode but keeps the tags.
     app.handle_key_for_test(char_key('s')); // toggle sort — not a motion
@@ -2001,8 +2147,7 @@ async fn test_dual_panel_copies_tagged_files() {
     app.handle_key_for_test(char_key('c'));
     for _ in 0..200 {
         app.resolve_loading_for_test();
-        let both = right.path().join("one.bin").exists()
-            && right.path().join("two.bin").exists();
+        let both = right.path().join("one.bin").exists() && right.path().join("two.bin").exists();
         if both {
             break;
         }
@@ -2331,7 +2476,11 @@ fn test_operation_overlay_shows_item_counts() {
         .unwrap();
 
     let text = buffer_to_string(&terminal.backend().buffer().clone());
-    assert!(text.contains("Copying"), "overlay shows the verb:\n{}", text);
+    assert!(
+        text.contains("Copying"),
+        "overlay shows the verb:\n{}",
+        text
+    );
     assert!(
         text.contains("3 / 10 items"),
         "overlay shows the running count:\n{}",
@@ -2445,7 +2594,10 @@ async fn test_search_uses_regex() {
             .unwrap_or_default(),
         _ => String::new(),
     };
-    assert_eq!(name, "report2024.log", "regex search should find the .log file");
+    assert_eq!(
+        name, "report2024.log",
+        "regex search should find the .log file"
+    );
 }
 
 #[tokio::test]
@@ -2592,5 +2744,816 @@ async fn test_create_dir_preserves_size_cache() {
         "create-dir must not clear the size cache (was {}, now {})",
         cache_before,
         cache_after
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transfer panel + non-blocking transfer queue.
+// ---------------------------------------------------------------------------
+
+use myd::app::FileBrowser;
+use myd::screen::Screen;
+
+/// Render the whole app and return its buffer as text.
+fn app_screen_text(app: &mut FileBrowser, w: u16, h: u16) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = terminal.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn transfer_panel_hidden_until_a_transfer_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 4096]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // At startup, with no transfers queued, the panel is not shown — it's not
+    // clutter before you've started a copy.
+    assert!(
+        !app.is_transfer_panel_visible(),
+        "panel must stay hidden until a transfer starts"
+    );
+    assert!(!app_screen_text(&mut app, 120, 20).contains("Transfers"));
+
+    // Once a transfer is queued, the panel appears on its own.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dir.path().join("out/payload.bin")),
+    );
+    assert!(
+        app.is_transfer_panel_visible(),
+        "panel must appear once a transfer is queued"
+    );
+    assert!(app_screen_text(&mut app, 120, 20).contains("Transfers"));
+
+    // It stays up while transfers remain, then hides again once the queue clears.
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // Finished transfers still count as "in the queue" until cleared, so the
+    // panel remains visible to show the results.
+    assert!(app.is_transfer_panel_visible());
+}
+
+#[tokio::test]
+async fn ctrl_t_toggles_the_transfer_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 4096]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Toggle it on before any transfer — the explicit override wins over the
+    // auto rule, so the user can pin it open whenever they like.
+    app.handle_key_for_test(ctrl_key('t'));
+    assert!(app.is_transfer_panel_visible());
+    assert!(app_screen_text(&mut app, 120, 20).contains("Transfers"));
+
+    // Toggle it back off.
+    app.handle_key_for_test(ctrl_key('t'));
+    assert!(!app.is_transfer_panel_visible());
+    assert!(!app_screen_text(&mut app, 120, 20).contains("Transfers"));
+
+    // Queue a transfer (like a copy) — this clears the override, so the auto
+    // rule shows it, and Ctrl+t can pin it hidden again.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dir.path().join("out/payload.bin")),
+    );
+    assert!(app.is_transfer_panel_visible());
+    app.handle_key_for_test(ctrl_key('t'));
+    assert!(
+        !app.is_transfer_panel_visible(),
+        "Ctrl+t should hide the panel even with a queued transfer"
+    );
+}
+
+#[tokio::test]
+async fn transfer_panel_yields_on_a_narrow_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 4096]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Queue a transfer so the panel wants to show, then confirm a narrow
+    // terminal still yields the room to the tree.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dir.path().join("out/payload.bin")),
+    );
+    assert!(app.is_transfer_panel_visible());
+    let narrow = app_screen_text(&mut app, 70, 20);
+    assert!(!narrow.contains("Transfers"));
+    assert!(
+        narrow.contains("File Tree"),
+        "tree must still render: {}",
+        narrow
+    );
+}
+
+#[tokio::test]
+async fn queued_transfers_show_in_the_panel_and_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("payload.bin");
+    let payload = vec![9u8; 512 * 1024];
+    std::fs::write(&src, &payload).unwrap();
+    let dest_dir = dir.path().join("out");
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dest_dir.join("payload.bin")),
+    );
+
+    // Before the first tick it is queued, and the panel says so.
+    app.tick_transfers_for_test();
+    let text = app_screen_text(&mut app, 120, 24);
+    assert!(
+        text.contains("payload.bin"),
+        "queued transfer should be listed: {}",
+        text
+    );
+
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    assert_eq!(app.transfer_queue().finished_count(), 1);
+    assert_eq!(
+        std::fs::read(dest_dir.join("payload.bin")).unwrap(),
+        payload
+    );
+}
+
+#[tokio::test]
+async fn navigation_still_works_while_transfers_run() {
+    // The whole point of the queue: the UI must not block.
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("f{}.bin", i)),
+            vec![1u8; 512 * 1024],
+        )
+        .unwrap();
+    }
+    let dest_dir = dir.path().join("out");
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    for i in 0..6 {
+        let name = format!("f{}.bin", i);
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(dir.path().join(&name)),
+            myd::vfs::VPath::local(dest_dir.join(&name)),
+        );
+    }
+    app.tick_transfers_for_test();
+
+    // Work is genuinely in flight here — that's the precondition for the
+    // responsiveness checks below. (Not all six need to be *queued*: the default
+    // cap is large enough to start them all at once, which is fine.)
+    assert!(app.transfer_queue().has_work());
+    assert!(app.transfer_queue().active_count() >= 1);
+    assert!(
+        app.transfer_queue().active_count() <= app.transfer_queue().config.max_parallel,
+        "the cap must still hold"
+    );
+
+    // Keys still route and the app still renders mid-transfer.
+    let cursor_before = match app.current_screen() {
+        Screen::Main(s) => s.tree.cursor,
+        _ => 0,
+    };
+    app.handle_key_for_test(char_key('j'));
+    let cursor_after = match app.current_screen() {
+        Screen::Main(s) => s.tree.cursor,
+        _ => 0,
+    };
+    assert_ne!(
+        cursor_before, cursor_after,
+        "cursor must move during transfers"
+    );
+
+    // Toggling views mid-transfer must not panic either.
+    app.handle_key_for_test(char_key('v'));
+    let _ = app_screen_text(&mut app, 120, 24);
+    app.handle_key_for_test(char_key('v'));
+
+    for _ in 0..4000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert_eq!(app.transfer_queue().finished_count(), 6);
+}
+
+#[tokio::test]
+async fn gx_cancels_outstanding_transfers() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("c{}.bin", i)), vec![2u8; 64 * 1024]).unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    for i in 0..5 {
+        let name = format!("c{}.bin", i);
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(dir.path().join(&name)),
+            myd::vfs::VPath::local(dir.path().join("out").join(&name)),
+        );
+    }
+
+    // g then x.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('x'));
+
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    assert!(!app.transfer_queue().has_work());
+    // Nothing succeeded: every entry was cancelled before or during transfer.
+    assert!(app
+        .transfer_queue()
+        .transfers()
+        .iter()
+        .all(|t| !matches!(t.state, myd::transfer::TransferState::Done)));
+}
+
+#[tokio::test]
+async fn transfer_panel_coexists_with_dual_panels_and_info_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, true);
+    settle(&mut app).await;
+    app.resolve_loading_for_test();
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Dual panels + info panel + transfer sidebar all at once must not panic and
+    // must all be present. Pin the transfer panel open (Ctrl+t) since it's not
+    // shown by default without a queued transfer.
+    app.handle_key_for_test(ctrl_key('b'));
+    app.handle_key_for_test(ctrl_key('t'));
+    let text = app_screen_text(&mut app, 160, 30);
+    assert!(text.contains("Transfers"), "sidebar missing: {}", text);
+    assert_eq!(app.panel_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Startup defaults to the current directory (not the directory picker).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn no_arg_startup_opens_current_directory_not_the_picker() {
+    // Serialize with other cwd-mutating tests (the cwd is process-global).
+    let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    // Set the process cwd so "no path" resolves to a known directory.
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    // No path given.
+    let mut app = FileBrowser::new(None, None, false);
+
+    // It must never land on the directory picker — it opens the cwd directly.
+    assert!(
+        !matches!(app.current_screen(), Screen::DirPicker(_)),
+        "no-arg startup should not open the directory picker"
+    );
+
+    settle(&mut app).await;
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+
+    let rooted = app
+        .panel_current_dir(0)
+        .and_then(|p| p.canonicalize().ok())
+        == std::env::current_dir().ok().and_then(|p| p.canonicalize().ok());
+    assert!(rooted, "panel should be rooted at the current directory");
+}
+
+#[tokio::test]
+async fn gd_chord_opens_the_directory_picker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+
+    // `g` then `d` — the picker is reached only via this chord now.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    assert!(
+        matches!(app.current_screen(), Screen::DirPicker(_)),
+        "gd should open the directory picker"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The user can always stop and exit, even during remote work.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ctrl_c_quits_even_with_a_modal_up() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Open the connect prompt (an Input modal). A plain key would be swallowed
+    // by the modal, but Ctrl-C must still quit.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('r'));
+    // Ctrl-C returns false (quit) regardless of the modal being up.
+    let keep_running = app.handle_key_for_test(ctrl_key('c'));
+    assert!(!keep_running, "Ctrl-C must quit even with a modal open");
+}
+
+#[tokio::test]
+async fn ctrl_c_quits_during_a_connection_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Point at an unroutable address so the connect hangs (it won't complete
+    // within the test); the "Connecting..." overlay is up.
+    app.connect_on_start("sftp://192.0.2.1/tmp"); // TEST-NET-1, never routable
+    assert!(app.is_connecting_for_test());
+
+    // Ctrl-C exits immediately without waiting for the connect to time out.
+    let keep_running = app.handle_key_for_test(ctrl_key('c'));
+    assert!(!keep_running, "Ctrl-C must quit while connecting");
+}
+
+#[tokio::test]
+async fn q_cancels_a_hanging_connection_and_returns_to_browsing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.connect_on_start("sftp://192.0.2.1/tmp");
+    assert!(app.is_connecting_for_test());
+
+    // q during "Connecting..." abandons the attempt and keeps the app running,
+    // dropping the user back to their local panel rather than trapping them.
+    let keep_running = app.handle_key_for_test(char_key('q'));
+    assert!(keep_running, "q should cancel the connect, not quit the app");
+    assert!(!app.is_connecting_for_test(), "connection attempt should be cancelled");
+    // Still on the local Main screen.
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+    assert_eq!(app.panel_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Ghost entries + auto-update of the destination on transfer completion.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_progress_transfer_shows_a_ghost_then_updates_on_completion() {
+    // Source file and an empty destination directory, both local.
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("payload.bin");
+    std::fs::write(&src, vec![7u8; 256 * 1024]).unwrap();
+    let dest_dir = root.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+
+    // Open the destination directory in the panel so we can watch it update.
+    let mut app = FileBrowser::new(Some(dest_dir.clone()), None, false);
+    settle(&mut app).await;
+
+    // The destination directory starts empty on screen.
+    let before = app_screen_text(&mut app, 100, 16);
+    assert!(!before.contains("payload.bin"), "dest should start empty: {}", before);
+
+    // Queue a transfer INTO the open destination directory.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dest_dir.join("payload.bin")),
+    );
+
+    // Before it runs, a ghost row is drawn in the destination tree.
+    let ghost_frame = app_screen_text(&mut app, 100, 16);
+    assert!(
+        ghost_frame.contains("payload.bin") && ghost_frame.contains("copying"),
+        "a ghost row should appear while queued: {}",
+        ghost_frame
+    );
+
+    // Drive to completion.
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert_eq!(app.transfer_queue().finished_count(), 1);
+    // The file really landed.
+    assert!(dest_dir.join("payload.bin").exists());
+
+    // The destination tree updated on its own — the real file is present and the
+    // ghost is gone — WITHOUT the user pressing `r`.
+    let after = app_screen_text(&mut app, 100, 16);
+    assert!(
+        after.contains("payload.bin"),
+        "completed file should appear automatically: {}",
+        after
+    );
+    assert!(
+        !after.contains("copying"),
+        "ghost should clear once the transfer completes: {}",
+        after
+    );
+}
+
+#[tokio::test]
+async fn completion_refresh_is_scoped_to_the_destination_directory() {
+    // A file already present in the dest dir must survive the targeted reload
+    // (i.e. the reload re-lists that one level, it doesn't wipe the tree).
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("new.bin");
+    std::fs::write(&src, vec![1u8; 64 * 1024]).unwrap();
+    let dest_dir = root.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    std::fs::write(dest_dir.join("already-here.txt"), "x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dest_dir.clone()), None, false);
+    settle(&mut app).await;
+    assert!(app_screen_text(&mut app, 100, 16).contains("already-here.txt"));
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dest_dir.join("new.bin")),
+    );
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let after = app_screen_text(&mut app, 100, 16);
+    assert!(after.contains("new.bin"), "new file should appear: {}", after);
+    assert!(
+        after.contains("already-here.txt"),
+        "existing file must survive the targeted reload: {}",
+        after
+    );
+}
+
+/// A symlink to a directory must be enterable, not treated as a plain file.
+///
+/// `read_dir` reports the *link's* type, so without resolving the target a
+/// symlinked directory arrives with `is_dir == false` and can't be expanded —
+/// the user sees it but can't traverse it.
+#[tokio::test]
+async fn test_symlinked_directory_is_traversable() {
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+
+    let td = tempfile::tempdir().unwrap();
+    let real = td.path().join("real_dir");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("inside.txt"), "hi").unwrap();
+    std::os::unix::fs::symlink(&real, td.path().join("link_dir")).unwrap();
+
+    let mut tree = FileTree::new(td.path().to_path_buf(), SortMode::Largest, true, false);
+    tree.expand_all();
+
+    let link = tree
+        .lines
+        .iter()
+        .find(|l| l.name == "link_dir")
+        .expect("link_dir should be listed");
+    assert!(link.is_symlink, "link_dir should be flagged as a symlink");
+    assert!(
+        link.is_dir,
+        "a symlink to a directory must report is_dir so it can be entered"
+    );
+
+    // Expanding it reaches the target's contents.
+    assert!(
+        tree.lines
+            .iter()
+            .any(|l| l.name == "inside.txt" && l.depth > 1),
+        "should traverse into the symlinked directory"
+    );
+}
+
+/// Symlinks render differently from the real files and directories they point
+/// at: a link glyph, a distinct colour, and a trailing `@` that survives on a
+/// monochrome terminal.
+#[tokio::test]
+async fn test_symlinks_render_distinctly() {
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::{FileTree, SYMLINK_COLOR};
+
+    let td = tempfile::tempdir().unwrap();
+    let real = td.path().join("real_dir");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(td.path().join("plain.txt"), "x").unwrap();
+    std::os::unix::fs::symlink(&real, td.path().join("link_dir")).unwrap();
+    std::os::unix::fs::symlink(td.path().join("plain.txt"), td.path().join("link_file")).unwrap();
+
+    let mut tree = FileTree::new(td.path().to_path_buf(), SortMode::Largest, true, false);
+    tree.expand_all();
+
+    let text = tree.render_text();
+    let rendered: Vec<String> = text
+        .lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+        .collect();
+    let all = rendered.join("\n");
+
+    // Directory link and file link both get the link glyph and an `@` suffix
+    // (with a `/` for the directory), while the real entries keep theirs.
+    assert!(all.contains("🔗 link_dir@/"), "dir symlink marker missing: {}", all);
+    assert!(all.contains("🔗 link_file@"), "file symlink marker missing: {}", all);
+    assert!(all.contains("📂 real_dir"), "real dir should keep its icon: {}", all);
+    assert!(all.contains("📄 plain.txt"), "real file should keep its icon: {}", all);
+
+    // The link name is coloured distinctly from a real directory's blue.
+    let link_style = text
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content.starts_with("link_dir"))
+        .map(|s| s.style)
+        .expect("link_dir span");
+    assert_eq!(link_style.fg, Some(SYMLINK_COLOR));
+}
+
+/// A long prompt must stay fully readable and keep its Enter/Esc hint on screen.
+///
+/// The dialog was a fixed 55x7 box with 7 content lines, so the borders clipped
+/// the last two rows — the hint vanished — and a long `user@host` was truncated
+/// at the border, leaving the user unsure what was being asked.
+#[tokio::test]
+async fn test_input_dialog_wraps_long_prompts_and_keeps_hint() {
+    use myd::widget::input_dialog::InputDialog;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dialog = InputDialog::new(
+        "Password for a-fairly-long-username@some.remote.host.example.com:",
+        "",
+    )
+    .masked();
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| dialog.render(f, f.area())).unwrap();
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The whole address survives, wrapped rather than cut at the border.
+    assert!(
+        text.contains("a-fairly-long-username@some.remote.host.example.com:"),
+        "long prompt was truncated: {}",
+        text
+    );
+    // And the user can still see how to answer it.
+    assert!(
+        text.contains("Enter: OK") && text.contains("Esc: Cancel"),
+        "the Enter/Esc hint was clipped: {}",
+        text
+    );
+}
+
+/// A rejected password must be re-promptable rather than a dead end.
+///
+/// A wrong password used to `bail!` into a generic failure dialog, stranding the
+/// user with no way back to the prompt — a typo meant restarting the connection.
+#[tokio::test]
+async fn test_wrong_password_reprompts_instead_of_failing() {
+    use myd::vfs::sftp::AuthNeed;
+
+    // The retry flag is what distinguishes "ask again" from a fatal error, and
+    // it drives the wording the user sees.
+    let first = AuthNeed::Password {
+        user: "juan".into(),
+        host: "example.com".into(),
+        retry: false,
+    };
+    let again = AuthNeed::Password {
+        user: "juan".into(),
+        host: "example.com".into(),
+        retry: true,
+    };
+    assert_ne!(first, again, "a retry must be distinguishable from the first ask");
+
+    // The retry prompt says the attempt failed and that Esc gives up.
+    let prompt = myd::app::credential_prompt_for_test(&again);
+    assert!(
+        prompt.contains("Authentication failed"),
+        "retry prompt should say the password was rejected: {}",
+        prompt
+    );
+    assert!(
+        prompt.contains("Esc"),
+        "retry prompt should offer a way out: {}",
+        prompt
+    );
+    // The first ask stays terse.
+    let first_prompt = myd::app::credential_prompt_for_test(&first);
+    assert!(!first_prompt.contains("Authentication failed"), "{}", first_prompt);
+}
+
+/// A nested directory copy must reproduce the tree exactly, including empty
+/// directories and byte-identical file contents.
+///
+/// Files within a level and subdirectories themselves are now copied
+/// concurrently (a serial walk was the dominant cost on a high-latency link), so
+/// this guards against the parallelism corrupting or dropping anything.
+#[tokio::test]
+async fn test_concurrent_directory_copy_reproduces_the_tree() {
+    use myd::transfer::{run_transfer, TransferConfig, TransferId, TransferJob, TransferProgress};
+    use myd::utils::sizes::CancelToken;
+    use myd::vfs::{LocalFs, VPath, Vfs};
+    use std::sync::Arc;
+
+    let td = tempfile::tempdir().unwrap();
+    let src = td.path().join("src");
+    let dest = td.path().join("dest");
+
+    // A tree wide and deep enough to exercise the concurrent paths, with varied
+    // file sizes and an empty directory.
+    let mut expected: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    for d in 0..4 {
+        let dir = src.join(format!("dir{}", d)).join("nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in 0..5 {
+            let content: Vec<u8> = (0..(1024 * (f + 1) + d)).map(|i| (i % 251) as u8).collect();
+            let path = dir.join(format!("file{}.bin", f));
+            std::fs::write(&path, &content).unwrap();
+            expected.push((path.strip_prefix(&src).unwrap().to_path_buf(), content));
+        }
+    }
+    std::fs::create_dir_all(src.join("empty_dir")).unwrap();
+
+    let fs: Arc<dyn Vfs> = Arc::new(LocalFs::new());
+    let outcome = run_transfer(TransferJob {
+        id: TransferId(1),
+        src_fs: fs.clone(),
+        dest_fs: fs.clone(),
+        src: VPath::local(&src),
+        dest: VPath::local(&dest),
+        progress: Arc::new(TransferProgress::new(0)),
+        cancel: CancelToken::new(),
+        config: TransferConfig::default(),
+    })
+    .await
+    .expect("directory copy failed");
+    assert!(matches!(outcome, myd::transfer::TransferOutcome::Done));
+
+    for (rel, content) in &expected {
+        let landed = dest.join(rel);
+        let got = std::fs::read(&landed)
+            .unwrap_or_else(|e| panic!("missing {}: {}", landed.display(), e));
+        assert_eq!(&got, content, "content differs for {}", rel.display());
+    }
+    assert!(
+        dest.join("empty_dir").is_dir(),
+        "an empty directory must still be created"
+    );
+}
+
+/// The progress total grows as the tree is discovered, and ends up matching the
+/// bytes actually transferred.
+///
+/// The total used to come from a full recursive pre-walk that had to finish
+/// before the first byte moved; it is now accumulated from the listings the copy
+/// already performs.
+#[tokio::test]
+async fn test_directory_copy_progress_total_matches_bytes_copied() {
+    use myd::transfer::{run_transfer, TransferConfig, TransferId, TransferJob, TransferProgress};
+    use myd::utils::sizes::CancelToken;
+    use myd::vfs::{LocalFs, VPath, Vfs};
+    use std::sync::Arc;
+
+    let td = tempfile::tempdir().unwrap();
+    let src = td.path().join("src");
+    let dest = td.path().join("dest");
+
+    let mut total_bytes = 0u64;
+    for d in 0..3 {
+        let dir = src.join(format!("d{}", d));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in 0..4 {
+            let content = vec![7u8; 2048 * (f + 1)];
+            total_bytes += content.len() as u64;
+            std::fs::write(dir.join(format!("f{}.bin", f)), &content).unwrap();
+        }
+    }
+
+    let fs: Arc<dyn Vfs> = Arc::new(LocalFs::new());
+    let progress = Arc::new(TransferProgress::new(0));
+    run_transfer(TransferJob {
+        id: TransferId(1),
+        src_fs: fs.clone(),
+        dest_fs: fs.clone(),
+        src: VPath::local(&src),
+        dest: VPath::local(&dest),
+        progress: progress.clone(),
+        cancel: CancelToken::new(),
+        config: TransferConfig::default(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        progress.total_bytes(),
+        total_bytes,
+        "discovered total should equal the tree's real size"
+    );
+    assert_eq!(progress.bytes_done(), total_bytes, "all bytes accounted for");
+    assert!((progress.fraction() - 1.0).abs() < 1e-9);
+}
+
+/// The transfer panel reports the work, not the worker-pool capacity.
+///
+/// It used to read "Transfers (0/4)", which looks like four transfers exist and
+/// none have started; the 4 was just the parallelism cap.
+#[tokio::test]
+async fn test_transfer_panel_title_shows_work_not_capacity() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.bin"), vec![1u8; 256 * 1024]).unwrap();
+    let dest_dir = dir.path().join("out");
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Idle: no misleading "0/N".
+    app.handle_key_for_test(ctrl_key('t')); // pin the panel visible
+    let idle = app_screen_text(&mut app, 120, 20);
+    assert!(idle.contains("Transfers"), "panel should be shown: {}", idle);
+    assert!(
+        !idle.contains("0/"),
+        "an idle panel must not imply pending work: {}",
+        idle
+    );
+
+    // With work in flight the title names active/queued counts explicitly.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("a.bin")),
+        myd::vfs::VPath::local(dest_dir.join("a.bin")),
+    );
+    app.tick_transfers_for_test();
+    let busy = app_screen_text(&mut app, 120, 20);
+    assert!(
+        busy.contains("active") || busy.contains("Transfers"),
+        "title should describe the actual work: {}",
+        busy
+    );
+    assert!(
+        !busy.contains("/4)"),
+        "title must not show the parallelism cap: {}",
+        busy
     );
 }

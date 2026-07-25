@@ -1,0 +1,608 @@
+//! End-to-end SFTP tests against a real sshd.
+//!
+//! Skipped unless `MYD_SFTP_TEST` names a config file, so `cargo test` stays
+//! hermetic. The test harness (scripts/sftp_test_env.sh) starts an isolated
+//! sshd on a high port with a dedicated key and writes that file. It never
+//! touches the user's real ~/.ssh.
+//!
+//! The config file has four lines: host, port, key path, remote data dir.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+use myd::transfer::{run_transfer, TransferConfig, TransferId, TransferJob, TransferProgress};
+use myd::utils::sizes::CancelToken;
+use myd::vfs::sftp::{ConnectOutcome, Credentials, SftpFs, SftpTarget};
+use myd::vfs::{VPath, Vfs};
+use std::sync::Arc;
+
+struct TestEnv {
+    host: String,
+    port: u16,
+    /// Present in the config for completeness; auth goes through the agent the
+    /// harness populates, so the path itself isn't read here.
+    #[allow(dead_code)]
+    key: PathBuf,
+    remote_dir: PathBuf,
+}
+
+/// Read the harness config, or `None` when the gate variable is unset.
+fn test_env() -> Option<TestEnv> {
+    // Redirect HOME for this process only (so the known_hosts write lands in the
+    // harness's throwaway dir, not the user's real ~/.ssh). Done here rather than
+    // on the cargo invocation, which would break rustup's toolchain lookup.
+    if let Ok(home) = std::env::var("MYD_SFTP_TEST_HOME") {
+        std::env::set_var("HOME", home);
+    }
+    let cfg = std::env::var("MYD_SFTP_TEST").ok()?;
+    let text = std::fs::read_to_string(cfg).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 4 {
+        return None;
+    }
+    Some(TestEnv {
+        host: lines[0].to_string(),
+        port: lines[1].parse().ok()?,
+        key: PathBuf::from(lines[2]),
+        remote_dir: PathBuf::from(lines[3]),
+    })
+}
+
+/// Connect using the harness key. The key path is passed to russh by pointing
+/// the ssh-config resolution at it via an explicit identity file — but since the
+/// public API resolves keys from ~/.ssh, the harness instead relies on the key
+/// being loadable directly, so we drive connect() with a target and no creds and
+/// let the agent/identity ladder find it.
+async fn connect(env: &TestEnv) -> SftpFs {
+    // The harness registers the key with a temporary ssh-agent whose socket is
+    // exported in SSH_AUTH_SOCK, so the agent step of the ladder authenticates.
+    let target = SftpTarget {
+        host: env.host.clone(),
+        user: Some(whoami()),
+        port: Some(env.port),
+        path: Some(env.remote_dir.clone()),
+    };
+    match SftpFs::connect(&target, &Credentials::default(), true)
+        .await
+        .expect("connect failed")
+    {
+        ConnectOutcome::Connected(fs) => fs,
+        ConnectOutcome::NeedsCredential(need) => {
+            panic!("unexpected credential prompt: {:?}", need)
+        }
+    }
+}
+
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "root".into())
+}
+
+/// Per-test wall-clock budget. Every test here talks to a real sshd, and any of
+/// those awaits can block forever if the server stops answering (a dropped
+/// connection mid-handshake, a wedged sftp subsystem, a firewalled port). The
+/// polling loops in these tests are all bounded, so an unbounded network await
+/// is the only way to hang — and a hung test reports nothing at all, which is
+/// strictly worse than a failure.
+///
+/// Override with `MYD_SFTP_TEST_TIMEOUT` (seconds) for a slow link.
+fn test_timeout() -> std::time::Duration {
+    let secs = std::env::var("MYD_SFTP_TEST_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Define a gated, time-bounded SFTP test.
+///
+/// Expands to a `#[tokio::test]` that (1) skips when the harness gate is unset,
+/// and (2) runs the body under [`test_timeout`], so a wedged server turns into a
+/// named failure instead of a test that never returns. Wrapping the whole body
+/// rather than each network call means awaits added later are covered too.
+///
+/// The bound `$env` is the [`TestEnv`], matching what each body expects.
+macro_rules! sftp_test {
+    ($name:ident, $env:ident, $body:block) => {
+        #[tokio::test]
+        async fn $name() {
+            let Some($env) = test_env() else {
+                eprintln!("MYD_SFTP_TEST unset; skipping SFTP integration test");
+                return;
+            };
+            let budget = test_timeout();
+            if tokio::time::timeout(budget, async move $body).await.is_err() {
+                panic!(
+                    "SFTP test `{}` exceeded {:?} and was aborted — the server \
+                     likely stopped responding. Check that the harness sshd is \
+                     still up (scripts/sftp_test_env.sh), or raise \
+                     MYD_SFTP_TEST_TIMEOUT.",
+                    stringify!($name),
+                    budget,
+                );
+            }
+        }
+    };
+}
+
+sftp_test!(sftp_lists_reads_and_round_trips_a_file, env, {
+    let fs = connect(&env).await;
+
+    // read_dir sees the fixtures the harness created.
+    let dir = VPath::new(myd::vfs::BackendId(1), &env.remote_dir);
+    let entries = fs.read_dir(&dir).await.expect("read_dir failed");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"greeting.txt"), "listing was {:?}", names);
+    assert!(names.contains(&"blob.bin"));
+
+    // stat reports a sane size for the known small file.
+    let greeting = dir.join("greeting.txt");
+    let meta = fs.stat(&greeting).await.expect("stat failed");
+    assert!(!meta.is_dir);
+    assert!(meta.len > 0);
+
+    // Download blob.bin and verify byte-for-byte against the local original.
+    let local_dir = tempfile::tempdir().unwrap();
+    let local_blob = local_dir.path().join("blob.bin");
+    let sftp_fs: Arc<dyn Vfs> = Arc::new(fs);
+    let local_fs: Arc<dyn Vfs> = Arc::new(myd::vfs::LocalFs::new());
+
+    run_transfer(TransferJob {
+        id: TransferId(1),
+        src_fs: sftp_fs.clone(),
+        dest_fs: local_fs.clone(),
+        src: dir.join("blob.bin"),
+        dest: VPath::local(&local_blob),
+        progress: Arc::new(TransferProgress::new(0)),
+        cancel: CancelToken::new(),
+        config: TransferConfig::default(),
+    })
+    .await
+    .expect("download failed");
+
+    let downloaded = std::fs::read(&local_blob).unwrap();
+    let original = std::fs::read(env.remote_dir.join("blob.bin")).unwrap();
+    assert_eq!(downloaded, original, "downloaded bytes differ from original");
+});
+
+sftp_test!(sftp_uploads_a_file, env, {
+    let fs = connect(&env).await;
+    let sftp_fs: Arc<dyn Vfs> = Arc::new(fs);
+    let local_fs: Arc<dyn Vfs> = Arc::new(myd::vfs::LocalFs::new());
+
+    // Make a local file and push it up.
+    let local_dir = tempfile::tempdir().unwrap();
+    let src = local_dir.path().join("upload.dat");
+    let payload = vec![0x5au8; 2 * 1024 * 1024];
+    let mut f = std::fs::File::create(&src).unwrap();
+    f.write_all(&payload).unwrap();
+    drop(f);
+
+    let remote_dest = VPath::new(myd::vfs::BackendId(1), env.remote_dir.join("uploaded.dat"));
+
+    run_transfer(TransferJob {
+        id: TransferId(2),
+        src_fs: local_fs.clone(),
+        dest_fs: sftp_fs.clone(),
+        src: VPath::local(&src),
+        dest: remote_dest.clone(),
+        progress: Arc::new(TransferProgress::new(0)),
+        cancel: CancelToken::new(),
+        config: TransferConfig::default(),
+    })
+    .await
+    .expect("upload failed");
+
+    // The bytes landed on the server (we can read the real file locally since
+    // the harness server shares this filesystem).
+    let landed = std::fs::read(env.remote_dir.join("uploaded.dat")).unwrap();
+    assert_eq!(landed, payload);
+});
+
+sftp_test!(app_connects_and_opens_a_browsable_remote_panel, env, {
+    // Drive the real app connect flow, exactly as `myd sftp://host` would.
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+
+    // Let the local panel settle first.
+    for _ in 0..200 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let target = format!("sftp://{}@{}:{}{}", whoami(), env.host, env.port, env.remote_dir.display());
+    app.connect_on_start(&target);
+    assert!(app.is_connecting_for_test());
+
+    // `gr` opens the remote in the active panel (index 0), replacing the local
+    // view. Tick until its tree finishes loading.
+    let mut opened = false;
+    for _ in 0..600 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    assert!(opened, "remote panel never opened on {}", env.remote_dir.display());
+
+    // Render the app and confirm the remote listing is on screen.
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect();
+
+    assert!(text.contains("greeting.txt"), "remote file not shown in tree");
+});
+
+sftp_test!(remote_navigation_does_not_block_the_event_loop, env, {
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..200 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Connect to the deep tree the harness built (data/deep exists in the fixtures
+    // for this test; fall back to the data dir root otherwise).
+    let start = if env.remote_dir.join("deep").exists() { env.remote_dir.join("deep") } else { env.remote_dir.clone() };
+    let target = format!("sftp://{}@{}:{}{}", whoami(), env.host, env.port, start.display());
+    app.connect_on_start(&target);
+
+    let mut opened = false;
+    for _ in 0..600 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(start.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote panel never opened");
+
+    // The remote panel is active (index 1). Dig into subdirectories with `l`,
+    // asserting each keystroke returns quickly (the event loop is never blocked
+    // by a synchronous network round trip) and the loading resolves.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    for depth in 0..3 {
+        // Move onto the first directory line, then expand it.
+        let before = std::time::Instant::now();
+        app.handle_key_for_test(key('j')); // step down
+        app.handle_key_for_test(key('l')); // expand/enter the directory
+        // The key handler itself must return promptly — this is the anti-freeze
+        // assertion. In the old code this call blocked on the SFTP round trip.
+        assert!(
+            before.elapsed() < std::time::Duration::from_millis(500),
+            "keystroke blocked for {:?} at depth {} — event loop froze",
+            before.elapsed(), depth
+        );
+
+        // Now let the async load resolve.
+        let mut settled = false;
+        for _ in 0..600 {
+            app.tick_for_test();
+            if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { settled = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(settled, "remote directory load never settled at depth {}", depth);
+    }
+
+    // After digging in, the panel still renders and lists entries.
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string()).collect();
+    assert!(text.contains("File Tree"), "remote tree not rendering after navigation");
+});
+
+sftp_test!(remote_refresh_stays_async_and_the_app_can_quit, env, {
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..200 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let target = format!("sftp://{}@{}:{}{}", whoami(), env.host, env.port, env.remote_dir.display());
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..600 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote panel never opened");
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    // Refresh the remote panel (`r`). The keystroke must return promptly — the
+    // re-list runs on the blocking pool, not the event loop.
+    let before = std::time::Instant::now();
+    app.handle_key_for_test(key('r'));
+    assert!(
+        before.elapsed() < std::time::Duration::from_millis(500),
+        "remote refresh blocked the event loop for {:?}",
+        before.elapsed()
+    );
+    // It went to a loading screen and resolves back to Main.
+    let mut settled = false;
+    for _ in 0..600 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { settled = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(settled, "remote refresh never settled");
+
+    // And the app can still be quit from the remote panel.
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(!app.handle_key_for_test(ctrl_c), "Ctrl-C must quit from a remote panel");
+});
+
+sftp_test!(remote_sort_and_hidden_toggle_do_not_block, env, {
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..200 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Open the large directory the harness built.
+    let start = if env.remote_dir.join("big").exists() { env.remote_dir.join("big") } else { env.remote_dir.clone() };
+    let target = format!("sftp://{}@{}:{}{}", whoami(), env.host, env.port, start.display());
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(start.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote panel with many files never opened");
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    // Cycle the sort order several times. Each `s` must return promptly — sorting
+    // reorders the in-memory nodes and must not touch the network. In the old
+    // code this fired an SFTP round trip per directory and froze the UI.
+    for _ in 0..5 {
+        let before = std::time::Instant::now();
+        app.handle_key_for_test(key('s'));
+        assert!(
+            before.elapsed() < std::time::Duration::from_millis(200),
+            "remote sort blocked the event loop for {:?}",
+            before.elapsed()
+        );
+    }
+
+    // Toggling hidden files must also be instant (a remote tree loads every
+    // entry; hiding is a pure reflatten).
+    let before = std::time::Instant::now();
+    app.handle_key_for_test(key('H'));
+    assert!(
+        before.elapsed() < std::time::Duration::from_millis(200),
+        "remote hidden-toggle blocked the event loop for {:?}",
+        before.elapsed()
+    );
+
+    // The panel still renders the directory after all that reordering.
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string()).collect();
+    assert!(text.contains("File Tree"), "remote tree not rendering after sort");
+});
+
+sftp_test!(gr_opens_remote_in_the_active_panel, env, {
+    // Start in dual-panel mode with two local panels.
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("l.txt"), "l").unwrap();
+    std::fs::write(right.path().join("r.txt"), "r").unwrap();
+    let mut app = myd::app::FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    assert_eq!(app.panel_count(), 2);
+
+    // Make the LEFT panel (index 0) active with Tab if needed, then connect.
+    // The app starts with panel 0 active, so no Tab needed — but assert it.
+    assert_eq!(app.active_panel_index(), 0, "left panel should be active at start");
+    let left_dir = app.panel_current_dir(0).unwrap();
+
+    let target = format!("sftp://{}@{}:{}{}", whoami(), env.host, env.port, env.remote_dir.display());
+    app.connect_on_start(&target);
+
+    // Wait for the connect to resolve and the remote to open.
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The remote replaced the ACTIVE (left, index 0) panel — not the other one.
+    assert!(opened, "remote did not open in the active (left) panel");
+    assert_ne!(
+        app.panel_current_dir(0),
+        Some(left_dir),
+        "left panel should no longer show its old local directory"
+    );
+    // The inactive right panel is untouched.
+    assert_eq!(
+        app.panel_current_dir(1),
+        Some(right.path().to_path_buf().canonicalize().unwrap()),
+        "right panel should be unchanged"
+    );
+    assert_eq!(app.active_panel_index(), 0, "active panel stays the one that connected");
+});
+
+sftp_test!(remote_transfer_ghost_updates_on_completion, env, {
+    // Local source file to upload.
+    let local = tempfile::tempdir().unwrap();
+    let src = local.path().join("uploaded_ghost.bin");
+    std::fs::write(&src, vec![9u8; 128 * 1024]).unwrap();
+
+    // Clean the remote target so the test is repeatable.
+    let incoming = env.remote_dir.join("incoming");
+    let _ = std::fs::create_dir_all(&incoming);
+    let _ = std::fs::remove_file(incoming.join("uploaded_ghost.bin"));
+
+    // Start a local panel, connect the remote in the active panel, then split so
+    // both are visible — but simplest: open remote in the active panel and browse
+    // its incoming dir.
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..200 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let target = format!("sftp://{}@{}:{}{}", whoami(), env.host, env.port, incoming.display());
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(incoming.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote incoming dir never opened");
+
+    // Queue an upload of the local file INTO the remote incoming directory (which
+    // is what the panel is showing). The dest is on the remote backend (id 1).
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::new(myd::vfs::BackendId(1), incoming.join("uploaded_ghost.bin")),
+    );
+
+    // A ghost appears in the remote panel while the upload is in flight.
+    let ghost = app_render_text(&mut app, 140, 24);
+    assert!(
+        ghost.contains("uploaded_ghost.bin") && ghost.contains("copying"),
+        "ghost should appear for the in-flight upload: {}",
+        ghost
+    );
+
+    // Drive to completion.
+    for _ in 0..3000 {
+        app.tick_for_test();
+        if !app.transfer_queue().has_work() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    assert_eq!(app.transfer_queue().finished_count(), 1);
+    assert!(incoming.join("uploaded_ghost.bin").exists(), "file should land on the server");
+
+    // The remote panel updated on its own — real file present, ghost gone.
+    let after = app_render_text(&mut app, 140, 24);
+    assert!(after.contains("uploaded_ghost.bin"), "uploaded file should appear: {}", after);
+    assert!(!after.contains("copying"), "ghost should clear: {}", after);
+});
+
+/// Render the whole app to text (for the ghost assertions above).
+fn app_render_text(app: &mut myd::app::FileBrowser, w: u16, h: u16) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer();
+    (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect()
+}
+
+sftp_test!(remote_symlinked_directory_is_resolved, env, {
+    let fs = connect(&env).await;
+    let dir = VPath::new(myd::vfs::BackendId(1), &env.remote_dir);
+    let entries = fs.read_dir(&dir).await.expect("read_dir failed");
+
+    let link_dir = entries
+        .iter()
+        .find(|e| e.name == "link_subdir")
+        .expect("harness fixture link_subdir missing — restart scripts/sftp_test_env.sh");
+    assert!(link_dir.is_symlink, "link_subdir should be flagged a symlink");
+    // READDIR alone reports the link's own type (not a directory); the backend
+    // must resolve the target so the tree can traverse it.
+    assert!(
+        link_dir.is_dir,
+        "a symlink to a remote directory must resolve to is_dir so it can be entered"
+    );
+
+    let link_file = entries
+        .iter()
+        .find(|e| e.name == "link_greeting.txt")
+        .expect("harness fixture link_greeting.txt missing");
+    assert!(link_file.is_symlink);
+    assert!(!link_file.is_dir, "a link to a file must not look like a directory");
+
+    // Listing through the link reaches the target's contents.
+    let through = fs
+        .read_dir(&dir.join("link_subdir"))
+        .await
+        .expect("listing through the symlink failed");
+    assert!(
+        through.iter().any(|e| e.name == "nested.txt"),
+        "should list the target's contents through the link: {:?}",
+        through.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+});
+
+sftp_test!(create_dir_all_is_cached_across_calls, env, {
+    // `create_dir_all` runs once per written file. On a long link an ancestor
+    // walk each time dominates a directory copy, so repeat calls for a known
+    // directory must not go back to the server.
+    let fs = connect(&env).await;
+    let deep = VPath::new(
+        myd::vfs::BackendId(1),
+        env.remote_dir.join("cachetest/a/b/c"),
+    );
+    let _ = std::fs::remove_dir_all(env.remote_dir.join("cachetest"));
+
+    // First call creates the chain.
+    let t0 = std::time::Instant::now();
+    fs.create_dir_all(&deep).await.expect("create_dir_all failed");
+    let first = t0.elapsed();
+    assert!(deep.path.is_dir(), "the directory chain should exist");
+
+    // Repeat calls are served from the cache — no round trips at all.
+    let t1 = std::time::Instant::now();
+    for _ in 0..20 {
+        fs.create_dir_all(&deep).await.expect("repeat create_dir_all failed");
+    }
+    let repeats = t1.elapsed();
+
+    assert!(
+        repeats < first.max(std::time::Duration::from_millis(1)) * 2,
+        "20 cached calls ({:?}) should cost far less than the first ({:?})",
+        repeats,
+        first
+    );
+
+    let _ = std::fs::remove_dir_all(env.remote_dir.join("cachetest"));
+});

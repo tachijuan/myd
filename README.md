@@ -15,13 +15,18 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the current directory to a regex, masking everything that doesn't match.
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+b`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
-- **Sort modes** — cycle through *dirs first*, *files first*, *largest*, and *smallest* with `s`.
+- **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
+- **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
 - **Rename and delete** — rename with `R`, delete with `D` (both with confirmation dialogs).
 - **Change root** — jump to any directory with `gd` without losing your sort and view settings.
 - **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy tagged/selected files into the other panel's directory with `c`. Toggle the split on and off any time with `|`.
 - **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
 - **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
+- **Remote browsing over SFTP** — connect to a remote host with `gr` (or launch with `myd sftp://[user@]host[:port][/path]`) and browse it in the active panel. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
+- **Non-blocking transfers** — copy (`c`) tagged files between a remote panel and a local one and the transfer runs in the background: the interface stays fully interactive, so you can keep browsing and queue more. Up to 16 transfers run at once and the rest stack up, and the files within a directory are copied concurrently — which is what makes a folder of small files usable over a high-latency link.
+- **Transfer panel** — a right-hand sidebar that appears once you start a copy (and stays while transfers remain) showing queued, active, and finished transfers with per-transfer progress bars, transfer rate, and ETA. Toggle it any time with `Ctrl+t`; cancel everything outstanding with `gx`.
+- **Fast SFTP engine** — large files download through many concurrent pipelined reads, reaching several hundred MB/s on a fast link — roughly 6× a naive sequential client and close to the `sftp` command itself.
 
 ## Requirements
 
@@ -60,6 +65,11 @@ myd /var/log
 myd --dual                    # split; left panel picks a directory
 myd ~/Documents --dual        # left panel at ~/Documents, right picks a directory
 myd ~/Documents ~/Downloads   # two paths implies dual: left and right roots
+
+# Remote browsing over SFTP — opens the remote in a panel beside your local files
+myd sftp://prod                       # host from ~/.ssh/config, auth via agent/keys
+myd sftp://user@host:2222/var/log     # explicit user, port, and starting path
+# ...or connect from inside the app with `gr`.
 ```
 
 ## Key Bindings
@@ -132,6 +142,18 @@ Search wraps around at the ends. Filtering masks non-matching entries in the cur
 | `Tab`     | Switch the active panel                          |
 | `c`       | Copy tagged / selected into the other panel      |
 
+A copy where one panel is remote runs as a background **transfer** instead of a blocking copy — see below.
+
+### Remote & transfers
+
+| Key       | Action                                          |
+|-----------|-------------------------------------------------|
+| `gr`      | Connect to a remote host (`sftp://…`)           |
+| `Ctrl+t`  | Show / hide the transfer panel                  |
+| `gx`      | Cancel all queued and in-flight transfers       |
+
+The transfer panel appears once you start a copy and lists queued, active, and finished transfers with per-transfer progress, rate, and ETA. Up to 16 transfers run at once; the rest wait their turn. Within a directory copy, files and subdirectories are also transferred concurrently, so a deep tree of small files is not paced by round-trip latency. The interface stays interactive throughout, so you can keep browsing and queue more. Toggle the panel any time with `Ctrl+t`.
+
 ### Screen-level
 
 | Key       | Action                        |
@@ -146,10 +168,15 @@ Search wraps around at the ends. Filtering masks non-matching entries in the cur
 
 Press `s` to cycle through:
 
-1. **Dirs first** — directories listed before files, alphabetical within each group.
-2. **Files first** — files listed before directories, alphabetical within each group.
-3. **Largest** — sorted by descending size (recursive directory sizes).
-4. **Smallest** — sorted by ascending size (recursive directory sizes).
+1. **Largest** — sorted by descending size (recursive directory sizes).
+2. **Smallest** — sorted by ascending size (recursive directory sizes).
+3. **Dirs first** — directories listed before files, alphabetical within each group.
+4. **Files first** — files listed before directories, alphabetical within each group.
+5. **Newest** — most recently modified first (mtime).
+6. **Oldest** — least recently modified first (mtime).
+7. **Recently accessed** — most recently accessed first (atime).
+
+The time-based sorts use the timestamps from the directory listing, so they work identically on local and remote (SFTP) trees with no extra latency.
 
 ## Size Bars
 

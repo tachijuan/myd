@@ -3,5 +3,7 @@ pub mod cli;
 pub mod keybinding;
 pub mod panel;
 pub mod screen;
+pub mod transfer;
 pub mod utils;
+pub mod vfs;
 pub mod widget;

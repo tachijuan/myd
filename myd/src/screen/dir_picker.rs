@@ -178,21 +178,40 @@ impl super::ScreenState for DirPickerState {
 
         // Title.
         let title = Paragraph::new(Span::styled(
-            "Select a starting directory (Esc to quit)",
+            "Select a directory (Esc to quit)",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(title, vertical[0]);
 
-        // Input field.
-        let input_display = if self.input.is_empty() {
-            "Enter a path..."
+        // Input field. A block cursor is drawn at the input position — an empty
+        // field shows the cursor over a dimmed placeholder so it's clearly the
+        // focused, editable box.
+        let input_line = if self.input.is_empty() {
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Yellow)),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "Enter a path...",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
         } else {
-            &self.input
+            // Split the value at the cursor and render a block glyph there.
+            let cut = self
+                .input
+                .char_indices()
+                .nth(self.input_cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(self.input.len());
+            let (before, after) = self.input.split_at(cut);
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Yellow)),
+                Span::styled(before.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+                Span::styled(after.to_string(), Style::default().fg(Color::Yellow)),
+            ])
         };
-        let input_para = Paragraph::new(Span::styled(
-            format!("> {}", input_display),
-            Style::default().fg(Color::Yellow),
-        )).block(
+        let input_para = Paragraph::new(input_line).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)

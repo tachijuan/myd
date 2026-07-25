@@ -1,4 +1,4 @@
-use crossterm::event::{KeyEvent, KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
 
 /// Actions that keybindings resolve to.
@@ -51,6 +51,12 @@ pub enum Action {
     SearchNext,
     /// Jump to the previous match of the last search (up the tree).
     SearchPrev,
+    /// Show or hide the transfer sidebar.
+    ToggleTransferPanel,
+    /// Cancel every queued and in-flight transfer.
+    CancelTransfers,
+    /// Prompt for a remote host to connect to.
+    Connect,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -94,7 +100,11 @@ impl KeyBindingHandler {
         };
 
         // Check if the chord is still alive (only g-prefix chords).
-        if let ChordState::Waiting { key: first, deadline } = self.chord {
+        if let ChordState::Waiting {
+            key: first,
+            deadline,
+        } = self.chord
+        {
             if Instant::now() > deadline {
                 // Timeout — fall back to single-key handling for the new key.
                 self.chord = ChordState::Idle;
@@ -170,6 +180,10 @@ impl KeyBindingHandler {
             "gg" => Some(Action::ToTop),
             "gu" => Some(Action::GoParent),
             "gd" => Some(Action::GoDirPicker),
+            // Single letters are effectively exhausted, so remote connect and
+            // transfer-cancel take g-chords.
+            "gr" => Some(Action::Connect),
+            "gx" => Some(Action::CancelTransfers),
             _ => None,
         }
     }
@@ -185,6 +199,8 @@ impl KeyBindingHandler {
                 KeyCode::Char('d') => Some(Action::PageDown),
                 KeyCode::Char('u') => Some(Action::PageUp),
                 KeyCode::Char('o') => Some(Action::PopScreen),
+                // Pairs with Ctrl-b for the info panel: both are sidebars.
+                KeyCode::Char('t') => Some(Action::ToggleTransferPanel),
                 _ => None,
             };
         }

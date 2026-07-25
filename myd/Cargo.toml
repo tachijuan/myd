@@ -1,6 +1,6 @@
 [package]
 name = "myd"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -17,6 +17,13 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 chrono = "0.4"
+async-trait = "0.1.91"
+futures = "0.3.33"
+url = "2.5.8"
+russh = "0.62.4"
+openssh-sftp-client = "0.15.7"
+ssh2-config = "0.7.1"
+bytes = "1.12.1"
 
 [dev-dependencies]
 tempfile = "3"

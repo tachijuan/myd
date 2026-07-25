@@ -1,9 +1,9 @@
 use ratatui::{
-    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    Frame,
 };
 
 /// Category of related keybindings for the help screen.
@@ -95,17 +95,23 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             ],
         },
         HelpCategory {
+            title: "Remote & transfers",
+            items: &[
+                ("gr", "Connect to a remote host (sftp://)"),
+                ("Ctrl+T", "Show / hide the transfer panel"),
+                ("gx", "Cancel all queued transfers"),
+            ],
+        },
+        HelpCategory {
             title: "Exit",
             items: &[
-                ("q / Esc", "Quit immediately"),
+                ("q / Esc", "Quit (cancels a scan or connect first)"),
+                ("Ctrl+C", "Force quit immediately, anytime"),
             ],
         },
         HelpCategory {
             title: "Dialogs",
-            items: &[
-                ("Enter", "Confirm"),
-                ("Esc", "Cancel"),
-            ],
+            items: &[("Enter", "Confirm"), ("Esc", "Cancel")],
         },
     ];
 
@@ -114,9 +120,12 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
     let height = height.min(area.height.saturating_sub(2));
 
     // Center the modal box vertically and horizontally.
-    let outer =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(height), Constraint::Min(1)])
-            .split(area);
+    let outer = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(height),
+        Constraint::Min(1),
+    ])
+    .split(area);
     let box_area = Layout::horizontal([
         Constraint::Min(1),
         Constraint::Length(70),

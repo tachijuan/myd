@@ -40,11 +40,17 @@ pub struct Panel {
     /// Paths being deleted, mirroring `delete_task`. All are removed from the
     /// tree once the task finishes (a delete may target many tagged files).
     pub deleting_paths: Vec<PathBuf>,
+    /// Which backend this panel's paths live on. Local by default; set to a
+    /// registered remote backend for an SFTP panel. Copies consult this to route
+    /// a cross-backend transfer through the queue rather than a local copy.
+    pub backend: crate::vfs::BackendId,
 }
 
 impl Panel {
-    /// Build a panel rooted at `start`, mirroring the single-panel launch logic:
-    /// a valid directory starts loading; anything else opens the dir picker.
+    /// Build a panel rooted at `start`. A valid directory starts loading; when
+    /// no path is given the panel opens on the current working directory (the
+    /// directory picker is reserved for the `gd` chord). Only a path that turns
+    /// out not to be a directory falls back to the picker.
     pub fn new(start: Option<PathBuf>) -> Self {
         let screen = match start {
             Some(path) => {
@@ -55,7 +61,11 @@ impl Panel {
                     Screen::dir_picker()
                 }
             }
-            None => Screen::dir_picker(),
+            // Default to the current directory rather than the picker.
+            None => match std::env::current_dir() {
+                Ok(cwd) => Screen::loading(cwd),
+                Err(_) => Screen::dir_picker(),
+            },
         };
 
         Self {
@@ -63,6 +73,7 @@ impl Panel {
             view_prefs: ViewPrefs::default(),
             delete_task: None,
             deleting_paths: Vec::new(),
+            backend: crate::vfs::BackendId::LOCAL,
         }
     }
 
@@ -170,6 +181,19 @@ impl Panel {
         }
     }
 
+    /// Open a panel on a remote backend, rooted at `path`, building its tree
+    /// through `source`. Used after a successful SFTP connection.
+    pub fn new_remote(source: crate::widget::source::Source, path: PathBuf) -> Self {
+        let backend = source.backend();
+        Self {
+            screen_stack: vec![Screen::loading_remote(source, path, None)],
+            view_prefs: ViewPrefs::default(),
+            delete_task: None,
+            deleting_paths: Vec::new(),
+            backend,
+        }
+    }
+
     /// As [`new`], but seed the tree build with an existing size cache so a
     /// panel opened on an already-scanned directory is a cache hit rather than a
     /// full rescan.
@@ -194,6 +218,7 @@ impl Panel {
             view_prefs: ViewPrefs::default(),
             delete_task: None,
             deleting_paths: Vec::new(),
+            backend: crate::vfs::BackendId::LOCAL,
         }
     }
 }
