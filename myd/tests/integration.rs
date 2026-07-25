@@ -4242,3 +4242,110 @@ async fn test_sort_order_survives_entering_a_directory() {
         _ => panic!("expected a main screen after entering the directory"),
     }
 }
+
+/// Changing the sort order must not touch the filesystem at all.
+///
+/// Reported against a CIFS mount: sorting there was unresponsive while a local
+/// disk was instant. The cause was I/O reachable from the sort path — the sort
+/// comparator stat'd on a cache miss, and the reflatten/treemap rebuild that
+/// follows every sort ran a *recursive walk* per uncached directory. On a
+/// network mount each of those is a round trip. "Local" does not mean "fast".
+///
+/// This proves the absence of I/O rather than its speed: the tree is loaded,
+/// then every file is deleted from disk. Any filesystem access during a sort
+/// would now see an empty directory, so if the sort still reports the sizes and
+/// entries it loaded with, it cannot have gone back to the disk.
+#[tokio::test]
+async fn test_sorting_does_no_filesystem_io() {
+    use myd::screen::SortMode;
+    use myd::utils::sizes::SizeCache;
+    use myd::widget::file_tree::FileTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    for d in 0..6 {
+        let sub = dir.path().join(format!("d{}", d));
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in 0..8 {
+            // Distinct sizes so the ordering is observable.
+            std::fs::write(sub.join(format!("f{}.bin", f)), vec![b'x'; 100 * (f + 1)]).unwrap();
+        }
+    }
+
+    let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, true);
+    tree.expand_all();
+    let loaded_lines = tree.lines.len();
+    assert!(loaded_lines > 40, "expected a populated tree, got {}", loaded_lines);
+
+    // Pull the disk out from under it.
+    for d in 0..6 {
+        std::fs::remove_dir_all(dir.path().join(format!("d{}", d))).unwrap();
+    }
+
+    // Every sort mode must still work purely from what is in memory.
+    for mode in [
+        SortMode::Smallest,
+        SortMode::DirsFirst,
+        SortMode::FilesFirst,
+        SortMode::Newest,
+        SortMode::Oldest,
+        SortMode::RecentlyAccessed,
+        SortMode::Largest,
+    ] {
+        let started = std::time::Instant::now();
+        tree.set_sort_mode(mode);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "sorting by {:?} took {:?} — it is doing I/O",
+            mode,
+            started.elapsed()
+        );
+        assert_eq!(
+            tree.lines.len(),
+            loaded_lines,
+            "sorting by {:?} lost entries — it re-read the (now empty) directory",
+            mode
+        );
+    }
+
+    // Largest-first still orders by the sizes captured at load time, which is
+    // only possible from the cache.
+    let files: Vec<u64> = tree
+        .lines
+        .iter()
+        .filter(|l| !l.is_dir)
+        .map(|l| tree.size_cache.get(&l.resolved_path).unwrap_or(0))
+        .collect();
+    assert!(
+        files.iter().any(|&s| s > 0),
+        "sizes from the load should survive the sort"
+    );
+
+    // The decisive case: an empty cache, so every lookup misses. Old code
+    // measured each entry here — a stat per file and a *recursive walk* per
+    // directory. Against a real tree that is what made a network mount crawl,
+    // and it also silently re-populates the cache from disk.
+    let dir2 = tempfile::tempdir().unwrap();
+    for d in 0..6 {
+        let sub = dir2.path().join(format!("d{}", d));
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in 0..8 {
+            std::fs::write(sub.join(format!("f{}.bin", f)), vec![b'y'; 100 * (f + 1)]).unwrap();
+        }
+    }
+    let mut cold = FileTree::new(dir2.path().to_path_buf(), SortMode::Largest, true, true);
+    cold.expand_all();
+    let cold_lines = cold.lines.len();
+    cold.size_cache.clear();
+    assert_eq!(cold.size_cache.len(), 0, "cache should start empty");
+
+    cold.set_sort_mode(SortMode::Smallest);
+    assert_eq!(cold.lines.len(), cold_lines, "cold-cache sort lost entries");
+    // Nothing was measured, so nothing was written back to the cache. A single
+    // entry here means the sort path went to the filesystem.
+    assert_eq!(
+        cold.size_cache.len(),
+        0,
+        "sorting re-populated the size cache — it measured entries from disk"
+    );
+    let _ = SizeCache::new();
+}

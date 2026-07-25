@@ -296,7 +296,8 @@ fn sort_entries(entries: &mut [TreeNode], cache: &SizeCache, source: &Source, so
     // allocates a lowercased String and hits the size cache, so an n-entry
     // directory paid O(n log n) allocations and map lookups. `sort_by_cached_key`
     // builds each key once.
-    entries.sort_by_cached_key(|node| sort_key_fast(node, cache, source, sort_mode));
+    let _ = source;
+    entries.sort_by_cached_key(|node| sort_key_fast(node, cache, sort_mode));
 }
 
 /// Re-order a node's already-loaded children in place, recursing into every
@@ -339,25 +340,19 @@ fn reload_node(
 
 /// Generate a sort key for a node — uses cached sizes for directories,
 /// falls back to a shallow size lookup for files if not yet cached.
-fn sort_key_fast(
-    node: &TreeNode,
-    cache: &SizeCache,
-    source: &Source,
-    sort_mode: SortMode,
-) -> (i32, i64, String) {
+fn sort_key_fast(node: &TreeNode, cache: &SizeCache, sort_mode: SortMode) -> (i32, i64, String) {
     let is_dir = if node.is_dir { 0 } else { 1 };
     let name = node.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-    // Use the cached size. A miss must NOT fall back to a stat on a remote
-    // tree: this runs inside a sort comparator, on the event-loop thread, so
-    // one blocking round trip per comparison freezes the UI for minutes on a
-    // large remote directory (a 733-entry listing cost ~3000 stats). Remote
-    // sizes come from the listing at load time, so a miss means "unknown" —
-    // sort it as 0 rather than going to the network to find out.
-    let size = match cache.get(&node.resolved_path) {
-        Some(size) => size as i64,
-        None if source.is_remote() => 0,
-        None => source.file_size(&node.path) as i64,
-    };
+    // Sorting is pure reordering: it reads the sizes gathered when the tree was
+    // built and never touches the filesystem.
+    //
+    // This runs on the event-loop thread, so any I/O here stalls the whole UI.
+    // "It's only a local stat" is not a safe assumption — a CIFS or NFS mount is
+    // an ordinary local path as far as this code can see, and a stat on one is a
+    // network round trip. A large directory on such a mount made changing the
+    // sort order unresponsive. A cache miss therefore sorts as unknown rather
+    // than going to find out.
+    let size = cache.get(&node.resolved_path).unwrap_or(0) as i64;
 
     match sort_mode {
         SortMode::DirsFirst => (is_dir, 0, name),
@@ -568,6 +563,22 @@ impl FileTree {
         // The scan was abandoned partway through — discard the partial tree.
         if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
             return None;
+        }
+
+        // Size the root from the children just loaded. `load_children` measures
+        // the entries *inside* a directory but not the directory itself, and
+        // nothing else may measure it later: rendering and sorting read the
+        // cache without ever falling back to the filesystem. Summing what is
+        // already cached costs nothing and keeps the root's bar and info panel
+        // correct.
+        if cache.get(&root.resolved_path).is_none() {
+            if let Some(children) = root.children.as_ref() {
+                let total: u64 = children
+                    .iter()
+                    .filter_map(|c| cache.get(&c.resolved_path))
+                    .sum();
+                cache.insert(&root.resolved_path, total);
+            }
         }
 
         let mut tree = Self {
@@ -1093,22 +1104,19 @@ impl FileTree {
         if let Some(size) = self.size_cache.get(&line.resolved_path) {
             return size;
         }
-        // A remote path must never be measured against the local disk. These
-        // helpers take *local* filesystem paths, so on a remote tree they either
-        // walk nothing (the path doesn't exist here) or — worse, for a path like
-        // /usr/share that exists on both — walk an unrelated local directory.
-        // This runs from `recompute_cache`, i.e. on every reflatten (every sort,
-        // filter and hidden toggle), so it must stay free.
-        if self.source.is_remote() {
-            return 0;
-        }
-        let size = if line.is_dir {
-            sizes::get_dir_size(&line.path)
-        } else {
-            sizes::get_file_size(&line.path)
-        };
-        self.size_cache.insert(&line.resolved_path, size);
-        size
+        // A miss reports "unknown" rather than measuring the entry here.
+        //
+        // This runs from `recompute_cache` — on every reflatten, so on every
+        // sort, filter and hidden toggle — on the event-loop thread. Measuring a
+        // directory means a full recursive walk, and even a file costs a stat.
+        // That is not affordable on a slow filesystem, and "local" does not
+        // imply "fast": a CIFS or NFS mount is an ordinary path here, and a
+        // recursive walk over one made changing the sort order unresponsive.
+        //
+        // Sizes are gathered when the tree is loaded (see `load_children`),
+        // which is where the scanning belongs — it runs off the event loop with
+        // a progress overlay and can be cancelled.
+        0
     }
 
     /// Render the full tree as ratatui Text.
