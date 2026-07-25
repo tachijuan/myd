@@ -690,6 +690,26 @@ impl FileBrowser {
                 ));
                 true
             }
+            // Create, rename and delete all go through `std::fs`, which would act
+            // on the LOCAL machine while the panel is showing a server — quietly
+            // creating, renaming or DELETING the wrong file, and for a path that
+            // exists on both, a plausible-looking one. None of the three are
+            // wired through the VFS yet, so say so rather than destroying data
+            // on the wrong host.
+            Action::CreateDir | Action::Rename | Action::Delete
+                if self.active_panel_is_remote() =>
+            {
+                let what = match action {
+                    Action::CreateDir => "Creating directories",
+                    Action::Rename => "Renaming",
+                    _ => "Deleting",
+                };
+                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    "{} on a remote host isn't supported yet.",
+                    what
+                )));
+                true
+            }
             Action::CreateDir => {
                 self.modal_target = Some(ModalTarget::CreateDir);
                 self.modal = Modal::Input(InputDialog::new("New directory name:", "name"));

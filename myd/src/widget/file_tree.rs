@@ -402,6 +402,10 @@ pub struct TreeLine {
     pub name: String,
     /// Is this entry a symlink? Rendered distinctly (arrow marker + colour).
     pub is_symlink: bool,
+    /// Listing timestamps, carried so the info panel can show them for a remote
+    /// entry without a per-selection stat (which would be a network round trip).
+    pub mtime: Option<std::time::SystemTime>,
+    pub atime: Option<std::time::SystemTime>,
 }
 
 /// The main FileTree widget state.
@@ -1085,6 +1089,15 @@ impl FileTree {
         if let Some(size) = self.size_cache.get(&line.resolved_path) {
             return size;
         }
+        // A remote path must never be measured against the local disk. These
+        // helpers take *local* filesystem paths, so on a remote tree they either
+        // walk nothing (the path doesn't exist here) or — worse, for a path like
+        // /usr/share that exists on both — walk an unrelated local directory.
+        // This runs from `recompute_cache`, i.e. on every reflatten (every sort,
+        // filter and hidden toggle), so it must stay free.
+        if self.source.is_remote() {
+            return 0;
+        }
         let size = if line.is_dir {
             sizes::get_dir_size(&line.path)
         } else {
@@ -1186,6 +1199,8 @@ impl FileTree {
             hidden: false,
             name,
             is_symlink: false,
+            mtime: None,
+            atime: None,
         };
         owned_line(self.render_line(&synthetic, false, false, false, true, 0, 0))
     }
@@ -1275,6 +1290,8 @@ fn flatten_node(node: &TreeNode, depth: usize, lines: &mut Vec<TreeLine>, show_h
         hidden,
         name,
         is_symlink: node.is_symlink,
+        mtime: node.mtime,
+        atime: node.atime,
     });
 
     if node.is_expanded {

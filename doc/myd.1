@@ -135,11 +135,23 @@ as a last resort. \fB~/.ssh/config\fR host aliases and \fB~/.ssh/known_hosts\fR
 are honored. Credentials are never written to disk.
 .PP
 Copying (\fBc\fR) between a remote and a local panel runs as a background
-transfer rather than blocking the interface. Up to four transfers run at once
+transfer rather than blocking the interface. Up to sixteen transfers run at once
 and further requests stack up. The transfer panel appears once you start a copy
 (toggle it any time with \fBCtrl+t\fR) and shows each transfer's progress, rate,
-and ETA. Large files download through many concurrent pipelined reads for high
-throughput.
+and ETA. Large files download through many concurrent pipelined reads, and the
+files and subdirectories within a directory copy transfer concurrently, so a
+tree of small files is not paced by round-trip latency.
+.PP
+Remote panels are read-only apart from copying. Browsing, sorting, filtering,
+tagging and transferring all work; creating directories (\fBN\fR), renaming
+(\fBR\fR) and deleting (\fBD\fR) are not yet implemented for remote hosts and
+are refused on a remote panel rather than being applied to the local machine.
+.PP
+Remote directory sizes are shallow \(em the directory's own size rather than a
+recursive total \(em because a \fBdu\fR-style walk over SFTP costs one round
+trip per directory. The info panel likewise shows only what the directory
+listing carries (size and timestamps); owner, group and creation time are not
+part of it.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes:
 .TP

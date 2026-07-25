@@ -406,11 +406,17 @@ fn collect_items(
         if !dir_children.is_empty() {
             // Show subdirectories.
             for child in dir_children {
+                // On a remote tree the size must come from the cache (populated
+                // from the directory listing): these helpers walk the *local*
+                // disk, so for a remote path they measure either nothing or an
+                // unrelated local directory of the same name.
                 let size = tree
                     .size_cache
                     .get(&child.resolved_path)
                     .unwrap_or_else(|| {
-                        if child.is_dir {
+                        if tree.source.is_remote() {
+                            0
+                        } else if child.is_dir {
                             crate::utils::sizes::get_dir_size(&child.path)
                         } else {
                             crate::utils::sizes::get_file_size(&child.path)
@@ -433,10 +439,14 @@ fn collect_items(
         } else if !file_children.is_empty() {
             // No subdirs — show files as leaves.
             for child in file_children {
-                let size = tree
-                    .size_cache
-                    .get(&child.resolved_path)
-                    .unwrap_or_else(|| crate::utils::sizes::get_file_size(&child.path));
+                let size = tree.size_cache.get(&child.resolved_path).unwrap_or_else(|| {
+                    // As above: never measure a remote path locally.
+                    if tree.source.is_remote() {
+                        0
+                    } else {
+                        crate::utils::sizes::get_file_size(&child.path)
+                    }
+                });
                 items.push((
                     TreeItemInfo {
                         path: child.path.clone(),

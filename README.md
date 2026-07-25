@@ -154,6 +154,8 @@ A copy where one panel is remote runs as a background **transfer** instead of a 
 
 The transfer panel appears once you start a copy and lists queued, active, and finished transfers with per-transfer progress, rate, and ETA. Up to 16 transfers run at once; the rest wait their turn. Within a directory copy, files and subdirectories are also transferred concurrently, so a deep tree of small files is not paced by round-trip latency. The interface stays interactive throughout, so you can keep browsing and queue more. Toggle the panel any time with `Ctrl+t`.
 
+Remote panels are currently **read-only plus copy**: you can browse, sort, filter, tag, and transfer files, but creating directories (`N`), renaming (`R`), and deleting (`D`) are not yet wired through to the server and are refused on a remote panel rather than acting on your local machine. The info panel shows what the directory listing provides — size and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes are shallow (the entry's own size, not a recursive total) because a `du`-style walk would be one round trip per directory.
+
 ### Screen-level
 
 | Key       | Action                        |
