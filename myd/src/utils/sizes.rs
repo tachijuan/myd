@@ -40,12 +40,29 @@ impl CancelToken {
 #[derive(Clone, Debug, Default)]
 pub struct SizeCache {
     inner: std::sync::Arc<DashMap<PathBuf, u64>>,
+    /// Bytes per content category for each directory, accumulated during the
+    /// same walk that measures sizes.
+    ///
+    /// The treemap colours a directory by whatever content dominates it. Working
+    /// that out needs the directory's contents — which the size walk is already
+    /// visiting, so recording it here is free. Deriving it later instead meant
+    /// re-walking the filesystem per tile on every treemap rebuild, i.e. on
+    /// every sort.
+    categories: std::sync::Arc<DashMap<PathBuf, CategoryTotals>>,
 }
+
+/// Bytes per category under one directory. Small and `Copy`-cheap to merge.
+pub type CategoryTotals = [u64; CATEGORY_SLOTS];
+
+/// Number of `FileCategory` variants; kept here so the cache needs no dependency
+/// on the widget layer.
+pub const CATEGORY_SLOTS: usize = 9;
 
 impl SizeCache {
     pub fn new() -> Self {
         Self {
             inner: std::sync::Arc::new(DashMap::new()),
+            categories: std::sync::Arc::new(DashMap::new()),
         }
     }
 
@@ -57,8 +74,23 @@ impl SizeCache {
         self.inner.insert(path.to_path_buf(), size);
     }
 
+    /// Add `bytes` to `dir`'s tally for category slot `slot`.
+    pub fn add_category_bytes(&self, dir: &Path, slot: usize, bytes: u64) {
+        if slot >= CATEGORY_SLOTS {
+            return;
+        }
+        let mut entry = self.categories.entry(dir.to_path_buf()).or_default();
+        entry[slot] += bytes;
+    }
+
+    /// The per-category byte tally recorded for `dir`, if the walk reached it.
+    pub fn category_totals(&self, dir: &Path) -> Option<CategoryTotals> {
+        self.categories.get(dir).map(|v| *v.value())
+    }
+
     pub fn clear(&self) {
         self.inner.clear();
+        self.categories.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -222,6 +254,18 @@ fn get_dir_size_inner(
         } else if entry.file_type().is_file() {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             cache.insert(entry.path(), size);
+            // Tally this file against every directory above it, up to the walk
+            // root. The treemap colours a directory by its dominant content, and
+            // doing it here is free — we are already visiting the file.
+            let slot = crate::utils::filetype::categorize(entry.path()).slot();
+            let mut dir = entry.path().parent();
+            while let Some(d) = dir {
+                cache.add_category_bytes(d, slot, size);
+                if d == path {
+                    break;
+                }
+                dir = d.parent();
+            }
             if let Some(p) = progress {
                 p.add_file(size);
             }
