@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -28,14 +28,18 @@ impl CancelToken {
     }
 }
 
-/// Shared, concurrent size cache: resolved Path string -> size in bytes.
+/// Shared, concurrent size cache: resolved path -> size in bytes.
 ///
 /// Cloning shares the underlying map rather than copying it, so a subtree
 /// opened from a parent directory reuses the sizes already computed instead of
 /// rescanning the disk. Call `clear` to force a rescan.
+///
+/// Keyed on `PathBuf` rather than `String` so a lookup can borrow a `&Path`.
+/// Stringifying the key allocated on *every* read, and reads are the hot path:
+/// re-sorting or reflattening a tree does one per line, plus one per sort key.
 #[derive(Clone, Debug, Default)]
 pub struct SizeCache {
-    inner: std::sync::Arc<DashMap<String, u64>>,
+    inner: std::sync::Arc<DashMap<PathBuf, u64>>,
 }
 
 impl SizeCache {
@@ -46,13 +50,11 @@ impl SizeCache {
     }
 
     pub fn get(&self, path: &Path) -> Option<u64> {
-        let key = Self::cache_key(path);
-        self.inner.get(&key).map(|v| *v.value())
+        self.inner.get(path).map(|v| *v.value())
     }
 
     pub fn insert(&self, path: &Path, size: u64) {
-        let key = Self::cache_key(path);
-        self.inner.insert(key, size);
+        self.inner.insert(path.to_path_buf(), size);
     }
 
     pub fn clear(&self) {
@@ -63,16 +65,6 @@ impl SizeCache {
         self.inner.len()
     }
 
-    /// Key a path for the map.
-    ///
-    /// Deliberately does **not** canonicalize: that is a filesystem syscall,
-    /// and the cache is consulted once per comparison while sorting, so
-    /// resolving here made lookups dominate the cost of opening a directory.
-    /// Callers pass already-resolved paths (`TreeNode::resolved_path`, or paths
-    /// from a `WalkDir` rooted at one).
-    fn cache_key(path: &Path) -> String {
-        path.to_string_lossy().to_string()
-    }
 }
 
 /// Format bytes into a human-readable string (e.g., "  1.5 KB").

@@ -4187,3 +4187,58 @@ async fn test_failed_cross_backend_move_keeps_the_source() {
         "a move whose copy failed must leave the source alone"
     );
 }
+
+/// Drilling into a directory keeps the sort order you chose.
+///
+/// The loading screens hardcoded `SortMode::Largest`, so entering a directory
+/// silently reset the order — the sort key was chosen at build time and nothing
+/// carried the user's choice down.
+#[tokio::test]
+async fn test_sort_order_survives_entering_a_directory() {
+    use myd::app::FileBrowser;
+    use myd::screen::{Screen, SortMode};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("subdir");
+    std::fs::create_dir(&sub).unwrap();
+    for i in 0..3 {
+        std::fs::write(sub.join(format!("f{}.txt", i)), vec![b'x'; 100 * (i + 1)]).unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Cycle off the default order, and remember what we landed on.
+    app.handle_key_for_test(char_key('s'));
+    let chosen = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => panic!("expected a main screen"),
+    };
+    assert_ne!(chosen, SortMode::default(), "`s` should change the order");
+
+    // Enter the subdirectory.
+    let mut entered = false;
+    for _ in 0..20 {
+        if let Screen::Main(s) = app.current_screen() {
+            if s.tree.selected_line().map(|l| l.name == "subdir").unwrap_or(false) {
+                entered = true;
+                break;
+            }
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert!(entered, "could not put the cursor on subdir");
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    settle(&mut app).await;
+
+    match app.current_screen() {
+        Screen::Main(s) => assert_eq!(
+            s.tree.sort_mode, chosen,
+            "the chosen sort order must survive drilling into a directory"
+        ),
+        _ => panic!("expected a main screen after entering the directory"),
+    }
+}

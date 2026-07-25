@@ -828,6 +828,9 @@ impl FileBrowser {
                                 p,
                                 state.tree.size_cache.clone(),
                                 state.tree.source.clone(),
+                                // Carry the order the user is looking at into the
+                                // directory being opened.
+                                state.tree.sort_mode,
                             )
                         })
                     } else {
@@ -836,18 +839,23 @@ impl FileBrowser {
                 } else {
                     None
                 };
-                if let Some((path, cache, source)) = target {
+                if let Some((path, cache, source, sort_mode)) = target {
                     // A remote directory loads through its backend on the
                     // blocking pool; expanding it in place would run the network
                     // round trips on the event-loop thread and freeze the UI.
                     if source.is_remote() {
-                        panel
-                            .screen_stack
-                            .push(Screen::loading_remote(source, path, Some(cache)));
+                        panel.screen_stack.push(Screen::loading_remote_sorted(
+                            source,
+                            path,
+                            Some(cache),
+                            sort_mode,
+                        ));
                     } else {
-                        panel
-                            .screen_stack
-                            .push(Screen::loading_with_cache(path, Some(cache)));
+                        panel.screen_stack.push(Screen::loading_sorted(
+                            path,
+                            Some(cache),
+                            sort_mode,
+                        ));
                     }
                 }
                 true
@@ -1059,7 +1067,17 @@ impl FileBrowser {
                     Action::PageUp => current.page_up(),
                     Action::GoParent => current.go_parent(),
                     Action::Refresh => current.refresh(),
-                    Action::ToggleSort => current.toggle_sort(),
+                    Action::ToggleSort => {
+                        let result = current.toggle_sort();
+                        // Remember the order for screens opened later, so it
+                        // survives navigation the same way the view and info
+                        // panel do.
+                        let panel = self.active_panel_mut();
+                        if let Screen::Main(state) = panel.current_screen() {
+                            panel.view_prefs.sort_mode = state.tree.sort_mode;
+                        }
+                        result
+                    }
                     Action::ToggleHidden => current.toggle_hidden(),
                     Action::ToggleBar => current.toggle_bar(),
                     Action::CollapseAll => current.collapse_all(),

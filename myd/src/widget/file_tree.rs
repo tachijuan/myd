@@ -292,7 +292,11 @@ fn is_hidden(path: &Path) -> bool {
 /// Sort entries in place according to sort mode.
 /// Uses precomputed sizes from the cache (populated by load_children).
 fn sort_entries(entries: &mut [TreeNode], cache: &SizeCache, source: &Source, sort_mode: SortMode) {
-    entries.sort_by_key(|node| sort_key_fast(node, cache, source, sort_mode));
+    // `sort_by_key` recomputes the key on *every comparison* — and each key
+    // allocates a lowercased String and hits the size cache, so an n-entry
+    // directory paid O(n log n) allocations and map lookups. `sort_by_cached_key`
+    // builds each key once.
+    entries.sort_by_cached_key(|node| sort_key_fast(node, cache, source, sort_mode));
 }
 
 /// Re-order a node's already-loaded children in place, recursing into every
@@ -650,15 +654,15 @@ impl FileTree {
             .map(|l| self.get_or_compute_size(l))
             .collect();
 
-        // Compute parent totals.
-        let mut parent_totals: std::collections::HashMap<PathBuf, u64> =
+        // Compute parent totals. Keyed on borrowed paths: a `to_path_buf` per
+        // line allocated once for every entry in the tree on every reflatten.
+        let mut parent_totals: std::collections::HashMap<&Path, u64> =
             std::collections::HashMap::new();
         for (i, line) in self.lines.iter().enumerate() {
             if line.depth == 0 {
                 continue;
             }
             if let Some(parent) = line.resolved_path.parent() {
-                let parent = parent.to_path_buf();
                 *parent_totals.entry(parent).or_insert(0) += self.cached_sizes[i];
             }
         }
@@ -681,7 +685,7 @@ impl FileTree {
         // Compute expanded status.
         let expanded_set = collect_expanded(&self.root);
         self.cached_expanded = (0..n)
-            .map(|i| expanded_set.contains(&self.lines[i].resolved_path))
+            .map(|i| expanded_set.contains(self.lines[i].resolved_path.as_path()))
             .collect();
 
         // Compute dir/file counts (excluding root at depth 0).
@@ -1218,17 +1222,26 @@ fn owned_line(line: Line<'_>) -> Line<'static> {
 }
 
 /// Collect all expanded node resolved paths for O(1) lookup during render.
-fn collect_expanded(node: &TreeNode) -> HashSet<PathBuf> {
+fn collect_expanded(node: &TreeNode) -> HashSet<&Path> {
     let mut result = HashSet::new();
+    collect_expanded_into(node, &mut result);
+    result
+}
+
+/// Fill `out` with the expanded nodes' paths, borrowing rather than cloning.
+///
+/// This runs on every reflatten — so on every sort, filter and hidden toggle.
+/// Building one set of borrowed paths, instead of a fresh `HashSet<PathBuf>` per
+/// node that the parent then `extend`s, avoids a clone and a map merge per entry.
+fn collect_expanded_into<'a>(node: &'a TreeNode, out: &mut HashSet<&'a Path>) {
     if node.is_expanded {
-        result.insert(node.resolved_path.clone());
+        out.insert(node.resolved_path.as_path());
     }
     if let Some(ref children) = node.children {
         for child in children {
-            result.extend(collect_expanded(child));
+            collect_expanded_into(child, out);
         }
     }
-    result
 }
 
 /// Generate size bar spans from precomputed values.

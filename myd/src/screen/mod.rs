@@ -78,7 +78,19 @@ impl Screen {
         path: std::path::PathBuf,
         cache: Option<crate::utils::sizes::SizeCache>,
     ) -> Self {
-        use crate::screen::SortMode;
+        Self::loading_sorted(path, cache, SortMode::default())
+    }
+
+    /// As [`loading_with_cache`], built in a given sort order.
+    ///
+    /// The order has to be decided here rather than applied afterwards: the tree
+    /// is sorted as it is built, so handing it down keeps a drilled-into
+    /// directory in whatever order the user had chosen.
+    pub fn loading_sorted(
+        path: std::path::PathBuf,
+        cache: Option<crate::utils::sizes::SizeCache>,
+        sort_mode: SortMode,
+    ) -> Self {
         use crate::utils::sizes::CancelToken;
         use crate::widget::file_tree::FileTree;
         use crate::widget::progress::OpProgress;
@@ -95,7 +107,7 @@ impl Screen {
                 let cache = cache.unwrap_or_default();
                 let tree = FileTree::with_cache_cancellable_progress(
                     path,
-                    SortMode::Largest,
+                    sort_mode,
                     true,
                     true,
                     cache,
@@ -119,7 +131,16 @@ impl Screen {
         path: std::path::PathBuf,
         cache: Option<crate::utils::sizes::SizeCache>,
     ) -> Self {
-        use crate::screen::SortMode;
+        Self::loading_remote_sorted(source, path, cache, SortMode::default())
+    }
+
+    /// As [`loading_remote`], built in a given sort order.
+    pub fn loading_remote_sorted(
+        source: crate::widget::source::Source,
+        path: std::path::PathBuf,
+        cache: Option<crate::utils::sizes::SizeCache>,
+        sort_mode: SortMode,
+    ) -> Self {
         use crate::utils::sizes::CancelToken;
         use crate::widget::file_tree::FileTree;
         use crate::widget::progress::OpProgress;
@@ -137,7 +158,7 @@ impl Screen {
                 let tree = FileTree::with_source_cancellable_progress(
                     source,
                     path,
-                    SortMode::Largest,
+                    sort_mode,
                     true,
                     true,
                     cache,
