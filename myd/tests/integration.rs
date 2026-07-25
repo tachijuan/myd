@@ -3557,3 +3557,161 @@ async fn test_transfer_panel_title_shows_work_not_capacity() {
         busy
     );
 }
+
+/// Changing the sort order on a remote tree must never touch the network.
+///
+/// Regression: `sort_key_fast` fell back to `source.file_size()` on a cache
+/// miss. That runs inside the sort comparator, on the event-loop thread, so on
+/// a remote tree every miss was a blocking SFTP round trip — a 733-entry
+/// listing produced thousands of them and froze the UI for minutes. Remote
+/// sizes come from the directory listing, so a miss now sorts as unknown
+/// instead of going to the server to find out.
+#[tokio::test]
+async fn test_remote_resort_never_hits_the_network() {
+    use myd::screen::SortMode;
+    use myd::utils::sizes::{CancelToken, SizeCache};
+    use myd::vfs::{BackendId, VEntry, VMetadata, VPath, VRead, VWrite, Vfs};
+    use myd::widget::file_tree::FileTree;
+    use myd::widget::progress::OpProgress;
+    use myd::widget::source::{RemoteSource, Source};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    static STATS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A remote backend that counts every stat, so any network access during a
+    /// re-sort is visible.
+    struct CountingRemote;
+
+    #[async_trait::async_trait]
+    impl Vfs for CountingRemote {
+        fn scheme(&self) -> &'static str {
+            "sftp"
+        }
+        async fn read_dir(&self, p: &VPath) -> anyhow::Result<Vec<VEntry>> {
+            // A wide, directory-heavy listing, like the reported case.
+            // Two levels of subdirectories below the root, which sits at
+            // /remote/data (3 components including the leading "/").
+            let depth = p.path.components().count();
+            let mut v = Vec::new();
+            if depth < 5 {
+                for i in 0..20 {
+                    v.push(VEntry::new(format!("d{:03}", i), true));
+                }
+            }
+            for i in 0..12 {
+                let mut e = VEntry::new(format!("f{:03}.txt", i), false);
+                e.len = 1000 + i as u64;
+                v.push(e);
+            }
+            Ok(v)
+        }
+        async fn stat(&self, p: &VPath) -> anyhow::Result<VMetadata> {
+            STATS.fetch_add(1, Ordering::Relaxed);
+            let n = p
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            Ok(VMetadata {
+                is_dir: !n.contains('.'),
+                is_symlink: false,
+                len: 4096,
+                mode: None,
+                uid: None,
+                gid: None,
+                mtime: None,
+                atime: None,
+                ctime: None,
+            })
+        }
+        async fn create_dir_all(&self, _p: &VPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_file(&self, _p: &VPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_dir(&self, _p: &VPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn rename(&self, _f: &VPath, _t: &VPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn open_read(&self, _p: &VPath) -> anyhow::Result<Box<dyn VRead>> {
+            anyhow::bail!("unused")
+        }
+        async fn open_write(
+            &self,
+            _p: &VPath,
+            _l: Option<u64>,
+        ) -> anyhow::Result<Box<dyn VWrite>> {
+            anyhow::bail!("unused")
+        }
+        async fn dir_size(
+            &self,
+            _p: &VPath,
+            _c: &SizeCache,
+            _ct: &CancelToken,
+            _pr: Option<&OpProgress>,
+        ) -> u64 {
+            0
+        }
+        fn has_recursive_sizes(&self) -> bool {
+            false
+        }
+    }
+
+    let vfs: Arc<dyn Vfs> = Arc::new(CountingRemote);
+    let source = Source::Remote(RemoteSource::new(BackendId(1), vfs).unwrap());
+    let cancel = CancelToken::new();
+    let progress = OpProgress::new();
+    let mut tree = FileTree::with_source_cancellable_progress(
+        source,
+        std::path::PathBuf::from("/remote/data"),
+        SortMode::Largest,
+        true,
+        false,
+        SizeCache::new(),
+        &cancel,
+        &progress,
+    )
+    .expect("remote tree should build");
+    tree.expand_all();
+    assert!(tree.lines.len() > 200, "need a large tree to be meaningful, got {}", tree.lines.len());
+
+    // Worst case: nothing cached at all. Even then the re-sort is pure
+    // in-memory work — a single stat here would be a network round trip.
+    tree.size_cache.clear();
+    let before = STATS.load(Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    tree.set_sort_mode(SortMode::Smallest);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        STATS.load(Ordering::Relaxed) - before,
+        0,
+        "re-sorting a remote tree must not stat the server"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "re-sort should be effectively instant, took {:?}",
+        elapsed
+    );
+
+    // Cycling through every mode stays network-free too (the time-based sorts
+    // read timestamps captured in the listing).
+    for mode in [
+        SortMode::Newest,
+        SortMode::Oldest,
+        SortMode::RecentlyAccessed,
+        SortMode::DirsFirst,
+        SortMode::FilesFirst,
+    ] {
+        tree.set_sort_mode(mode);
+    }
+    assert_eq!(
+        STATS.load(Ordering::Relaxed) - before,
+        0,
+        "no sort mode may reach the network"
+    );
+}

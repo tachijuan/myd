@@ -343,10 +343,17 @@ fn sort_key_fast(
 ) -> (i32, i64, String) {
     let is_dir = if node.is_dir { 0 } else { 1 };
     let name = node.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-    // Use cached size (recursive for dirs, metadata for files).
-    let size = cache
-        .get(&node.resolved_path)
-        .unwrap_or_else(|| source.file_size(&node.path)) as i64;
+    // Use the cached size. A miss must NOT fall back to a stat on a remote
+    // tree: this runs inside a sort comparator, on the event-loop thread, so
+    // one blocking round trip per comparison freezes the UI for minutes on a
+    // large remote directory (a 733-entry listing cost ~3000 stats). Remote
+    // sizes come from the listing at load time, so a miss means "unknown" —
+    // sort it as 0 rather than going to the network to find out.
+    let size = match cache.get(&node.resolved_path) {
+        Some(size) => size as i64,
+        None if source.is_remote() => 0,
+        None => source.file_size(&node.path) as i64,
+    };
 
     match sort_mode {
         SortMode::DirsFirst => (is_dir, 0, name),
@@ -536,7 +543,18 @@ impl FileTree {
         // The root is always a directory; determine it via the source so a
         // remote root doesn't trigger a local stat.
         let root_is_dir = source.is_dir(&path);
-        let mut root = TreeNode::with_kind(path.clone(), root_is_dir);
+        // A remote root must not be canonicalized against the *local* filesystem:
+        // a path like /var/log or /home/<user> often exists locally too, so
+        // `canonicalize` silently resolves the wrong one. That rewrites the
+        // node's cache key and every later lookup misses.
+        let mut root = TreeNode::with_meta_link_resolved(
+            path.clone(),
+            root_is_dir,
+            None,
+            None,
+            false,
+            !source.is_remote(),
+        );
         root.expand_cancellable_progress(&source, &cache, sort_mode, show_hidden, cancel, progress);
 
         // The scan was abandoned partway through — discard the partial tree.
