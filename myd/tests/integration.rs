@@ -4349,3 +4349,49 @@ async fn test_sorting_does_no_filesystem_io() {
     );
     let _ = SizeCache::new();
 }
+
+/// Sorting must not rebuild the info panel.
+///
+/// The panel's text depends on which entry is selected, not on the order rows
+/// are displayed in — but `rebuild_treemap` dropped its cache on every sort,
+/// and rebuilding it costs a stat, a canonicalize and a `read_dir` of the
+/// selected directory. On a network filesystem that is several round trips paid
+/// on every press of `s`, on top of the sort itself.
+#[tokio::test]
+async fn test_sorting_does_not_rebuild_the_info_panel() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("f{}.txt", i)), vec![b'x'; 50 * (i + 1)]).unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Open the info panel and render once so its text is cached.
+    app.handle_key_for_test(ctrl_key('b'));
+    let _ = app_screen_text(&mut app, 120, 20);
+
+    let cached_after_first_render = match app.current_screen() {
+        Screen::Main(s) => s.info_cache_key_for_test(),
+        _ => panic!("expected a main screen"),
+    };
+    assert!(
+        cached_after_first_render,
+        "the info panel should be cached after rendering"
+    );
+
+    // Sorting reorders rows; it changes nothing about the selected entry, so
+    // the cached panel text must survive.
+    app.handle_key_for_test(char_key('s'));
+    let still_cached = match app.current_screen() {
+        Screen::Main(s) => s.info_cache_key_for_test(),
+        _ => panic!("expected a main screen"),
+    };
+    assert!(
+        still_cached,
+        "sorting invalidated the info panel, forcing a filesystem re-read"
+    );
+}
