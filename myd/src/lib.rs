@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod hosts;
 pub mod keybinding;
 pub mod panel;
 pub mod screen;

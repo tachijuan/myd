@@ -82,6 +82,31 @@ impl SftpTarget {
             None => self.host.clone(),
         }
     }
+
+    /// The canonical URL for this target — the inverse of [`parse`](Self::parse).
+    ///
+    /// Saved hosts round-trip through here, so anything the catalog stores can be
+    /// handed straight back to the existing connect path as a string.
+    pub fn to_url(&self) -> String {
+        let mut s = String::from("sftp://");
+        if let Some(u) = &self.user {
+            s.push_str(u);
+            s.push('@');
+        }
+        s.push_str(&self.host);
+        if let Some(p) = self.port {
+            s.push(':');
+            s.push_str(&p.to_string());
+        }
+        if let Some(path) = &self.path {
+            let p = path.to_string_lossy();
+            if !p.starts_with('/') {
+                s.push('/');
+            }
+            s.push_str(&p);
+        }
+        s
+    }
 }
 
 #[cfg(test)]

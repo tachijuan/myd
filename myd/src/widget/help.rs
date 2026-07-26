@@ -99,7 +99,10 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         HelpCategory {
             title: "Remote & transfers",
             items: &[
-                ("gr", "Connect to a remote host (sftp://)"),
+                ("gr", "Connect — recent hosts, or type an address"),
+                ("gs", "All saved hosts (the dialing directory)"),
+                ("  /", "  Search the list; j/k/g/G navigate"),
+                ("  a / e / d", "  Add / edit / delete a saved host"),
                 ("Ctrl+T", "Show / hide the transfer panel"),
                 ("gx", "Cancel all queued transfers"),
             ],

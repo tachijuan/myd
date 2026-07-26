@@ -60,6 +60,8 @@ pub enum Action {
     CancelTransfers,
     /// Prompt for a remote host to connect to.
     Connect,
+    /// Open the dialing directory on the full saved-host list.
+    HostDirectory,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -187,6 +189,8 @@ impl KeyBindingHandler {
             // Single letters are effectively exhausted, so remote connect and
             // transfer-cancel take g-chords.
             "gr" => Some(Action::Connect),
+            // The full saved-host list, skipping the recent-three view.
+            "gs" => Some(Action::HostDirectory),
             "gx" => Some(Action::CancelTransfers),
             _ => None,
         }
