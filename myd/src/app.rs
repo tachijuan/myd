@@ -96,6 +96,8 @@ pub enum ModalTarget {
     HostForm { editing: Option<String> },
     /// Confirm removing a saved host.
     HostDelete { label: String },
+    /// Confirm cancelling a running or queued transfer.
+    CancelTransfer { id: crate::transfer::TransferId },
 }
 
 /// Main application state machine.
@@ -182,6 +184,15 @@ pub struct FileBrowser {
     /// Cell and time of the last left click, for double-click detection.
     /// Terminals report presses individually and never a double-click.
     last_click: Option<(u16, u16, std::time::Instant)>,
+    /// Whether the transfer sidebar has keyboard focus instead of a panel.
+    transfer_focused: bool,
+    /// The transfer the sidebar has highlighted, if it is focused.
+    transfer_cursor: Option<crate::transfer::TransferId>,
+    /// Where each cancellable transfer was drawn last frame, for hit-testing.
+    transfer_rows: crate::widget::transfer_panel::PanelRows,
+    /// The sidebar's rect from the last frame, so a click can be attributed to
+    /// it rather than to the panel beside it.
+    transfer_area: Option<ratatui::layout::Rect>,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -256,6 +267,10 @@ impl FileBrowser {
             panel_areas: Vec::new(),
             last_frame: ratatui::layout::Rect::new(0, 0, 0, 0),
             last_click: None,
+            transfer_focused: false,
+            transfer_cursor: None,
+            transfer_rows: Default::default(),
+            transfer_area: None,
         }
     }
 
@@ -438,7 +453,22 @@ impl FileBrowser {
         // Draw the sidebar first: it borrows the queue, while the panel loop
         // below needs `self.panels` mutably.
         if let Some(ta) = transfer_area {
-            transfer_panel::render(f, ta, &self.transfers);
+            self.transfer_rows = transfer_panel::render(
+                f,
+                ta,
+                &self.transfers,
+                self.transfer_focused,
+                self.transfer_cursor,
+            );
+            self.transfer_area = Some(ta);
+        } else {
+            // The sidebar hides itself on a narrow terminal and when the queue
+            // is empty. Clear the stale geometry, or a click in that column
+            // would still be attributed to a panel that is no longer drawn — and
+            // focus would be stuck on something invisible.
+            self.transfer_area = None;
+            self.transfer_rows = Default::default();
+            self.transfer_focused = false;
         }
 
         // In-progress transfer destinations, to overlay as ghost rows on the
@@ -743,6 +773,24 @@ impl FileBrowser {
         self.scroll_by(delta);
     }
 
+    /// Whether the transfer sidebar has focus (for tests).
+    pub fn transfer_focused_for_test(&self) -> bool {
+        self.transfer_focused
+    }
+
+    /// The sidebar's selected transfer (for tests).
+    pub fn transfer_cursor_for_test(&self) -> Option<crate::transfer::TransferId> {
+        self.transfer_cursor
+    }
+
+    /// The screen row and id of the nth cancellable transfer (for tests).
+    pub fn transfer_row_for_test(
+        &self,
+        n: usize,
+    ) -> Option<(u16, crate::transfer::TransferId)> {
+        self.transfer_rows.rows.get(n).copied()
+    }
+
     /// The name of the entry under the cursor (for tests).
     pub fn selected_name_for_test(&self) -> Option<String> {
         match self.panels[self.active].current_screen() {
@@ -928,8 +976,31 @@ impl FileBrowser {
             return true;
         }
 
+        // A click in the sidebar focuses it and selects a transfer; a
+        // double-click on one asks to cancel it.
+        if let Some(ta) = self.transfer_area {
+            let in_sidebar =
+                x >= ta.x && x < ta.x + ta.width && y >= ta.y && y < ta.y + ta.height;
+            if in_sidebar {
+                if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    let double = self.note_click(x, y);
+                    self.transfer_focused = true;
+                    if let Some(id) = self.transfer_rows.at(y) {
+                        self.transfer_cursor = Some(id);
+                        if double {
+                            self.prompt_cancel_selected_transfer();
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // A click back in a browser panel takes focus off the sidebar.
+                self.transfer_focused = false;
+
                 // The sort indicator in the title bar opens the sort menu.
                 // Checked before the panel hit-test, since it sits on the border
                 // row that the tree would otherwise ignore.
@@ -976,6 +1047,94 @@ impl FileBrowser {
                 true
             }
             _ => true,
+        }
+    }
+
+    /// Give the transfer sidebar keyboard focus, selecting its first entry.
+    fn focus_transfers(&mut self) {
+        if self.transfer_area.is_none() {
+            return;
+        }
+        self.transfer_focused = true;
+        if self.transfer_cursor.is_none() {
+            self.transfer_cursor = self.transfer_rows.ids().first().copied();
+        }
+    }
+
+    /// Move the sidebar's selection by one entry.
+    fn transfer_cursor_step(&mut self, forward: bool) {
+        let ids = self.transfer_rows.ids();
+        if ids.is_empty() {
+            self.transfer_cursor = None;
+            return;
+        }
+        let at = self
+            .transfer_cursor
+            .and_then(|c| ids.iter().position(|i| *i == c));
+        let next = match at {
+            Some(i) if forward => (i + 1) % ids.len(),
+            Some(i) => {
+                if i == 0 {
+                    ids.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.transfer_cursor = Some(ids[next]);
+    }
+
+    /// Ask before cancelling the selected transfer.
+    ///
+    /// Confirmed because cancelling discards work that may have taken minutes on
+    /// a slow link, and `k` is one key away from the `j` used to get there.
+    fn prompt_cancel_selected_transfer(&mut self) {
+        let Some(id) = self.transfer_cursor else {
+            return;
+        };
+        let Some(t) = self.transfers.transfers().iter().find(|t| t.id == id) else {
+            return;
+        };
+        let name = t.name.clone();
+        self.modal_target = Some(ModalTarget::CancelTransfer { id });
+        self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+            "Cancel the transfer of '{}'? Any partial copy is discarded.",
+            name
+        )));
+    }
+
+    /// Keys the transfer sidebar handles while focused.
+    ///
+    /// Returns `None` when the key isn't one of them, so it falls through to the
+    /// usual handling and the sidebar can't swallow global keys like `?` or
+    /// Ctrl+C.
+    fn handle_transfer_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if !self.transfer_focused {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.transfer_cursor_step(true);
+                Some(true)
+            }
+            KeyCode::Char('K') | KeyCode::Up => {
+                self.transfer_cursor_step(false);
+                Some(true)
+            }
+            // Lowercase k cancels; K moves up. Vi users expect k to move, so this
+            // is a deliberate departure — it is what was asked for, and the
+            // confirmation dialog makes a mistaken press recoverable.
+            KeyCode::Char('k') | KeyCode::Delete => {
+                self.prompt_cancel_selected_transfer();
+                Some(true)
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.transfer_focused = false;
+                self.transfer_cursor = None;
+                Some(true)
+            }
+            _ => None,
         }
     }
 
@@ -1033,6 +1192,12 @@ impl FileBrowser {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // The transfer sidebar takes its own keys while focused, but only the
+        // ones it owns — anything else falls through so global keys still work.
+        if let Some(result) = self.handle_transfer_key(key) {
+            return result;
+        }
+
         // Let the current screen handle raw keys first (e.g., dir picker input).
         if let Some(result) = self
             .active_panel_mut()
@@ -1101,8 +1266,17 @@ impl FileBrowser {
                 false
             }
             Action::SwitchPanel => {
-                // Tab moves focus to the other panel (no-op in single-panel mode).
-                if let Some(other) = self.other_index() {
+                // Tab cycles the browser panels and then the transfer sidebar,
+                // so everything focusable is reachable from one key rather than
+                // the sidebar needing its own.
+                if self.transfer_focused {
+                    self.transfer_focused = false;
+                    self.transfer_cursor = None;
+                } else if self.transfer_area.is_some()
+                    && (self.other_index().is_none() || self.active + 1 == self.panels.len())
+                {
+                    self.focus_transfers();
+                } else if let Some(other) = self.other_index() {
                     self.active = other;
                 }
                 true
@@ -1535,6 +1709,9 @@ impl FileBrowser {
                         Some(ModalTarget::Delete { paths }) if result => {
                             self.spawn_delete_batch(paths);
                         }
+                        Some(ModalTarget::CancelTransfer { id }) if result => {
+                            self.transfers.cancel(id);
+                        }
                         Some(ModalTarget::HostDelete { label }) => {
                             if result {
                                 self.hosts.remove(&label);
@@ -1651,7 +1828,8 @@ impl FileBrowser {
                             ModalTarget::HostForm { editing } => {
                                 self.submit_host_form(&value, editing);
                             }
-                            ModalTarget::HostDelete { .. } => {}
+                            ModalTarget::HostDelete { .. }
+                            | ModalTarget::CancelTransfer { .. } => {}
                             ModalTarget::Password => {
                                 if value.is_empty() {
                                     // An empty entry cancels the whole attempt.
