@@ -62,6 +62,8 @@ pub enum Action {
     Connect,
     /// Open the dialing directory on the full saved-host list.
     HostDirectory,
+    /// Release or re-grab the mouse, for terminal text selection.
+    ToggleMouse,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -209,6 +211,8 @@ impl KeyBindingHandler {
                 KeyCode::Char('o') => Some(Action::PopScreen),
                 // Pairs with Ctrl-b for the info panel: both are sidebars.
                 KeyCode::Char('t') => Some(Action::ToggleTransferPanel),
+                // Releases the mouse so the terminal's own text selection works.
+                KeyCode::Char('n') => Some(Action::ToggleMouse),
                 _ => None,
             };
         }

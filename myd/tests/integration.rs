@@ -4921,3 +4921,165 @@ async fn picker_renders_at_realistic_sizes() {
         term.draw(|f| app.render_for_test(f)).unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mouse
+// ---------------------------------------------------------------------------
+
+fn mouse_at(
+    kind: crossterm::event::MouseEventKind,
+    x: u16,
+    y: u16,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }
+}
+
+/// Clicking a tree row must select exactly the row under the pointer.
+///
+/// The mapping depends on the rect and scroll offset recorded during render,
+/// so the app has to be drawn first — testing it against a guessed geometry
+/// would prove nothing.
+#[tokio::test]
+async fn clicking_a_tree_row_selects_it() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // Row 0 of the box is the border/title, so content starts at y = 1.
+    // Clicking the third content row selects tree line 2.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 3));
+    assert_eq!(
+        app.selected_line_index_for_test(),
+        Some(2),
+        "click should land on the row under the pointer"
+    );
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 1));
+    assert_eq!(app.selected_line_index_for_test(), Some(0));
+}
+
+/// A click on the border or outside the tree must not move the cursor.
+#[tokio::test]
+async fn clicking_outside_the_rows_does_nothing() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 3));
+    let before = app.selected_line_index_for_test();
+
+    // The top border row.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 0));
+    assert_eq!(app.selected_line_index_for_test(), before);
+
+    // Far below the last row.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 29));
+    assert_eq!(app.selected_line_index_for_test(), before);
+}
+
+/// In dual mode a click focuses the panel it landed in, so it can't move the
+/// other panel's cursor.
+#[tokio::test]
+async fn clicking_a_panel_focuses_it() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(
+        Some(dir.path().to_path_buf()),
+        Some(dir.path().to_path_buf()),
+        true,
+    );
+    app.resolve_loading_for_test();
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    assert_eq!(app.panel_count(), 2);
+
+    // Right half, then left half.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 75, 3));
+    assert_eq!(app.active_panel_index(), 1);
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 3));
+    assert_eq!(app.active_panel_index(), 0);
+}
+
+/// The wheel scrolls without needing a click first.
+#[tokio::test]
+async fn scrolling_moves_the_cursor() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let start = app.selected_line_index_for_test().unwrap();
+    app.scroll_by_for_test(3);
+    assert_eq!(app.selected_line_index_for_test(), Some(start + 3));
+
+    app.scroll_by_for_test(-2);
+    assert_eq!(app.selected_line_index_for_test(), Some(start + 1));
+}
+
+/// Ctrl+N releases the mouse so terminal text selection works, and re-grabs it.
+#[tokio::test]
+async fn ctrl_n_toggles_mouse_capture() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let before = app.mouse_captured();
+    app.handle_key_for_test(ctrl_key('n'));
+    assert_ne!(app.mouse_captured(), before, "Ctrl+N should toggle capture");
+    app.handle_key_for_test(ctrl_key('n'));
+    assert_eq!(app.mouse_captured(), before);
+}
+
+/// A click while a dialog is up must not reach the tree behind it.
+#[tokio::test]
+async fn a_modal_swallows_clicks() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 3));
+    let before = app.selected_line_index_for_test();
+
+    // Open help, then click where a row would be.
+    app.handle_key_for_test(char_key('?'));
+    assert_eq!(app.modal_kind_for_test(), "help");
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 6));
+
+    assert_eq!(
+        app.selected_line_index_for_test(),
+        before,
+        "the click leaked through the modal"
+    );
+}

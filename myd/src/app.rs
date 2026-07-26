@@ -164,6 +164,18 @@ pub struct FileBrowser {
     /// only once the connection actually succeeds — a host that never connects
     /// should not climb the list.
     connecting_label: Option<String>,
+    /// Whether mouse capture is on.
+    ///
+    /// Capture takes over the terminal's own click-drag selection, so it can be
+    /// released (Ctrl+O) when the user wants to copy text out. Most terminals
+    /// also honour Shift+drag as an override while captured.
+    mouse_captured: bool,
+    /// Column ranges of each panel from the last frame, for click-to-focus.
+    /// Recomputed every draw, like every other rect in the layout.
+    panel_areas: Vec<ratatui::layout::Rect>,
+    /// The whole terminal area from the last frame. Modals centre on this, so a
+    /// click has to be tested against the same rect they were drawn into.
+    last_frame: ratatui::layout::Rect,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -234,6 +246,9 @@ impl FileBrowser {
             pending_connect: None,
             hosts: HostCatalog::load(),
             connecting_label: None,
+            mouse_captured: false,
+            panel_areas: Vec::new(),
+            last_frame: ratatui::layout::Rect::new(0, 0, 0, 0),
         }
     }
 
@@ -260,10 +275,11 @@ impl FileBrowser {
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::DisableMouseCapture,
+            crossterm::event::EnableMouseCapture,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::Hide,
         )?;
+        self.mouse_captured = true;
 
         // Insert guard FIRST so any early return still cleans up.
         let _guard = TerminalGuard;
@@ -289,12 +305,56 @@ impl FileBrowser {
                 running = false;
             }
 
-            if let Ok(true) = crossterm::event::poll(std::time::Duration::from_millis(100)) {
-                if let Ok(Event::Key(key)) = crossterm::event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        running = self.route_key(key);
-                    }
+            // Drain everything queued rather than one event per 100 ms poll.
+            // Mouse movement arrives in bursts, and taking a single event per
+            // tick would leave the UI lagging seconds behind the pointer.
+            let mut pending_scroll: i32 = 0;
+            let mut first = true;
+            while running {
+                let ready = if first {
+                    // Block briefly on the first read so an idle app doesn't spin.
+                    matches!(
+                        crossterm::event::poll(std::time::Duration::from_millis(100)),
+                        Ok(true)
+                    )
+                } else {
+                    matches!(
+                        crossterm::event::poll(std::time::Duration::ZERO),
+                        Ok(true)
+                    )
+                };
+                first = false;
+                if !ready {
+                    break;
                 }
+                match crossterm::event::read() {
+                    Ok(Event::Key(key)) => {
+                        if key.kind == KeyEventKind::Press {
+                            running = self.route_key(key);
+                        }
+                    }
+                    Ok(Event::Mouse(m)) => {
+                        use crossterm::event::MouseEventKind;
+                        // Coalesce wheel ticks: a fast scroll delivers many
+                        // events, and handling each with a full redraw between
+                        // them is what makes scrolling feel sticky.
+                        match m.kind {
+                            MouseEventKind::ScrollDown => pending_scroll += 1,
+                            MouseEventKind::ScrollUp => pending_scroll -= 1,
+                            // Drags and plain moves carry no meaning here, and
+                            // acting on each would flood the loop.
+                            MouseEventKind::Moved | MouseEventKind::Drag(_) => {}
+                            _ => running = self.route_mouse(m),
+                        }
+                    }
+                    // Resize is handled by the next draw, which re-reads the
+                    // frame size; previously every non-Key event was discarded.
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if pending_scroll != 0 {
+                self.scroll_by(pending_scroll);
             }
 
             // Per-phase timing so a stall between keypresses can be attributed
@@ -351,6 +411,7 @@ impl FileBrowser {
         let deleting = self.panels.iter().any(|p| p.is_deleting());
         let show_transfers = self.transfer_panel_visible();
         let full = f.area();
+        self.last_frame = full;
 
         // Carve the transfer sidebar off the right edge before the panels divide
         // what's left, so it spans full height and is independent of
@@ -380,6 +441,9 @@ impl FileBrowser {
         if panel_count == 2 {
             let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
+            // Kept for click-to-focus; every rect here is a frame-local that
+            // would otherwise be gone before the next mouse event arrives.
+            self.panel_areas = cols.to_vec();
             for (i, panel) in self.panels.iter_mut().enumerate() {
                 let backend = panel.backend;
                 // Tell the top Main screen whether it's the active panel so its
@@ -391,6 +455,7 @@ impl FileBrowser {
                 panel.current_screen_mut().render(f, cols[i]);
             }
         } else {
+            self.panel_areas = vec![area];
             let backend = self.panels[0].backend;
             if let Screen::Main(state) = self.panels[0].current_screen_mut() {
                 state.active = true;
@@ -649,6 +714,19 @@ impl FileBrowser {
         self.advance_transfers();
     }
 
+    /// The active panel's cursor position in the flattened tree (for tests).
+    pub fn selected_line_index_for_test(&self) -> Option<usize> {
+        match self.panels[self.active].current_screen() {
+            Screen::Main(state) => Some(state.tree.cursor),
+            _ => None,
+        }
+    }
+
+    /// Scroll as the wheel does (for tests).
+    pub fn scroll_by_for_test(&mut self, delta: i32) {
+        self.scroll_by(delta);
+    }
+
     /// Which modal is up, as a stable name (for tests).
     pub fn modal_kind_for_test(&self) -> &'static str {
         match &self.modal {
@@ -778,6 +856,97 @@ impl FileBrowser {
             }
             _ => self.handle_modal_key(key),
         }
+    }
+
+    /// Route a mouse event. Returns whether the app should keep running.
+    ///
+    /// Mirrors [`route_key`](Self::route_key)'s modal-first ordering: a modal is
+    /// on top of everything, so it must get the click before the panels do.
+    pub fn route_mouse(&mut self, ev: crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let (x, y) = (ev.column, ev.row);
+
+        // The picker is the only modal with clickable rows; for the others a
+        // click is swallowed so it can't act on the screen underneath.
+        if let Modal::HostPicker(picker) = &mut self.modal {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let area = self.last_frame;
+                if picker.click_row(area, y) {
+                    // A second click on the highlighted row connects, so a
+                    // double-click reads naturally.
+                    let outcome = picker.handle_key(crossterm::event::KeyEvent::new(
+                        KeyCode::Enter,
+                        crossterm::event::KeyModifiers::NONE,
+                    ));
+                    return self.apply_picker_outcome(outcome);
+                }
+            }
+            return true;
+        }
+        if !matches!(self.modal, Modal::None) {
+            return true;
+        }
+
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Clicking a panel focuses it, so a click in the inactive pane
+                // doesn't move the other pane's cursor.
+                if let Some(i) = self
+                    .panel_areas
+                    .iter()
+                    .position(|a| x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height)
+                {
+                    if i < self.panels.len() {
+                        self.active = i;
+                    }
+                }
+                if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+                    state.click_at(x, y);
+                }
+                true
+            }
+            // Enter a directory, matching the usual double-click idiom.
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+                    if state.click_at(x, y) {
+                        return self.dispatch_action(Action::Confirm);
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Scroll the view under the pointer by `delta` rows.
+    fn scroll_by(&mut self, delta: i32) {
+        let screen = self.active_panel_mut().current_screen_mut();
+        if delta > 0 {
+            for _ in 0..delta {
+                screen.cursor_down();
+            }
+        } else {
+            for _ in 0..(-delta) {
+                screen.cursor_up();
+            }
+        }
+    }
+
+    /// Release or re-grab the mouse, so terminal text selection can be used.
+    fn toggle_mouse_capture(&mut self) {
+        let mut out = std::io::stdout();
+        if self.mouse_captured {
+            let _ = crossterm::execute!(out, crossterm::event::DisableMouseCapture);
+        } else {
+            let _ = crossterm::execute!(out, crossterm::event::EnableMouseCapture);
+        }
+        self.mouse_captured = !self.mouse_captured;
+    }
+
+    /// Whether mouse capture is currently on (for the footer and tests).
+    pub fn mouse_captured(&self) -> bool {
+        self.mouse_captured
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -980,6 +1149,10 @@ impl FileBrowser {
             }
             Action::HostDirectory => {
                 self.modal = Modal::HostPicker(HostPicker::full(&self.hosts));
+                true
+            }
+            Action::ToggleMouse => {
+                self.toggle_mouse_capture();
                 true
             }
             Action::ChangeRoot => {
@@ -1240,7 +1413,8 @@ impl FileBrowser {
                     | Action::ToggleTransferPanel
                     | Action::CancelTransfers
                     | Action::Connect
-                    | Action::HostDirectory => unreachable!(),
+                    | Action::HostDirectory
+                    | Action::ToggleMouse => unreachable!(),
                     Action::None => true,
                 }
             }
