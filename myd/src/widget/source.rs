@@ -155,7 +155,7 @@ impl RemoteSource {
     /// channel `recv`, never a runtime, and the future runs on a different
     /// thread. That matters: the tree's interactive navigation is driven
     /// synchronously from inside the async loop.
-    fn block<F>(&self, fut: F) -> F::Output
+    fn block<F>(&self, what: &'static str, fut: F) -> F::Output
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -164,9 +164,10 @@ impl RemoteSource {
         self.driver.handle.spawn(async move {
             let _ = tx.send(fut.await);
         });
-        // Every remote round trip funnels through here. Timing it attributes a
-        // freeze to the network rather than to the UI, which is otherwise very
-        // hard to tell apart from the outside.
+        // Every remote round trip funnels through here, and a slow one on the
+        // event-loop thread is indistinguishable from a hang. Logging which call
+        // blocked, and for how long, names the culprit instead of leaving it to
+        // inference.
         let started = crate::app::trace_enabled().then(std::time::Instant::now);
         let out = rx
             .recv()
@@ -175,8 +176,9 @@ impl RemoteSource {
             let elapsed = started.elapsed();
             if elapsed > std::time::Duration::from_millis(100) {
                 crate::app::trace_note(format_args!(
-                    "  remote blocking call took {:.1}ms",
-                    elapsed.as_secs_f64() * 1000.0
+                    "  remote {} blocked {:.1}ms",
+                    what,
+                    elapsed.as_secs_f64() * 1000.0,
                 ));
             }
         }
@@ -186,19 +188,19 @@ impl RemoteSource {
     /// List a remote directory (owned inputs, so the future is `'static`).
     fn read_dir(&self, path: VPath) -> anyhow::Result<Vec<VEntry>> {
         let vfs = self.vfs.clone();
-        self.block(async move { vfs.read_dir(&path).await })
+        self.block("read_dir", async move { vfs.read_dir(&path).await })
     }
 
     /// Stat a remote path.
     fn stat(&self, path: VPath) -> anyhow::Result<crate::vfs::VMetadata> {
         let vfs = self.vfs.clone();
-        self.block(async move { vfs.stat(&path).await })
+        self.block("stat", async move { vfs.stat(&path).await })
     }
 
     /// Create a directory (and any missing parents).
     fn create_dir_all(&self, path: VPath) -> anyhow::Result<()> {
         let vfs = self.vfs.clone();
-        self.block(async move { vfs.create_dir_all(&path).await })
+        self.block("create_dir_all", async move { vfs.create_dir_all(&path).await })
     }
 
     /// Directory size (shallow for SFTP).
@@ -210,7 +212,7 @@ impl RemoteSource {
         progress: Option<OpProgress>,
     ) -> u64 {
         let vfs = self.vfs.clone();
-        self.block(async move {
+        self.block("dir_size", async move {
             vfs.dir_size(&path, &cache, &cancel, progress.as_ref())
                 .await
         })
