@@ -35,6 +35,22 @@ pub struct SourceEntry {
     /// Whether the entry is a symlink. `is_dir` describes the *target*, so a
     /// symlinked directory is traversable; this flag only drives display.
     pub is_symlink: bool,
+    /// Unix mode bits, when the listing reports them. `None` on a backend that
+    /// doesn't, or on a non-unix host — rendered as a placeholder rather than
+    /// guessed at.
+    pub mode: Option<u32>,
+}
+
+/// Unix mode bits from local metadata, or `None` off unix.
+#[cfg(unix)]
+pub(crate) fn mode_of(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(meta.permissions().mode())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mode_of(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 /// Where a tree's data comes from.
@@ -257,7 +273,9 @@ impl Source {
                             Ok(t) => t.is_dir(),
                             Err(_) => path.is_dir(),
                         };
-                        // One metadata read serves size and timestamps.
+                        // One metadata read serves size, timestamps and mode.
+                        // `DirEntry::metadata` does not follow symlinks, so a
+                        // link reports its own `lrwxrwxrwx` — what `ls -l` shows.
                         let meta = entry.metadata().ok();
                         // Local directories need a recursive walk for their real
                         // size (done later, cached); leave `len` unset for them.
@@ -275,6 +293,7 @@ impl Source {
                             mtime: meta.as_ref().and_then(|m| m.modified().ok()),
                             atime: meta.as_ref().and_then(|m| m.accessed().ok()),
                             is_symlink,
+                            mode: meta.as_ref().and_then(mode_of),
                         });
                     }
                 }
@@ -295,6 +314,7 @@ impl Source {
                             mtime: e.mtime,
                             atime: e.atime,
                             is_symlink: e.is_symlink,
+                            mode: e.mode,
                         })
                         .collect(),
                     Err(_) => Vec::new(),

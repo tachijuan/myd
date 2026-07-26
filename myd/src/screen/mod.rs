@@ -238,6 +238,8 @@ pub trait ScreenState {
     fn to_bottom(&mut self) -> bool { true }
     fn page_down(&mut self) -> bool { true }
     fn page_up(&mut self) -> bool { true }
+    fn half_page_down(&mut self) -> bool { true }
+    fn half_page_up(&mut self) -> bool { true }
     fn go_parent(&mut self) -> bool { true }
     fn change_root(&mut self) -> bool { true }
     fn delete(&mut self) -> bool { true }
@@ -246,6 +248,8 @@ pub trait ScreenState {
     fn toggle_sort(&mut self) -> bool { true }
     fn toggle_hidden(&mut self) -> bool { true }
     fn toggle_bar(&mut self) -> bool { true }
+    fn toggle_perms(&mut self) -> bool { true }
+    fn toggle_times(&mut self) -> bool { true }
     fn collapse_all(&mut self) -> bool { true }
     fn expand_all(&mut self) -> bool { true }
     fn search(&mut self, _pattern: &str) -> bool { true }
@@ -311,6 +315,20 @@ impl Screen {
             Screen::Loading(_) => true,
         }
     }
+    pub fn half_page_down(&mut self) -> bool {
+        match self {
+            Screen::DirPicker(s) => s.half_page_down(),
+            Screen::Main(s) => s.half_page_down(),
+            Screen::Loading(_) => true,
+        }
+    }
+    pub fn half_page_up(&mut self) -> bool {
+        match self {
+            Screen::DirPicker(s) => s.half_page_up(),
+            Screen::Main(s) => s.half_page_up(),
+            Screen::Loading(_) => true,
+        }
+    }
     pub fn go_parent(&mut self) -> bool {
         match self {
             Screen::DirPicker(s) => s.go_parent(),
@@ -364,6 +382,20 @@ impl Screen {
         match self {
             Screen::DirPicker(s) => s.toggle_bar(),
             Screen::Main(s) => s.toggle_bar(),
+            Screen::Loading(_) => true,
+        }
+    }
+    pub fn toggle_perms(&mut self) -> bool {
+        match self {
+            Screen::DirPicker(s) => s.toggle_perms(),
+            Screen::Main(s) => s.toggle_perms(),
+            Screen::Loading(_) => true,
+        }
+    }
+    pub fn toggle_times(&mut self) -> bool {
+        match self {
+            Screen::DirPicker(s) => s.toggle_times(),
+            Screen::Main(s) => s.toggle_times(),
             Screen::Loading(_) => true,
         }
     }

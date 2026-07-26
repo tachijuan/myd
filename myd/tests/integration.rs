@@ -986,8 +986,8 @@ async fn test_info_panel_state_survives_entering_a_directory() {
     assert_eq!(view_state(&app), (true, FocusTarget::Tree));
 
     // Open the info panel, then descend into "sub".
-    app.handle_key_for_test(ctrl_key('b'));
-    assert!(!view_state(&app).0, "Ctrl+b should show the panel");
+    app.handle_key_for_test(ctrl_key('p'));
+    assert!(!view_state(&app).0, "Ctrl+p should show the panel");
 
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     settle(&mut app).await;
@@ -1031,7 +1031,7 @@ async fn test_both_view_prefs_survive_navigation_round_trip() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    app.handle_key_for_test(ctrl_key('b'));
+    app.handle_key_for_test(ctrl_key('p'));
     app.handle_key_for_test(char_key('v'));
     let want = (false, FocusTarget::Treemap);
     assert_eq!(view_state(&app), want);
@@ -1058,8 +1058,8 @@ async fn test_toggling_prefs_back_also_persists() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    app.handle_key_for_test(ctrl_key('b')); // show
-    app.handle_key_for_test(ctrl_key('b')); // hide again
+    app.handle_key_for_test(ctrl_key('p')); // show
+    app.handle_key_for_test(ctrl_key('p')); // hide again
     app.handle_key_for_test(char_key('v')); // treemap
     app.handle_key_for_test(char_key('v')); // back to tree
 
@@ -3116,7 +3116,7 @@ async fn transfer_panel_coexists_with_dual_panels_and_info_panel() {
     // Dual panels + info panel + transfer sidebar all at once must not panic and
     // must all be present. Pin the transfer panel open (Ctrl+t) since it's not
     // shown by default without a queued transfer.
-    app.handle_key_for_test(ctrl_key('b'));
+    app.handle_key_for_test(ctrl_key('p'));
     app.handle_key_for_test(ctrl_key('t'));
     let text = app_screen_text(&mut app, 160, 30);
     assert!(text.contains("Transfers"), "sidebar missing: {}", text);
@@ -4459,7 +4459,7 @@ async fn test_sorting_does_not_rebuild_the_info_panel() {
     settle(&mut app).await;
 
     // Open the info panel and render once so its text is cached.
-    app.handle_key_for_test(ctrl_key('b'));
+    app.handle_key_for_test(ctrl_key('p'));
     let _ = app_screen_text(&mut app, 120, 20);
 
     let cached_after_first_render = match app.current_screen() {
@@ -5712,4 +5712,887 @@ async fn focusing_the_transfer_panel_unfocuses_the_browser_panels() {
 
     // The screen enum is exhaustive; keep the import meaningful.
     assert!(matches!(app.current_screen(), Screen::Main(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Paging: Ctrl+F / Ctrl+B move a full screen, Ctrl+D / Ctrl+U half, and all
+// four measure the terminal instead of assuming 20 lines.
+// ---------------------------------------------------------------------------
+
+/// A directory with enough entries to page through several screens of them.
+fn paging_fixture(n: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..n {
+        // Descending sizes, so the default Largest sort gives a stable order
+        // that does not depend on the filesystem's readdir order.
+        std::fs::write(
+            dir.path().join(format!("f{:03}.bin", i)),
+            vec![0u8; (n - i) * 8],
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// A main screen over `paging_fixture`, plus a terminal to draw it into.
+fn paging_screen(
+    n: usize,
+    w: u16,
+    h: u16,
+) -> (
+    tempfile::TempDir,
+    myd::screen::MainScreenState,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = paging_fixture(n);
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, true);
+    let st = myd::screen::MainScreenState::from_tree(dir.path().to_path_buf(), tree);
+    let terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    (dir, st, terminal)
+}
+
+fn draw(
+    st: &mut myd::screen::MainScreenState,
+    terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    use myd::screen::ScreenState;
+    terminal.draw(|f| st.render(f, f.area())).unwrap();
+}
+
+#[test]
+fn ctrl_f_and_ctrl_b_move_a_full_viewport() {
+    // Pre-fix Ctrl+F was unbound entirely, so the cursor did not move at all.
+    let (_dir, mut st, mut term) = paging_screen(60, 80, 20);
+    draw(&mut st, &mut term);
+    // 20 rows, less the 1-row footer, less the tree box's top border + title bar
+    // and bottom border.
+    assert_eq!(st.tree_viewport, 16, "viewport should be measured, not assumed");
+
+    st.page_down();
+    assert_eq!(st.tree.cursor, 16, "Ctrl+F moves one full screen");
+    st.page_up();
+    assert_eq!(st.tree.cursor, 0, "Ctrl+B comes back");
+}
+
+#[test]
+fn ctrl_d_and_ctrl_u_move_half_a_viewport() {
+    // Pre-fix these moved a hardcoded 20 regardless of the terminal, so the
+    // exact expected value is what makes this test meaningful — asserting
+    // merely "it moved" would have passed against the constant.
+    let (_dir, mut st, mut term) = paging_screen(60, 80, 20);
+    draw(&mut st, &mut term);
+
+    st.half_page_down();
+    assert_eq!(st.tree.cursor, 8, "half of a 16-row viewport");
+    st.half_page_up();
+    assert_eq!(st.tree.cursor, 0);
+}
+
+#[test]
+fn page_moves_scale_with_the_terminal_height() {
+    // The regression guard against anyone reintroducing a constant.
+    let (_dir_a, mut short, mut term_a) = paging_screen(120, 80, 20);
+    draw(&mut short, &mut term_a);
+    short.page_down();
+
+    let (_dir_b, mut tall, mut term_b) = paging_screen(120, 80, 44);
+    draw(&mut tall, &mut term_b);
+    tall.page_down();
+
+    assert!(
+        tall.tree.cursor > short.tree.cursor,
+        "a taller terminal must page further: {} vs {}",
+        tall.tree.cursor,
+        short.tree.cursor
+    );
+}
+
+#[test]
+fn a_page_move_before_the_first_frame_still_moves() {
+    // Nothing has been drawn, so there is no measured viewport yet; the motion
+    // falls back to the distance the old hardcoded page used.
+    let (_dir, mut st, _term) = paging_screen(60, 80, 20);
+    assert_eq!(st.tree_viewport, 0, "nothing drawn yet");
+    st.page_down();
+    assert_eq!(st.tree.cursor, 20, "falls back to DEFAULT_VIEWPORT");
+}
+
+#[tokio::test]
+async fn page_moves_tag_the_range_in_visual_mode() {
+    use myd::app::FileBrowser;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    // Pre-fix this tagged exactly one entry: dispatch_action_inner ended visual
+    // mode before the motion ran, and the motion assigned `cursor` directly and
+    // so never called tag_visual_span either.
+    let dir = paging_fixture(60);
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    app.handle_key_for_test(char_key('V'));
+    app.handle_key_for_test(ctrl_key('d'));
+
+    let tagged = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tree.tagged_paths().len(),
+        _ => panic!("expected a main screen"),
+    };
+    // Anchor at 0 through the cursor at 8, inclusive.
+    assert_eq!(tagged, 9, "a half-page jump must tag the range it crossed");
+}
+
+#[tokio::test]
+async fn to_top_and_to_bottom_tag_the_range_in_visual_mode() {
+    use myd::app::FileBrowser;
+
+    // `to_top` / `to_bottom` bypassed tag_visual_span the same way the page
+    // motions did, so `V` then `G` tagged only the anchor.
+    let dir = paging_fixture(30);
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let total = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tree.lines.len(),
+        _ => panic!("expected a main screen"),
+    };
+
+    app.handle_key_for_test(char_key('V'));
+    app.handle_key_for_test(char_key('G'));
+
+    let tagged = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tree.tagged_paths().len(),
+        _ => panic!("expected a main screen"),
+    };
+    assert_eq!(tagged, total, "V then G tags every line");
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling: the cursor crosses the viewport before the content moves.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_moves_within_the_viewport_before_the_view_scrolls() {
+    // The headline regression. The offset used to be recomputed from the cursor
+    // on every frame (`cursor - visible + 1`), which pinned the cursor to the
+    // bottom row once it passed the first screenful: moving *up* then shifted
+    // the whole view instead of walking the cursor back up through it.
+    let (_dir, mut st, mut term) = paging_screen(60, 80, 20);
+    draw(&mut st, &mut term);
+    let visible = st.tree_viewport;
+    assert_eq!(visible, 16);
+
+    // Walk down past the first screen. The offset must have followed by exactly
+    // as much as the cursor overshot the window.
+    for _ in 0..25 {
+        st.cursor_down();
+        draw(&mut st, &mut term);
+    }
+    assert_eq!(st.tree.cursor, 25);
+    assert_eq!(st.tree_scroll, 25 + 1 - visible, "offset tracks the bottom edge");
+    let parked = st.tree_scroll;
+
+    // The precise statement of the bug: one press of `k` moves the cursor up
+    // *within* the window and leaves the content exactly where it was. Pre-fix
+    // the offset was re-derived as 24 - 16 + 1 and the whole view jumped.
+    st.cursor_up();
+    draw(&mut st, &mut term);
+    assert_eq!(st.tree.cursor, 24);
+    assert_eq!(
+        st.tree_scroll, parked,
+        "moving the cursor inside the window must not scroll the view"
+    );
+}
+
+#[test]
+fn scrolling_down_then_up_returns_to_the_same_offset() {
+    // Guards against an off-by-one that accumulates over a long sweep.
+    let (_dir, mut st, mut term) = paging_screen(60, 80, 20);
+    draw(&mut st, &mut term);
+
+    for _ in 0..30 {
+        st.cursor_down();
+        draw(&mut st, &mut term);
+    }
+    for _ in 0..30 {
+        st.cursor_up();
+        draw(&mut st, &mut term);
+    }
+
+    assert_eq!(st.tree.cursor, 0);
+    assert_eq!(st.tree_scroll, 0, "a round trip must land back at the top");
+}
+
+#[test]
+fn the_scroll_offset_is_clamped_when_lines_disappear() {
+    // A post-fix invariant guard, not a pre-fix failure: with the offset derived
+    // from the cursor this was vacuously true. Now that the offset persists, a
+    // shrinking line list could leave the view scrolled past the end.
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("big")).unwrap();
+    for i in 0..80 {
+        std::fs::write(dir.path().join("big").join(format!("f{:03}", i)), b"x").unwrap();
+    }
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, true);
+    let mut st = myd::screen::MainScreenState::from_tree(dir.path().to_path_buf(), tree);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+    // Expand the subtree, drop to the bottom, and scroll deep into it.
+    st.expand_all();
+    draw(&mut st, &mut term);
+    st.to_bottom();
+    draw(&mut st, &mut term);
+    assert!(st.tree_scroll > 0, "should be scrolled well down");
+
+    // Collapsing throws most of those lines away.
+    st.collapse_all();
+    draw(&mut st, &mut term);
+
+    let visible = st.tree_viewport;
+    assert!(
+        st.tree_scroll + visible <= st.tree.lines.len().max(visible),
+        "offset {} + viewport {} ran past {} lines",
+        st.tree_scroll,
+        visible,
+        st.tree.lines.len()
+    );
+    assert!(
+        st.tree.cursor >= st.tree_scroll && st.tree.cursor < st.tree_scroll + visible,
+        "cursor {} outside the window [{}, {})",
+        st.tree.cursor,
+        st.tree_scroll,
+        st.tree_scroll + visible
+    );
+}
+
+#[test]
+fn clicking_a_row_still_selects_it_after_scrolling() {
+    // The tree_scroll/click_at contract: the recorded offset must keep meaning
+    // "index of the first visible line", or mouse hit-testing silently drifts.
+    let (_dir, mut st, mut term) = paging_screen(60, 80, 20);
+    draw(&mut st, &mut term);
+    st.to_bottom();
+    draw(&mut st, &mut term);
+
+    let scroll = st.tree_scroll;
+    assert!(scroll > 0, "should be scrolled down");
+
+    let area = st.tree_area.expect("tree drew");
+    // Content row 3: past the top border/title row.
+    st.click_at(area.x + 2, area.y + 1 + 3);
+    assert_eq!(st.tree.cursor, scroll + 3);
+}
+
+#[test]
+fn to_bottom_leaves_the_last_line_visible() {
+    let (_dir, mut st, mut term) = paging_screen(60, 80, 20);
+    draw(&mut st, &mut term);
+    st.to_bottom();
+    draw(&mut st, &mut term);
+
+    let visible = st.tree_viewport;
+    assert_eq!(st.tree.cursor, st.tree.lines.len() - 1);
+    assert_eq!(
+        st.tree_scroll,
+        st.tree.lines.len() - visible,
+        "the last line should sit on the bottom row, with no blank rows below"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shallow remote directory sizes: shown as unknown, sorted as unknown.
+// ---------------------------------------------------------------------------
+
+use myd::screen::SortMode as ShallowSortMode;
+use myd::utils::sizes::{CancelToken as ShallowCancel, SizeCache as ShallowCache};
+use myd::widget::file_tree::FileTree as ShallowTree;
+use myd::widget::progress::OpProgress as ShallowProgress;
+
+/// A remote backend whose listing mimics SFTP: real file lengths, and the
+/// directory inode's own 4096 bytes for every directory.
+struct ShallowDirs;
+
+#[async_trait::async_trait]
+impl myd::vfs::Vfs for ShallowDirs {
+    fn scheme(&self) -> &'static str {
+        "sftp"
+    }
+    async fn read_dir(&self, p: &myd::vfs::VPath) -> anyhow::Result<Vec<myd::vfs::VEntry>> {
+        // Only the root has children; the two directories are empty.
+        if p.path.file_name().map(|s| s.to_string_lossy().to_string()) == Some("dir_a".into())
+            || p.path.file_name().map(|s| s.to_string_lossy().to_string()) == Some("dir_b".into())
+        {
+            return Ok(Vec::new());
+        }
+        let mut v = Vec::new();
+        for name in ["dir_a", "dir_b"] {
+            let mut e = myd::vfs::VEntry::new(name, true);
+            // What a real SFTP READDIR reports for a directory: its inode size.
+            e.len = 4096;
+            e.mode = Some(0o750);
+            v.push(e);
+        }
+        let mut small = myd::vfs::VEntry::new("small_file", false);
+        small.len = 100;
+        v.push(small);
+        let mut big = myd::vfs::VEntry::new("big_file", false);
+        big.len = 1_000_000;
+        v.push(big);
+        Ok(v)
+    }
+    async fn stat(&self, p: &myd::vfs::VPath) -> anyhow::Result<myd::vfs::VMetadata> {
+        let n = p
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let is_dir = !n.contains("file");
+        Ok(myd::vfs::VMetadata {
+            is_dir,
+            is_symlink: false,
+            len: if is_dir { 4096 } else { 100 },
+            mode: None,
+            uid: None,
+            gid: None,
+            mtime: None,
+            atime: None,
+            ctime: None,
+        })
+    }
+    async fn create_dir_all(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn remove_file(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn remove_dir(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn rename(&self, _f: &myd::vfs::VPath, _t: &myd::vfs::VPath) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn open_read(&self, _p: &myd::vfs::VPath) -> anyhow::Result<Box<dyn myd::vfs::VRead>> {
+        anyhow::bail!("unused")
+    }
+    async fn open_write(
+        &self,
+        _p: &myd::vfs::VPath,
+        _l: Option<u64>,
+    ) -> anyhow::Result<Box<dyn myd::vfs::VWrite>> {
+        anyhow::bail!("unused")
+    }
+    async fn dir_size(
+        &self,
+        _p: &myd::vfs::VPath,
+        _c: &ShallowCache,
+        _ct: &ShallowCancel,
+        _pr: Option<&ShallowProgress>,
+    ) -> u64 {
+        4096
+    }
+    fn has_recursive_sizes(&self) -> bool {
+        false
+    }
+}
+
+/// A remote tree over [`ShallowDirs`], sorted by `mode`.
+fn shallow_remote_tree(mode: ShallowSortMode) -> ShallowTree {
+    use myd::widget::source::Source;
+
+    let vfs: std::sync::Arc<dyn myd::vfs::Vfs> = std::sync::Arc::new(ShallowDirs);
+    let source = Source::Remote(
+        myd::widget::source::RemoteSource::new(myd::vfs::BackendId(1), vfs).unwrap(),
+    );
+    ShallowTree::with_source_cancellable_progress(
+        source,
+        std::path::PathBuf::from("/remote"),
+        mode,
+        true,
+        true,
+        ShallowCache::new(),
+        &ShallowCancel::new(),
+        &ShallowProgress::new(),
+    )
+    .expect("remote tree should build")
+}
+
+/// Names of the depth-1 entries, in render order.
+fn child_names(tree: &ShallowTree) -> Vec<String> {
+    tree.lines
+        .iter()
+        .filter(|l| l.depth == 1)
+        .map(|l| l.name.clone())
+        .collect()
+}
+
+#[test]
+fn remote_directories_sort_last_in_largest() {
+    // Pre-fix every directory sorted as its 4096-byte inode size, so a directory
+    // holding gigabytes landed below any file over 4 KB.
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    assert_eq!(
+        child_names(&tree),
+        vec!["big_file", "small_file", "dir_a", "dir_b"],
+        "real sizes first, unmeasured directories last"
+    );
+}
+
+#[test]
+fn remote_directories_also_sort_last_in_smallest() {
+    // The sign-flip catcher. `Largest` negates its size, so "sorts last" is
+    // i64::MAX in *both* arms; an implementation that reaches for i64::MIN in one
+    // of them puts the directories first here, and only here.
+    let tree = shallow_remote_tree(ShallowSortMode::Smallest);
+    assert_eq!(
+        child_names(&tree),
+        vec!["small_file", "big_file", "dir_a", "dir_b"],
+        "unmeasured directories stay last regardless of direction"
+    );
+}
+
+#[test]
+fn local_directories_still_sort_by_size() {
+    // The gate must not become unconditional: locally, directory sizes are real
+    // recursive totals and must keep ordering against files.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("fat_dir")).unwrap();
+    std::fs::write(dir.path().join("fat_dir/inner.bin"), vec![0u8; 500_000]).unwrap();
+    std::fs::create_dir_all(dir.path().join("thin_dir")).unwrap();
+    std::fs::write(dir.path().join("thin_dir/inner.bin"), vec![0u8; 10]).unwrap();
+    std::fs::write(dir.path().join("mid_file.bin"), vec![0u8; 50_000]).unwrap();
+
+    let tree = ShallowTree::new(dir.path().to_path_buf(), ShallowSortMode::Largest, true, true);
+    assert_eq!(
+        child_names(&tree),
+        vec!["fat_dir", "mid_file.bin", "thin_dir"],
+        "local directory sizes are real and must sort against files"
+    );
+}
+
+/// Render a tree and return its lines as strings.
+fn tree_rows(tree: &ShallowTree, w: u16, h: u16) -> Vec<String> {
+    use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
+
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal
+        .draw(|f| f.render_widget(Paragraph::new(tree.render_text()), f.area()))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    (0..h)
+        .map(|y| {
+            (0..w)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_remote_directory_renders_a_dash_instead_of_a_fake_size() {
+    // Pre-fix these rows read "4.0KB", which is the directory inode's size and
+    // says nothing about the contents.
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let rows = tree_rows(&tree, 100, 10);
+
+    let dir_row = rows
+        .iter()
+        .find(|r| r.contains("dir_a"))
+        .expect("dir_a should render");
+    assert!(dir_row.contains('—'), "unmeasured dir needs a dash: {}", dir_row);
+    assert!(
+        !dir_row.contains("4.0KB") && !dir_row.contains("4KB"),
+        "must not show the inode size as if it were real: {}",
+        dir_row
+    );
+
+    // A file's size is reported accurately by the listing and must survive.
+    let file_row = rows
+        .iter()
+        .find(|r| r.contains("big_file"))
+        .expect("big_file should render");
+    assert!(
+        file_row.contains("976.6KB"),
+        "file sizes are real and must still show: {}",
+        file_row
+    );
+}
+
+#[test]
+fn a_remote_directory_bar_is_empty() {
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let rows = tree_rows(&tree, 100, 10);
+    let dir_row = rows.iter().find(|r| r.contains("dir_a")).unwrap();
+
+    let bar = &dir_row[dir_row.find('[').unwrap()..=dir_row.find(']').unwrap()];
+    assert!(!bar.contains('█'), "an unknown size cannot fill a bar: {}", bar);
+    assert!(bar.contains('░'), "the empty bar should still be drawn: {}", bar);
+}
+
+#[test]
+fn a_shallow_size_row_keeps_the_column_width() {
+    // The em dash is padded by char count, so this is where alignment would break.
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let rows = tree_rows(&tree, 100, 10);
+
+    // Counted in characters, not bytes: the em dash is 3 bytes in UTF-8 while a
+    // formatted size is ASCII, so a byte offset would differ even when the
+    // columns line up perfectly on screen.
+    let icon_col = |needle: &str| -> usize {
+        let row = rows.iter().find(|r| r.contains(needle)).unwrap();
+        row.chars()
+            .position(|c| c == ']')
+            .expect("bar should close")
+    };
+    assert_eq!(
+        icon_col("dir_a"),
+        icon_col("big_file"),
+        "the size column must be the same width whether or not the size is known"
+    );
+}
+
+#[test]
+fn the_treemap_gives_remote_directories_equal_tiles() {
+    // Pre-fix all directories carried 4096 bytes, so squarify produced tiles of
+    // unequal area that looked meaningful but encoded nothing.
+    use myd::widget::treemap::TreeMap;
+
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let mut map = TreeMap::from_file_tree(&tree);
+    map.compute_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
+
+    assert_eq!(
+        map.total_size, 0,
+        "unmeasured directories must not contribute a fake total"
+    );
+    let dir_cells: Vec<_> = map.cells.iter().filter(|c| c.is_dir).collect();
+    assert!(dir_cells.len() >= 2, "expected the two directories");
+    let first = dir_cells[0].rect;
+    for c in &dir_cells {
+        assert_eq!(
+            (c.rect.width, c.rect.height),
+            (first.width, first.height),
+            "unmeasured directories should tile equally"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Permissions and modification-time columns.
+// ---------------------------------------------------------------------------
+
+/// A directory with a known-mode file and directory, plus the app over it.
+async fn columns_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a_dir")).unwrap();
+    std::fs::write(dir.path().join("a_file.txt"), b"hello").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join("a_file.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            dir.path().join("a_dir"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    (dir, app)
+}
+
+/// Draw the app and return its screen rows.
+fn app_rows(app: &mut myd::app::FileBrowser, w: u16, h: u16) -> Vec<String> {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p_shows_a_permissions_column() {
+    let (_dir, mut app) = columns_app().await;
+
+    let before = app_rows(&mut app, 120, 12).join("\n");
+    assert!(
+        !before.contains("rw-"),
+        "permissions must be off by default: {}",
+        before
+    );
+
+    app.handle_key_for_test(char_key('P'));
+    let after = app_rows(&mut app, 120, 12).join("\n");
+    assert!(
+        after.contains("-rw-r--r--"),
+        "the 0o644 file needs its mode: {}",
+        after
+    );
+    assert!(
+        after.contains("drwxr-xr-x"),
+        "the 0o755 directory needs its mode: {}",
+        after
+    );
+}
+
+#[tokio::test]
+async fn t_shows_a_timestamp_column() {
+    let (_dir, mut app) = columns_app().await;
+
+    let before = app_rows(&mut app, 120, 12).join("\n");
+    let stamp = regex::Regex::new(r"\d{4}-\d\d-\d\d \d\d:\d\d").unwrap();
+    assert!(!stamp.is_match(&before), "times must be off by default");
+
+    app.handle_key_for_test(char_key('T'));
+    let after = app_rows(&mut app, 120, 12).join("\n");
+    assert!(
+        stamp.is_match(&after),
+        "expected a Y-m-d H:M timestamp: {}",
+        after
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_two_columns_are_independent() {
+    let (_dir, mut app) = columns_app().await;
+    let stamp = regex::Regex::new(r"\d{4}-\d\d-\d\d \d\d:\d\d").unwrap();
+
+    // On, on, then the first back off: only the timestamp should remain.
+    app.handle_key_for_test(char_key('P'));
+    app.handle_key_for_test(char_key('T'));
+    app.handle_key_for_test(char_key('P'));
+
+    let rows = app_rows(&mut app, 120, 12).join("\n");
+    assert!(stamp.is_match(&rows), "the time column should still be on");
+    assert!(
+        !rows.contains("rw-"),
+        "the permissions column should be back off: {}",
+        rows
+    );
+}
+
+#[tokio::test]
+async fn the_columns_survive_entering_a_directory() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (_dir, mut app) = columns_app().await;
+    // Draw first, so the tree has a viewport and the cursor lands on a real row.
+    let _ = app_rows(&mut app, 120, 12);
+
+    app.handle_key_for_test(char_key('P'));
+    app.handle_key_for_test(char_key('T'));
+
+    let flags = |app: &myd::app::FileBrowser| match app.current_screen() {
+        myd::screen::Screen::Main(s) => (s.tree.show_perms, s.tree.show_times),
+        _ => panic!("expected a main screen"),
+    };
+    assert_eq!(flags(&app), (true, true));
+
+    // Descend into the subdirectory: a freshly built screen must adopt them.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+    assert_eq!(
+        flags(&app),
+        (true, true),
+        "columns must survive entering a directory"
+    );
+
+    // And on the way back out.
+    app.handle_key_for_test(ctrl_key('o'));
+    settle(&mut app).await;
+    assert_eq!(flags(&app), (true, true), "and popping back out");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_columns_keep_names_aligned() {
+    let (_dir, mut app) = columns_app().await;
+    app.handle_key_for_test(char_key('P'));
+    app.handle_key_for_test(char_key('T'));
+
+    let rows = app_rows(&mut app, 120, 12);
+    // Counted in characters, not bytes: the icons and the em-dash placeholders
+    // are multibyte, so byte offsets would differ even on a perfectly aligned row.
+    let name_col = |needle: &str| -> usize {
+        let row = rows.iter().find(|r| r.contains(needle)).unwrap();
+        let byte_idx = row.find(needle).unwrap();
+        row[..byte_idx].chars().count()
+    };
+    assert_eq!(
+        name_col("a_file.txt"),
+        name_col("a_dir"),
+        "a file row and a directory row must start their names at the same column"
+    );
+}
+
+#[tokio::test]
+async fn remote_listings_carry_their_mode_bits() {
+    // Pre-fix the remote arm of Source::read_dir dropped VEntry.mode entirely, so
+    // a remote tree could never show permissions.
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let dir_line = tree
+        .lines
+        .iter()
+        .find(|l| l.name == "dir_a")
+        .expect("dir_a should be listed");
+    assert_eq!(
+        dir_line.mode,
+        Some(0o750),
+        "the listing's mode must reach the tree line"
+    );
+}
+
+#[test]
+fn the_two_plain_key_tables_agree() {
+    // `resolve_single` and `resolve_single_char` are near-duplicate tables; the
+    // second only runs after a timed-out `g` chord, so a binding added to one and
+    // not the other fails in a way nobody trips over until much later.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::keybinding::KeyBindingHandler;
+
+    let h = KeyBindingHandler::new();
+    let candidates: Vec<char> = ('a'..='z')
+        .chain('A'..='Z')
+        .chain("0*/?|".chars())
+        .collect();
+
+    for c in candidates {
+        let via_event = h.resolve_single_for_test(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        ));
+        let via_char = h.resolve_single_char_for_test(c);
+        if let (Some(a), Some(b)) = (via_event, via_char) {
+            assert_eq!(
+                a, b,
+                "the two tables disagree on {:?}: {:?} vs {:?}",
+                c, a, b
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ctrl_b_no_longer_toggles_the_info_panel() {
+    // Ctrl+B used to open the info panel and now pages up instead. Asserting the
+    // panel state is *unchanged* is what stops a future revert from quietly
+    // reclaiming the key and breaking paging.
+    let dir = nav_fixture();
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let before = view_state(&app).0;
+    app.handle_key_for_test(ctrl_key('b'));
+    assert_eq!(
+        view_state(&app).0,
+        before,
+        "Ctrl+B must not touch the info panel; that is Ctrl+P"
+    );
+
+    // And the key that should work, does.
+    app.handle_key_for_test(ctrl_key('p'));
+    assert_ne!(view_state(&app).0, before, "Ctrl+P toggles the info panel");
+}
+
+#[test]
+fn ghost_rows_render_without_a_mode() {
+    // A ghost row is a synthetic TreeLine for a transfer destination that does
+    // not exist yet, so it has no permissions to show. With the column on it must
+    // still render — and keep the column's width, or every ghost row's name would
+    // sit 12 characters left of its neighbours'.
+    use myd::screen::SortMode;
+    use myd::transfer::PendingDest;
+    use myd::vfs::{BackendId, VPath};
+    use myd::widget::file_tree::FileTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+
+    let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, false);
+    tree.show_perms = true;
+    tree.show_times = true;
+
+    let ghost = PendingDest {
+        path: VPath {
+            backend: BackendId(0),
+            path: dir.path().join("arriving.bin"),
+        },
+        is_dir: false,
+    };
+
+    // Must not panic, and the placeholder must be there at full width.
+    let text = tree.render_text_with_ghosts(&[ghost]);
+    let rendered: Vec<String> = text
+        .lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+
+    let ghost_row = rendered
+        .iter()
+        .find(|r| r.contains("arriving.bin"))
+        .expect("the ghost row should render");
+    assert!(
+        ghost_row.contains("?---------"),
+        "a not-yet-existing entry needs the unknown-mode placeholder: {}",
+        ghost_row
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_root_row_carries_its_own_metadata() {
+    // The root is built separately from the listing, so it initially had no mode
+    // or times and rendered "?---------" and a dash while every other row was
+    // correct. One local stat per tree fixes it.
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, false);
+    let root = &tree.lines[0];
+    assert_eq!(root.depth, 0, "line 0 should be the root");
+    assert!(root.mode.is_some(), "the local root should report its mode");
+    assert!(root.mtime.is_some(), "the local root should report its mtime");
+}
+
+#[test]
+fn a_remote_root_reports_no_local_metadata() {
+    // A remote root must NOT be stat'ed with std::fs: a path like /var/log exists
+    // on both machines, so local metadata would silently describe the wrong file —
+    // the same class of bug that made the info panel show local data for remote
+    // entries. A placeholder is correct here.
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let root = &tree.lines[0];
+    assert_eq!(root.depth, 0);
+    assert!(
+        root.mode.is_none(),
+        "a remote root must not borrow local mode bits"
+    );
 }

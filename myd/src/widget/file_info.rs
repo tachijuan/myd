@@ -287,23 +287,47 @@ pub fn render_info_owned(path: &Path, size_cache: &crate::utils::sizes::SizeCach
     Text::from(lines)
 }
 
+/// Width of an `ls -l` permission string — the tree's permissions column.
+pub const MODE_COL_WIDTH: usize = 10;
+
+/// An `ls -l` permission string built from raw mode bits.
+///
+/// Takes the bits rather than a `std::fs::Metadata`, so it serves both a local
+/// stat and a remote listing (which has no `Metadata` to offer), and is testable
+/// on any host. Always [`MODE_COL_WIDTH`] characters: an unknown mode renders as
+/// `?---------`, distinguishable from the genuine "no permissions" `----------`
+/// by its type character.
+pub fn format_mode(mode: Option<u32>, is_dir: bool, is_symlink: bool) -> String {
+    let Some(mode) = mode else {
+        return "?---------".to_string();
+    };
+    let file_type = if is_symlink {
+        'l'
+    } else if is_dir {
+        'd'
+    } else {
+        '-'
+    };
+    let mut out = String::with_capacity(MODE_COL_WIDTH);
+    out.push(file_type);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 7;
+        out.push(if bits & 4 != 0 { 'r' } else { '-' });
+        out.push(if bits & 2 != 0 { 'w' } else { '-' });
+        out.push(if bits & 1 != 0 { 'x' } else { '-' });
+    }
+    out
+}
+
 fn format_permissions(metadata: &std::fs::Metadata) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode();
-        let file_type = if metadata.is_dir() { 'd' }
-            else if metadata.file_type().is_symlink() { 'l' }
-            else { '-' };
-
-        let mut perms = String::new();
-        for shift in [6, 3, 0] {
-            let bits = (mode >> shift) & 7;
-            perms.push(if bits & 4 != 0 { 'r' } else { '-' });
-            perms.push(if bits & 2 != 0 { 'w' } else { '-' });
-            perms.push(if bits & 1 != 0 { 'x' } else { '-' });
-        }
-        format!("{}{}", file_type, perms)
+        format_mode(
+            Some(metadata.permissions().mode()),
+            metadata.is_dir(),
+            metadata.file_type().is_symlink(),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -375,6 +399,20 @@ fn format_time(time: Option<std::time::SystemTime>) -> String {
     }
 }
 
+/// Width of a `%Y-%m-%d %H:%M` timestamp — the tree's time column.
+pub const TIME_COL_WIDTH: usize = 16;
+
+/// A timestamp in a fixed-width field, for the tree's aligned column.
+///
+/// Always [`TIME_COL_WIDTH`] characters. [`format_time`]'s `"N/A"` is three, and
+/// in a column it would shift every name on the row.
+pub fn format_time_fixed(time: Option<std::time::SystemTime>) -> String {
+    match time {
+        Some(_) => format_time(time),
+        None => format!("{:>width$}", "—", width = TIME_COL_WIDTH),
+    }
+}
+
 fn count_items(path: &Path) -> (usize, usize) {
     let mut files = 0usize;
     let mut dirs = 0usize;
@@ -390,4 +428,54 @@ fn count_items(path: &Path) -> (usize, usize) {
         }
     }
     (files, dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_mode_matches_ls() {
+        // Takes raw bits, so this is host-independent — no real files involved.
+        assert_eq!(format_mode(Some(0o755), true, false), "drwxr-xr-x");
+        assert_eq!(format_mode(Some(0o644), false, false), "-rw-r--r--");
+        assert_eq!(format_mode(Some(0o777), false, true), "lrwxrwxrwx");
+        assert_eq!(format_mode(Some(0o000), false, false), "----------");
+        // A symlink's own type wins over the target's directory-ness, as in ls -l.
+        assert_eq!(format_mode(Some(0o777), true, true), "lrwxrwxrwx");
+        // Unknown is distinguishable from "no permissions" by the type character.
+        assert_eq!(format_mode(None, true, false), "?---------");
+    }
+
+    #[test]
+    fn format_mode_is_always_column_width() {
+        // The tree draws this in a fixed column; a short string would shift every
+        // name on the row.
+        for m in [None, Some(0o000), Some(0o644), Some(0o7777)] {
+            assert_eq!(
+                format_mode(m, false, false).chars().count(),
+                MODE_COL_WIDTH,
+                "mode {:?} is not {} chars",
+                m,
+                MODE_COL_WIDTH
+            );
+        }
+    }
+
+    #[test]
+    fn format_time_fixed_is_always_column_width() {
+        // `format_time` returns "N/A" for None, which is 3 chars and would break
+        // the column — the whole reason format_time_fixed exists.
+        assert_eq!(
+            format_time_fixed(None).chars().count(),
+            TIME_COL_WIDTH,
+            "a missing time must still fill the column"
+        );
+        assert_eq!(
+            format_time_fixed(Some(std::time::SystemTime::UNIX_EPOCH))
+                .chars()
+                .count(),
+            TIME_COL_WIDTH
+        );
+    }
 }

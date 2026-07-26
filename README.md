@@ -14,7 +14,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the current directory to a regex, masking everything that doesn't match.
 - **Create directories** — make a new directory in the current location with `N`.
-- **Info panel** — optional sidebar (toggle with `Ctrl+b`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
+- **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
@@ -86,8 +86,10 @@ myd sftp://user@host:2222/var/log     # explicit user, port, and starting path
 | `l`       | Expand directory (tree) / move right (treemap) |
 | `gg`      | Jump to top                   |
 | `G`       | Jump to bottom                |
-| `Ctrl+d`  | Page down                     |
-| `Ctrl+u`  | Page up                       |
+| `Ctrl+f`  | Page down (full screen)       |
+| `Ctrl+b`  | Page up (full screen)         |
+| `Ctrl+d`  | Half page down                |
+| `Ctrl+u`  | Half page up                  |
 | `g u`     | Go to parent directory        |
 | `g d`     | Change root directory         |
 | `0`       | Collapse all                  |
@@ -134,7 +136,9 @@ Search wraps around at the ends. Filtering masks non-matching entries in the cur
 | `s`       | Cycle sort mode               |
 | `H`       | Toggle hidden files           |
 | `b`       | Toggle size bars              |
-| `Ctrl+b`  | Toggle info panel             |
+| `P`       | Toggle permissions column     |
+| `T`       | Toggle modification-time column |
+| `Ctrl+p`  | Toggle info panel             |
 | `?` / `F1`| Help                          |
 
 ### Panels
@@ -160,7 +164,7 @@ Inside the dialing directory: `j`/`k`/`g`/`G` navigate, `Enter` connects, `/` se
 
 The transfer panel appears once you start a copy and lists queued, active, and finished transfers with per-transfer progress, rate, and ETA. Up to 16 transfers run at once; the rest wait their turn. Within a directory copy, files and subdirectories are also transferred concurrently, so a deep tree of small files is not paced by round-trip latency. The interface stays interactive throughout, so you can keep browsing and queue more. Toggle the panel any time with `Ctrl+t`.
 
-Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all work on remote panels too, routed through the same backend the panel is browsing. The info panel shows what the directory listing provides — size and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes are shallow (the entry's own size, not a recursive total) because a `du`-style walk would be one round trip per directory.
+Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all work on remote panels too, routed through the same backend the panel is browsing. The info panel shows what the directory listing provides — size and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes cannot be measured cheaply because a `du`-style walk would be one round trip per directory. Such directories therefore show a dash (`—`) with an empty size bar and sort as *unknown* (grouped last) rather than as small — reporting the directory inode's own ~4 KB would deceive both the eye and the sort order.
 
 ### Screen-level
 
@@ -170,7 +174,7 @@ Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all 
 | `Esc`     | Quit                          |
 | `Ctrl+o`  | Go back to the parent directory |
 | `r` / `Ctrl+r` | Rescan (refresh sizes from disk) |
-| `Ctrl+b`  | Toggle info panel             |
+| `Ctrl+p`  | Toggle info panel             |
 
 ### Mouse
 

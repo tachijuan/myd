@@ -14,6 +14,10 @@ use crate::widget::treemap::FocusTarget;
 pub struct ViewPrefs {
     pub info_panel_hidden: bool,
     pub focus: FocusTarget,
+    /// Whether the tree shows its `ls -l` permissions and modification-time
+    /// columns.
+    pub show_perms: bool,
+    pub show_times: bool,
     /// Sort order, carried across screens so drilling into a directory keeps
     /// whatever order the user chose rather than snapping back to the default.
     pub sort_mode: crate::screen::SortMode,
@@ -23,9 +27,13 @@ impl Default for ViewPrefs {
     fn default() -> Self {
         Self {
             // The file listing is the reason to open the app; the info pane is
-            // detail on demand. Start with it closed and let `t` bring it up.
+            // detail on demand. Start with it closed and let `Ctrl+p` bring it up.
             info_panel_hidden: true,
             focus: FocusTarget::default(),
+            // Extra columns are opt-in: together with the size bar they cost
+            // over 50 columns before the name even starts.
+            show_perms: false,
+            show_times: false,
             sort_mode: crate::screen::SortMode::default(),
         }
     }
@@ -103,7 +111,7 @@ impl Panel {
         self.screen_stack.pop();
         let prefs = self.view_prefs;
         if let Some(Screen::Main(state)) = self.screen_stack.last_mut() {
-            state.apply_view_prefs(prefs.info_panel_hidden, prefs.focus);
+            state.apply_view_prefs(prefs);
         }
     }
 
@@ -122,7 +130,7 @@ impl Panel {
                 let mut state = MainScreenState::from_tree(path, tree);
                 // Carry the panel's view preferences onto the new screen so
                 // entering a directory doesn't silently reset them.
-                state.apply_view_prefs(prefs.info_panel_hidden, prefs.focus);
+                state.apply_view_prefs(prefs);
                 *self.screen_stack.last_mut().expect("empty stack") = Screen::Main(state);
                 true
             }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::screen::SortMode;
 use crate::utils::sizes::{self, SizeCache};
+use crate::widget::file_info;
 use crate::widget::source::Source;
 
 /// Highlight color for tagged rows — a vivid amber that reads clearly against
@@ -23,6 +24,12 @@ pub const GHOST_COLOR: Color = Color::Rgb(120, 180, 190);
 /// `ls` and most file managers. Distinct from the blue used for real
 /// directories, since a link may point at either a file or a directory.
 pub const SYMLINK_COLOR: Color = Color::Rgb(80, 220, 220);
+
+/// Width of the bar drawn beside the size, and of the size text column itself.
+/// Shared by the known- and unknown-size builders so the two cannot drift apart
+/// and misalign a listing that contains both.
+const BAR_WIDTH: usize = 10;
+const SIZE_COL_WIDTH: usize = 10;
 
 /// A single node in the file tree.
 #[derive(Debug, Clone)]
@@ -42,6 +49,10 @@ pub struct TreeNode {
     /// (so symlinked directories expand), and this flag is what distinguishes
     /// the link itself for display.
     pub is_symlink: bool,
+    /// Unix mode bits from the directory listing, for the permissions column.
+    /// Carried like the timestamps so rendering `ls -l` permissions costs no
+    /// per-row stat. `None` when the listing didn't report them.
+    pub mode: Option<u32>,
     /// Children, loaded lazily. `None` means not yet loaded.
     pub children: Option<Vec<TreeNode>>,
     /// Whether this node is currently expanded.
@@ -101,6 +112,25 @@ impl TreeNode {
         is_symlink: bool,
         canonicalize: bool,
     ) -> Self {
+        Self::with_meta_link_resolved_mode(path, is_dir, mtime, atime, is_symlink, canonicalize, None)
+    }
+
+    /// As [`TreeNode::with_meta_link_resolved`], plus the listing's unix mode
+    /// bits for the permissions column.
+    ///
+    /// A separate constructor rather than a seventh parameter on the existing one,
+    /// which has four public wrappers and call sites throughout the tests: only
+    /// the listing path has a mode to pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_meta_link_resolved_mode(
+        path: PathBuf,
+        is_dir: bool,
+        mtime: Option<std::time::SystemTime>,
+        atime: Option<std::time::SystemTime>,
+        is_symlink: bool,
+        canonicalize: bool,
+        mode: Option<u32>,
+    ) -> Self {
         let resolved = if canonicalize {
             path.canonicalize().unwrap_or_else(|_| path.clone())
         } else {
@@ -113,6 +143,7 @@ impl TreeNode {
             mtime,
             atime,
             is_symlink,
+            mode,
             children: None,
             is_expanded: false,
         }
@@ -224,7 +255,7 @@ fn load_children(
             continue;
         }
         listing_sizes.push(entry.len);
-        entries.push(TreeNode::with_meta_link_resolved(
+        entries.push(TreeNode::with_meta_link_resolved_mode(
             entry.path,
             entry.is_dir,
             entry.mtime,
@@ -233,6 +264,7 @@ fn load_children(
             // Remote paths are server-side; canonicalizing them locally is a
             // failed stat per entry.
             !source.is_remote(),
+            entry.mode,
         ));
     }
 
@@ -296,8 +328,10 @@ fn sort_entries(entries: &mut [TreeNode], cache: &SizeCache, source: &Source, so
     // allocates a lowercased String and hits the size cache, so an n-entry
     // directory paid O(n log n) allocations and map lookups. `sort_by_cached_key`
     // builds each key once.
-    let _ = source;
-    entries.sort_by_cached_key(|node| sort_key_fast(node, cache, sort_mode));
+    // Hoisted out of the closure: on a remote source this is a virtual call
+    // through an `Arc<dyn Vfs>`, and the closure runs once per entry.
+    let unknown_dirs = !source.has_recursive_sizes();
+    entries.sort_by_cached_key(|node| sort_key_fast(node, cache, sort_mode, unknown_dirs));
 }
 
 /// Re-order a node's already-loaded children in place, recursing into every
@@ -340,7 +374,12 @@ fn reload_node(
 
 /// Generate a sort key for a node — uses cached sizes for directories,
 /// falls back to a shallow size lookup for files if not yet cached.
-fn sort_key_fast(node: &TreeNode, cache: &SizeCache, sort_mode: SortMode) -> (i32, i64, String) {
+fn sort_key_fast(
+    node: &TreeNode,
+    cache: &SizeCache,
+    sort_mode: SortMode,
+    unknown_dirs: bool,
+) -> (i32, i64, String) {
     let is_dir = if node.is_dir { 0 } else { 1 };
     let name = node.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
     // Sorting is pure reordering: it reads the sizes gathered when the tree was
@@ -354,11 +393,20 @@ fn sort_key_fast(node: &TreeNode, cache: &SizeCache, sort_mode: SortMode) -> (i3
     // than going to find out.
     let size = cache.get(&node.resolved_path).unwrap_or(0) as i64;
 
+    // A directory whose backend only reports a shallow size is *unknown*, not
+    // small. Sorting one by its ~4 KB inode length buried directories holding
+    // gigabytes below every file over 4 KB, and made every remote directory tie.
+    //
+    // Both size arms use `i64::MAX` — not `i64::MIN` for one of them. The key is
+    // ascending in both cases and it is the mapped value that differs (`Largest`
+    // negates), so the largest key is what sorts last either way.
+    let shallow = unknown_dirs && node.is_dir;
+
     match sort_mode {
         SortMode::DirsFirst => (is_dir, 0, name),
         SortMode::FilesFirst => (if is_dir == 0 { 1 } else { 0 }, 0, name),
-        SortMode::Largest => (0, -size, name),
-        SortMode::Smallest => (0, size, name),
+        SortMode::Largest => (0, if shallow { i64::MAX } else { -size }, name),
+        SortMode::Smallest => (0, if shallow { i64::MAX } else { size }, name),
         // Time sorts use the listing timestamps already on the node — no I/O.
         // Newest / most-recently-accessed negate so the largest time sorts
         // first; an entry with no timestamp sorts last (treated as the oldest).
@@ -405,6 +453,9 @@ pub struct TreeLine {
     /// entry without a per-selection stat (which would be a network round trip).
     pub mtime: Option<std::time::SystemTime>,
     pub atime: Option<std::time::SystemTime>,
+    /// Unix mode bits from the listing, for the permissions column. `None` when
+    /// the backend didn't report them.
+    pub mode: Option<u32>,
 }
 
 /// The main FileTree widget state.
@@ -418,12 +469,31 @@ pub struct FileTree {
     pub root: TreeNode,
     /// Current cursor position (flat line index).
     pub cursor: usize,
+    /// Index of the first visible line.
+    ///
+    /// Persistent, and deliberately not derived from the cursor. The offset used
+    /// to be recomputed every frame as `cursor - visible + 1`, which pinned the
+    /// cursor to the bottom row as soon as it went past the first screenful: the
+    /// view then shifted on every single `j` or `k` instead of the cursor moving
+    /// within it. Keeping the offset means the cursor travels to the edge of the
+    /// window first, and only then does the content scroll.
+    ///
+    /// [`Self::clamp_scroll`] brings it back into range; nothing else writes it.
+    pub scroll: usize,
     /// Sort mode.
     pub sort_mode: SortMode,
     /// Show hidden files.
     pub show_hidden: bool,
     /// Show size bars.
     pub show_size_bar: bool,
+    /// Show an `ls -l` permissions column (`P`).
+    ///
+    /// Unlike `show_size_bar` these are not constructor parameters: the build
+    /// functions already carry seven or eight arguments across six wrappers and
+    /// dozens of call sites, and both default off and are toggled afterwards.
+    pub show_perms: bool,
+    /// Show a modification-time column (`T`).
+    pub show_times: bool,
     /// Concurrent size cache.
     pub size_cache: SizeCache,
     /// Flattened lines (recomputed when tree structure changes).
@@ -555,13 +625,23 @@ impl FileTree {
         // a path like /var/log or /home/<user> often exists locally too, so
         // `canonicalize` silently resolves the wrong one. That rewrites the
         // node's cache key and every later lookup misses.
-        let mut root = TreeNode::with_meta_link_resolved(
+        // The root's own metadata, for the permissions and time columns. One
+        // local stat per tree is affordable; a remote root is left blank rather
+        // than paying a round trip for a single row (and `std::fs` would describe
+        // an unrelated local path anyway).
+        let root_meta = if source.is_remote() {
+            None
+        } else {
+            std::fs::metadata(&path).ok()
+        };
+        let mut root = TreeNode::with_meta_link_resolved_mode(
             path.clone(),
             root_is_dir,
-            None,
-            None,
+            root_meta.as_ref().and_then(|m| m.modified().ok()),
+            root_meta.as_ref().and_then(|m| m.accessed().ok()),
             false,
             !source.is_remote(),
+            root_meta.as_ref().and_then(crate::widget::source::mode_of),
         );
         root.expand_cancellable_progress(&source, &cache, sort_mode, show_hidden, cancel, progress);
 
@@ -589,9 +669,12 @@ impl FileTree {
         let mut tree = Self {
             root,
             cursor: 0,
+            scroll: 0,
             sort_mode,
             show_hidden,
             show_size_bar,
+            show_perms: false,
+            show_times: false,
             size_cache: cache,
             lines: Vec::new(),
             cached_sizes: Vec::new(),
@@ -640,6 +723,18 @@ impl FileTree {
         if self.cursor >= self.lines.len() {
             self.cursor = self.lines.len().saturating_sub(1);
         }
+        // Keep the offset sane without knowing the viewport height (only render
+        // knows that). A collapse or filter can drop the line count far below the
+        // current offset, and `click_at` may read it before the next frame is
+        // drawn. Pulling it back to the cursor is also what makes collapsing a
+        // deep subtree feel right: the view follows the cursor up rather than
+        // staying parked below it.
+        if self.scroll > self.cursor {
+            self.scroll = self.cursor;
+        }
+        if self.scroll >= self.lines.len() {
+            self.scroll = self.lines.len().saturating_sub(1);
+        }
         self.recompute_cache();
     }
 
@@ -672,6 +767,13 @@ impl FileTree {
 
         // Compute parent totals. Keyed on borrowed paths: a `to_path_buf` per
         // line allocated once for every entry in the tree on every reflatten.
+        //
+        // These totals still include the placeholder inode size of an unmeasured
+        // remote directory, so a sibling *file*'s bar is scaled against a
+        // denominator a few KB larger than the truth. Left as is: the unmeasured
+        // rows themselves draw an empty bar and never consult this, and excluding
+        // them would make the bars of files that sit beside directories no more
+        // meaningful than they already are.
         let mut parent_totals: std::collections::HashMap<&Path, u64> =
             std::collections::HashMap::new();
         for (i, line) in self.lines.iter().enumerate() {
@@ -839,14 +941,58 @@ impl FileTree {
         }
     }
 
+    /// Bring the cursor into view with the smallest offset change possible.
+    ///
+    /// Scrolls only when the cursor has actually left the window, and only far
+    /// enough to bring it back — so a cursor moving inside the window leaves the
+    /// view completely still. Called from render, the only place the viewport
+    /// height is known.
+    ///
+    /// The content clamp comes first on purpose: applied afterwards it would undo
+    /// a `to_bottom` on a list shorter than the viewport.
+    pub fn clamp_scroll(&mut self, visible: usize) {
+        let visible = visible.max(1);
+        // Never leave blank rows below the last line when there is content that
+        // could fill them.
+        let max_scroll = self.lines.len().saturating_sub(visible);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+
+        // Scroll only once the cursor is outside the window, and only far enough
+        // to bring it back to the edge it left by. Matches the host picker, so
+        // every list in the app scrolls the same way.
+        //
+        // A vim-style `scrolloff` (keeping N rows of context below the cursor)
+        // would go here, as `cursor < scroll + n` / `cursor + n >= scroll +
+        // visible`, capped at `(visible - 1) / 2` so a very short terminal cannot
+        // oscillate. Left out until someone wants it.
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + visible {
+            self.scroll = self.cursor + 1 - visible;
+        }
+    }
+
+    /// Move the cursor to `index`, clamped to the line list.
+    ///
+    /// The seam every cursor move other than `j` / `k` should go through, so a
+    /// jump cannot silently skip [`tag_visual_span`] — the page motions used to
+    /// assign `cursor` directly and so moved the cursor through a visual-mode
+    /// selection without tagging anything along the way.
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursor = index.min(self.lines.len().saturating_sub(1));
+        self.tag_visual_span();
+    }
+
     /// Move cursor to top.
     pub fn to_top(&mut self) {
-        self.cursor = 0;
+        self.set_cursor(0);
     }
 
     /// Move cursor to bottom.
     pub fn to_bottom(&mut self) {
-        self.cursor = self.lines.len().saturating_sub(1);
+        self.set_cursor(self.lines.len().saturating_sub(1));
     }
 
     /// Move cursor down.
@@ -1003,14 +1149,39 @@ impl FileTree {
         is_ghost: bool,
         my_size: u64,
         sibling_total: u64,
+        size_unknown: bool,
     ) -> Line<'a> {
         let mut spans = Vec::new();
 
         // Size column: first, right-justified in a fixed-width field.
         if self.show_size_bar {
-            let (size_text, bar) = make_bar_spans(my_size, sibling_total);
+            let (size_text, bar) = if size_unknown {
+                make_unknown_bar_spans()
+            } else {
+                make_bar_spans(my_size, sibling_total)
+            };
             spans.push(Span::styled(size_text, Style::default().fg(Color::Gray)));
             spans.extend(bar);
+        }
+
+        // Permissions and modification time, in `ls -l` order and to the left of
+        // the name. Fixed-width, so the names below stay aligned whatever the
+        // listing reported — including nothing at all. The colours match the info
+        // panel's, so the two surfaces describe the same entry the same way.
+        if self.show_perms {
+            spans.push(Span::styled(
+                format!(
+                    "{}  ",
+                    file_info::format_mode(line.mode, line.is_dir, line.is_symlink)
+                ),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        if self.show_times {
+            spans.push(Span::styled(
+                format!("{}  ", file_info::format_time_fixed(line.mtime)),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         // Tag marker column: a bright chevron on tagged rows, a space otherwise,
@@ -1194,6 +1365,7 @@ impl FileTree {
                 is_ghost,
                 if self.show_size_bar { self.cached_sizes.get(i).copied().unwrap_or(0) } else { 0 },
                 if self.show_size_bar { self.cached_siblings.get(i).copied().unwrap_or(0) } else { 0 },
+                self.size_is_unknown(line),
             )));
 
             // If this line is a directory that has pending arrivals, inject their
@@ -1245,8 +1417,29 @@ impl FileTree {
             is_symlink: false,
             mtime: None,
             atime: None,
+            // A destination that does not exist yet has no permissions.
+            mode: None,
         };
-        owned_line(self.render_line(&synthetic, false, false, false, true, 0, 0))
+        // A ghost is a pending copy of an entry whose size the transfer already
+        // knows, so it is never an "unmeasured" row.
+        owned_line(self.render_line(&synthetic, false, false, false, true, 0, 0, false))
+    }
+
+    /// Whether this row's size is a placeholder rather than a measurement.
+    ///
+    /// True for a directory on a backend that cannot report recursive sizes: SFTP
+    /// gives the directory inode's own length, and a real `du` would be thousands
+    /// of round trips. Derived rather than stored, so it cannot fall out of sync
+    /// with the cache across a reflatten, a re-sort, or a cache clear.
+    ///
+    /// Note this stays true for an *expanded* remote directory. Expanding reveals
+    /// one level, not the whole subtree, so a roll-up would be a number that grows
+    /// with every expand and is never the real total. A dash that stays a dash is
+    /// the honest answer. It also means the tree's own root row shows a dash even
+    /// though its one-level sum is genuine — that sum is exactly the half-truth
+    /// this avoids.
+    fn size_is_unknown(&self, line: &TreeLine) -> bool {
+        line.is_dir && !self.source.has_recursive_sizes()
     }
 }
 
@@ -1288,8 +1481,8 @@ fn collect_expanded_into<'a>(node: &'a TreeNode, out: &mut HashSet<&'a Path>) {
 /// Returns: (right-justified size text, bar spans).
 /// The size text column has fixed width for clean alignment.
 fn make_bar_spans(my_size: u64, sibling_total: u64) -> (String, Vec<Span<'static>>) {
-    let bar_width: usize = 10;
-    let size_col_width: usize = 10;
+    let bar_width: usize = BAR_WIDTH;
+    let size_col_width: usize = SIZE_COL_WIDTH;
 
     let total = if sibling_total > 0 { sibling_total } else { my_size };
     let ratio = if total > 0 { my_size as f64 / total as f64 } else { 0.0 };
@@ -1321,6 +1514,24 @@ fn make_bar_spans(my_size: u64, sibling_total: u64) -> (String, Vec<Span<'static
     (padded, bar)
 }
 
+/// The size column and bar for an entry whose size is not actually known.
+///
+/// A remote directory's listing reports the size of the directory *inode* (4 KB
+/// on most filesystems), not of its contents. Printing that reads as a real
+/// measurement of a directory that might hold gigabytes, so an unmeasured
+/// directory gets a dash and an empty bar instead. Same fixed widths as
+/// [`make_bar_spans`], so a mixed listing stays aligned.
+fn make_unknown_bar_spans() -> (String, Vec<Span<'static>>) {
+    let padded = format!("{:>width$}", "—", width = SIZE_COL_WIDTH);
+    let bar = vec![
+        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("░".repeat(BAR_WIDTH), Style::default().fg(Color::DarkGray)),
+        Span::styled("]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ];
+    (padded, bar)
+}
+
 /// Recursively flatten a node into lines.
 fn flatten_node(node: &TreeNode, depth: usize, lines: &mut Vec<TreeLine>, show_hidden: bool) {
     // Never filter the root node (depth 0).
@@ -1345,6 +1556,7 @@ fn flatten_node(node: &TreeNode, depth: usize, lines: &mut Vec<TreeLine>, show_h
         is_symlink: node.is_symlink,
         mtime: node.mtime,
         atime: node.atime,
+        mode: node.mode,
     });
 
     if node.is_expanded {
@@ -1642,5 +1854,108 @@ mod tests {
         for line in &tree.lines {
             assert!(line.resolved_path.is_absolute(), "resolved_path should be absolute: {:?}", line.resolved_path);
         }
+    }
+
+    /// Build a tree with `n` synthetic lines, for testing cursor/offset logic
+    /// without touching a filesystem.
+    fn tree_with_lines(n: usize) -> FileTree {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, false);
+        tree.lines = (0..n)
+            .map(|i| TreeLine {
+                path: PathBuf::from(format!("/x/f{}", i)),
+                resolved_path: PathBuf::from(format!("/x/f{}", i)),
+                is_dir: false,
+                depth: 0,
+                hidden: false,
+                name: format!("f{}", i),
+                is_symlink: false,
+                mtime: None,
+                atime: None,
+                mode: None,
+            })
+            .collect();
+        tree
+    }
+
+    #[test]
+    fn clamp_scroll_only_moves_when_the_cursor_leaves_the_window() {
+        let mut tree = tree_with_lines(100);
+
+        // Cursor inside the window: the offset must not budge. This is the whole
+        // point of keeping a persistent offset.
+        tree.scroll = 20;
+        tree.cursor = 25;
+        tree.clamp_scroll(10);
+        assert_eq!(tree.scroll, 20);
+
+        // One row below the window: scroll exactly one row.
+        tree.scroll = 20;
+        tree.cursor = 30;
+        tree.clamp_scroll(10);
+        assert_eq!(tree.scroll, 21);
+
+        // One row above: the offset follows the cursor up.
+        tree.scroll = 20;
+        tree.cursor = 19;
+        tree.clamp_scroll(10);
+        assert_eq!(tree.scroll, 19);
+
+        // A jump far below puts the cursor on the last visible row.
+        tree.scroll = 0;
+        tree.cursor = 55;
+        tree.clamp_scroll(10);
+        assert_eq!(tree.scroll, 46);
+    }
+
+    #[test]
+    fn clamp_scroll_survives_a_one_row_viewport() {
+        // `area.height - 3` is 0 on a 3-row terminal, so the `.max(1)` and the
+        // saturating arithmetic inside clamp_scroll are load-bearing.
+        let mut tree = tree_with_lines(5);
+        tree.cursor = 3;
+        tree.scroll = 3;
+        tree.clamp_scroll(0);
+        tree.clamp_scroll(1);
+        assert!(tree.scroll <= tree.cursor);
+
+        // An empty tree must not underflow either.
+        let mut empty = tree_with_lines(0);
+        empty.clamp_scroll(10);
+        assert_eq!(empty.scroll, 0);
+    }
+
+    #[test]
+    fn clamp_scroll_never_leaves_blank_rows_below_the_content() {
+        let mut tree = tree_with_lines(30);
+        tree.scroll = 25;
+        tree.cursor = 29;
+        tree.clamp_scroll(10);
+        // 30 lines in a 10-row window: the furthest honest offset is 20.
+        assert_eq!(tree.scroll, 20);
+    }
+
+    #[test]
+    fn reflatten_pulls_the_offset_back_to_the_cursor() {
+        // Lines vanishing (a collapse, a filter) must not leave the view parked
+        // past the end of the content.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.path().join("sub").join(format!("f{}", i)), b"x").unwrap();
+        }
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, false);
+        tree.expand_all();
+        tree.to_bottom();
+        tree.scroll = tree.cursor;
+
+        tree.collapse_all();
+        assert!(
+            tree.scroll <= tree.cursor,
+            "offset {} left behind cursor {}",
+            tree.scroll,
+            tree.cursor
+        );
+        assert!(tree.scroll < tree.lines.len());
     }
 }

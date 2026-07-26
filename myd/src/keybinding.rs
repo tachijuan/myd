@@ -13,8 +13,13 @@ pub enum Action {
     Expand,
     ToTop,
     ToBottom,
+    /// A full viewport down / up (vim `Ctrl-F` / `Ctrl-B`, and the PageDown /
+    /// PageUp keys).
     PageDown,
     PageUp,
+    /// Half a viewport down / up (vim `Ctrl-D` / `Ctrl-U`).
+    HalfPageDown,
+    HalfPageUp,
     GoParent,
     ChangeRoot,
     Delete,
@@ -64,6 +69,10 @@ pub enum Action {
     HostDirectory,
     /// Release or re-grab the mouse, for terminal text selection.
     ToggleMouse,
+    /// Show or hide the tree's `ls -l` permissions column.
+    TogglePerms,
+    /// Show or hide the tree's modification-time column.
+    ToggleTimes,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -148,6 +157,17 @@ impl KeyBindingHandler {
         self.resolve_single(key)
     }
 
+    /// Test hooks for the two plain-key tables, so a test can assert they agree.
+    /// The chord-fallback table is only reachable through a timed-out `g`, which
+    /// makes a disagreement between them very easy to miss in practice.
+    pub fn resolve_single_for_test(&self, key: KeyEvent) -> Option<Action> {
+        self.resolve_single(key)
+    }
+
+    pub fn resolve_single_char_for_test(&self, c: char) -> Option<Action> {
+        self.resolve_single_char(c)
+    }
+
     /// Resolve a single character to an action (used by chord fallback).
     fn resolve_single_char(&self, c: char) -> Option<Action> {
         match c {
@@ -162,6 +182,8 @@ impl KeyBindingHandler {
             's' => Some(Action::ToggleSort),
             'H' => Some(Action::ToggleHidden),
             'b' => Some(Action::ToggleBar),
+            'P' => Some(Action::TogglePerms),
+            'T' => Some(Action::ToggleTimes),
             '0' => Some(Action::CollapseAll),
             '*' => Some(Action::ExpandAll),
             '/' => Some(Action::Search),
@@ -205,11 +227,15 @@ impl KeyBindingHandler {
             return match key.code {
                 KeyCode::Char('c') => Some(Action::Quit), // Ctrl-C to quit.
                 KeyCode::Char('r') => Some(Action::Refresh),
-                KeyCode::Char('b') => Some(Action::ToggleInfoPanel),
-                KeyCode::Char('d') => Some(Action::PageDown),
-                KeyCode::Char('u') => Some(Action::PageUp),
+                KeyCode::Char('p') => Some(Action::ToggleInfoPanel),
+                // vim paging: Ctrl-F / Ctrl-B move a whole screen, Ctrl-D /
+                // Ctrl-U half of one. All four measure the real viewport.
+                KeyCode::Char('f') => Some(Action::PageDown),
+                KeyCode::Char('b') => Some(Action::PageUp),
+                KeyCode::Char('d') => Some(Action::HalfPageDown),
+                KeyCode::Char('u') => Some(Action::HalfPageUp),
                 KeyCode::Char('o') => Some(Action::PopScreen),
-                // Pairs with Ctrl-b for the info panel: both are sidebars.
+                // Pairs with Ctrl-p for the info panel: both are sidebars.
                 KeyCode::Char('t') => Some(Action::ToggleTransferPanel),
                 // Releases the mouse so the terminal's own text selection works.
                 KeyCode::Char('n') => Some(Action::ToggleMouse),
@@ -230,6 +256,8 @@ impl KeyBindingHandler {
             KeyCode::Char('s') => Some(Action::ToggleSort),
             KeyCode::Char('H') => Some(Action::ToggleHidden),
             KeyCode::Char('b') => Some(Action::ToggleBar),
+            KeyCode::Char('P') => Some(Action::TogglePerms),
+            KeyCode::Char('T') => Some(Action::ToggleTimes),
             KeyCode::Char('v') => Some(Action::ToggleView),
             KeyCode::Char('c') => Some(Action::Copy),
             KeyCode::Char('m') => Some(Action::Move),
