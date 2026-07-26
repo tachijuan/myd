@@ -38,11 +38,17 @@ Jump to the first line of the tree.
 .B G
 Jump to the last line of the tree.
 .TP
+.B Ctrl+f
+Move down a full screen. The PageDown key does the same.
+.TP
+.B Ctrl+b
+Move up a full screen. The PageUp key does the same.
+.TP
 .B Ctrl+d
-Scroll down half a page.
+Move down half a screen.
 .TP
 .B Ctrl+u
-Scroll up half a page.
+Move up half a screen.
 .TP
 .B g u
 Move cursor to the parent directory.
@@ -92,7 +98,7 @@ cached and reused as you navigate, so this is how to pick up on-disk changes.
 Toggle between the tree view and the treemap view. The chosen view persists as
 you navigate between directories.
 .TP
-.B Ctrl+b
+.B Ctrl+p
 Toggle the info panel sidebar. Hidden by default.
 .TP
 .B s
@@ -105,6 +111,17 @@ Toggle visibility of hidden (dot) files and directories.
 .TP
 .B b
 Toggle display of proportional size bars in the tree.
+.TP
+.B P
+Toggle an
+.BR ls (1)-style
+permissions column, shown to the left of each entry's name. Entries whose
+backend does not report permissions show
+.BR ?--------- .
+.TP
+.B T
+Toggle a modification-time column, shown to the left of each entry's name.
+Entries with no reported time show a dash.
 .TP
 .B /
 Search for a file or directory by name.
@@ -129,7 +146,7 @@ Go back to the parent directory.
 .B Ctrl+r
 Rescan the file tree.
 .TP
-.B Ctrl+b
+.B Ctrl+p
 Toggle the info panel sidebar.
 .TP
 .B gr
@@ -187,11 +204,18 @@ Creating directories (\fBN\fR), renaming (\fBR\fR), deleting (\fBD\fR) and
 moving (\fBm\fR) are all routed through the backend the panel is browsing, so
 they act on the remote host rather than the local machine.
 .PP
-Remote directory sizes are shallow \(em the directory's own size rather than a
-recursive total \(em because a \fBdu\fR-style walk over SFTP costs one round
-trip per directory. The info panel likewise shows only what the directory
-listing carries (size and timestamps); owner, group and creation time are not
-part of it.
+Remote directory sizes cannot be measured cheaply: a \fBdu\fR-style walk over
+SFTP costs one round trip per directory. Rather than report the directory
+inode's own size as though it were a total, such directories show a dash
+(\(em) with an empty size bar, and they sort as \fIunknown\fR \(em grouped
+last \(em rather than as small. This holds whether or not the directory is
+expanded: expanding reveals one level, not the whole subtree, so a running
+total would grow with each expansion and never be the truth. The treemap
+likewise gives unmeasured directories equal tiles instead of implying a size
+comparison it cannot make.
+.PP
+The info panel shows only what the directory listing carries (size and
+timestamps); owner, group and creation time are not part of it.
 .SH DIALING DIRECTORY
 Saved remote locations live in \fB~/.config/myd/hosts.toml\fR (honouring
 \fBXDG_CONFIG_HOME\fR) and are hand-editable. An entry records a label, host,
@@ -320,7 +344,7 @@ legend in the status bar names the categories currently on screen. When a tile
 is too narrow to show its full name, the selected item's name is shown in the
 status bar.
 .SH INFO PANEL
-The right-hand sidebar (hidden by default; toggle with \fBt\fR or \fBCtrl+b\fR)
+The right-hand sidebar (hidden by default; toggle with \fBCtrl+p\fR)
 displays detailed metadata for the currently selected item:
 .TP
 .B Name
@@ -347,7 +371,7 @@ Creation, modification, and last access times.
 .B Path
 The absolute path to the item.
 .PP
-Hide or show the panel with \fBt\fR or \fBCtrl+b\fR.
+Hide or show the panel with \fBCtrl+p\fR.
 .SH EXAMPLES
 .TP
 .B myd

@@ -443,6 +443,15 @@ fn collect_items(
         return;
     }
 
+    // On a backend that cannot report recursive directory sizes, a directory's
+    // cached size is its inode's own length (~4 KB), identical for every one of
+    // them. Squarifying by that produces tiles whose *areas* look meaningful and
+    // are not. Reporting 0 instead makes a directory-only listing sum to 0, which
+    // routes `squarify` to its existing equal-tiles fallback — honest about
+    // knowing nothing rather than confidently wrong. Files keep their real sizes,
+    // which remote listings do report accurately.
+    let dirs_unmeasured = !tree.source.has_recursive_sizes();
+
     if let Some(ref children) = node.children {
         let dir_children: Vec<_> = children.iter().filter(|c| c.is_dir).collect();
         let file_children: Vec<_> = children.iter().filter(|c| !c.is_dir).collect();
@@ -455,7 +464,11 @@ fn collect_items(
                 // the treemap is rebuilt on every sort — unaffordable on a slow
                 // filesystem, whether that is SFTP or a CIFS/NFS mount that
                 // merely looks local.
-                let size = tree.size_cache.get(&child.resolved_path).unwrap_or(0);
+                let size = if dirs_unmeasured {
+                    0
+                } else {
+                    tree.size_cache.get(&child.resolved_path).unwrap_or(0)
+                };
                 items.push((
                     TreeItemInfo {
                         path: child.path.clone(),

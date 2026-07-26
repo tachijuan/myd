@@ -688,3 +688,67 @@ sftp_test!(remote_move_within_the_server_is_a_rename, env, {
 
     let _ = std::fs::remove_dir_all(&base);
 });
+
+sftp_test!(real_remote_directories_report_unknown_sizes, env, {
+    // The mocked version of this lives in tests/integration.rs. This one proves it
+    // against a real SFTP server: that a genuine READDIR reports a directory's
+    // inode size, and that the tree treats it as unknown rather than as ~4 KB.
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..200 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let target = format!(
+        "sftp://{}@{}:{}{}",
+        whoami(), env.host, env.port, env.remote_dir.display()
+    );
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote panel never opened");
+
+    let myd::screen::Screen::Main(state) = app.current_screen() else {
+        panic!("expected a main screen");
+    };
+    assert!(
+        !state.tree.source.has_recursive_sizes(),
+        "a real SFTP backend cannot measure directories recursively"
+    );
+
+    // Render and confirm the directory rows carry the dash, not a fake size.
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..24)
+        .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    let myd::screen::Screen::Main(state) = app.current_screen() else { unreachable!() };
+    let dir_names: Vec<String> = state
+        .tree
+        .lines
+        .iter()
+        .filter(|l| l.is_dir && l.depth > 0)
+        .map(|l| l.name.clone())
+        .collect();
+    assert!(!dir_names.is_empty(), "harness should provide subdirectories");
+
+    for name in &dir_names {
+        if let Some(row) = rows.iter().find(|r| r.contains(name.as_str())) {
+            assert!(
+                row.contains('—'),
+                "remote dir {} should show a dash: {}",
+                name,
+                row
+            );
+        }
+    }
+});

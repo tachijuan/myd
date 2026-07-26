@@ -1246,6 +1246,13 @@ impl FileBrowser {
     }
 
     /// Scroll the view under the pointer by `delta` rows.
+    ///
+    /// The wheel moves the *cursor*, not the viewport, so it stays consistent
+    /// with `j`/`k`: within the window the cursor travels and the content holds
+    /// still, and the view scrolls once the cursor reaches an edge. Moving the
+    /// viewport independently would let the cursor drift off-screen, and the
+    /// render-time clamp would immediately drag the view back — the two would
+    /// fight each other.
     fn scroll_by(&mut self, delta: i32) {
         let screen = self.active_panel_mut().current_screen_mut();
         if delta > 0 {
@@ -1317,9 +1324,21 @@ impl FileBrowser {
     fn dispatch_action_inner(&mut self, action: Action) -> bool {
         // Visual mode only survives motion and its own toggle; any other command
         // ends the range-tag gesture (tags already made are kept).
+        //
+        // Every motion belongs here, not just j/k: a page jump or `G` inside a
+        // visual selection has to extend it, and if the action ends visual mode
+        // first then the tagging inside the motion has no anchor to work from.
         if !matches!(
             action,
-            Action::CursorUp | Action::CursorDown | Action::VisualMode
+            Action::CursorUp
+                | Action::CursorDown
+                | Action::PageDown
+                | Action::PageUp
+                | Action::HalfPageDown
+                | Action::HalfPageUp
+                | Action::ToTop
+                | Action::ToBottom
+                | Action::VisualMode
         ) {
             self.active_panel_mut().current_screen_mut().exit_visual();
         }
@@ -1712,6 +1731,8 @@ impl FileBrowser {
                     Action::ToBottom => current.to_bottom(),
                     Action::PageDown => current.page_down(),
                     Action::PageUp => current.page_up(),
+                    Action::HalfPageDown => current.half_page_down(),
+                    Action::HalfPageUp => current.half_page_up(),
                     Action::GoParent => current.go_parent(),
                     Action::Refresh => current.refresh(),
                     Action::ToggleSort => {
@@ -1743,6 +1764,24 @@ impl FileBrowser {
                         let result = panel.current_screen_mut().toggle_view();
                         if let Screen::Main(state) = panel.current_screen() {
                             panel.view_prefs.focus = state.focus;
+                        }
+                        result
+                    }
+                    // Both columns are remembered for screens opened later, so
+                    // entering a directory doesn't silently drop them.
+                    Action::TogglePerms => {
+                        let panel = self.active_panel_mut();
+                        let result = panel.current_screen_mut().toggle_perms();
+                        if let Screen::Main(state) = panel.current_screen() {
+                            panel.view_prefs.show_perms = state.tree.show_perms;
+                        }
+                        result
+                    }
+                    Action::ToggleTimes => {
+                        let panel = self.active_panel_mut();
+                        let result = panel.current_screen_mut().toggle_times();
+                        if let Screen::Main(state) = panel.current_screen() {
+                            panel.view_prefs.show_times = state.tree.show_times;
                         }
                         result
                     }

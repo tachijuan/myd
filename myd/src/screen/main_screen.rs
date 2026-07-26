@@ -50,10 +50,24 @@ pub struct MainScreenState {
     /// hit-testing needs both to turn a screen row into a tree line.
     pub tree_area: Option<Rect>,
     pub tree_scroll: usize,
+    /// Content rows the tree last rendered into — `area.height - 3` (top border
+    /// plus title bar, bottom border). Recorded during render for the same
+    /// reason as `tree_scroll`: it depends on the area, so it cannot be recovered
+    /// from state alone.
+    ///
+    /// Zero until the first frame; the page motions fall back to
+    /// [`DEFAULT_VIEWPORT`] so a key pressed before the first draw still moves a
+    /// sensible amount.
+    pub tree_viewport: usize,
     /// Where the "Sort: …" indicator was drawn in the title bar, so a click on
     /// it can open the sort menu. Recorded during render like `tree_area`.
     pub sort_area: Option<Rect>,
 }
+
+/// Lines a page motion moves before the first frame has been drawn and the real
+/// viewport height is known. The value the page motions used unconditionally
+/// before they were taught to measure the terminal.
+const DEFAULT_VIEWPORT: usize = 20;
 
 impl MainScreenState {
     pub fn new(root_path: PathBuf) -> Self {
@@ -72,6 +86,7 @@ impl MainScreenState {
             pending_ghosts: Vec::new(),
             tree_area: None,
             tree_scroll: 0,
+            tree_viewport: 0,
             sort_area: None,
         }
     }
@@ -92,6 +107,7 @@ impl MainScreenState {
             pending_ghosts: Vec::new(),
             tree_area: None,
             tree_scroll: 0,
+            tree_viewport: 0,
             sort_area: None,
         }
     }
@@ -102,12 +118,31 @@ impl MainScreenState {
         &self.root_path
     }
 
-    /// Adopt session-wide view preferences (info panel visibility, focused view).
-    /// Applied to freshly built screens so navigating into a directory preserves
-    /// how the user has set the view up.
-    pub fn apply_view_prefs(&mut self, info_panel_hidden: bool, focus: FocusTarget) {
-        self.info_panel_hidden = info_panel_hidden;
-        self.focus = focus;
+    /// Adopt session-wide view preferences. Applied to freshly built screens so
+    /// navigating into a directory preserves how the user has set the view up.
+    ///
+    /// Takes the whole struct rather than a list of bools, which would be easy to
+    /// transpose silently. `sort_mode` is deliberately not applied here: the order
+    /// has to be known before the tree is built, so it is threaded through the
+    /// loading screen instead of being set after the fact.
+    pub fn apply_view_prefs(&mut self, prefs: crate::panel::ViewPrefs) {
+        self.info_panel_hidden = prefs.info_panel_hidden;
+        self.focus = prefs.focus;
+        self.tree.show_perms = prefs.show_perms;
+        self.tree.show_times = prefs.show_times;
+    }
+
+    /// Visible content rows in the tree, from the last render.
+    ///
+    /// Falls back to [`DEFAULT_VIEWPORT`] before the first frame, so a page
+    /// motion dispatched ahead of any draw still moves the distance it always
+    /// used to.
+    fn viewport(&self) -> usize {
+        if self.tree_viewport == 0 {
+            DEFAULT_VIEWPORT
+        } else {
+            self.tree_viewport
+        }
     }
 
     /// Whether the info panel's text is currently cached. Test hook: sorting
@@ -164,6 +199,9 @@ impl MainScreenState {
         let row = (y - area.y - 1) as usize;
         let index = self.tree_scroll + row;
         if index < self.tree.lines.len() {
+            // Assigned directly rather than through `set_cursor`: a click is a
+            // fresh selection, not a motion, and should not extend an in-progress
+            // visual-mode range.
             self.tree.cursor = index;
             self.cached_info_key = None;
             return true;
@@ -213,29 +251,53 @@ impl MainScreenState {
         true
     }
 
-    pub fn page_down(&mut self) -> bool {
+    /// Move the focused view's cursor by `delta` rows, clamped to its contents.
+    ///
+    /// Goes through [`FileTree::set_cursor`] rather than assigning `tree.cursor`,
+    /// so a page jump tags the range it crossed while visual mode is active.
+    fn move_cursor_by(&mut self, delta: isize) -> bool {
         match self.focus {
             FocusTarget::Tree => {
-                let page = self.tree.lines.len().min(20);
-                self.tree.cursor = (self.tree.cursor + page).min(self.tree.lines.len().saturating_sub(1));
+                let last = self.tree.lines.len().saturating_sub(1) as isize;
+                let target = (self.tree.cursor as isize + delta).clamp(0, last.max(0));
+                self.tree.set_cursor(target as usize);
             }
             FocusTarget::Treemap => {
-                self.treemap.cursor = (self.treemap.cursor + 5).min(self.treemap.cells.len().saturating_sub(1));
+                let last = self.treemap.cells.len().saturating_sub(1) as isize;
+                let target = (self.treemap.cursor as isize + delta).clamp(0, last.max(0));
+                self.treemap.cursor = target as usize;
             }
         }
         true
     }
 
-    pub fn page_up(&mut self) -> bool {
+    /// Rows a page motion covers in the focused view.
+    ///
+    /// The tree pages by the terminal's real content height — it used to page by
+    /// a hardcoded 20, which is a third of a screen on a tall terminal and an
+    /// overshoot on a short one. The treemap is a 2-D layout with no row-based
+    /// viewport, so a fixed step is all that means anything there.
+    fn page_step(&self) -> usize {
         match self.focus {
-            FocusTarget::Tree => {
-                self.tree.cursor = self.tree.cursor.saturating_sub(20);
-            }
-            FocusTarget::Treemap => {
-                self.treemap.cursor = self.treemap.cursor.saturating_sub(5);
-            }
+            FocusTarget::Tree => self.viewport(),
+            FocusTarget::Treemap => 5,
         }
-        true
+    }
+
+    pub fn page_down(&mut self) -> bool {
+        self.move_cursor_by(self.page_step() as isize)
+    }
+
+    pub fn page_up(&mut self) -> bool {
+        self.move_cursor_by(-(self.page_step() as isize))
+    }
+
+    pub fn half_page_down(&mut self) -> bool {
+        self.move_cursor_by((self.page_step() / 2).max(1) as isize)
+    }
+
+    pub fn half_page_up(&mut self) -> bool {
+        self.move_cursor_by(-((self.page_step() / 2).max(1) as isize))
     }
 
     pub fn expand(&mut self) -> bool {
@@ -307,6 +369,19 @@ impl MainScreenState {
 
     pub fn toggle_bar(&mut self) -> bool {
         self.tree.show_size_bar = !self.tree.show_size_bar;
+        true
+    }
+
+    /// Show or hide the permissions column. A pure display flag, so no treemap
+    /// rebuild — the same reasoning as `toggle_bar`.
+    pub fn toggle_perms(&mut self) -> bool {
+        self.tree.show_perms = !self.tree.show_perms;
+        true
+    }
+
+    /// Show or hide the modification-time column.
+    pub fn toggle_times(&mut self) -> bool {
+        self.tree.show_times = !self.tree.show_times;
         true
     }
 
@@ -397,7 +472,7 @@ impl MainScreenState {
                 (start + n - offset) % n
             };
             if re.is_match(&self.tree.lines[i].name) {
-                self.tree.cursor = i;
+                self.tree.set_cursor(i);
                 return;
             }
         }
@@ -419,7 +494,7 @@ impl MainScreenState {
                 (start + n - offset) % n
             };
             if re.is_match(&self.tree.lines[i].name) {
-                self.tree.cursor = i;
+                self.tree.set_cursor(i);
                 return;
             }
         }
@@ -634,6 +709,19 @@ impl ScreenState for MainScreenState {
 
 impl MainScreenState {
     fn render_tree(&mut self, frame: &mut Frame, area: Rect) {
+        // The block has borders (top/bottom) and a title bar, reducing usable
+        // height. Borders and the title bar consume 3 rows; saturate so a very
+        // short terminal underflows to 1 line instead of panicking.
+        let visible_lines = area.height.saturating_sub(3).max(1) as usize;
+
+        // Bring the cursor into view. This is the only place the viewport height
+        // is known, so it is where the tree's persistent offset gets clamped —
+        // the offset itself is never derived from the cursor, or the cursor would
+        // be stuck to the window's bottom edge. Done before the text is built,
+        // which borrows the tree.
+        self.tree.clamp_scroll(visible_lines);
+        let scroll = self.tree.scroll;
+
         let text = if self.pending_ghosts.is_empty() {
             self.tree.render_text()
         } else {
@@ -665,23 +753,13 @@ impl MainScreenState {
             (start < end).then(|| Rect::new(start, area.y, end - start, 1))
         };
 
-        // Calculate scroll offset so the cursor line stays visible.
-        // The block has borders (top/bottom) and a title bar, reducing usable height.
-        // Borders and the title bar consume 3 rows; saturate so a very short
-        // terminal underflows to 1 line instead of panicking.
-        let visible_lines = area.height.saturating_sub(3).max(1) as usize;
-        let scroll = if self.tree.cursor >= visible_lines {
-            self.tree.cursor - visible_lines + 1
-        } else {
-            0
-        };
-
         // Keep what was drawn so a mouse click can be mapped back to a row. The
         // offset depends on the area's height, so it cannot be recomputed later
         // from state alone — it has to be recorded here, as the treemap already
         // does with its cell rects.
         self.tree_area = Some(area);
         self.tree_scroll = scroll;
+        self.tree_viewport = visible_lines;
 
         let paragraph = Paragraph::new(text)
             .block(
@@ -696,7 +774,12 @@ impl MainScreenState {
         frame.render_widget(paragraph, area);
 
         if !self.tree.lines.is_empty() {
-            let mut scrollbar_state = ScrollbarState::default().position(self.tree.cursor);
+            // The thumb tracks the window, not the cursor. Built with
+            // `default()` the content length stayed 0, which drew a thumb of no
+            // meaningful size or position.
+            let mut scrollbar_state = ScrollbarState::new(self.tree.lines.len())
+                .viewport_content_length(visible_lines)
+                .position(scroll);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
                 area,
