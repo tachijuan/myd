@@ -1756,25 +1756,27 @@ async fn test_other_key_in_help_dismisses_and_acts() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    let cursor_before = match app.current_screen() {
-        Screen::Main(s) => s.tree.cursor,
+    let bars_before = match app.current_screen() {
+        Screen::Main(s) => s.tree.show_size_bar,
         _ => panic!("expected main screen"),
     };
 
     app.handle_key_for_test(char_key('?'));
     assert!(app.is_help_open());
 
-    let keep_running = app.handle_key_for_test(char_key('j'));
+    // `b` (toggle size bars) rather than `j`: the help list is taller than the
+    // terminal, so j/k now scroll *within* it instead of dismissing it. A key
+    // the overlay has no use for still dismisses and acts.
+    let keep_running = app.handle_key_for_test(char_key('b'));
     assert!(keep_running);
-    assert!(!app.is_help_open(), "j should dismiss help");
-    let cursor_after = match app.current_screen() {
-        Screen::Main(s) => s.tree.cursor,
+    assert!(!app.is_help_open(), "an unrelated key should dismiss help");
+    let bars_after = match app.current_screen() {
+        Screen::Main(s) => s.tree.show_size_bar,
         _ => panic!("expected main screen"),
     };
-    assert_eq!(
-        cursor_after,
-        cursor_before + 1,
-        "j should also move the cursor down after dismissing help"
+    assert_ne!(
+        bars_after, bars_before,
+        "the key should also act after dismissing help"
     );
 }
 
@@ -4808,15 +4810,18 @@ fn special_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
 fn test_catalog() -> myd::hosts::HostCatalog {
     use myd::hosts::SavedHost;
     let mut hosts = Vec::new();
-    for (label, host, uses) in [
-        ("prod", "prod.example.com", 30u64),
-        ("backup", "10.0.0.5", 20),
-        ("scratch", "dev.local", 10),
-        ("france", "fr.example.com", 5),
+    // Timestamps descending: the quick list is ordered by recency, so `prod` is
+    // the most recent connection and heads the list.
+    for (label, host, uses, last) in [
+        ("prod", "prod.example.com", 30u64, "2026-07-26T12:00:00Z"),
+        ("backup", "10.0.0.5", 20, "2026-07-25T12:00:00Z"),
+        ("scratch", "dev.local", 10, "2026-07-24T12:00:00Z"),
+        ("france", "fr.example.com", 5, "2026-07-23T12:00:00Z"),
     ] {
         let mut h = SavedHost::new(label, host);
         h.uses = uses;
         h.user = Some("juan".into());
+        h.last_used = Some(last.into());
         hosts.push(h);
     }
     myd::hosts::HostCatalog::in_memory(hosts)
@@ -5443,4 +5448,268 @@ async fn clicking_a_transfer_selects_it_and_double_click_cancels() {
         "confirm",
         "a double-click should ask to cancel"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Quit guard
+// ---------------------------------------------------------------------------
+
+/// Quitting with transfers in flight asks first, and declining keeps the app up.
+#[tokio::test]
+async fn quitting_during_a_transfer_asks_first() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    // `q` must not end the app while work is outstanding.
+    let running = app.handle_key_for_test(char_key('q'));
+    assert!(running, "q must not quit outright during a transfer");
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+
+    // Declining keeps running and leaves the queue alone.
+    let running = app.handle_key_for_test(char_key('n'));
+    assert!(running, "declining should keep the app open");
+    assert_eq!(app.modal_kind_for_test(), "none");
+    assert!(app.transfer_queue().has_work(), "the transfer must survive");
+}
+
+/// Confirming the prompt actually quits.
+#[tokio::test]
+async fn confirming_the_quit_prompt_exits() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    app.handle_key_for_test(char_key('q'));
+    let running = app.handle_key_for_test(char_key('y'));
+    assert!(!running, "confirming should quit");
+}
+
+/// With no transfers the prompt must not appear — the common case keeps its
+/// single-keystroke exit.
+#[tokio::test]
+async fn quitting_with_an_idle_queue_exits_immediately() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let running = app.handle_key_for_test(char_key('q'));
+    assert!(!running, "q should quit at once when nothing is transferring");
+    assert_eq!(app.modal_kind_for_test(), "none");
+}
+
+/// Ctrl+C stays an unconditional exit: it is the guaranteed way out and must
+/// not be gated behind a dialog.
+#[tokio::test]
+async fn ctrl_c_still_force_quits_during_a_transfer() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let running = app.handle_key_for_test(ctrl_key('c'));
+    assert!(!running, "Ctrl+C must force-quit regardless of transfers");
+}
+
+/// Declining leaves no latent quit: a later `q` asks again rather than exiting.
+#[tokio::test]
+async fn declining_the_quit_prompt_does_not_arm_a_later_quit() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    app.handle_key_for_test(char_key('q'));
+    app.handle_key_for_test(char_key('n'));
+
+    let running = app.handle_key_for_test(char_key('q'));
+    assert!(running, "the second q should prompt again, not exit silently");
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+}
+
+// ---------------------------------------------------------------------------
+// Help scrolling
+// ---------------------------------------------------------------------------
+
+/// Render the help overlay at a given size and return its text.
+fn help_text(app: &mut FileBrowser, w: u16, h: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(w, h);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The help list is far taller than a terminal, and the transfer keys sit at the
+/// bottom. Before scrolling existed they were simply unreachable — which is why
+/// cancelling a transfer looked impossible.
+#[tokio::test]
+async fn help_scrolls_to_reach_the_transfer_keys() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('?'));
+    assert!(app.is_help_open());
+
+    let top = help_text(&mut app, 80, 24);
+    assert!(
+        top.contains("Navigation"),
+        "the top of the list should be visible"
+    );
+    assert!(
+        !top.contains("Cancel the selected transfer"),
+        "the transfer keys should be below the fold on a 24-row terminal"
+    );
+
+    // G jumps to the bottom, where the transfer keys live.
+    app.handle_key_for_test(char_key('G'));
+    let bottom = help_text(&mut app, 80, 24);
+    assert!(
+        bottom.contains("Cancel the selected transfer"),
+        "scrolling to the bottom must reveal how to cancel a transfer:\n{}",
+        bottom
+    );
+    assert!(app.is_help_open(), "scrolling must not dismiss the overlay");
+}
+
+/// j/k scroll rather than dismissing, and the offset clamps at both ends.
+#[tokio::test]
+async fn help_scroll_keys_move_and_clamp() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('?'));
+    let first = help_text(&mut app, 80, 24);
+
+    app.handle_key_for_test(char_key('j'));
+    let scrolled = help_text(&mut app, 80, 24);
+    assert!(app.is_help_open(), "j must scroll, not dismiss");
+    assert_ne!(first, scrolled, "j should move the view");
+
+    // Scrolling up past the start clamps rather than wrapping or underflowing.
+    for _ in 0..50 {
+        app.handle_key_for_test(char_key('k'));
+    }
+    let back_at_top = help_text(&mut app, 80, 24);
+    assert_eq!(back_at_top, first, "scrolling up should clamp at the top");
+
+    // And down past the end.
+    for _ in 0..200 {
+        app.handle_key_for_test(char_key('j'));
+    }
+    let bottom = help_text(&mut app, 80, 24);
+    for _ in 0..20 {
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert_eq!(
+        bottom,
+        help_text(&mut app, 80, 24),
+        "scrolling down should clamp at the bottom"
+    );
+}
+
+/// A tall terminal shows everything, so no scroll indicator is needed.
+#[tokio::test]
+async fn help_without_overflow_shows_no_scroll_hint() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('?'));
+    let text = help_text(&mut app, 80, 100);
+    assert!(
+        !text.contains("to scroll"),
+        "a terminal tall enough for the whole list should not advertise scrolling"
+    );
+    assert!(text.contains("Cancel the selected transfer"));
+}
+
+/// Exactly one pane may look focused at a time.
+///
+/// `state.active` used to mean "is the active panel index" and never consulted
+/// the transfer sidebar, so tabbing to the sidebar left the previous panel still
+/// drawing a cyan border — two focused-looking panes at once.
+#[tokio::test]
+async fn focusing_the_transfer_panel_unfocuses_the_browser_panels() {
+    use myd::screen::Screen;
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(
+        Some(dir.path().to_path_buf()),
+        Some(dir.path().to_path_buf()),
+        true,
+    );
+    settle_all(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // A browser panel starts focused.
+    assert!(!app.transfer_focused_for_test());
+    assert_eq!(
+        app.focused_panel_count_for_test(),
+        1,
+        "exactly one panel should look focused to begin with"
+    );
+
+    // Tab through to the sidebar, redrawing each time so the render hint updates.
+    for _ in 0..3 {
+        app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+        term.draw(|f| app.render_for_test(f)).unwrap();
+        if app.transfer_focused_for_test() {
+            break;
+        }
+    }
+    assert!(
+        app.transfer_focused_for_test(),
+        "Tab should reach the transfer panel"
+    );
+
+    assert_eq!(
+        app.focused_panel_count_for_test(),
+        0,
+        "no browser panel may still look focused once the sidebar has focus"
+    );
+
+    // And tabbing away restores exactly one focused panel.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    assert!(!app.transfer_focused_for_test());
+    assert_eq!(app.focused_panel_count_for_test(), 1);
+
+    // The screen enum is exhaustive; keep the import meaningful.
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
 }

@@ -2,7 +2,7 @@
 //!
 //! Connecting used to mean typing a full `sftp://user@host:port/path` every
 //! time. This is a small persistent catalog of the places you actually go,
-//! ordered so the ones you use most are one keystroke away.
+//! ordered most-recently-connected first so the last few are one keystroke away.
 //!
 //! **No passwords are stored, ever.** An entry records where to connect and as
 //! whom; authentication still goes through the usual ladder (ssh-agent, then
@@ -44,10 +44,11 @@ pub struct SavedHost {
     /// Directory to open on arrival. `None` means the server's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Times connected, for ranking.
+    /// Times connected. Shown in the picker; does not affect ordering.
     #[serde(default)]
     pub uses: u64,
-    /// RFC 3339 timestamp of the last connection, breaking ties in the ranking.
+    /// RFC 3339 timestamp of the last connection. This is what the quick list is
+    /// ordered by — newest first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<String>,
 }
@@ -235,17 +236,29 @@ impl HostCatalog {
         self.hosts.len()
     }
 
-    /// The `n` most-used hosts, most recent first among equals.
+    /// The `n` most recently connected hosts, newest first.
     ///
     /// This is what `gr` shows without asking for the full list — the whole
     /// point of the catalog is that the usual destinations need no searching.
+    ///
+    /// Strictly least-recently-used. Ranking by *frequency* first (as this once
+    /// did) meant a host connected fifty times last month outranked one used an
+    /// hour ago, and the order barely moved as you worked. Recency changes
+    /// visibly with use, so the list stays predictable: whatever you just
+    /// connected to is at the top.
     pub fn recent(&self, n: usize) -> Vec<&SavedHost> {
         let mut refs: Vec<&SavedHost> = self.hosts.iter().collect();
         refs.sort_by(|a, b| {
-            b.uses
-                .cmp(&a.uses)
-                .then_with(|| b.last_used.cmp(&a.last_used))
-                .then_with(|| a.label.cmp(&b.label))
+            // RFC 3339 with a fixed offset sorts correctly as a string. A host
+            // that has never been connected to has no timestamp; treating that
+            // as an empty string sinks it below every dated entry, whereas
+            // comparing the `Option`s directly would sort `None` *first* and put
+            // unused hosts at the top of a "recent" list.
+            let (ak, bk) = (
+                a.last_used.as_deref().unwrap_or(""),
+                b.last_used.as_deref().unwrap_or(""),
+            );
+            bk.cmp(ak).then_with(|| a.label.cmp(&b.label))
         });
         refs.into_iter().take(n).collect()
     }
@@ -324,13 +337,64 @@ mod tests {
         }
     }
 
+    /// Recency beats frequency: whatever was connected to last is at the top.
     #[test]
-    fn recent_ranks_by_use_then_recency() {
+    fn recent_ranks_by_recency_not_frequency() {
+        let hosts = vec![
+            SavedHost {
+                label: "workhorse".into(),
+                host: "a.example.com".into(),
+                uses: 50,
+                last_used: Some("2026-06-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            SavedHost {
+                label: "yesterday".into(),
+                host: "b.example.com".into(),
+                uses: 1,
+                last_used: Some("2026-07-25T00:00:00Z".into()),
+                ..Default::default()
+            },
+        ];
+        let c = HostCatalog::in_memory(hosts);
+        assert_eq!(
+            c.recent(1)[0].label,
+            "yesterday",
+            "a host used once yesterday must outrank one used 50 times last month"
+        );
+    }
+
+    /// A host that has never been connected to sorts below every dated one —
+    /// `Option` ordering would otherwise put `None` first.
+    #[test]
+    fn never_connected_hosts_sort_last() {
+        let hosts = vec![
+            SavedHost::new("never", "new.example.com"),
+            SavedHost {
+                label: "used".into(),
+                host: "old.example.com".into(),
+                uses: 1,
+                last_used: Some("2026-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        ];
+        let c = HostCatalog::in_memory(hosts);
+        let order: Vec<&str> = c.recent(10).iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(order, vec!["used", "never"]);
+    }
+
+    #[test]
+    fn recent_returns_at_most_n_and_is_stable() {
         let c = HostCatalog::in_memory(sample());
-        let top = c.recent(2);
-        assert_eq!(top[0].label, "prod");
-        assert_eq!(top[1].label, "backup");
+        assert_eq!(c.recent(2).len(), 2);
         assert_eq!(c.recent(10).len(), 3);
+        // Two hosts with no timestamp fall back to label order, so the list does
+        // not shuffle between renders.
+        let a = c.recent(10);
+        let b = c.recent(10);
+        let names_a: Vec<&str> = a.iter().map(|h| h.label.as_str()).collect();
+        let names_b: Vec<&str> = b.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(names_a, names_b);
     }
 
     #[test]

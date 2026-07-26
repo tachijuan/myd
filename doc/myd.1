@@ -110,14 +110,18 @@ Toggle display of proportional size bars in the tree.
 Search for a file or directory by name.
 .TP
 .B ? / F1
-Show/hide help.
+Show or hide the key reference. It is taller than a typical terminal, so
+\fBj\fR / \fBk\fR, the arrow keys, PageUp/PageDown, \fBg\fR / \fBG\fR and the
+mouse wheel scroll it; the title bar shows your position in the list.
 .SS Screen Level
 .TP
 .B q
-Quit the application immediately.
+Quit. With transfers still queued or running this asks for confirmation first,
+since abandoning one discards a partial copy. \fBCtrl+C\fR force-quits without
+asking.
 .TP
 .B Esc
-Quit the application.
+Quit, with the same confirmation as \fBq\fR.
 .TP
 .B Ctrl+o
 Go back to the parent directory.
@@ -147,7 +151,8 @@ re-grab it.
 Show or hide the transfer panel.
 .TP
 .B Tab
-Cycles the browser panels and then the transfer panel. While the transfer
+Cycles the browser panels and then the transfer panel. Only one pane shows the
+bright focus border at a time. While the transfer
 panel has focus, \fBj\fR / \fBK\fR move between transfers, \fBk\fR or
 \fBDelete\fR cancels the selected one (after a confirmation), and \fBEsc\fR
 returns to the tree. A double-click on a transfer also cancels it.
@@ -190,7 +195,13 @@ part of it.
 .SH DIALING DIRECTORY
 Saved remote locations live in \fB~/.config/myd/hosts.toml\fR (honouring
 \fBXDG_CONFIG_HOME\fR) and are hand-editable. An entry records a label, host,
-optional user, port and starting path, plus a use count used to rank the list.
+optional user, port and starting path, plus a use count and the time of the last
+connection.
+.PP
+The quick list \fBgr\fR shows is ordered strictly by recency \(em most recently
+connected first \(em so it changes visibly as you work. The use count is
+displayed but does not affect the order. The full list (\fBgs\fR) stays
+alphabetical, since that list is for finding a host by name.
 .PP
 .B No passwords are stored.
 Authentication goes through the same ladder as always: ssh-agent, then
