@@ -14,7 +14,7 @@ use crate::transfer::TransferQueue;
 use crate::utils::sizes::CancelToken;
 use crate::vfs::{BackendRegistry, VPath};
 use crate::widget::confirm_dialog::ConfirmDialog;
-use crate::widget::help::render_help;
+use crate::widget::help::{render_help, HelpState};
 use crate::widget::host_picker::{HostPicker, PickerOutcome};
 use crate::widget::input_dialog::InputDialog;
 use crate::widget::sort_menu::{SortMenu, SortMenuOutcome};
@@ -57,7 +57,7 @@ pub enum Modal {
     /// A background copy or delete is running. The verb ("Copying"/"Deleting")
     /// titles the overlay; live counts come from `FileBrowser::op_progress`.
     Operation { verb: &'static str },
-    Help,
+    Help(HelpState),
     /// The dialing directory. Owns its own key handling (vi navigation and `/`
     /// search), which is why it is a modal rather than a screen.
     HostPicker(HostPicker),
@@ -98,6 +98,8 @@ pub enum ModalTarget {
     HostDelete { label: String },
     /// Confirm cancelling a running or queued transfer.
     CancelTransfer { id: crate::transfer::TransferId },
+    /// Confirm quitting while transfers are still in flight.
+    QuitConfirm,
 }
 
 /// Main application state machine.
@@ -193,6 +195,12 @@ pub struct FileBrowser {
     /// The sidebar's rect from the last frame, so a click can be attributed to
     /// it rather than to the panel beside it.
     transfer_area: Option<ratatui::layout::Rect>,
+    /// Set when the user confirms quitting past in-flight transfers.
+    ///
+    /// A confirm dialog cannot end the app on its own: `handle_modal_key`
+    /// returns "keep running" and the dialog arm has no way to say otherwise.
+    /// `route_key` reads this flag on the way out instead.
+    quit_requested: bool,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -271,6 +279,7 @@ impl FileBrowser {
             transfer_cursor: None,
             transfer_rows: Default::default(),
             transfer_area: None,
+            quit_requested: false,
         }
     }
 
@@ -376,7 +385,13 @@ impl FileBrowser {
                 }
             }
             if pending_scroll != 0 {
-                self.scroll_by(pending_scroll);
+                // The help overlay scrolls itself; otherwise the wheel drives
+                // whatever pane is focused underneath.
+                if let Modal::Help(state) = &mut self.modal {
+                    state.scroll_by(pending_scroll as isize);
+                } else {
+                    self.scroll_by(pending_scroll);
+                }
             }
 
             // Per-phase timing so a stall between keypresses can be attributed
@@ -475,6 +490,12 @@ impl FileBrowser {
         // panel(s) they land in.
         let pending = self.transfers.pending_destinations();
 
+        // Focus lives in one place: a browser panel, or the transfer sidebar.
+        // `state.active` used to mean "is the active panel index", which stopped
+        // being true once the sidebar became focusable — both it and the last
+        // panel drew a cyan border at once.
+        let panel_has_focus = !self.transfer_focused;
+
         if panel_count == 2 {
             let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
@@ -486,7 +507,7 @@ impl FileBrowser {
                 // Tell the top Main screen whether it's the active panel so its
                 // border can stand out.
                 if let Screen::Main(state) = panel.current_screen_mut() {
-                    state.active = i == active;
+                    state.active = panel_has_focus && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                 }
                 panel.current_screen_mut().render(f, cols[i]);
@@ -495,7 +516,7 @@ impl FileBrowser {
             self.panel_areas = vec![area];
             let backend = self.panels[0].backend;
             if let Screen::Main(state) = self.panels[0].current_screen_mut() {
-                state.active = true;
+                state.active = panel_has_focus;
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
             }
             self.panels[0].current_screen_mut().render(f, area);
@@ -526,7 +547,7 @@ impl FileBrowser {
                 };
                 overlay.render(f, full);
             }
-            Modal::Help => render_help(f, full),
+            Modal::Help(state) => render_help(f, full, state),
             Modal::None => {
                 // A delete that started from the confirm dialog also runs in the
                 // background; show its overlay when no modal is up.
@@ -701,7 +722,7 @@ impl FileBrowser {
 
     /// Whether the help screen is currently showing (for tests).
     pub fn is_help_open(&self) -> bool {
-        matches!(self.modal, Modal::Help)
+        matches!(self.modal, Modal::Help(_))
     }
 
     /// Whether the transfer sidebar should be drawn.
@@ -773,6 +794,16 @@ impl FileBrowser {
         self.scroll_by(delta);
     }
 
+    /// How many browser panels are drawing themselves as focused (for tests).
+    ///
+    /// Must always be 0 (sidebar focused) or 1 — never two at once.
+    pub fn focused_panel_count_for_test(&self) -> usize {
+        self.panels
+            .iter()
+            .filter(|p| matches!(p.current_screen(), Screen::Main(s) if s.active))
+            .count()
+    }
+
     /// Whether the transfer sidebar has focus (for tests).
     pub fn transfer_focused_for_test(&self) -> bool {
         self.transfer_focused
@@ -806,7 +837,7 @@ impl FileBrowser {
             Modal::Confirm(_) => "confirm",
             Modal::Input(_) => "input",
             Modal::Operation { .. } => "operation",
-            Modal::Help => "help",
+            Modal::Help(_) => "help",
             Modal::HostPicker(_) => "host_picker",
             Modal::SortMenu(_) => "sort_menu",
         }
@@ -908,14 +939,67 @@ impl FileBrowser {
             return false;
         }
 
+        let keep_running = self.route_key_inner(key);
+        // A confirmed quit-past-transfers cannot be reported by the dialog
+        // itself, so it is picked up here on the way out.
+        keep_running && !self.quit_requested
+    }
+
+    fn route_key_inner(&mut self, key: KeyEvent) -> bool {
         match self.modal {
             Modal::None => self.handle_key(key),
-            Modal::Help => {
-                // Dismiss help. Keys whose only role here is to close the help
-                // screen (quit/back and the help toggles) are consumed so they
-                // don't also act on the screen behind it — e.g. q must not quit
-                // the app. Any other key both dismisses help and acts (so j
-                // moves the cursor).
+            Modal::Help(_) => {
+                // Scrolling comes first: the list is far taller than a terminal,
+                // so j/k have to move within it rather than dismissing it and
+                // moving the file cursor underneath.
+                if let Modal::Help(state) = &mut self.modal {
+                    let ctrl = key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL);
+                    let handled = match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            state.scroll_by(1);
+                            true
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            state.scroll_by(-1);
+                            true
+                        }
+                        KeyCode::PageDown | KeyCode::Char(' ') => {
+                            state.page(true);
+                            true
+                        }
+                        KeyCode::PageUp => {
+                            state.page(false);
+                            true
+                        }
+                        KeyCode::Char('d') if ctrl => {
+                            state.page(true);
+                            true
+                        }
+                        KeyCode::Char('u') if ctrl => {
+                            state.page(false);
+                            true
+                        }
+                        KeyCode::Char('g') | KeyCode::Home => {
+                            state.to_top();
+                            true
+                        }
+                        KeyCode::Char('G') | KeyCode::End => {
+                            state.to_bottom();
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        return true;
+                    }
+                }
+
+                // Otherwise dismiss. Keys whose only role here is to close the
+                // help screen (quit/back and the help toggles) are consumed so
+                // they don't also act on the screen behind it — e.g. q must not
+                // quit the app. Any other key both dismisses help and acts.
                 self.modal = Modal::None;
                 let dismiss_only = matches!(
                     key.code,
@@ -1261,6 +1345,22 @@ impl FileBrowser {
                     self.pop_screen();
                     return true;
                 }
+                // Abandoning transfers is not recoverable — a partial copy is
+                // discarded — so it is worth one keystroke to confirm. Queued
+                // transfers count too: losing them loses the intent, not just
+                // the progress. Ctrl-C still force-quits without asking.
+                if self.transfers.has_work() {
+                    let n = self.transfers.active_count() + self.transfers.queued_count();
+                    self.modal_target = Some(ModalTarget::QuitConfirm);
+                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                        "{} transfer{} still running. Quit and abandon {}?",
+                        n,
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "it" } else { "them" },
+                    )));
+                    return true;
+                }
+
                 // Otherwise quit the app immediately, regardless of history.
                 // Use Ctrl-o (PopScreen) to step back up a directory.
                 false
@@ -1329,10 +1429,10 @@ impl FileBrowser {
                 true
             }
             Action::Help => {
-                if matches!(self.modal, Modal::Help) {
+                if matches!(self.modal, Modal::Help(_)) {
                     self.modal = Modal::None;
                 } else {
-                    self.modal = Modal::Help;
+                    self.modal = Modal::Help(HelpState::new());
                 }
                 true
             }
@@ -1709,6 +1809,11 @@ impl FileBrowser {
                         Some(ModalTarget::Delete { paths }) if result => {
                             self.spawn_delete_batch(paths);
                         }
+                        Some(ModalTarget::QuitConfirm) => {
+                            // Declining simply closes the dialog; the flag stays
+                            // false so a later `q` asks again.
+                            self.quit_requested = result;
+                        }
                         Some(ModalTarget::CancelTransfer { id }) if result => {
                             self.transfers.cancel(id);
                         }
@@ -1829,7 +1934,8 @@ impl FileBrowser {
                                 self.submit_host_form(&value, editing);
                             }
                             ModalTarget::HostDelete { .. }
-                            | ModalTarget::CancelTransfer { .. } => {}
+                            | ModalTarget::CancelTransfer { .. }
+                            | ModalTarget::QuitConfirm => {}
                             ModalTarget::Password => {
                                 if value.is_empty() {
                                     // An empty entry cancels the whole attempt.
@@ -1861,7 +1967,7 @@ impl FileBrowser {
                 }
                 true
             }
-            Modal::Help => {
+            Modal::Help(_) => {
                 // Dismiss help — the real key is handled by handle_key.
                 self.modal = Modal::None;
                 true

@@ -697,16 +697,19 @@ mod tests {
 
     fn catalog() -> HostCatalog {
         let mut hosts = Vec::new();
-        for (label, host, uses) in [
-            ("prod", "prod.example.com", 30u64),
-            ("backup", "10.0.0.5", 20),
-            ("scratch", "dev.local", 10),
-            ("france", "fr.example.com", 5),
-            ("archive", "old.example.com", 1),
+        // Timestamps descending, since the quick list is ordered by recency —
+        // `prod` is the most recent connection and so heads the list.
+        for (label, host, uses, last) in [
+            ("prod", "prod.example.com", 30u64, "2026-07-26T12:00:00Z"),
+            ("backup", "10.0.0.5", 20, "2026-07-25T12:00:00Z"),
+            ("scratch", "dev.local", 10, "2026-07-24T12:00:00Z"),
+            ("france", "fr.example.com", 5, "2026-07-23T12:00:00Z"),
+            ("archive", "old.example.com", 1, "2026-07-22T12:00:00Z"),
         ] {
             let mut h = SavedHost::new(label, host);
             h.uses = uses;
             h.user = Some("juan".into());
+            h.last_used = Some(last.into());
             hosts.push(h);
         }
         // One entry whose target cannot fit on a line at any realistic width.
