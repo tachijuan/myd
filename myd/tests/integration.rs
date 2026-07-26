@@ -4543,3 +4543,168 @@ async fn test_leaving_the_dir_picker_does_not_quit() {
         "q on the main screen should still quit"
     );
 }
+
+/// Changing the sort order on a remote tree must make **zero** backend calls.
+///
+/// Not "few" or "fast": none. Sorting reorders data already in memory, so any
+/// call to the backend is a bug regardless of how quick it happens to be on a
+/// fast link. This asserts that directly — the fake backend panics if it is
+/// touched once sorting begins — rather than inferring it from timings, which
+/// is what let earlier I/O in the sort path go unnoticed.
+#[tokio::test]
+async fn test_remote_sort_makes_no_backend_calls_at_all() {
+    use myd::screen::SortMode;
+    use myd::utils::sizes::{CancelToken, SizeCache};
+    use myd::vfs::{BackendId, VEntry, VMetadata, VPath, VRead, VWrite, Vfs};
+    use myd::widget::file_tree::FileTree;
+    use myd::widget::progress::OpProgress;
+    use myd::widget::source::{RemoteSource, Source};
+    use myd::widget::treemap::TreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Live while loading; any touch after `SEALED` is set panics.
+    static SEALED: AtomicBool = AtomicBool::new(false);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct Tripwire;
+    impl Tripwire {
+        fn hit(what: &str) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !SEALED.load(Ordering::SeqCst),
+                "sorting reached the backend: {}",
+                what
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Vfs for Tripwire {
+        fn scheme(&self) -> &'static str {
+            "sftp"
+        }
+        async fn read_dir(&self, p: &VPath) -> anyhow::Result<Vec<VEntry>> {
+            Self::hit("read_dir");
+            let depth = p.path.components().count();
+            let mut v = Vec::new();
+            if depth < 4 {
+                for i in 0..12 {
+                    v.push(VEntry::new(format!("d{:02}", i), true));
+                }
+            }
+            for i in 0..20 {
+                let mut e = VEntry::new(format!("f{:02}.txt", i), false);
+                e.len = 1000 + i as u64;
+                e.mtime = Some(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64),
+                );
+                v.push(e);
+            }
+            Ok(v)
+        }
+        async fn stat(&self, p: &VPath) -> anyhow::Result<VMetadata> {
+            Self::hit("stat");
+            let n = p
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            Ok(VMetadata {
+                is_dir: !n.contains('.'),
+                is_symlink: false,
+                len: 4096,
+                mode: None,
+                uid: None,
+                gid: None,
+                mtime: None,
+                atime: None,
+                ctime: None,
+            })
+        }
+        async fn symlink_stat(&self, p: &VPath) -> anyhow::Result<VMetadata> {
+            Self::hit("symlink_stat");
+            self.stat(p).await
+        }
+        async fn create_dir_all(&self, _p: &VPath) -> anyhow::Result<()> {
+            Self::hit("create_dir_all");
+            Ok(())
+        }
+        async fn remove_file(&self, _p: &VPath) -> anyhow::Result<()> {
+            Self::hit("remove_file");
+            Ok(())
+        }
+        async fn remove_dir(&self, _p: &VPath) -> anyhow::Result<()> {
+            Self::hit("remove_dir");
+            Ok(())
+        }
+        async fn rename(&self, _f: &VPath, _t: &VPath) -> anyhow::Result<()> {
+            Self::hit("rename");
+            Ok(())
+        }
+        async fn open_read(&self, _p: &VPath) -> anyhow::Result<Box<dyn VRead>> {
+            Self::hit("open_read");
+            anyhow::bail!("unused")
+        }
+        async fn open_write(
+            &self,
+            _p: &VPath,
+            _l: Option<u64>,
+        ) -> anyhow::Result<Box<dyn VWrite>> {
+            Self::hit("open_write");
+            anyhow::bail!("unused")
+        }
+        async fn dir_size(
+            &self,
+            _p: &VPath,
+            _c: &SizeCache,
+            _ct: &CancelToken,
+            _pr: Option<&OpProgress>,
+        ) -> u64 {
+            Self::hit("dir_size");
+            0
+        }
+        fn has_recursive_sizes(&self) -> bool {
+            false
+        }
+    }
+
+    let vfs: Arc<dyn Vfs> = Arc::new(Tripwire);
+    let source = Source::Remote(RemoteSource::new(BackendId(1), vfs).unwrap());
+    let cancel = CancelToken::new();
+    let progress = OpProgress::new();
+    let mut tree = FileTree::with_source_cancellable_progress(
+        source,
+        std::path::PathBuf::from("/remote/data"),
+        SortMode::Largest,
+        true,
+        true,
+        SizeCache::new(),
+        &cancel,
+        &progress,
+    )
+    .expect("remote tree should build");
+    tree.expand_all();
+    assert!(
+        CALLS.load(Ordering::SeqCst) > 0,
+        "loading the tree should talk to the backend"
+    );
+    assert!(tree.lines.len() > 200, "need a large tree to be meaningful");
+
+    // Everything past here is pure reordering.
+    SEALED.store(true, Ordering::SeqCst);
+    for mode in [
+        SortMode::Smallest,
+        SortMode::DirsFirst,
+        SortMode::FilesFirst,
+        SortMode::Newest,
+        SortMode::Oldest,
+        SortMode::RecentlyAccessed,
+        SortMode::Largest,
+    ] {
+        tree.set_sort_mode(mode);
+    }
+    // `toggle_sort` rebuilds the treemap too, so that must be clean as well.
+    let _ = TreeMap::from_file_tree(&tree);
+    SEALED.store(false, Ordering::SeqCst);
+}
