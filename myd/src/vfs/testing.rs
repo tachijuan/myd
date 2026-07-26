@@ -496,6 +496,65 @@ impl VPositionedRead for LatencyPositionedRead {
     }
 }
 
+/// A positioned-write handle over the simulated file.
+struct LatencyPositionedWrite {
+    fs: Arc<LatencyVfs>,
+    path: PathBuf,
+}
+
+#[async_trait]
+impl super::VPositionedWrite for LatencyPositionedWrite {
+    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        // A real server caps one WRITE at its negotiated limit, so a larger
+        // request is several serial wire requests on that handle.
+        let mut done = 0usize;
+        while done < data.len() {
+            let n = self.fs.profile.max_write_len.min(data.len() - done);
+            self.fs.wire(&self.fs.stats.writes, n as u64).await;
+            self.fs
+                .stats
+                .bytes_written
+                .fetch_add(n as u64, Ordering::Relaxed);
+            done += n;
+        }
+
+        let mut written = self.fs.written.lock().unwrap();
+        let buf = written.entry(self.path.clone()).or_default();
+        let end = offset as usize + data.len();
+        if buf.len() < end {
+            buf.resize(end, 0);
+        }
+        buf[offset as usize..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    async fn clone_handle(&self) -> Option<Box<dyn super::VPositionedWrite>> {
+        Some(Box::new(LatencyPositionedWrite {
+            fs: self.fs.clone(),
+            path: self.path.clone(),
+        }))
+    }
+
+    async fn finish(&self) -> Result<()> {
+        let len = self
+            .fs
+            .written
+            .lock()
+            .unwrap()
+            .get(&self.path)
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
+        self.fs.nodes.lock().unwrap().insert(
+            self.path.clone(),
+            Node {
+                is_dir: false,
+                len,
+            },
+        );
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Vfs for LatencyVfs {
     fn scheme(&self) -> &'static str {
@@ -626,6 +685,22 @@ impl Vfs for LatencyVfs {
         Ok(Box::new(LatencyPositionedRead {
             fs: self.arc_self(),
             len: node.len,
+        }))
+    }
+
+    fn supports_parallel_write(&self) -> bool {
+        self.parallel_reads
+    }
+
+    async fn open_positioned_write(
+        &self,
+        path: &VPath,
+        _len_hint: Option<u64>,
+    ) -> Result<Box<dyn super::VPositionedWrite>> {
+        self.wire(&self.stats.opens, 0).await;
+        Ok(Box::new(LatencyPositionedWrite {
+            fs: self.arc_self(),
+            path: path.path.clone(),
         }))
     }
 

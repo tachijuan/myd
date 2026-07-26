@@ -12,6 +12,27 @@ pub enum TransferOutcome {
     Cancelled,
 }
 
+/// Which copy strategy a file took, for logging and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path {
+    /// Concurrent positioned reads — a large download from a pipelining backend.
+    ParallelRead,
+    /// Concurrent positioned writes — a large upload to one.
+    ParallelWrite,
+    /// Read a buffer, write it, repeat. Best locally and for small files.
+    Sequential,
+}
+
+impl Path {
+    fn as_str(self) -> &'static str {
+        match self {
+            Path::ParallelRead => "parallel_read",
+            Path::ParallelWrite => "parallel_write",
+            Path::Sequential => "sequential",
+        }
+    }
+}
+
 /// Everything one file transfer needs. Grouped into a struct so the worker and
 /// the queue pass a single value around rather than an unwieldy argument list.
 pub struct TransferJob {
@@ -246,32 +267,53 @@ async fn stream_file(
     config: &TransferConfig,
     len_hint: u64,
 ) -> Result<TransferOutcome> {
-    let parallel = src_fs.supports_parallel_read() && len_hint >= super::LARGE_FILE_THRESHOLD;
+    // Which side can overlap round trips decides the path. Keying only on the
+    // source meant an upload (local source, remote destination) always fell to
+    // the sequential path, where one write is outstanding at a time — the reason
+    // uploads ran far below the download rate.
+    let big = len_hint >= super::LARGE_FILE_THRESHOLD;
+    let path_taken = if big && src_fs.supports_parallel_read() {
+        Path::ParallelRead
+    } else if big && dest_fs.supports_parallel_write() {
+        Path::ParallelWrite
+    } else {
+        Path::Sequential
+    };
     let started = std::time::Instant::now();
 
-    let outcome = if parallel {
-        stream_file_parallel(
-            src_fs, dest_fs, src, part, progress, cancel, config, len_hint,
-        )
-        .await
-    } else {
-        stream_file_sequential(src_fs, dest_fs, src, part, progress, cancel, config).await
+    let outcome = match path_taken {
+        Path::ParallelRead => {
+            stream_file_parallel(
+                src_fs, dest_fs, src, part, progress, cancel, config, len_hint,
+            )
+            .await
+        }
+        Path::ParallelWrite => {
+            stream_file_parallel_upload(
+                src_fs, dest_fs, src, part, progress, cancel, config, len_hint,
+            )
+            .await
+        }
+        Path::Sequential => {
+            stream_file_sequential(src_fs, dest_fs, src, part, progress, cancel, config).await
+        }
     };
 
     // One event per file rather than per chunk: on a fast link a per-chunk event
     // would cost more than the work it describes.
     if crate::trace::enabled() {
         let secs = started.elapsed().as_secs_f64();
+        let concurrent = !matches!(path_taken, Path::Sequential);
         tracing::debug!(
             path = %src,
             bytes = len_hint,
-            path_taken = if parallel { "parallel" } else { "sequential" },
-            chunk_size = if parallel {
+            path_taken = path_taken.as_str(),
+            chunk_size = if concurrent {
                 super::effective_chunk_size(config)
             } else {
-                config.chunk_size
+                super::sequential_buffer_size(config)
             },
-            window = if parallel {
+            window = if concurrent {
                 super::large_file_chunks_in_flight(config)
             } else {
                 1
@@ -324,6 +366,124 @@ async fn stream_file_sequential(
 
     writer.flush().await?;
     writer.shutdown().await?;
+    Ok(TransferOutcome::Done)
+}
+
+/// The concurrent copy path for a large *upload*.
+///
+/// The mirror of [`stream_file_parallel`]: the source is read sequentially (it
+/// is local, where the kernel's readahead already makes that fast) and the
+/// chunks are written concurrently at explicit offsets. Without this an upload
+/// can only have one write outstanding at a time, so it pays a full round trip
+/// per chunk and runs far below the download rate on a long link.
+///
+/// Writes may complete out of order — each carries its own offset, so the file
+/// is correct regardless.
+#[allow(clippy::too_many_arguments)]
+async fn stream_file_parallel_upload(
+    src_fs: &Arc<dyn Vfs>,
+    dest_fs: &Arc<dyn Vfs>,
+    src: &VPath,
+    part: &VPath,
+    progress: &Arc<TransferProgress>,
+    cancel: &CancelToken,
+    config: &TransferConfig,
+    total: u64,
+) -> Result<TransferOutcome> {
+    use crate::vfs::VPositionedWrite;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::sync::Arc as StdArc;
+
+    let mut reader = src_fs.open_read(src).await?;
+    let first: StdArc<dyn VPositionedWrite> =
+        StdArc::from(dest_fs.open_positioned_write(part, Some(total)).await?);
+
+    let chunk = super::effective_chunk_size(config);
+    let window = super::large_file_chunks_in_flight(config);
+
+    // As on the read side, clone handles where the backend allows it so the pool
+    // costs one open rather than one per slot.
+    let mut pool: Vec<StdArc<dyn VPositionedWrite>> = Vec::with_capacity(window);
+    pool.push(first.clone());
+    while pool.len() < window {
+        match first.clone_handle().await {
+            Some(h) => pool.push(StdArc::from(h)),
+            None => break,
+        }
+    }
+
+    let mut inflight = FuturesUnordered::new();
+    let mut offset = 0u64;
+    let mut slot = 0usize;
+    let mut cancelled = false;
+    let mut written_total = 0u64;
+
+    loop {
+        if cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+
+        // Read the next chunk locally. `read` may return less than asked for, so
+        // fill the buffer before handing it to a writer — a short local read is
+        // not an error and must not become a short chunk.
+        let mut buf = vec![0u8; chunk];
+        let mut filled = 0usize;
+        while filled < chunk {
+            let n = reader.read(&mut buf[filled..]).await?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break; // end of source
+        }
+        buf.truncate(filled);
+
+        // Wait for a free slot before issuing another write, which bounds both
+        // the outstanding requests and the memory held by their buffers.
+        if inflight.len() >= window {
+            match inflight.next().await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => {}
+            }
+        }
+
+        let handle = pool[slot % pool.len()].clone();
+        slot += 1;
+        let at = offset;
+        offset += filled as u64;
+        written_total += filled as u64;
+        let progress = progress.clone();
+        inflight.push(async move {
+            handle.write_at(at, &buf).await?;
+            progress.add_bytes(buf.len() as u64);
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+
+    // Drain the rest, propagating the first failure.
+    while let Some(result) = inflight.next().await {
+        result?;
+    }
+
+    if cancelled {
+        return Ok(TransferOutcome::Cancelled);
+    }
+
+    first.finish().await?;
+    drop(pool);
+
+    if written_total != total {
+        anyhow::bail!(
+            "short upload: wrote {} of {} bytes",
+            written_total,
+            total
+        );
+    }
+
     Ok(TransferOutcome::Done)
 }
 

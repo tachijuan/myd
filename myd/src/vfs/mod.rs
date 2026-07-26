@@ -111,6 +111,36 @@ pub trait VPositionedRead: Send + Sync {
     }
 }
 
+/// A handle that writes a file at explicit offsets.
+///
+/// The mirror of [`VPositionedRead`], and it exists for the same reason: a
+/// sequential upload alternates read and write and cannot overlap round trips,
+/// so on a long link it runs at a fraction of the download rate. SFTP's WRITE
+/// carries an explicit offset, so chunks can be written concurrently and out of
+/// order.
+#[async_trait]
+pub trait VPositionedWrite: Send + Sync {
+    /// Write all of `data` starting at `offset`.
+    ///
+    /// Unlike [`VPositionedRead::read_at`] this must write everything or fail —
+    /// a partial write with no way to report how much landed would corrupt the
+    /// file silently.
+    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Another handle onto the same file, cheaply if possible.
+    async fn clone_handle(&self) -> Option<Box<dyn VPositionedWrite>> {
+        None
+    }
+
+    /// Close the file, flushing anything outstanding.
+    ///
+    /// Takes `&self` rather than `self` so the handle can live in a pool behind
+    /// an `Arc`; the caller guarantees no writes follow.
+    async fn finish(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A filesystem backend.
 ///
 /// All methods take `&self` and the implementor is `Send + Sync`, so one backend
@@ -166,6 +196,29 @@ pub trait Vfs: Send + Sync {
     /// is true; the default is unreachable for other backends.
     async fn open_positioned_read(&self, _path: &VPath) -> Result<Box<dyn VPositionedRead>> {
         anyhow::bail!("positioned reads not supported by this backend")
+    }
+
+    /// Whether this backend benefits from concurrent positioned writes within a
+    /// single file — the upload counterpart of
+    /// [`supports_parallel_read`](Self::supports_parallel_read).
+    ///
+    /// True for SFTP, where a sequential upload can only have one write
+    /// outstanding at a time and so runs far below the download rate on a long
+    /// link. False for local, where the page cache already absorbs writes.
+    fn supports_parallel_write(&self) -> bool {
+        false
+    }
+
+    /// Open a handle for positioned writes.
+    ///
+    /// Only called when
+    /// [`supports_parallel_write`](Self::supports_parallel_write) is true.
+    async fn open_positioned_write(
+        &self,
+        _path: &VPath,
+        _len_hint: Option<u64>,
+    ) -> Result<Box<dyn VPositionedWrite>> {
+        anyhow::bail!("positioned writes not supported by this backend")
     }
 
     /// Recursive size of a directory.
