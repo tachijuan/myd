@@ -81,7 +81,10 @@ pub async fn run_transfer(job: TransferJob) -> Result<TransferOutcome> {
         return Ok(TransferOutcome::Cancelled);
     }
 
-    let meta = src_fs.stat(&src).await?;
+    let meta = src_fs
+        .stat(&src)
+        .await
+        .with_context(|| format!("could not read source {}", src))?;
 
     // A directory is transferred by recursively copying its contents. Its total
     // size is summed up front so the panel shows one progress figure for the
@@ -102,15 +105,49 @@ pub async fn run_transfer(job: TransferJob) -> Result<TransferOutcome> {
 
     progress.set_total(meta.len);
 
+    // A failure here is not fatal on its own — the directory may already exist,
+    // and open_write creates parents too — but it is the usual precursor to a
+    // confusing write error, so record why it failed rather than dropping it.
     if let Some(parent) = dest.parent() {
-        dest_fs.create_dir_all(&parent).await.ok();
+        if let Err(e) = dest_fs.create_dir_all(&parent).await {
+            tracing::debug!(
+                dest_parent = %parent,
+                error = %e,
+                "could not pre-create the destination directory; continuing"
+            );
+        }
     }
 
     let part = part_path(&dest, id);
     let result = stream_file(
         &src_fs, &dest_fs, &src, &part, &progress, &cancel, &config, meta.len,
     )
-    .await;
+    .await
+    .with_context(|| {
+        format!(
+            "copying {} -> {} ({} bytes)",
+            src, dest, meta.len
+        )
+    });
+
+    // Log the failure here rather than only in the queue: the headless binary
+    // and the move machinery call `run_transfer` directly, and a diagnostic that
+    // only appears on one of three paths is the one that is missing when needed.
+    if let Err(e) = &result {
+        let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+        tracing::error!(
+            id = %id,
+            src = %src,
+            dest = %dest,
+            src_backend = src_fs.scheme(),
+            dest_backend = dest_fs.scheme(),
+            total_bytes = meta.len,
+            bytes_done = progress.bytes_done(),
+            error = %e,
+            cause_chain = ?chain,
+            "transfer failed"
+        );
+    }
 
     match result {
         Ok(TransferOutcome::Done) => {
@@ -123,24 +160,42 @@ pub async fn run_transfer(job: TransferJob) -> Result<TransferOutcome> {
             // load-bearing, but unconditionally removing first cost a round trip
             // on every file including the common case where nothing is there.
             if let Err(first) = dest_fs.rename(&part, &dest).await {
-                dest_fs.remove_file(&dest).await.ok();
+                tracing::debug!(
+                    part = %part, dest = %dest, error = %first,
+                    "rename into place failed; clearing the destination and retrying"
+                );
+                if let Err(rm) = dest_fs.remove_file(&dest).await {
+                    tracing::debug!(dest = %dest, error = %rm, "could not clear the destination");
+                }
                 if let Err(e) = dest_fs.rename(&part, &dest).await {
                     dest_fs.remove_file(&part).await.ok();
-                    // Report the retry's error: the first failure may just have
-                    // been "destination exists", which the removal addressed.
-                    let _ = first;
-                    return Err(e);
+                    // Both attempts are reported: the first failure is often the
+                    // informative one ("permission denied") while the retry only
+                    // says the destination is still there.
+                    return Err(e).with_context(|| {
+                        format!(
+                            "could not move the completed copy into place at {} \
+                             (first attempt: {})",
+                            dest, first
+                        )
+                    });
                 }
             }
             progress.finish();
             Ok(TransferOutcome::Done)
         }
         Ok(TransferOutcome::Cancelled) => {
-            dest_fs.remove_file(&part).await.ok();
+            if let Err(e) = dest_fs.remove_file(&part).await {
+                tracing::debug!(part = %part, error = %e, "could not remove the part file after cancel");
+            }
             Ok(TransferOutcome::Cancelled)
         }
         Err(e) => {
-            dest_fs.remove_file(&part).await.ok();
+            // Clean up the partial file, but never let a cleanup failure replace
+            // the error that actually caused the transfer to fail.
+            if let Err(rm) = dest_fs.remove_file(&part).await {
+                tracing::debug!(part = %part, error = %rm, "could not remove the part file after failure");
+            }
             Err(e)
         }
     }
@@ -188,9 +243,15 @@ fn transfer_dir_inner<'a>(
         if cancel.is_cancelled() {
             return Ok(TransferOutcome::Cancelled);
         }
-        dest_fs.create_dir_all(dest).await?;
+        dest_fs
+            .create_dir_all(dest)
+            .await
+            .with_context(|| format!("could not create destination directory {}", dest))?;
 
-        let entries = src_fs.read_dir(src).await?;
+        let entries = src_fs
+            .read_dir(src)
+            .await
+            .with_context(|| format!("could not list source directory {}", src))?;
         let (dirs, files): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.is_dir);
 
         // Grow the progress total from this listing, which we needed anyway.
@@ -225,6 +286,11 @@ fn transfer_dir_inner<'a>(
                         src_fs, dest_fs, &child_src, &child_dest, progress, cancel, config, len,
                     )
                     .await
+                    // Name the file that failed. A directory copy reports one
+                    // error for the whole tree, and without this it named only
+                    // the directory — leaving no way to tell which of a thousand
+                    // files was the problem.
+                    .with_context(|| format!("copying {} ({} bytes)", child_src, len))
                 });
             }
             let Some(result) = inflight.next().await else {
@@ -378,8 +444,14 @@ async fn stream_file_sequential(
     cancel: &CancelToken,
     config: &TransferConfig,
 ) -> Result<TransferOutcome> {
-    let mut reader = src_fs.open_read(src).await?;
-    let mut writer = dest_fs.open_write(part, None).await?;
+    let mut reader = src_fs
+        .open_read(src)
+        .await
+        .with_context(|| format!("could not open {} for reading", src))?;
+    let mut writer = dest_fs
+        .open_write(part, None)
+        .await
+        .with_context(|| format!("could not open {} for writing", part))?;
 
     // The sequential path wants a *large* buffer, for the opposite reason the
     // parallel path wants a small one. Here the buffer is simply how much moves
@@ -430,7 +502,10 @@ async fn stream_file_parallel_upload(
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::Arc as StdArc;
 
-    let mut reader = src_fs.open_read(src).await?;
+    let mut reader = src_fs
+        .open_read(src)
+        .await
+        .with_context(|| format!("could not open {} for reading", src))?;
     let first: StdArc<dyn VPositionedWrite> =
         StdArc::from(dest_fs.open_positioned_write(part, Some(total)).await?);
 
@@ -552,7 +627,10 @@ async fn stream_file_parallel(
     use futures::stream::{FuturesOrdered, StreamExt};
     use std::sync::Arc as StdArc;
 
-    let writer = dest_fs.open_write(part, Some(total)).await?;
+    let writer = dest_fs
+        .open_write(part, Some(total))
+        .await
+        .with_context(|| format!("could not open {} for writing", part))?;
 
     let chunk = super::effective_chunk_size(config) as u64;
     // Share the connection's request budget with the other transfers that may be

@@ -313,10 +313,95 @@ impl TransferQueue {
 /// Wrapper turning the worker's `Result` into a [`Completion`] so a failure is
 /// recorded against the transfer instead of escaping the task.
 async fn run_worker(job: TransferJob) -> Completion {
+    let (id, src, dest) = (job.id, job.src.clone(), job.dest.clone());
+    let (src_scheme, dest_scheme) = (job.src_fs.scheme(), job.dest_fs.scheme());
+    let started = std::time::Instant::now();
+    let bytes_at_start = job.progress.bytes_done();
+
     match run_transfer(job).await {
-        Ok(TransferOutcome::Done) => Completion::Done,
-        Ok(TransferOutcome::Cancelled) => Completion::Cancelled,
-        Err(e) => Completion::Failed(e.to_string()),
+        Ok(TransferOutcome::Done) => {
+            tracing::debug!(
+                %id, %src, %dest,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "transfer done"
+            );
+            Completion::Done
+        }
+        Ok(TransferOutcome::Cancelled) => {
+            tracing::debug!(%id, %src, %dest, "transfer cancelled");
+            Completion::Cancelled
+        }
+        Err(e) => {
+            // `run_transfer` already logged the full chain with both backends.
+            // What matters here is that the *message stored on the transfer* —
+            // the one the panel shows — carries the root cause. `to_string` on
+            // an anyhow error gives only the outermost context, so a copy that
+            // failed on "permission denied" surfaced as nothing more than
+            // "could not open <path>": true, but useless for troubleshooting.
+            let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+            tracing::debug!(
+                %id, %src, %dest,
+                src_backend = src_scheme,
+                dest_backend = dest_scheme,
+                bytes_done = bytes_at_start,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "transfer task finished with an error"
+            );
+            Completion::Failed(format_error_chain(&chain))
+        }
+    }
+}
+
+/// Render an error chain as a single line the transfer panel can show.
+///
+/// The root cause is what actually identifies the problem ("permission denied"
+/// rather than "could not open"), so it must survive into the UI rather than
+/// only the log.
+fn format_error_chain(chain: &[String]) -> String {
+    match chain.len() {
+        0 => "unknown error".to_string(),
+        1 => chain[0].clone(),
+        // Outermost gives the operation, last gives the cause. Middle links are
+        // usually restatements and would only crowd a narrow panel.
+        _ => format!("{}: {}", chain[0], chain[chain.len() - 1]),
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+
+    /// A failed transfer must report the *cause*, not just the operation.
+    ///
+    /// `anyhow::Error::to_string` shows only the outermost context, so a copy
+    /// that failed on "permission denied" surfaced in the UI as nothing more
+    /// than "could not open <path>" — true, but useless for troubleshooting.
+    #[test]
+    fn failure_messages_carry_the_root_cause() {
+        let chain = vec![
+            "copying /remote/f -> /local/f (100 bytes)".to_string(),
+            "could not open /local/f for writing".to_string(),
+            "Permission denied (os error 13)".to_string(),
+        ];
+        let msg = format_error_chain(&chain);
+        assert!(
+            msg.contains("Permission denied"),
+            "the root cause must survive into the message: {msg}"
+        );
+        assert!(
+            msg.contains("copying"),
+            "the operation must survive too: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_single_link_chain_is_passed_through() {
+        assert_eq!(format_error_chain(&["boom".to_string()]), "boom");
+    }
+
+    #[test]
+    fn an_empty_chain_does_not_produce_an_empty_message() {
+        assert!(!format_error_chain(&[]).is_empty());
     }
 }
 

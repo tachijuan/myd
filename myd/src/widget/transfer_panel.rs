@@ -153,12 +153,18 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
                 }
                 TransferState::Failed(msg) => {
                     lines.push(status_line("!", &t.name, width, Color::Red));
-                    // The error is the whole value of a failed row, so show it
-                    // even though it costs a line.
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", truncate(msg, width.saturating_sub(2))),
-                        Style::default().fg(Color::Red),
-                    )));
+                    // The error is the whole value of a failed row, so it is
+                    // wrapped rather than truncated: the message now carries the
+                    // root cause ("...: Permission denied") at its *end*, which
+                    // is exactly the part a single truncated line would drop.
+                    // Capped at three lines so one failure can't crowd out the
+                    // rest of the queue.
+                    for line in wrap(msg, width.saturating_sub(2)).into_iter().take(3) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", line),
+                            Style::default().fg(Color::Red),
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -243,6 +249,57 @@ fn stats_line(t: &crate::transfer::Transfer, width: usize) -> Line<'static> {
 ///
 /// Counts chars rather than bytes: a multibyte filename would otherwise be
 /// mis-measured and overflow the panel.
+/// Wrap `s` to `width` columns, breaking at spaces where possible.
+///
+/// Counts chars rather than bytes so a path with multibyte characters wraps at
+/// the right column. A word longer than the line (a long path with no spaces) is
+/// hard-split so it stays fully visible instead of being cut at the border.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut len = 0usize;
+    for word in s.split_whitespace() {
+        let wlen = word.chars().count();
+        if wlen > width {
+            if len > 0 {
+                lines.push(std::mem::take(&mut current));
+                len = 0;
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            if !chunk.is_empty() {
+                current = chunk;
+                len = current.chars().count();
+            }
+            continue;
+        }
+        let need = if len == 0 { wlen } else { len + 1 + wlen };
+        if need > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            len = wlen;
+        } else {
+            if len > 0 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            len = need;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 fn truncate(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
