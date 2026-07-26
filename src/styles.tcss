@@ -1,0 +1,39 @@
+/* File Browser TUI - Styles */
+
+/* Folder styling */
+FileTree > .directory-tree--folder {
+    color: blue;
+    text-style: bold;
+}
+
+/* File styling */
+FileTree > .directory-tree--file {
+    color: $text;
+}
+
+/* Extension styling */
+FileTree > .directory-tree--extension {
+    color: $accent;
+}
+
+/* Hidden file styling */
+FileTree > .directory-tree--hidden {
+    color: $text-muted;
+    text-style: dim;
+}
+
+/* Size text styling */
+FileTree > .file-tree--size-text {
+    color: $text-muted;
+}
+
+/* Size bar styling */
+FileTree > .file-tree--size-bar {
+    color: $text-muted;
+}
+
+/* OptionList styling */
+OptionList > .option-list-option-highlight {
+    background: $accent;
+    text-style: bold;
+}

@@ -1,8 +1,10 @@
 pub mod app;
 pub mod cli;
+pub mod config;
 pub mod keybinding;
 pub mod panel;
 pub mod screen;
+pub mod trace;
 pub mod transfer;
 pub mod utils;
 pub mod vfs;

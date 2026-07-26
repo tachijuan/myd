@@ -53,6 +53,25 @@ echo "inside the real dir" > "$DIR/data/real_subdir/nested.txt"
 ln -sfn real_subdir "$DIR/data/link_subdir"
 ln -sf greeting.txt "$DIR/data/link_greeting.txt"
 
+# A deep tree, for the navigation tests. These reference data/deep and fall back
+# to the data root when it is missing — which silently turned them into much
+# weaker tests than intended, so the fixture is built here.
+mkdir -p "$DIR/data/deep/l1/l2/l3/l4"
+for lvl in "" /l1 /l1/l2 /l1/l2/l3 /l1/l2/l3/l4; do
+  for i in 1 2 3; do
+    echo "depth marker $lvl $i" > "$DIR/data/deep${lvl}/file${i}.txt"
+  done
+done
+
+# A directory with enough entries to make sorting and re-listing measurable;
+# also referenced with an .exists() fallback today.
+mkdir -p "$DIR/data/big"
+for i in $(seq 1 300); do
+  printf 'entry %03d\n' "$i" > "$DIR/data/big/f$(printf '%03d' "$i").txt"
+done
+# A few hidden entries so `toggle_hidden` has something to filter.
+for i in 1 2 3; do echo hidden > "$DIR/data/big/.hidden$i"; done
+
 /usr/sbin/sshd -f "$DIR/etc/sshd_config"
 
 eval "$(ssh-agent -s -a "$DIR/agent.sock")" >/dev/null
