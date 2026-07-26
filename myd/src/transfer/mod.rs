@@ -31,9 +31,38 @@ use crate::vfs::VPath;
 /// [`large_file_chunks_in_flight`]).
 pub const DEFAULT_MAX_PARALLEL: usize = 16;
 
-/// Chunk size for streaming a file. 1 MB is the documented plateau for SFTP —
-/// larger buffers stop helping latency.
+/// Chunk size for streaming a file sequentially. 1 MiB suits a local copy, where
+/// the buffer is just how much is moved per `read`/`write` pair.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Chunk size on the *parallel* path, where one chunk should be one wire request.
+///
+/// A remote server caps a single READ at the size it negotiated — 256 KiB for
+/// OpenSSH. Asking for more does not produce a bigger request; it produces
+/// several issued back-to-back on one handle, so the pipeline ends up only as
+/// deep as its slot count while appearing to carry far more. Sizing chunks to the
+/// limit keeps every window slot worth exactly one in-flight request.
+pub const PARALLEL_CHUNK_SIZE: usize = 256 * 1024;
+
+/// The chunk size the parallel path should use.
+///
+/// Clamped to [`PARALLEL_CHUNK_SIZE`] so an unusually large configured value
+/// cannot silently re-introduce serialised sub-reads.
+pub fn effective_chunk_size(config: &TransferConfig) -> usize {
+    config.chunk_size.min(PARALLEL_CHUNK_SIZE).max(1)
+}
+
+/// The buffer size the sequential path should use.
+///
+/// The two paths pull in opposite directions. On the parallel path a chunk is a
+/// wire request, so it must not exceed what one request can carry. On the
+/// sequential path the buffer is just how much moves per read/write pair over a
+/// client that already pipelines underneath, so a *larger* buffer means fewer
+/// alternations and fewer round trips. Sharing one number between them made
+/// every upload four times as chatty.
+pub fn sequential_buffer_size(config: &TransferConfig) -> usize {
+    config.chunk_size.max(DEFAULT_CHUNK_SIZE)
+}
 
 /// Files at or above this size get intra-file concurrency; below it the
 /// per-request overhead outweighs the benefit and parallelism comes from running
@@ -50,18 +79,32 @@ pub const DEFAULT_CHUNKS_IN_FLIGHT: usize = 32;
 
 /// The SFTP connection's `max_pending_requests`. Kept here so the transfer
 /// engine can size its windows against the same budget the backend advertises.
-const CONNECTION_REQUEST_BUDGET: usize = 256;
+fn connection_request_budget() -> usize {
+    crate::config::sftp_max_pending() as usize
+}
 
-/// Per-file chunk window, reduced so that several concurrent large-file
-/// transfers together stay inside the connection's request budget.
+/// Smallest window worth using for one large file.
 ///
-/// Without this, `max_parallel` × `chunks_in_flight` could far exceed
-/// `max_pending_requests`, and the surplus requests would queue inside the
-/// client rather than adding throughput — while the memory for their buffers
-/// (one `chunk_size` each) was already committed.
+/// Dividing the budget by `max_parallel` alone starves a single large transfer:
+/// with 16-way parallelism the fair share is a sixteenth of the budget even when
+/// that transfer is the only one running. Since one chunk is now exactly one wire
+/// request, a floor here is safe — the surplus only materialises if that many
+/// transfers really are in flight, and the server has its own limit besides.
+const MIN_LARGE_FILE_WINDOW: usize = 32;
+
+/// Per-file chunk window, sized against the connection's request budget so that
+/// several concurrent large-file transfers don't oversubscribe it.
+///
+/// The accounting is only meaningful because a chunk maps to one request (see
+/// [`PARALLEL_CHUNK_SIZE`]). While chunks were larger than the server's read
+/// limit, each slot silently expanded into several sequential requests and this
+/// arithmetic bore no relation to what was actually on the wire.
 pub fn large_file_chunks_in_flight(config: &TransferConfig) -> usize {
-    let fair_share = CONNECTION_REQUEST_BUDGET / config.max_parallel.max(1);
-    config.chunks_in_flight.min(fair_share).max(1)
+    let fair_share = connection_request_budget() / config.max_parallel.max(1);
+    config
+        .chunks_in_flight
+        .min(fair_share.max(MIN_LARGE_FILE_WINDOW))
+        .max(1)
 }
 
 /// Tunables for the engine.
@@ -80,10 +123,12 @@ pub struct TransferConfig {
 
 impl Default for TransferConfig {
     fn default() -> Self {
+        // Read from the environment so a slow link can be bisected in the field
+        // without a rebuild; the constants above are the fallbacks.
         Self {
-            max_parallel: DEFAULT_MAX_PARALLEL,
-            chunk_size: DEFAULT_CHUNK_SIZE,
-            chunks_in_flight: DEFAULT_CHUNKS_IN_FLIGHT,
+            max_parallel: crate::config::transfer_max_parallel(),
+            chunk_size: crate::config::transfer_chunk_size(),
+            chunks_in_flight: crate::config::transfer_chunks_in_flight(),
         }
     }
 }
@@ -338,26 +383,60 @@ mod tests {
     fn default_config_matches_the_spec() {
         let c = TransferConfig::default();
         assert_eq!(c.max_parallel, DEFAULT_MAX_PARALLEL);
-        assert_eq!(c.chunk_size, 1024 * 1024);
+        // The default chunk size is request-sized, not buffer-sized: on the
+        // parallel path one chunk must be one wire request.
+        assert_eq!(c.chunk_size, PARALLEL_CHUNK_SIZE);
     }
 
-    /// Concurrent large-file transfers must not oversubscribe the SFTP
-    /// connection: their combined chunk windows stay inside its request budget.
+    /// One chunk must never exceed what a single remote request can carry.
+    ///
+    /// Above that limit a chunk quietly becomes several requests issued
+    /// back-to-back on one handle, so the read window ends up only as deep as its
+    /// slot count while the arithmetic below claims otherwise.
     #[test]
-    fn chunk_windows_stay_within_the_connection_budget() {
+    fn parallel_chunks_stay_request_sized() {
         let c = TransferConfig::default();
-        let window = large_file_chunks_in_flight(&c);
-        assert!(window >= 1);
+        assert!(effective_chunk_size(&c) <= PARALLEL_CHUNK_SIZE);
+
+        // Even an over-large configured value is clamped.
+        let big = TransferConfig {
+            chunk_size: 8 * 1024 * 1024,
+            ..TransferConfig::default()
+        };
+        assert_eq!(effective_chunk_size(&big), PARALLEL_CHUNK_SIZE);
+    }
+
+    /// The sequential path pulls the other way: its buffer is how much moves per
+    /// read/write pair, so clamping it to the request size would multiply round
+    /// trips on every upload.
+    #[test]
+    fn sequential_buffer_is_not_clamped_to_the_request_size() {
+        let c = TransferConfig::default();
         assert!(
-            window * c.max_parallel <= CONNECTION_REQUEST_BUDGET,
-            "{} transfers x {} chunks exceeds the {}-request budget",
-            c.max_parallel,
-            window,
-            CONNECTION_REQUEST_BUDGET
+            sequential_buffer_size(&c) >= DEFAULT_CHUNK_SIZE,
+            "sequential buffer shrank to {}, which would multiply upload round trips",
+            sequential_buffer_size(&c)
         );
-        // A single transfer still gets the full window.
-        let solo = TransferConfig { max_parallel: 1, ..TransferConfig::default() };
+    }
+
+    /// A lone large transfer must get a usable window rather than a fair share of
+    /// a budget nobody else is competing for.
+    #[test]
+    fn a_single_large_transfer_gets_a_deep_window() {
+        let solo = TransferConfig {
+            max_parallel: 1,
+            ..TransferConfig::default()
+        };
         assert_eq!(large_file_chunks_in_flight(&solo), DEFAULT_CHUNKS_IN_FLIGHT);
+
+        // And with the default 16-way parallelism it must not collapse to a
+        // sixteenth of the budget — that starved every large download.
+        let c = TransferConfig::default();
+        assert!(
+            large_file_chunks_in_flight(&c) >= MIN_LARGE_FILE_WINDOW.min(c.chunks_in_flight),
+            "window {} is below the floor",
+            large_file_chunks_in_flight(&c)
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod local;
 pub mod ops;
 mod path;
 pub mod sftp;
+pub mod testing;
 
 pub use local::LocalFs;
 pub use path::{BackendId, VPath};
@@ -89,9 +90,25 @@ impl<T: tokio::io::AsyncWrite + Send + Unpin> VWrite for T {}
 /// all of them at once; the backend's connection pipelines the requests.
 #[async_trait]
 pub trait VPositionedRead: Send + Sync {
-    /// Read up to `len` bytes starting at `offset`. A short read at end-of-file
-    /// is normal; an empty result means EOF.
+    /// Read starting at `offset`, returning at most `len` bytes.
+    ///
+    /// A short read is always legal, not just at end-of-file: remote backends cap
+    /// one request at whatever the server negotiated, and an implementation is
+    /// expected to issue a *single* request rather than looping to fill `len`
+    /// (looping would serialise requests that could otherwise overlap). An empty
+    /// result means end-of-file. Callers must therefore re-issue from
+    /// `offset + got` until they have what they need.
     async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
+
+    /// Another handle onto the same file, if the backend can make one cheaply.
+    ///
+    /// Concurrent reads need one handle each. For SFTP a handle can be cloned
+    /// client-side for no round trip, so a pool costs one open instead of one per
+    /// slot — worth several seconds of dead time on a long link. `None` means the
+    /// caller should open handles the ordinary way.
+    async fn clone_handle(&self) -> Option<Box<dyn VPositionedRead>> {
+        None
+    }
 }
 
 /// A filesystem backend.

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -246,13 +246,48 @@ async fn stream_file(
     config: &TransferConfig,
     len_hint: u64,
 ) -> Result<TransferOutcome> {
-    if src_fs.supports_parallel_read() && len_hint >= super::LARGE_FILE_THRESHOLD {
-        return stream_file_parallel(
+    let parallel = src_fs.supports_parallel_read() && len_hint >= super::LARGE_FILE_THRESHOLD;
+    let started = std::time::Instant::now();
+
+    let outcome = if parallel {
+        stream_file_parallel(
             src_fs, dest_fs, src, part, progress, cancel, config, len_hint,
         )
-        .await;
+        .await
+    } else {
+        stream_file_sequential(src_fs, dest_fs, src, part, progress, cancel, config).await
+    };
+
+    // One event per file rather than per chunk: on a fast link a per-chunk event
+    // would cost more than the work it describes.
+    if crate::trace::enabled() {
+        let secs = started.elapsed().as_secs_f64();
+        tracing::debug!(
+            path = %src,
+            bytes = len_hint,
+            path_taken = if parallel { "parallel" } else { "sequential" },
+            chunk_size = if parallel {
+                super::effective_chunk_size(config)
+            } else {
+                config.chunk_size
+            },
+            window = if parallel {
+                super::large_file_chunks_in_flight(config)
+            } else {
+                1
+            },
+            elapsed_ms = secs * 1000.0,
+            mib_per_sec = if secs > 0.0 {
+                (len_hint as f64 / (1024.0 * 1024.0)) / secs
+            } else {
+                0.0
+            },
+            ok = outcome.is_ok(),
+            "transfer_complete"
+        );
     }
-    stream_file_sequential(src_fs, dest_fs, src, part, progress, cancel, config).await
+
+    outcome
 }
 
 /// The sequential copy path: read a chunk, write it, repeat.
@@ -268,7 +303,12 @@ async fn stream_file_sequential(
     let mut reader = src_fs.open_read(src).await?;
     let mut writer = dest_fs.open_write(part, None).await?;
 
-    let mut buf = vec![0u8; config.chunk_size];
+    // The sequential path wants a *large* buffer, for the opposite reason the
+    // parallel path wants a small one. Here the buffer is simply how much moves
+    // per read/write pair, and the underlying client pipelines beneath it, so a
+    // bigger buffer means fewer alternations. Clamping this to the parallel
+    // path's request-sized chunk would multiply the round trips on every upload.
+    let mut buf = vec![0u8; super::sequential_buffer_size(config)];
     loop {
         if cancel.is_cancelled() {
             // Flush nothing; the part file is discarded by the caller.
@@ -289,9 +329,18 @@ async fn stream_file_sequential(
 
 /// The concurrent copy path for a large file on a pipelining backend.
 ///
-/// Chunks are read in a sliding window of `chunks_in_flight` overlapping
-/// positioned reads (each on its own handle) and written in order. Ordered
-/// writes keep the destination correct while the reads run ahead.
+/// Chunks are read in a sliding window of overlapping positioned reads, each on
+/// its own handle, and handed to a writer task that appends them in order. Two
+/// details make the window actually as deep as it looks:
+///
+/// * **The writer is decoupled.** Writing inline would drain the window to
+///   `window - 1` on every chunk and refill it only after the write completed,
+///   so the pipeline would spend much of its time partly empty. A bounded
+///   channel keeps ordering and backpressure while letting reads run ahead.
+/// * **Chunks are sized to the backend's request limit.** A chunk larger than
+///   what one request can carry becomes several sequential requests inside a
+///   single slot (see [`VPositionedRead::read_at`]), which caps the pipeline at
+///   its slot count regardless of the byte counts involved.
 #[allow(clippy::too_many_arguments)]
 async fn stream_file_parallel(
     src_fs: &Arc<dyn Vfs>,
@@ -307,59 +356,138 @@ async fn stream_file_parallel(
     use futures::stream::{FuturesOrdered, StreamExt};
     use std::sync::Arc as StdArc;
 
-    let mut writer = dest_fs.open_write(part, Some(total)).await?;
+    let writer = dest_fs.open_write(part, Some(total)).await?;
 
-    let chunk = config.chunk_size as u64;
+    let chunk = super::effective_chunk_size(config) as u64;
     // Share the connection's request budget with the other transfers that may be
     // running large files concurrently.
     let window = super::large_file_chunks_in_flight(config);
 
-    // A pool of positioned-read handles, opened once. Each in-flight read borrows
-    // one; reusing them avoids an SFTP OPEN per chunk (which would erase the win).
+    // A pool of positioned-read handles. The first is opened for real; the rest
+    // are cloned from it when the backend can do so without a round trip, which
+    // on a long link saves `window - 1` sequential opens before the first byte
+    // moves.
+    let first: StdArc<dyn VPositionedRead> = StdArc::from(src_fs.open_positioned_read(src).await?);
     let mut pool: Vec<StdArc<dyn VPositionedRead>> = Vec::with_capacity(window);
-    for _ in 0..window {
-        pool.push(StdArc::from(src_fs.open_positioned_read(src).await?));
+    pool.push(first.clone());
+    while pool.len() < window {
+        match first.clone_handle().await {
+            Some(h) => pool.push(StdArc::from(h)),
+            // No cheap clone available: fall back to opening the rest, in
+            // parallel rather than one at a time.
+            None => {
+                let need = window - pool.len();
+                let opens = (0..need).map(|_| src_fs.open_positioned_read(src));
+                for handle in futures::future::try_join_all(opens).await? {
+                    pool.push(StdArc::from(handle));
+                }
+                break;
+            }
+        }
     }
 
-    // The byte offsets of every chunk, in order.
-    let offsets: Vec<u64> = (0..total).step_by(config.chunk_size).collect();
+    // Ordered writes on a bounded queue: the reader can run `window` chunks ahead
+    // and no further, so memory stays bounded at roughly `window * chunk`.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(window.max(1));
+    let progress_for_writer = progress.clone();
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        let mut written: u64 = 0;
+        while let Some(data) = rx.recv().await {
+            writer.write_all(&data).await?;
+            written += data.len() as u64;
+            progress_for_writer.add_bytes(data.len() as u64);
+        }
+        writer.flush().await?;
+        writer.shutdown().await?;
+        Ok::<u64, anyhow::Error>(written)
+    });
+
+    // Read one chunk's worth, re-issuing until the range is filled.
+    //
+    // A backend may return less than asked for at any offset, not only at EOF,
+    // and the pieces are concatenated in order — so a short read that was simply
+    // accepted would silently produce a truncated file. Re-issuing happens per
+    // chunk, concurrently with the other slots, rather than inside `read_at`
+    // where it would serialise the whole window.
+    async fn read_chunk(
+        handle: StdArc<dyn VPositionedRead>,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        let mut out = handle.read_at(offset, len).await?;
+        while out.len() < len {
+            let got = handle
+                .read_at(offset + out.len() as u64, len - out.len())
+                .await?;
+            if got.is_empty() {
+                break; // genuine EOF
+            }
+            out.extend_from_slice(&got);
+        }
+        Ok(out)
+    }
+
+    let n_chunks = total.div_ceil(chunk) as usize;
     let mut next = 0usize;
     let mut inflight = FuturesOrdered::new();
 
-    // One in-flight read: which pool slot it used, and its result.
     type ChunkFut =
         std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>>)> + Send>>;
-    let make_read = |handle: StdArc<dyn VPositionedRead>, slot: usize, offset: u64| -> ChunkFut {
+    let make_read = |handle: StdArc<dyn VPositionedRead>, slot: usize, index: usize| -> ChunkFut {
+        let offset = index as u64 * chunk;
+        let len = chunk.min(total - offset) as usize;
         Box::pin(async move {
-            let data = handle.read_at(offset, chunk as usize).await;
+            let data = read_chunk(handle, offset, len).await;
             (slot, data)
         })
     };
 
-    // Prime the window: each initial read gets its own handle from the pool.
-    while next < offsets.len() && inflight.len() < window {
+    while next < n_chunks && inflight.len() < window {
         let slot = next % window;
-        inflight.push_back(make_read(pool[slot].clone(), slot, offsets[next]));
+        inflight.push_back(make_read(pool[slot].clone(), slot, next));
         next += 1;
     }
 
+    let mut produced: u64 = 0;
+    let mut cancelled = false;
     while let Some((slot, result)) = inflight.next().await {
         if cancel.is_cancelled() {
-            return Ok(TransferOutcome::Cancelled);
+            cancelled = true;
+            break;
         }
         let data = result?;
-        writer.write_all(&data).await?;
-        progress.add_bytes(data.len() as u64);
+        produced += data.len() as u64;
+        // A closed channel means the writer failed; stop reading and surface it.
+        if tx.send(data).await.is_err() {
+            break;
+        }
 
-        // Reuse the freed handle for the next chunk.
-        if next < offsets.len() {
-            inflight.push_back(make_read(pool[slot].clone(), slot, offsets[next]));
+        if next < n_chunks {
+            inflight.push_back(make_read(pool[slot].clone(), slot, next));
             next += 1;
         }
     }
 
-    writer.flush().await?;
-    writer.shutdown().await?;
+    // Dropping the sender ends the writer's loop and flushes it.
+    drop(tx);
+    let written = writer_task.await.context("writer task panicked")??;
+
+    if cancelled {
+        return Ok(TransferOutcome::Cancelled);
+    }
+
+    // Fail loudly rather than leave a plausible-looking short file. Without this
+    // a dropped or truncated chunk would rename into place as if complete.
+    if written != total {
+        anyhow::bail!(
+            "short transfer: wrote {} of {} bytes (read {})",
+            written,
+            total,
+            produced
+        );
+    }
+
     Ok(TransferOutcome::Done)
 }
 
@@ -484,8 +612,122 @@ mod tests {
         // Byte-exact despite out-of-order concurrent reads.
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
         assert_eq!(progress.bytes_done() as usize, size);
-        // The concurrent path actually opened its pool of handles.
+        // The concurrent path ran. This mock offers no `clone_handle`, so it
+        // falls back to opening one handle per slot; a backend that can clone
+        // (SFTP) opens exactly one regardless of window size.
         assert_eq!(handles.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    /// A backend that returns *half* of what was asked for, at every offset.
+    ///
+    /// Short reads are legal at any point, not just at EOF, and the pieces are
+    /// concatenated in order — so a caller that accepts a short read without
+    /// re-issuing silently produces a truncated file that then renames into
+    /// place looking complete. This is the shape of that bug.
+    struct ShortReadVfs {
+        data: Vec<u8>,
+    }
+
+    struct ShortHandle {
+        data: std::sync::Arc<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl VPositionedRead for ShortHandle {
+        async fn read_at(&self, offset: u64, len: usize) -> AResult<Vec<u8>> {
+            let start = (offset as usize).min(self.data.len());
+            // Deliberately serve less than requested while bytes remain.
+            let half = (len / 2).max(1);
+            let end = (start + half).min(self.data.len());
+            Ok(self.data[start..end].to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl Vfs for ShortReadVfs {
+        fn scheme(&self) -> &'static str {
+            "short"
+        }
+        async fn read_dir(&self, _p: &VPath) -> AResult<Vec<VEntry>> {
+            Ok(vec![])
+        }
+        async fn stat(&self, _p: &VPath) -> AResult<VMetadata> {
+            Ok(VMetadata {
+                len: self.data.len() as u64,
+                ..Default::default()
+            })
+        }
+        async fn create_dir_all(&self, _p: &VPath) -> AResult<()> {
+            Ok(())
+        }
+        async fn remove_file(&self, _p: &VPath) -> AResult<()> {
+            Ok(())
+        }
+        async fn remove_dir(&self, _p: &VPath) -> AResult<()> {
+            Ok(())
+        }
+        async fn rename(&self, _a: &VPath, _b: &VPath) -> AResult<()> {
+            Ok(())
+        }
+        async fn open_read(&self, _p: &VPath) -> AResult<Box<dyn VRead>> {
+            Ok(Box::new(std::io::Cursor::new(self.data.clone())))
+        }
+        async fn open_write(&self, _p: &VPath, _l: Option<u64>) -> AResult<Box<dyn VWrite>> {
+            anyhow::bail!("read-only mock")
+        }
+        fn supports_parallel_read(&self) -> bool {
+            true
+        }
+        async fn open_positioned_read(&self, _p: &VPath) -> AResult<Box<dyn VPositionedRead>> {
+            Ok(Box::new(ShortHandle {
+                data: std::sync::Arc::new(self.data.clone()),
+            }))
+        }
+        async fn dir_size(
+            &self,
+            _p: &VPath,
+            _c: &crate::utils::sizes::SizeCache,
+            _cancel: &CancelToken,
+            _pr: Option<&crate::widget::progress::OpProgress>,
+        ) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn short_reads_mid_file_still_produce_a_complete_copy() {
+        let size = 5 * 1024 * 1024 + 777;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+        let src_fs: Arc<dyn Vfs> = Arc::new(ShortReadVfs {
+            data: payload.clone(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("short.bin");
+        let dest_fs: Arc<dyn Vfs> = Arc::new(LocalFs::new());
+
+        rt().block_on(run_transfer(TransferJob {
+            id: TransferId(1),
+            src_fs,
+            dest_fs,
+            src: VPath::new(BackendId(1), "/remote/short.bin"),
+            dest: VPath::local(&dest),
+            progress: Arc::new(TransferProgress::new(0)),
+            cancel: CancelToken::new(),
+            config: TransferConfig {
+                chunks_in_flight: 4,
+                ..Default::default()
+            },
+        }))
+        .expect("transfer must succeed despite short reads");
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "file was truncated: short reads were not re-issued"
+        );
+        assert_eq!(got, payload, "content mismatch after short reads");
     }
 
     #[test]

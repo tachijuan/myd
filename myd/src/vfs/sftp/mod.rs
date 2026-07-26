@@ -30,9 +30,38 @@ use super::{VEntry, VMetadata, VPath, VPositionedRead, VRead, VWrite, Vfs};
 use crate::utils::sizes::{CancelToken, SizeCache};
 use crate::widget::progress::OpProgress;
 
-/// Keep a deep request pipeline in flight. The default of 100 leaves a
-/// high-latency link idle waiting on round trips; 256 keeps the wire busy.
-const MAX_PENDING_REQUESTS: u16 = 256;
+/// Build the SSH transport configuration.
+///
+/// Two of russh's defaults are actively harmful on a long link:
+///
+/// * `window_size` is 2 MiB. The SSH channel window is a hard ceiling on
+///   in-flight data: throughput cannot exceed `window / rtt` however deep the
+///   SFTP request pipeline is. At a 150 ms transatlantic round trip that caps
+///   the connection near 13 MiB/s — *below* what the request pipeline alone
+///   would allow, so it binds first and hides every other improvement.
+/// * `nodelay` is false, leaving Nagle's algorithm on. SFTP is request/response
+///   with many small packets, the exact shape where Nagle and delayed ACK
+///   interact to add tens of milliseconds per exchange.
+///
+/// `maximum_packet_size` is deliberately left alone: it is not a bottleneck and
+/// raising it past 32 KiB risks a disconnect from stricter servers.
+fn ssh_config() -> client::Config {
+    client::Config {
+        window_size: crate::config::ssh_window_size(),
+        maximum_packet_size: crate::config::ssh_max_packet(),
+        nodelay: crate::config::ssh_nodelay(),
+        ..Default::default()
+    }
+}
+
+/// Keep a deep request pipeline in flight. The crate default of 100 leaves a
+/// high-latency link idle waiting on round trips.
+///
+/// This is a client-side cap only — the server enforces its own — so sizing it
+/// generously costs nothing when the pipeline is shallower.
+fn max_pending_requests() -> u16 {
+    crate::config::sftp_max_pending()
+}
 
 /// Flush immediately. The crate's own docs note this costs nothing (flushing
 /// happens on a daemon task) while removing up to 0.5 ms of added latency per
@@ -109,6 +138,7 @@ impl SftpFs {
         creds: &Credentials,
         accept_new_host: bool,
     ) -> Result<ConnectOutcome> {
+        let started = std::time::Instant::now();
         let resolved = auth::resolve_target(target);
         auth::precheck(&resolved)?;
 
@@ -143,7 +173,7 @@ impl SftpFs {
             }
         }
 
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(ssh_config());
         let mut session = tokio::time::timeout(
             CONNECT_TIMEOUT,
             client::connect(config, addr, ClientHandler { accept_key: true }),
@@ -231,9 +261,23 @@ impl SftpFs {
 
         let options = SftpOptions::new()
             .flush_interval(FLUSH_INTERVAL)
-            .max_pending_requests(NonZeroU16::new(MAX_PENDING_REQUESTS).expect("non-zero constant"))
+            .max_pending_requests(
+                NonZeroU16::new(max_pending_requests()).unwrap_or(
+                    NonZeroU16::new(256).expect("non-zero constant"),
+                ),
+            )
             .responses_buffer_size(
                 NonZeroUsize::new(RESPONSE_BUFFER_SIZE).expect("non-zero constant"),
+            )
+            // How many bytes may be outstanding on the sequential write path
+            // before it blocks. The crate's 640 KiB default caps uploads near
+            // 4 MiB/s over a 150 ms link regardless of the buffer sizes above
+            // it, because that is all the data the pipeline is allowed to have
+            // in flight at once.
+            .tokio_compat_file_write_limit(
+                NonZeroUsize::new(crate::config::sftp_write_limit()).unwrap_or(
+                    NonZeroUsize::new(16 * 1024 * 1024).expect("non-zero constant"),
+                ),
             );
 
         let sftp = Sftp::new(writer, reader, options)
@@ -250,6 +294,22 @@ impl SftpFs {
                 .unwrap_or_else(|_| PathBuf::from("/"))
         };
 
+        tracing::info!(
+            host = %resolved.host,
+            port = resolved.port,
+            user = %resolved.user,
+            connect_ms = started.elapsed().as_secs_f64() * 1000.0,
+            window_size = crate::config::ssh_window_size(),
+            nodelay = crate::config::ssh_nodelay(),
+            max_pending = max_pending_requests(),
+            write_limit = crate::config::sftp_write_limit(),
+            "sftp connected"
+        );
+
+        if crate::trace::enabled() && crate::trace::observed_read_limit().is_none() {
+            probe_read_limit(&sftp, &home).await;
+        }
+
         Ok(ConnectOutcome::Connected(SftpFs {
             sftp,
             _session: session,
@@ -263,6 +323,62 @@ impl SftpFs {
     pub fn home(&self) -> &Path {
         &self.home
     }
+}
+
+/// Discover the SFTP read limit the server actually negotiated.
+///
+/// `openssh-sftp-client` keeps its `max_read_len` accessor behind a private
+/// feature, so the negotiated value cannot be read back — but it can be
+/// observed: ask for more than any plausible limit and see how much comes back.
+/// The reply is capped at exactly the negotiated size.
+///
+/// This matters because a chunk size above that limit does not produce a bigger
+/// request; it produces *several* requests issued back-to-back on one handle,
+/// making the pipeline shallower than its window count suggests. Costs one round
+/// trip, once per connection, and only when diagnostics are on.
+async fn probe_read_limit(sftp: &Sftp, home: &Path) {
+    use bytes::BytesMut;
+
+    // Any readable file will do; the directory listing supplies one.
+    let mut fs = sftp.fs();
+    let Ok(dir) = fs.open_dir(home).await else {
+        return;
+    };
+    // `ReadDir` is a self-referential stream, so it must be pinned to poll.
+    let read_dir = dir.read_dir();
+    futures::pin_mut!(read_dir);
+    use futures::StreamExt;
+
+    let mut name = None;
+    while let Some(Ok(entry)) = read_dir.next().await {
+        let n = entry.filename().to_string_lossy().to_string();
+        if n == "." || n == ".." {
+            continue;
+        }
+        // Needs to be a regular file with enough bytes to reach any plausible
+        // limit; a short file would report its own length, not the server's cap.
+        let meta = entry.metadata();
+        if meta.file_type().is_some_and(|t| t.is_file()) && meta.len().unwrap_or(0) > 512 * 1024 {
+            name = Some(n);
+            break;
+        }
+    }
+    let Some(name) = name else {
+        // Nothing big enough to measure against; better to log nothing than a
+        // number that is really just some small file's size.
+        return;
+    };
+
+    let Ok(mut file) = sftp.open(home.join(&name)).await else {
+        return;
+    };
+    // 1 MiB is above every limit in practice (OpenSSH reports 256 KiB), so the
+    // reply length is the limit.
+    let want = 1024 * 1024u32;
+    if let Ok(Some(chunk)) = file.read(want, BytesMut::with_capacity(want as usize)).await {
+        crate::trace::set_observed_read_limit(chunk.len() as u64);
+    }
+    let _ = file.close().await;
 }
 
 /// Open a throwaway connection purely to read the server's host key.
@@ -288,7 +404,7 @@ async fn probe_host_key(addr: (&str, u16)) -> Result<russh::keys::PublicKey> {
     }
 
     let seen = Arc::new(Mutex::new(None));
-    let config = Arc::new(client::Config::default());
+    let config = Arc::new(ssh_config());
     // This is expected to fail at key-exchange time, having captured the key.
     let _ = client::connect(config, addr, Probe(seen.clone())).await;
 
@@ -344,38 +460,63 @@ async fn try_key_auth(
 /// A positioned reader over one remote file.
 ///
 /// The crate's `File` clones share the remote file handle but each keeps its own
-/// offset, and reads from different clones pipeline over the one connection.
-/// Each [`clone_handle`](VPositionedRead::clone_handle) therefore produces an
-/// independent `File` clone: the mutex only serialises the seek+read pair *for a
-/// single handle*, while separate handles read concurrently — which is what
-/// keeps a high-latency link busy.
+/// offset, so reads issued on different clones pipeline over the one connection.
+/// The mutex only serialises the seek+read pair for a *single* handle; the
+/// transfer worker holds a pool of clones and reads from all of them at once.
 struct SftpPositionedRead {
     file: std::sync::Arc<tokio::sync::Mutex<openssh_sftp_client::file::File>>,
 }
 
 #[async_trait]
 impl VPositionedRead for SftpPositionedRead {
+    /// Issue exactly one SFTP READ and return whatever the server sends.
+    ///
+    /// This deliberately does *not* loop to fill `len`. A server caps one READ at
+    /// its negotiated limit (256 KiB for OpenSSH), so a loop here would turn one
+    /// logical chunk into several round trips issued back-to-back while holding
+    /// the handle's mutex — making the read pipeline exactly as deep as its slot
+    /// count no matter how many bytes each slot asked for. Callers size their
+    /// chunks at or below the limit and treat a short read as normal, which
+    /// keeps every window slot worth one in-flight wire request.
+    ///
+    /// Not looping also removes a silent-corruption hazard. `File::read` advances
+    /// the handle's offset by the *requested* length rather than the returned
+    /// one, so a genuinely short read mid-file would leave a gap: the next
+    /// iteration would resume past the missing bytes and concatenate
+    /// non-contiguous data. Seeking to an absolute offset on every call makes
+    /// that unrepresentable.
     async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         use bytes::BytesMut;
         use tokio::io::AsyncSeekExt;
+
+        if len == 0 {
+            return Ok(Vec::new());
+        }
 
         let mut file = self.file.lock().await;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .context("seek failed")?;
 
-        // Read until `len` bytes are collected or EOF; one SFTP read may return
-        // less than requested.
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            let want = (len - out.len()) as u32;
-            let buf = BytesMut::with_capacity(want as usize);
-            match file.read(want, buf).await.context("remote read failed")? {
-                Some(chunk) if !chunk.is_empty() => out.extend_from_slice(&chunk),
-                _ => break, // EOF or empty
-            }
+        let want = len.min(u32::MAX as usize) as u32;
+        let buf = BytesMut::with_capacity(want as usize);
+        match file.read(want, buf).await.context("remote read failed")? {
+            Some(chunk) => Ok(chunk.to_vec()),
+            None => Ok(Vec::new()), // EOF
         }
-        Ok(out)
+    }
+
+    /// Produce another handle onto the same remote file for no round trip.
+    ///
+    /// `File::clone` duplicates the client-side handle without an SFTP OPEN, so a
+    /// pool of readers costs one open rather than one per slot. On a 150 ms link
+    /// that is the difference between 2.4 s of dead time before the first byte
+    /// and a single round trip.
+    async fn clone_handle(&self) -> Option<Box<dyn VPositionedRead>> {
+        let file = self.file.lock().await.clone();
+        Some(Box::new(SftpPositionedRead {
+            file: std::sync::Arc::new(tokio::sync::Mutex::new(file)),
+        }))
     }
 }
 
@@ -664,8 +805,30 @@ mod tests {
     fn tuning_constants_beat_the_defaults() {
         // The crate defaults are 100 pending requests and a 0.5 ms flush wait;
         // both are latency killers on a long link.
-        const _: () = assert!(MAX_PENDING_REQUESTS > 100);
+        assert!(max_pending_requests() > 100);
         assert_eq!(FLUSH_INTERVAL, Duration::from_micros(0));
+    }
+
+    /// The two russh defaults that cap a long link, regardless of anything the
+    /// SFTP layer does.
+    #[test]
+    fn ssh_transport_defaults_are_overridden() {
+        let c = ssh_config();
+        let stock = client::Config::default();
+
+        // A 2 MiB window caps throughput at window/rtt — about 13 MiB/s at a
+        // 150 ms round trip, below what the request pipeline could sustain.
+        assert!(
+            c.window_size > stock.window_size,
+            "window_size {} is not above russh's {}",
+            c.window_size,
+            stock.window_size
+        );
+        // Nagle plus delayed ACK adds tens of ms per request/response exchange.
+        assert!(c.nodelay, "Nagle must be disabled on the SSH socket");
+        // Deliberately left alone: raising it risks a disconnect from stricter
+        // servers and it is not a bottleneck.
+        assert_eq!(c.maximum_packet_size, stock.maximum_packet_size);
     }
 
     #[test]
