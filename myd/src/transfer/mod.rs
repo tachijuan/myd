@@ -22,13 +22,13 @@ use crate::vfs::VPath;
 ///
 /// Every small file costs a few serial round trips (open, write, close), so on a
 /// long link (a US↔EU hop is ~150 ms) throughput is set by how many of those
-/// sequences overlap, not by bandwidth. Measured against a simulated 30 ms link
-/// copying 50 small files: 4 → 0.99 s, 8 → 0.60 s, 16 → 0.42 s, 32 → 0.29 s.
+/// sequences overlap, not by bandwidth.
 ///
-/// 16 takes most of that win while staying well inside the connection's
-/// `max_pending_requests` (256): only large files also open a
-/// [`DEFAULT_CHUNKS_IN_FLIGHT`] window, and those are capped separately (see
-/// [`large_file_chunks_in_flight`]).
+/// Reproduce with `cargo test --release --test bench_transfer -- --ignored`;
+/// `bench_many_small_files` is the scenario this constant governs. Total fan-out
+/// across a recursive copy is bounded separately by
+/// [`crate::config::transfer_global_concurrency`], since per-level windows would
+/// otherwise multiply.
 pub const DEFAULT_MAX_PARALLEL: usize = 16;
 
 /// Chunk size for streaming a file sequentially. 1 MiB suits a local copy, where
@@ -71,10 +71,12 @@ pub const LARGE_FILE_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 /// Concurrent positioned reads per large file.
 ///
-/// Measured against a real sshd: sequential reads managed ~54 MB/s on localhost;
-/// a window of 32 reached ~320 MB/s (≈6×), close to the `sftp` binary. Going
-/// higher keeps scaling but 4 parallel transfers × 32 reads already approaches
-/// the SFTP connection's `max_pending_requests`, so 32 is the balance point.
+/// Each slot is one outstanding wire request, so this is the pipeline depth: on
+/// a link with round trip `rtt` it allows roughly
+/// `chunks_in_flight * chunk_size / rtt` of throughput. Reproduce with
+/// `bench_large_file_download` in `tests/bench_transfer.rs`, which reports the
+/// peak in-flight depth alongside the rate; `large_download_keeps_the_pipeline_full`
+/// fails if a slot ever serialises its reads internally.
 pub const DEFAULT_CHUNKS_IN_FLIGHT: usize = 32;
 
 /// The SFTP connection's `max_pending_requests`. Kept here so the transfer

@@ -24,9 +24,11 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
 - **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
 - **Remote browsing over SFTP** — connect to a remote host with `gr` (or launch with `myd sftp://[user@]host[:port][/path]`) and browse it in the active panel. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Remote trees are fully manageable: create directories (`N`), rename (`R`), delete (`D`) and move (`m`) all act on the server. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
+- **Dialing directory** — `gr` offers your three most-used remote locations; `gs` opens the full saved list with vi navigation (`j`/`k`/`g`/`G`), `/` to search, and `a`/`e`/`d` to add, edit and delete entries. Saved to `~/.config/myd/hosts.toml`, which you can edit by hand. **Passwords are never stored** — an entry holds only where to connect and as whom, and authentication still goes through `ssh-agent`, your `~/.ssh` keys, or a prompt.
+- **Mouse support** — scroll with the wheel, click to focus a panel and select a row or treemap tile, right-click to open a directory. Press `Ctrl+N` to release the mouse when you want your terminal's own text selection back.
 - **Non-blocking transfers** — copy (`c`) tagged files between a remote panel and a local one and the transfer runs in the background: the interface stays fully interactive, so you can keep browsing and queue more. Up to 16 transfers run at once and the rest stack up, and the files within a directory are copied concurrently — which is what makes a folder of small files usable over a high-latency link.
 - **Transfer panel** — a right-hand sidebar that appears once you start a copy (and stays while transfers remain) showing queued, active, and finished transfers with per-transfer progress bars, transfer rate, and ETA. Toggle it any time with `Ctrl+t`; cancel everything outstanding with `gx`.
-- **Fast SFTP engine** — large files download through many concurrent pipelined reads, reaching several hundred MB/s on a fast link — roughly 6× a naive sequential client and close to the `sftp` command itself.
+- **Fast SFTP engine** — transfers are built around round trips rather than bandwidth, which is what governs a long link. Large files move through a deep pipeline of concurrent positioned reads (and, for uploads, positioned writes), the SSH channel window is sized so it isn't itself the ceiling, and Nagle is disabled. Against a simulated 150 ms link: downloads 12.7 → 37.9 MiB/s, uploads 1.3 → 14.9 MiB/s. Reproduce with `cargo test --release --test bench_transfer -- --ignored --nocapture`, or compare against the `sftp` binary on your own link with `scripts/compare_sftp.sh user@host 512M`.
 
 ## Requirements
 
@@ -149,9 +151,12 @@ A copy where one panel is remote runs as a background **transfer** instead of a 
 
 | Key       | Action                                          |
 |-----------|-------------------------------------------------|
-| `gr`      | Connect to a remote host (`sftp://…`)           |
+| `gr`      | Connect — your recent hosts, or type an address  |
+| `gs`      | The dialing directory (all saved hosts)          |
 | `Ctrl+t`  | Show / hide the transfer panel                  |
 | `gx`      | Cancel all queued and in-flight transfers       |
+
+Inside the dialing directory: `j`/`k`/`g`/`G` navigate, `Enter` connects, `/` searches, `a` adds, `e` edits, `d` deletes, `Esc` closes. Hosts are ranked by how often you connect to them, so the ones you use are at the top. Entries live in `~/.config/myd/hosts.toml` and hold no passwords — only where to connect and as whom.
 
 The transfer panel appears once you start a copy and lists queued, active, and finished transfers with per-transfer progress, rate, and ETA. Up to 16 transfers run at once; the rest wait their turn. Within a directory copy, files and subdirectories are also transferred concurrently, so a deep tree of small files is not paced by round-trip latency. The interface stays interactive throughout, so you can keep browsing and queue more. Toggle the panel any time with `Ctrl+t`.
 
@@ -166,6 +171,45 @@ Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all 
 | `Ctrl+o`  | Go back to the parent directory |
 | `r` / `Ctrl+r` | Rescan (refresh sizes from disk) |
 | `Ctrl+b`  | Toggle info panel             |
+
+### Mouse
+
+| Action        | Effect                                        |
+|---------------|-----------------------------------------------|
+| Wheel         | Scroll the focused view                       |
+| Left click    | Focus a panel, select a row or treemap tile   |
+| Right click   | Select and open (enter a directory)           |
+| `Ctrl+N`      | Release the mouse for terminal text selection |
+
+Mouse capture takes over your terminal's own click-drag selection. `Ctrl+N` hands it back and re-grabs it; most terminals also honour Shift+drag while captured.
+
+## Tuning transfers
+
+Every performance-relevant setting is an environment variable, so a slow link can be diagnosed without a rebuild:
+
+| Variable                  | Default | What it controls                                  |
+|---------------------------|---------|---------------------------------------------------|
+| `MYD_SSH_WINDOW`          | 64 MiB  | SSH channel window — the hard ceiling on in-flight data (`window / rtt`) |
+| `MYD_SSH_NODELAY`         | `true`  | Disable Nagle on the SSH socket                   |
+| `MYD_SFTP_WRITE_LIMIT`    | 16 MiB  | Outstanding bytes on the sequential write path    |
+| `MYD_SFTP_MAX_PENDING`    | 1024    | SFTP requests in flight on one connection         |
+| `MYD_CHUNK_SIZE`          | 256 KiB | Bytes per chunk (one wire request on the parallel path) |
+| `MYD_CHUNKS_IN_FLIGHT`    | 32      | Concurrent chunk reads within one large file      |
+| `MYD_MAX_PARALLEL`        | 16      | Concurrent transfers / files per directory level  |
+| `MYD_GLOBAL_CONCURRENCY`  | 192     | Ceiling on concurrent operations in a recursive copy |
+
+## Diagnostics
+
+`MYD_TRACE=1` writes a log to `~/.cache/myd-trace.log` (override with `MYD_TRACE_FILE`). `MYD_LOG` takes a filter directive instead — `MYD_LOG=myd::transfer=debug` for just the transfer engine — and `MYD_LOG_FORMAT=json` makes it machine-readable.
+
+The log records connection timing, the SFTP read limit the server negotiated, and one line per file with the path taken, chunk size, window depth and achieved rate. Per-chunk latencies are accumulated into a histogram and summarised once per file, so tracing never becomes the bottleneck it is measuring.
+
+`myd-transfer` runs a single transfer with no TUI, for timing without the render loop in the way:
+
+```bash
+myd-transfer sftp://user@host/big.bin /tmp/big.bin
+scripts/compare_sftp.sh user@host 512M    # myd vs the native sftp client
+```
 
 ## Sort Modes
 

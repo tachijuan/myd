@@ -103,7 +103,13 @@ fn test_timeout() -> std::time::Duration {
 /// The bound `$env` is the [`TestEnv`], matching what each body expects.
 macro_rules! sftp_test {
     ($name:ident, $env:ident, $body:block) => {
-        #[tokio::test]
+        // Multi-threaded on purpose. A remote `Source` drives its async Vfs from
+        // a dedicated thread and *blocks* the caller waiting for the reply, which
+        // is exactly what the app's synchronous tree does. On a single-threaded
+        // runtime that blocks the only worker, so nothing else can make progress
+        // — including the timeout below, which then never fires and turns a
+        // deadlock into a test that hangs forever reporting nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn $name() {
             let Some($env) = test_env() else {
                 eprintln!("MYD_SFTP_TEST unset; skipping SFTP integration test");
