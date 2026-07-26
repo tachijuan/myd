@@ -58,7 +58,8 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         HelpCategory {
             title: "View",
             items: &[
-                ("s", "Toggle sort order"),
+                ("s", "Cycle sort order"),
+                ("click Sort:", "Pick a sort order from a numbered menu"),
                 ("H", "Toggle hidden files"),
                 ("b", "Toggle size bars"),
                 ("Ctrl+B", "Toggle info panel"),
@@ -112,6 +113,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             items: &[
                 ("Wheel", "Scroll the focused view"),
                 ("Left click", "Focus a panel and select a row / tile"),
+                ("Double click", "Open (same as Enter)"),
                 ("Right click", "Select and open (enter a directory)"),
                 ("Ctrl+N", "Release the mouse for terminal text selection"),
             ],

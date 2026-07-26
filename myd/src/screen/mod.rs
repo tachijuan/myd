@@ -50,6 +50,33 @@ impl SortMode {
             SortMode::RecentlyAccessed => "recently-accessed",
         }
     }
+
+    /// Every mode, in the order `s` cycles through them.
+    ///
+    /// Single source of truth for the cycle, the sort menu and the help text, so
+    /// adding a mode cannot leave one of them behind.
+    pub const ALL: [SortMode; 7] = [
+        SortMode::Largest,
+        SortMode::Smallest,
+        SortMode::DirsFirst,
+        SortMode::FilesFirst,
+        SortMode::Newest,
+        SortMode::Oldest,
+        SortMode::RecentlyAccessed,
+    ];
+
+    /// A one-line explanation, for the sort menu.
+    pub fn description(&self) -> &'static str {
+        match self {
+            SortMode::DirsFirst => "Directories first, then files, each A-Z",
+            SortMode::FilesFirst => "Files first, then directories, each A-Z",
+            SortMode::Largest => "Biggest first",
+            SortMode::Smallest => "Smallest first",
+            SortMode::Newest => "Most recently modified first",
+            SortMode::Oldest => "Least recently modified first",
+            SortMode::RecentlyAccessed => "Most recently opened first",
+        }
+    }
 }
 
 /// Top-level screen enum.

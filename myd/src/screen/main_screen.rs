@@ -50,6 +50,9 @@ pub struct MainScreenState {
     /// hit-testing needs both to turn a screen row into a tree line.
     pub tree_area: Option<Rect>,
     pub tree_scroll: usize,
+    /// Where the "Sort: …" indicator was drawn in the title bar, so a click on
+    /// it can open the sort menu. Recorded during render like `tree_area`.
+    pub sort_area: Option<Rect>,
 }
 
 impl MainScreenState {
@@ -69,6 +72,7 @@ impl MainScreenState {
             pending_ghosts: Vec::new(),
             tree_area: None,
             tree_scroll: 0,
+            sort_area: None,
         }
     }
 
@@ -88,6 +92,7 @@ impl MainScreenState {
             pending_ghosts: Vec::new(),
             tree_area: None,
             tree_scroll: 0,
+            sort_area: None,
         }
     }
 
@@ -265,28 +270,27 @@ impl MainScreenState {
     }
 
     pub fn toggle_sort(&mut self) -> bool {
-        let modes = [
-            SortMode::Largest,
-            SortMode::Smallest,
-            SortMode::DirsFirst,
-            SortMode::FilesFirst,
-            SortMode::Newest,
-            SortMode::Oldest,
-            SortMode::RecentlyAccessed,
-        ];
+        // The cycle order lives on SortMode so `s`, the sort menu and the help
+        // text cannot drift apart — this used to keep its own copy of the list.
+        let modes = SortMode::ALL;
         let current_idx = modes.iter().position(|m| *m == self.tree.sort_mode).unwrap_or(0);
         let next_idx = (current_idx + 1) % modes.len();
+        self.set_sort_mode(modes[next_idx])
+    }
 
+    /// Apply a sort order directly, as the sort menu does.
+    pub fn set_sort_mode(&mut self, mode: SortMode) -> bool {
         // Timed in three parts so a slow sort can be attributed to reordering,
         // reflattening, or the treemap rebuild rather than guessed at.
         let trace = crate::app::trace_enabled();
         let t0 = trace.then(std::time::Instant::now);
-        self.tree.set_sort_mode(modes[next_idx]);
+        self.tree.set_sort_mode(mode);
         let after_sort = trace.then(std::time::Instant::now);
         self.rebuild_treemap();
         if let (Some(t0), Some(after_sort)) = (t0, after_sort) {
             crate::app::trace_note(format_args!(
-                "  toggle_sort: reorder+reflatten={:.1}ms treemap={:.1}ms lines={}",
+                "  set_sort_mode({}): reorder+reflatten={:.1}ms treemap={:.1}ms lines={}",
+                mode.label(),
                 after_sort.duration_since(t0).as_secs_f64() * 1000.0,
                 after_sort.elapsed().as_secs_f64() * 1000.0,
                 self.tree.lines.len(),
@@ -640,14 +644,26 @@ impl MainScreenState {
         let total = self.tree.lines.len().saturating_sub(1); // subtract root
         let dirs = self.tree.dir_count();
         let files = self.tree.file_count();
-        let title = format!(
-            " File Tree ({}) | {} items | {} dirs | {} files | Sort: {} ",
+        let prefix = format!(
+            " File Tree ({}) | {} items | {} dirs | {} files | ",
             self.root_path.display(),
             total,
             dirs,
             files,
-            self.tree.sort_mode.label()
         );
+        let sort_text = format!("Sort: {} ▾ ", self.tree.sort_mode.label());
+        let title = format!("{}{}", prefix, sort_text);
+
+        // Remember where "Sort: …" landed so a click on it can open the sort
+        // menu. The title is drawn inside the top border starting one column in,
+        // and ratatui truncates it at the border — a hit region past the edge
+        // would match clicks on nothing, so it is clipped to the box.
+        self.sort_area = {
+            let start = area.x + 1 + prefix.chars().count() as u16;
+            let end = (start + sort_text.chars().count() as u16)
+                .min(area.x + area.width.saturating_sub(1));
+            (start < end).then(|| Rect::new(start, area.y, end - start, 1))
+        };
 
         // Calculate scroll offset so the cursor line stays visible.
         // The block has borders (top/bottom) and a title bar, reducing usable height.

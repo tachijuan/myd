@@ -5241,3 +5241,101 @@ async fn clicks_on_different_rows_do_not_count_as_a_double() {
         "clicks on different rows must not open anything"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sort menu
+// ---------------------------------------------------------------------------
+
+/// Clicking the "Sort:" indicator opens a numbered menu, and typing a number
+/// applies that order.
+#[tokio::test]
+async fn clicking_the_sort_indicator_opens_a_menu() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use myd::screen::{Screen, SortMode};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // The indicator's rect is recorded during render.
+    let sort_area = match app.current_screen() {
+        Screen::Main(s) => s.sort_area.expect("sort indicator should have a rect"),
+        _ => panic!("expected a main screen"),
+    };
+
+    app.route_mouse(mouse_at(
+        MouseEventKind::Down(MouseButton::Left),
+        sort_area.x + 1,
+        sort_area.y,
+    ));
+    assert_eq!(app.modal_kind_for_test(), "sort_menu");
+
+    // Typing a number applies that order and closes the menu.
+    app.handle_key_for_test(char_key('4'));
+    assert_eq!(app.modal_kind_for_test(), "none");
+    let mode = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => panic!(),
+    };
+    assert_eq!(mode, SortMode::ALL[3]);
+}
+
+/// Esc closes the menu without changing the order.
+#[tokio::test]
+async fn the_sort_menu_can_be_dismissed() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use myd::screen::Screen;
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let before = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => panic!(),
+    };
+    let sort_area = match app.current_screen() {
+        Screen::Main(s) => s.sort_area.unwrap(),
+        _ => panic!(),
+    };
+
+    app.route_mouse(mouse_at(
+        MouseEventKind::Down(MouseButton::Left),
+        sort_area.x + 1,
+        sort_area.y,
+    ));
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Esc));
+
+    assert_eq!(app.modal_kind_for_test(), "none");
+    let after = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => panic!(),
+    };
+    assert_eq!(before, after, "cancelling must not change the sort order");
+}
+
+/// A click elsewhere in the title bar must not open the menu.
+#[tokio::test]
+async fn clicking_away_from_the_indicator_does_not_open_the_menu() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // Far left of the title bar, where the path is drawn.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 0));
+    assert_eq!(app.modal_kind_for_test(), "none");
+}
