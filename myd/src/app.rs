@@ -176,6 +176,9 @@ pub struct FileBrowser {
     /// The whole terminal area from the last frame. Modals centre on this, so a
     /// click has to be tested against the same rect they were drawn into.
     last_frame: ratatui::layout::Rect,
+    /// Cell and time of the last left click, for double-click detection.
+    /// Terminals report presses individually and never a double-click.
+    last_click: Option<(u16, u16, std::time::Instant)>,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -249,6 +252,7 @@ impl FileBrowser {
             mouse_captured: false,
             panel_areas: Vec::new(),
             last_frame: ratatui::layout::Rect::new(0, 0, 0, 0),
+            last_click: None,
         }
     }
 
@@ -727,6 +731,14 @@ impl FileBrowser {
         self.scroll_by(delta);
     }
 
+    /// The name of the entry under the cursor (for tests).
+    pub fn selected_name_for_test(&self) -> Option<String> {
+        match self.panels[self.active].current_screen() {
+            Screen::Main(state) => state.tree.selected_line().map(|l| l.name.clone()),
+            _ => None,
+        }
+    }
+
     /// Which modal is up, as a stable name (for tests).
     pub fn modal_kind_for_test(&self) -> &'static str {
         match &self.modal {
@@ -869,12 +881,15 @@ impl FileBrowser {
 
         // The picker is the only modal with clickable rows; for the others a
         // click is swallowed so it can't act on the screen underneath.
-        if let Modal::HostPicker(picker) = &mut self.modal {
+        if matches!(self.modal, Modal::HostPicker(_)) {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let area = self.last_frame;
-                if picker.click_row(area, y) {
-                    // A second click on the highlighted row connects, so a
-                    // double-click reads naturally.
+                // Same rule as the file tree: one click selects, two connect.
+                let double = self.note_click(x, y);
+                let Modal::HostPicker(picker) = &mut self.modal else {
+                    return true;
+                };
+                if picker.click_row(area, y) && double {
                     let outcome = picker.handle_key(crossterm::event::KeyEvent::new(
                         KeyCode::Enter,
                         crossterm::event::KeyModifiers::NONE,
@@ -901,12 +916,17 @@ impl FileBrowser {
                         self.active = i;
                     }
                 }
+                let double = self.note_click(x, y);
                 if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
-                    state.click_at(x, y);
+                    if state.click_at(x, y) && double {
+                        // A double-click does exactly what Enter does — open a
+                        // directory, or act on the selection.
+                        return self.dispatch_action(Action::Confirm);
+                    }
                 }
                 true
             }
-            // Enter a directory, matching the usual double-click idiom.
+            // Right-click also opens, for anyone who prefers it to a double-click.
             MouseEventKind::Down(MouseButton::Right) => {
                 if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
                     if state.click_at(x, y) {
@@ -917,6 +937,29 @@ impl FileBrowser {
             }
             _ => true,
         }
+    }
+
+    /// Record a click and report whether it completes a double-click.
+    ///
+    /// Terminals report individual presses; there is no double-click event, so it
+    /// has to be inferred from timing and position. The cell must match exactly —
+    /// two quick clicks on different rows are two selections, not an open.
+    fn note_click(&mut self, x: u16, y: u16) -> bool {
+        /// Matches the common desktop default. Long enough to be comfortable,
+        /// short enough that two deliberate selections aren't merged.
+        const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+        let now = std::time::Instant::now();
+        let is_double = match self.last_click {
+            Some((lx, ly, at)) => {
+                lx == x && ly == y && now.duration_since(at) <= DOUBLE_CLICK
+            }
+            None => false,
+        };
+        // Clear on a match so a third click starts a fresh pair rather than
+        // counting as another double.
+        self.last_click = if is_double { None } else { Some((x, y, now)) };
+        is_double
     }
 
     /// Scroll the view under the pointer by `delta` rows.
