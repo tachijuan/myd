@@ -1017,12 +1017,26 @@ impl FileTree {
         // so tagged files are obvious even under the cursor and keep alignment
         // with untagged rows.
         if is_tagged {
-            spans.push(Span::styled(
-                "▶ ",
+            // Mirrors the name styling below: inverted on the cursor row so the
+            // marker column also distinguishes "tagged and here" from "tagged".
+            let marker_style = if is_selected {
+                Style::default()
+                    .fg(TAG_COLOR)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
                 Style::default()
                     .fg(Color::Black)
                     .bg(TAG_COLOR)
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled("▶ ", marker_style));
+        } else if is_selected {
+            // An untagged cursor row still needs a marker; without one the only
+            // cue is REVERSED, which some terminals render weakly.
+            spans.push(Span::styled(
+                "› ",
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
             ));
         } else {
             spans.push(Span::raw("  "));
@@ -1069,15 +1083,28 @@ impl FileTree {
         }
         style = style.add_modifier(modifier);
         // Tagged rows get a bright, high-contrast fill so their staged state is
-        // unmistakable. On the cursor row the REVERSED highlight would fight the
-        // fill, so there we drop REVERSED and rely on the tag color plus a bold
-        // marker to show both "selected" and "tagged" at once.
+        // unmistakable.
+        //
+        // The cursor has to remain visible on a tagged row. Simply dropping
+        // REVERSED there made the cursor row identical to every other tagged row,
+        // so moving through a directory of tagged files lost the cursor entirely.
+        // Instead the two states use different fills: the cursor row inverts to
+        // amber-on-black, tagged-but-unselected rows stay black-on-amber. Both
+        // read as "tagged" (same colour, same ▶ marker) while only one reads as
+        // "here".
         if is_tagged {
-            style = style
-                .remove_modifier(Modifier::REVERSED)
-                .fg(Color::Black)
-                .bg(TAG_COLOR)
-                .add_modifier(Modifier::BOLD);
+            style = if is_selected {
+                Style::default()
+                    .fg(TAG_COLOR)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                style
+                    .remove_modifier(Modifier::REVERSED)
+                    .fg(Color::Black)
+                    .bg(TAG_COLOR)
+                    .add_modifier(Modifier::BOLD)
+            };
         }
         // A ghost — a transfer in progress toward this location — is drawn in a
         // muted, italic style so it reads clearly as "not there yet". It wins

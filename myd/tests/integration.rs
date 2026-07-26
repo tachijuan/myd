@@ -2635,6 +2635,92 @@ async fn test_tagged_row_renders_marker() {
     );
 }
 
+/// The cursor must stay visible when it sits on a tagged file.
+///
+/// Tagged rows are filled black-on-amber. When the cursor landed on one, the
+/// REVERSED highlight was simply dropped, leaving that row styled identically to
+/// every other tagged row — so moving through a directory of tagged files lost
+/// the cursor entirely. The two states now use inverted fills of the same
+/// colour: both read as "tagged", only one reads as "here".
+#[tokio::test]
+async fn cursor_stays_visible_on_a_tagged_row() {
+    use myd::app::FileBrowser;
+    use myd::screen::Screen;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag two adjacent rows and leave the cursor on the second.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 2);
+
+    let cursor_row = app.selected_line_index_for_test().unwrap();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            if let Screen::Main(s) = app.current_screen_mut() {
+                s.active = true;
+                myd::screen::ScreenState::render(s, f, f.area());
+            }
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+
+    // Collect the background colours of the two tagged rows. Content starts one
+    // row below the top border.
+    // Compare whole rows rather than one column: the amber tag fill only covers
+    // the marker and the name, whose width varies per entry.
+    let row_styles = |line_index: usize| -> Vec<(ratatui::style::Color, ratatui::style::Color)> {
+        let y = (line_index + 1) as u16;
+        (0..buf.area.width)
+            .map(|x| {
+                let c = &buf[(x, y)];
+                (c.fg, c.bg)
+            })
+            .collect()
+    };
+
+    let here = row_styles(cursor_row);
+    let other = row_styles(cursor_row - 1);
+
+    let tag_amber = ratatui::style::Color::Rgb(255, 170, 40);
+
+    // The distinguishing property has to be the *styling*, not the text: two
+    // tagged rows naturally differ in filename. Compare the set of fg/bg pairs
+    // each row uses, ignoring how many cells carry them.
+    let palette = |row: &[(ratatui::style::Color, ratatui::style::Color)]| {
+        let mut v: Vec<_> = row
+            .iter()
+            .filter(|(f, b)| *f == tag_amber || *b == tag_amber)
+            .copied()
+            .collect();
+        v.sort_by_key(|(f, b)| (format!("{:?}", f), format!("{:?}", b)));
+        v.dedup();
+        v
+    };
+
+    let here_palette = palette(&here);
+    let other_palette = palette(&other);
+
+    // Both must still read as tagged.
+    assert!(!here_palette.is_empty(), "the cursor row lost its tagged colour");
+    assert!(!other_palette.is_empty(), "the tagged row lost its tagged colour");
+
+    assert_ne!(
+        here_palette, other_palette,
+        "a tagged row under the cursor is styled exactly like a tagged row that \
+         is not ({:?}) — the cursor is invisible among tagged files",
+        here_palette
+    );
+}
+
 // ---------------------------------------------------------------------------
 // n / p step through search matches.
 // ---------------------------------------------------------------------------
