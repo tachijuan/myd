@@ -5169,3 +5169,75 @@ async fn a_modal_swallows_clicks() {
         "the click leaked through the modal"
     );
 }
+
+/// Double-clicking a directory opens it, exactly as Enter does.
+///
+/// Terminals report presses individually and never a double-click, so this is
+/// inferred from timing and cell position — which means a single click must
+/// still only select.
+#[tokio::test]
+async fn double_click_opens_a_directory() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let root = app.panel_current_dir(0);
+
+    // Find the row holding "subdir" so the click lands on a directory.
+    let subdir_row = (0..12)
+        .find(|&row| {
+            app.route_mouse(mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                10,
+                (row + 1) as u16,
+            ));
+            app.selected_name_for_test().as_deref() == Some("subdir")
+        })
+        .expect("subdir should be visible in the tree");
+    let y = (subdir_row + 1) as u16;
+
+    // One click only selects.
+    assert_eq!(app.panel_current_dir(0), root, "a single click should not open");
+
+    // Two clicks in the same cell, close together, open it.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, y));
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, y));
+    settle(&mut app).await;
+
+    assert_ne!(
+        app.panel_current_dir(0),
+        root,
+        "a double-click on a directory should enter it"
+    );
+}
+
+/// Two clicks on *different* rows are two selections, not an open.
+#[tokio::test]
+async fn clicks_on_different_rows_do_not_count_as_a_double() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let root = app.panel_current_dir(0);
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 2));
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 3));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.panel_current_dir(0),
+        root,
+        "clicks on different rows must not open anything"
+    );
+}
