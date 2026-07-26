@@ -26,7 +26,7 @@ use openssh_sftp_client::{Sftp, SftpOptions};
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
 
-use super::{VEntry, VMetadata, VPath, VPositionedRead, VRead, VWrite, Vfs};
+use super::{VEntry, VMetadata, VPath, VPositionedRead, VPositionedWrite, VRead, VWrite, Vfs};
 use crate::utils::sizes::{CancelToken, SizeCache};
 use crate::widget::progress::OpProgress;
 
@@ -520,6 +520,63 @@ impl VPositionedRead for SftpPositionedRead {
     }
 }
 
+/// A positioned writer over one remote file.
+///
+/// Uploads are otherwise strictly sequential — read a buffer, write it, wait —
+/// so they cannot overlap round trips and run far below the download rate on a
+/// long link. SFTP's WRITE carries an explicit offset, so chunks can be written
+/// concurrently and out of order, exactly as reads are.
+struct SftpPositionedWrite {
+    file: std::sync::Arc<tokio::sync::Mutex<openssh_sftp_client::file::File>>,
+}
+
+#[async_trait]
+impl VPositionedWrite for SftpPositionedWrite {
+    /// Write all of `data` at `offset`.
+    ///
+    /// Deliberately does not use the crate's `write_all`, which loops on the
+    /// handle's *running* offset. A short write would leave that offset
+    /// mismatched with where the remaining bytes belong, silently interleaving
+    /// them with another slot's data. Re-seeking to an absolute offset before
+    /// each attempt makes every write self-locating, so a short write costs
+    /// another round trip rather than corrupting the file.
+    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncSeekExt;
+
+        let mut file = self.file.lock().await;
+        let mut written = 0usize;
+        while written < data.len() {
+            file.seek(std::io::SeekFrom::Start(offset + written as u64))
+                .await
+                .context("seek failed")?;
+            let n = file
+                .write(&data[written..])
+                .await
+                .context("remote write failed")?;
+            if n == 0 {
+                bail!("remote accepted no bytes at offset {}", offset + written as u64);
+            }
+            written += n;
+        }
+        Ok(())
+    }
+
+    /// Clone the handle client-side, for no round trip.
+    async fn clone_handle(&self) -> Option<Box<dyn VPositionedWrite>> {
+        let file = self.file.lock().await.clone();
+        Some(Box::new(SftpPositionedWrite {
+            file: std::sync::Arc::new(tokio::sync::Mutex::new(file)),
+        }))
+    }
+
+    async fn finish(&self) -> Result<()> {
+        // Closing one clone would close the shared remote handle out from under
+        // the others, so the pool relies on drop instead. The server commits the
+        // data when the last handle goes away.
+        Ok(())
+    }
+}
+
 /// Rebuild a numeric Unix mode from the SFTP permission flags.
 ///
 /// The crate exposes one accessor per bit rather than the raw value, but the
@@ -776,6 +833,28 @@ impl Vfs for SftpFs {
         Ok(Box::new(Box::pin(
             openssh_sftp_client::file::TokioCompatFile::new(file),
         )))
+    }
+
+    fn supports_parallel_write(&self) -> bool {
+        true
+    }
+
+    async fn open_positioned_write(
+        &self,
+        path: &VPath,
+        _len_hint: Option<u64>,
+    ) -> Result<Box<dyn VPositionedWrite>> {
+        if let Some(parent) = path.parent() {
+            self.create_dir_all(&parent).await.ok();
+        }
+        let file = self
+            .sftp
+            .create(&path.path)
+            .await
+            .with_context(|| format!("could not create {}", path.path.display()))?;
+        Ok(Box::new(SftpPositionedWrite {
+            file: std::sync::Arc::new(tokio::sync::Mutex::new(file)),
+        }))
     }
 
     async fn dir_size(

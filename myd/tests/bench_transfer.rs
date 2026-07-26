@@ -303,6 +303,26 @@ async fn bench_deep_tree() {
     }
 }
 
+/// The upload counterpart: writes must overlap too.
+///
+/// Keying the path choice on the *source* backend alone sent every upload down
+/// the sequential path, where one write is outstanding at a time — so an upload
+/// paid a full round trip per chunk and ran an order of magnitude below the
+/// download rate. This pins the destination side of that decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_upload_keeps_the_pipeline_full() {
+    let profile = LatencyProfile::with_rtt(Duration::from_millis(1));
+    let config = TransferConfig::default();
+    let row = bench_upload("upload pipeline depth", profile, 8 * MIB, config).await;
+
+    let peak = row.stats.max_concurrent_inflight.load(Ordering::Relaxed);
+    assert!(
+        peak > 1,
+        "uploads are serialising: peak in-flight writes = {peak} ({})",
+        row.stats.summary()
+    );
+}
+
 /// The regression guard: a large-file download must keep many reads in flight.
 ///
 /// This is the assertion that would have caught the serialised read loop, and it
