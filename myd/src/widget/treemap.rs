@@ -43,6 +43,22 @@ pub struct TreeMap {
 }
 
 impl TreeMap {
+    /// The index of the tile covering screen position `(x, y)`, if any.
+    ///
+    /// Cell rects are recomputed and stored on every render, so they always
+    /// describe what is currently on screen. Degenerate layouts zero the rects,
+    /// which this rejects naturally.
+    pub fn cell_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.cells.iter().position(|c| {
+            c.rect.width > 0
+                && c.rect.height > 0
+                && x >= c.rect.x
+                && x < c.rect.x + c.rect.width
+                && y >= c.rect.y
+                && y < c.rect.y + c.rect.height
+        })
+    }
+
     /// Build a treemap from the current file tree.
     ///
     /// Directories are shown as tiles. If a directory has no subdirectories

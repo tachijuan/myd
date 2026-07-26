@@ -108,6 +108,15 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             ],
         },
         HelpCategory {
+            title: "Mouse",
+            items: &[
+                ("Wheel", "Scroll the focused view"),
+                ("Left click", "Focus a panel and select a row / tile"),
+                ("Right click", "Select and open (enter a directory)"),
+                ("Ctrl+N", "Release the mouse for terminal text selection"),
+            ],
+        },
+        HelpCategory {
             title: "Exit",
             items: &[
                 ("q / Esc", "Quit (cancels a scan or connect first)"),

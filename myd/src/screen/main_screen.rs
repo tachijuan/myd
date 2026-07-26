@@ -43,6 +43,13 @@ pub struct MainScreenState {
     /// drawn as "ghost" rows. Set by the app each frame before rendering (like
     /// `active`); empty when nothing is being transferred here.
     pub pending_ghosts: Vec<crate::transfer::PendingDest>,
+    /// The rect the file tree last rendered into, and the scroll offset it used.
+    ///
+    /// Recorded during render because the offset is derived from the area's
+    /// height, so it cannot be recovered afterwards from state alone. Mouse
+    /// hit-testing needs both to turn a screen row into a tree line.
+    pub tree_area: Option<Rect>,
+    pub tree_scroll: usize,
 }
 
 impl MainScreenState {
@@ -60,6 +67,8 @@ impl MainScreenState {
             cached_info_key: None,
             last_search: None,
             pending_ghosts: Vec::new(),
+            tree_area: None,
+            tree_scroll: 0,
         }
     }
 
@@ -77,6 +86,8 @@ impl MainScreenState {
             cached_info_key: None,
             last_search: None,
             pending_ghosts: Vec::new(),
+            tree_area: None,
+            tree_scroll: 0,
         }
     }
 
@@ -116,6 +127,51 @@ impl MainScreenState {
     fn rebuild_treemap_and_info(&mut self) {
         self.rebuild_treemap();
         self.cached_info_key = None;
+    }
+
+    /// Move the cursor to whatever was drawn at screen position `(x, y)`.
+    ///
+    /// Returns whether the click landed on something selectable. Uses the rect
+    /// and scroll offset recorded during the last render, so a click always
+    /// refers to what the user actually saw.
+    pub fn click_at(&mut self, x: u16, y: u16) -> bool {
+        // Treemap first: its cells already carry their rects.
+        if self.focus == FocusTarget::Treemap {
+            if let Some(i) = self.treemap.cell_at(x, y) {
+                self.treemap.cursor = i;
+                self.cached_info_key = None;
+                return true;
+            }
+            return false;
+        }
+
+        let Some(area) = self.tree_area else {
+            return false;
+        };
+        if x < area.x || x >= area.x + area.width || y < area.y || y >= area.y + area.height {
+            return false;
+        }
+        // Row 0 of the box is the top border and title; content starts below it,
+        // and the bottom border is not a row.
+        if y <= area.y || y + 1 >= area.y + area.height {
+            return false;
+        }
+        let row = (y - area.y - 1) as usize;
+        let index = self.tree_scroll + row;
+        if index < self.tree.lines.len() {
+            self.tree.cursor = index;
+            self.cached_info_key = None;
+            return true;
+        }
+        false
+    }
+
+    /// Whether `(x, y)` falls inside the area the tree last rendered into.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        match self.tree_area {
+            Some(a) => x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height,
+            None => false,
+        }
     }
 
     pub fn cursor_down(&mut self) -> bool {
@@ -603,6 +659,13 @@ impl MainScreenState {
         } else {
             0
         };
+
+        // Keep what was drawn so a mouse click can be mapped back to a row. The
+        // offset depends on the area's height, so it cannot be recomputed later
+        // from state alone — it has to be recorded here, as the treemap already
+        // does with its cell rects.
+        self.tree_area = Some(area);
+        self.tree_scroll = scroll;
 
         let paragraph = Paragraph::new(text)
             .block(
