@@ -5339,3 +5339,108 @@ async fn clicking_away_from_the_indicator_does_not_open_the_menu() {
     app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 0));
     assert_eq!(app.modal_kind_for_test(), "none");
 }
+
+// ---------------------------------------------------------------------------
+// Transfer panel focus
+// ---------------------------------------------------------------------------
+
+/// Tab reaches the transfer sidebar, j/k move within it, and k asks before
+/// cancelling.
+#[tokio::test]
+async fn the_transfer_panel_is_focusable_and_cancellable() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Queue two transfers so the sidebar has content and a cursor can move.
+    let src = dir.path().join("file_a.txt");
+    for name in ["one.txt", "two.txt"] {
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(&src),
+            myd::vfs::VPath::local(dir.path().join(name)),
+        );
+    }
+
+    // The sidebar's geometry only exists once drawn.
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    assert!(!app.transfer_focused_for_test(), "starts on the file tree");
+
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test(), "Tab should reach the sidebar");
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let first = app.transfer_cursor_for_test();
+    assert!(first.is_some(), "focusing should select a transfer");
+
+    app.handle_key_for_test(char_key('j'));
+    assert_ne!(app.transfer_cursor_for_test(), first, "j should move");
+
+    // k asks before cancelling rather than doing it outright.
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+
+    // Declining leaves the transfer alone.
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(app.modal_kind_for_test(), "none");
+}
+
+/// Esc returns focus to the file tree.
+#[tokio::test]
+async fn esc_leaves_the_transfer_panel() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test());
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Esc));
+    assert!(!app.transfer_focused_for_test());
+}
+
+/// Clicking a transfer focuses the sidebar and selects it; double-clicking asks
+/// to cancel.
+#[tokio::test]
+async fn clicking_a_transfer_selects_it_and_double_click_cancels() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let (row, _) = app
+        .transfer_row_for_test(0)
+        .expect("a queued transfer should have a row");
+
+    // Somewhere inside the sidebar's columns.
+    let x = 100u16;
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), x, row));
+    assert!(app.transfer_focused_for_test(), "a click should focus the sidebar");
+    assert!(app.transfer_cursor_for_test().is_some());
+    assert_eq!(app.modal_kind_for_test(), "none", "one click must not cancel");
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), x, row));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a double-click should ask to cancel"
+    );
+}

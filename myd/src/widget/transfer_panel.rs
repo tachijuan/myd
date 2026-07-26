@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::transfer::{format_eta, format_rate, TransferQueue, TransferState};
+use crate::transfer::{format_eta, format_rate, TransferId, TransferQueue, TransferState};
 use crate::widget::progress::ratio_bar;
 
 /// Below this terminal width the panel hides itself: at narrower sizes it would
@@ -29,13 +29,50 @@ pub fn desired_width(total_width: u16) -> Option<u16> {
     Some(pct.clamp(MIN_WIDTH, MAX_WIDTH))
 }
 
+/// Where each cancellable transfer was drawn, so a click or the cursor can be
+/// mapped back to one.
+///
+/// Only active and queued transfers appear: a finished one has nothing to
+/// cancel, so including it would give the cursor stops that do nothing.
+#[derive(Debug, Default, Clone)]
+pub struct PanelRows {
+    /// `(first screen row of the entry, transfer id)`, in display order.
+    pub rows: Vec<(u16, TransferId)>,
+}
+
+impl PanelRows {
+    /// The transfer drawn at screen row `y`, if any.
+    ///
+    /// An entry spans several rows (name, bar, stats), so this takes the last
+    /// entry that starts at or above `y` — a click anywhere in the block selects
+    /// it, which is what a user aiming at a progress bar expects.
+    pub fn at(&self, y: u16) -> Option<TransferId> {
+        self.rows
+            .iter()
+            .rev()
+            .find(|(row, _)| *row <= y)
+            .map(|(_, id)| *id)
+    }
+
+    pub fn ids(&self) -> Vec<TransferId> {
+        self.rows.iter().map(|(_, id)| *id).collect()
+    }
+}
+
 /// Render the transfer queue as a right-hand sidebar.
 ///
-/// This is a pure view over the queue — it holds no state and takes no input, so
-/// it cannot interfere with navigation.
-pub fn render(frame: &mut Frame, area: Rect, queue: &TransferQueue) {
+/// `focused` draws the same bright border the browser panels use when active,
+/// and `selected` highlights one transfer. Returns where each cancellable
+/// transfer landed, for hit-testing.
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    queue: &TransferQueue,
+    focused: bool,
+    selected: Option<TransferId>,
+) -> PanelRows {
     if area.width == 0 || area.height == 0 {
-        return;
+        return PanelRows::default();
     }
 
     // Report the work itself, not the worker-pool capacity: "0/4" read as if
@@ -43,35 +80,70 @@ pub fn render(frame: &mut Frame, area: Rect, queue: &TransferQueue) {
     // running and what is still waiting.
     let active = queue.active_count();
     let queued = queue.queued_count();
-    let title = if active == 0 && queued == 0 {
+    let base = if active == 0 && queued == 0 {
         " Transfers ".to_string()
     } else if queued == 0 {
         format!(" Transfers ({} active) ", active)
     } else {
         format!(" Transfers ({} active, {} queued) ", active, queued)
     };
+    // Say how to cancel only while focused; otherwise it is noise on a panel
+    // the user isn't driving. Dropped entirely when it wouldn't fit, since
+    // ratatui clips a title at the border and half a hint is worse than none.
+    let title = if focused {
+        let hint = " — j/k move, k cancels ";
+        let with_hint = format!("{}{}", base.trim_end(), hint);
+        // Two border corners plus a column of slack.
+        if with_hint.chars().count() + 3 <= area.width as usize {
+            with_hint
+        } else {
+            base
+        }
+    } else {
+        base
+    };
+
+    // Matches the browser panels: bright cyan when this panel has focus, a light
+    // grey otherwise, so "where am I" reads the same everywhere.
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::Rgb(160, 160, 172)
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(if queue.has_work() {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        }))
+        .border_style(Style::default().fg(border))
         .title(title);
 
     // Content width inside the borders; the bar is sized from this so it never
     // overflows a narrow panel.
     let inner_width = area.width.saturating_sub(2) as usize;
-    let lines = build_lines(queue, inner_width);
+    let (lines, rows) = build_lines_tracked(queue, inner_width, selected, area.y + 1);
 
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    rows
 }
 
 /// Build the panel body: an Active section, then Queued, then finished.
+#[cfg(test)]
 fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
+    build_lines_tracked(queue, width, None, 0).0
+}
+
+/// As [`build_lines`], also reporting where each cancellable transfer landed.
+///
+/// `origin` is the screen row of the panel's first content line, so the recorded
+/// positions are absolute and can be compared against a mouse event directly.
+fn build_lines_tracked(
+    queue: &TransferQueue,
+    width: usize,
+    selected: Option<TransferId>,
+    origin: u16,
+) -> (Vec<Line<'static>>, PanelRows) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rows = PanelRows::default();
 
     if queue.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -83,7 +155,7 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
             "Copy with c to queue one.",
             Style::default().fg(Color::DarkGray),
         )));
-        return lines;
+        return (lines, rows);
     }
 
     let active: Vec<_> = queue
@@ -108,7 +180,14 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
             Color::Cyan,
         ));
         for t in &active {
-            lines.push(name_line(&transfer_label(t), width, Color::White));
+            rows.rows.push((origin + lines.len() as u16, t.id));
+            let picked = selected == Some(t.id);
+            lines.push(name_line_selected(
+                &transfer_label(t),
+                width,
+                Color::White,
+                picked,
+            ));
             lines.push(bar_line(t.progress.fraction(), width));
             lines.push(stats_line(t, width));
         }
@@ -123,7 +202,14 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
             Color::Yellow,
         ));
         for t in &queued {
-            lines.push(name_line(&transfer_label(t), width, Color::Gray));
+            rows.rows.push((origin + lines.len() as u16, t.id));
+            let picked = selected == Some(t.id);
+            lines.push(name_line_selected(
+                &transfer_label(t),
+                width,
+                Color::Gray,
+                picked,
+            ));
         }
     }
 
@@ -171,7 +257,7 @@ fn build_lines(queue: &TransferQueue, width: usize) -> Vec<Line<'static>> {
         }
     }
 
-    lines
+    (lines, rows)
 }
 
 fn section_header(text: String, color: Color) -> Line<'static> {
@@ -191,10 +277,25 @@ fn transfer_label(t: &crate::transfer::Transfer) -> String {
     }
 }
 
-fn name_line(name: &str, width: usize, color: Color) -> Line<'static> {
+/// A transfer's name row, highlighted when it is the panel's selection.
+///
+/// The highlight fills the whole width so the selection reads as a row rather
+/// than as a differently-coloured word.
+fn name_line_selected(name: &str, width: usize, color: Color, selected: bool) -> Line<'static> {
+    if !selected {
+        return Line::from(Span::styled(
+            truncate(name, width),
+            Style::default().fg(color),
+        ));
+    }
+    let text = truncate(name, width);
+    let pad = width.saturating_sub(text.chars().count());
     Line::from(Span::styled(
-        truncate(name, width),
-        Style::default().fg(color),
+        format!("{}{}", text, " ".repeat(pad)),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(80, 200, 235))
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -420,9 +521,9 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| {
             // Degenerate and normal rects both must be safe.
-            render(f, Rect::new(0, 0, 0, 0), &q);
-            render(f, Rect::new(0, 0, 1, 1), &q);
-            render(f, Rect::new(0, 0, 30, 18), &q);
+            render(f, Rect::new(0, 0, 0, 0), &q, false, None);
+            render(f, Rect::new(0, 0, 1, 1), &q, false, None);
+            render(f, Rect::new(0, 0, 30, 18), &q, false, None);
         })
         .unwrap();
     }
