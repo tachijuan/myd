@@ -17,6 +17,7 @@ use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
 use crate::widget::host_picker::{HostPicker, PickerOutcome};
 use crate::widget::input_dialog::InputDialog;
+use crate::widget::sort_menu::{SortMenu, SortMenuOutcome};
 use crate::widget::progress::{OpProgress, ProgressOverlay};
 use crate::widget::transfer_panel;
 use crate::widget::treemap::FocusTarget;
@@ -60,6 +61,8 @@ pub enum Modal {
     /// The dialing directory. Owns its own key handling (vi navigation and `/`
     /// search), which is why it is a modal rather than a screen.
     HostPicker(HostPicker),
+    /// Numbered sort-order menu, opened by clicking the "Sort:" indicator.
+    SortMenu(SortMenu),
 }
 
 /// Context for modal operations.
@@ -468,6 +471,14 @@ impl FileBrowser {
             self.panels[0].current_screen_mut().render(f, area);
         }
 
+        // Where the active panel drew its "Sort:" indicator, so the sort menu can
+        // open directly beneath it. Read after the panels render, since that is
+        // when the rect is recorded.
+        let sort_anchor = match self.panels[self.active].current_screen() {
+            Screen::Main(s) => s.sort_area,
+            _ => None,
+        };
+
         // Modals center on the whole terminal, not the tree column, so toggling
         // the sidebar doesn't shift a dialog under the cursor.
         // Taken by value so the picker can render with `&mut self` (it keeps a
@@ -477,6 +488,7 @@ impl FileBrowser {
             Modal::Confirm(d) => d.render(f, full),
             Modal::Input(d) => d.render(f, full),
             Modal::HostPicker(p) => p.render(f, full),
+            Modal::SortMenu(m) => m.render(f, full, sort_anchor),
             Modal::Operation { verb } => {
                 let overlay = match &op_progress {
                     Some(p) => ProgressOverlay::for_operation(verb, p),
@@ -748,6 +760,7 @@ impl FileBrowser {
             Modal::Operation { .. } => "operation",
             Modal::Help => "help",
             Modal::HostPicker(_) => "host_picker",
+            Modal::SortMenu(_) => "sort_menu",
         }
     }
 
@@ -899,12 +912,39 @@ impl FileBrowser {
             }
             return true;
         }
+        if matches!(self.modal, Modal::SortMenu(_)) {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Modal::SortMenu(menu) = &mut self.modal else {
+                    return true;
+                };
+                // A single click picks: this is a menu of commands, and needing
+                // a double-click to run one is not what a menu does.
+                let outcome = menu.click_at(x, y);
+                return self.apply_sort_menu_outcome(outcome);
+            }
+            return true;
+        }
         if !matches!(self.modal, Modal::None) {
             return true;
         }
 
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // The sort indicator in the title bar opens the sort menu.
+                // Checked before the panel hit-test, since it sits on the border
+                // row that the tree would otherwise ignore.
+                let on_sort = self.panels.iter().position(|p| {
+                    matches!(p.current_screen(), Screen::Main(s)
+                        if s.sort_area.is_some_and(|a| {
+                            x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height
+                        }))
+                });
+                if let Some(i) = on_sort {
+                    self.active = i;
+                    self.open_sort_menu();
+                    return true;
+                }
+
                 // Clicking a panel focuses it, so a click in the inactive pane
                 // doesn't move the other pane's cursor.
                 if let Some(i) = self
@@ -1472,6 +1512,11 @@ impl FileBrowser {
             let outcome = picker.handle_key(key);
             return self.apply_picker_outcome(outcome);
         }
+        // Same for the sort menu: it binds the digits and j/k itself.
+        if let Modal::SortMenu(menu) = &mut self.modal {
+            let outcome = menu.handle_key(key);
+            return self.apply_sort_menu_outcome(outcome);
+        }
 
         match &mut self.modal {
             Modal::Confirm(dialog) => {
@@ -1643,9 +1688,9 @@ impl FileBrowser {
                 self.modal = Modal::None;
                 true
             }
-            // Handled by the early return at the top of this function, which
-            // needs `&mut self` for the whole call and so can't sit in this match.
-            Modal::HostPicker(_) => true,
+            // Handled by the early returns at the top of this function, which
+            // need `&mut self` for the whole call and so can't sit in this match.
+            Modal::HostPicker(_) | Modal::SortMenu(_) => true,
             Modal::None => true,
         }
     }
@@ -1766,6 +1811,30 @@ impl FileBrowser {
                 )));
             }
         }
+    }
+
+    /// Act on the sort menu's decision.
+    fn apply_sort_menu_outcome(&mut self, outcome: SortMenuOutcome) -> bool {
+        match outcome {
+            SortMenuOutcome::Continue => {}
+            SortMenuOutcome::Cancelled => self.modal = Modal::None,
+            SortMenuOutcome::Chosen(mode) => {
+                self.modal = Modal::None;
+                if let Screen::Main(st) = self.active_panel_mut().current_screen_mut() {
+                    st.set_sort_mode(mode);
+                }
+            }
+        }
+        true
+    }
+
+    /// Open the sort menu for the active panel.
+    fn open_sort_menu(&mut self) {
+        let current = match self.panels[self.active].current_screen() {
+            Screen::Main(s) => s.tree.sort_mode,
+            _ => return,
+        };
+        self.modal = Modal::SortMenu(SortMenu::new(current));
     }
 
     /// Return to the dialing directory after a management action.
