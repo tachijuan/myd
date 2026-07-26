@@ -114,13 +114,23 @@ pub async fn run_transfer(job: TransferJob) -> Result<TransferOutcome> {
 
     match result {
         Ok(TransferOutcome::Done) => {
-            // Atomically put the completed bytes at the real destination. An
-            // existing file is replaced — the overwrite decision was made by the
-            // caller before queueing.
-            dest_fs.remove_file(&dest).await.ok();
-            if let Err(e) = dest_fs.rename(&part, &dest).await {
-                dest_fs.remove_file(&part).await.ok();
-                return Err(e);
+            // Put the completed bytes at the real destination. An existing file
+            // is replaced — the overwrite decision was made by the caller before
+            // queueing.
+            //
+            // Try the rename first and only clear the destination if it fails.
+            // SFTP v3 rename refuses an existing destination, so the removal is
+            // load-bearing, but unconditionally removing first cost a round trip
+            // on every file including the common case where nothing is there.
+            if let Err(first) = dest_fs.rename(&part, &dest).await {
+                dest_fs.remove_file(&dest).await.ok();
+                if let Err(e) = dest_fs.rename(&part, &dest).await {
+                    dest_fs.remove_file(&part).await.ok();
+                    // Report the retry's error: the first failure may just have
+                    // been "destination exists", which the removal addressed.
+                    let _ = first;
+                    return Err(e);
+                }
             }
             progress.finish();
             Ok(TransferOutcome::Done)
@@ -149,6 +159,28 @@ fn transfer_dir<'a>(
     progress: &'a Arc<TransferProgress>,
     cancel: &'a CancelToken,
     config: &'a TransferConfig,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TransferOutcome>> + Send + 'a>> {
+    // One shared budget for the whole tree. Each recursion level otherwise opens
+    // its own window of `max_parallel`, and those multiply: a tree `d` levels
+    // deep could reach `max_parallel^d` simultaneous operations and swamp the
+    // connection's request budget. The per-level windows below still bound
+    // breadth; this bounds the product.
+    let limit = Arc::new(tokio::sync::Semaphore::new(
+        crate::config::transfer_global_concurrency().max(1),
+    ));
+    transfer_dir_inner(src_fs, dest_fs, src, dest, progress, cancel, config, limit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_dir_inner<'a>(
+    src_fs: &'a Arc<dyn Vfs>,
+    dest_fs: &'a Arc<dyn Vfs>,
+    src: &'a VPath,
+    dest: &'a VPath,
+    progress: &'a Arc<TransferProgress>,
+    cancel: &'a CancelToken,
+    config: &'a TransferConfig,
+    limit: Arc<tokio::sync::Semaphore>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TransferOutcome>> + Send + 'a>> {
     Box::pin(async move {
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -182,7 +214,10 @@ fn transfer_dir<'a>(
                 let child_src = src.join(&entry.name);
                 let child_dest = dest.join(&entry.name);
                 let len = entry.len;
+                let limit = limit.clone();
                 inflight.push(async move {
+                    // Wait for room in the tree-wide budget before starting.
+                    let _permit = limit.acquire().await;
                     // Stream straight to the final name: a per-file part rename
                     // across a whole tree adds round trips for little safety,
                     // and the directory itself is the unit of retry.
@@ -226,9 +261,10 @@ fn transfer_dir<'a>(
                 let Some(entry) = dirs.next() else { break };
                 let child_src = src.join(&entry.name);
                 let child_dest = dest.join(&entry.name);
+                let limit = limit.clone();
                 walking.push(async move {
-                    transfer_dir(
-                        src_fs, dest_fs, &child_src, &child_dest, progress, cancel, config,
+                    transfer_dir_inner(
+                        src_fs, dest_fs, &child_src, &child_dest, progress, cancel, config, limit,
                     )
                     .await
                 });

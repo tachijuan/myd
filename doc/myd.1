@@ -129,9 +129,19 @@ Rescan the file tree.
 Toggle the info panel sidebar.
 .TP
 .B gr
-Connect to a remote host over SFTP and open it in the active panel, replacing
-whatever it was showing. Prompts for an
+Open the dialing directory on your three most-used remote locations, and
+connect to the chosen one in the active panel, replacing whatever it was
+showing. With nothing saved yet it prompts directly for an
 \fBsftp://[user@]host[:port][/path]\fR target (or an ssh config alias).
+.TP
+.B gs
+Open the dialing directory on the full saved-host list. Inside it, \fBj\fR /
+\fBk\fR / \fBg\fR / \fBG\fR navigate, \fBEnter\fR connects, \fB/\fR searches,
+\fBa\fR adds, \fBe\fR edits, \fBd\fR deletes and \fBEsc\fR closes.
+.TP
+.B Ctrl+N
+Release the mouse so the terminal's own text selection works; press again to
+re-grab it.
 .TP
 .B Ctrl+t
 Show or hide the transfer panel.
@@ -171,14 +181,66 @@ recursive total \(em because a \fBdu\fR-style walk over SFTP costs one round
 trip per directory. The info panel likewise shows only what the directory
 listing carries (size and timestamps); owner, group and creation time are not
 part of it.
+.SH DIALING DIRECTORY
+Saved remote locations live in \fB~/.config/myd/hosts.toml\fR (honouring
+\fBXDG_CONFIG_HOME\fR) and are hand-editable. An entry records a label, host,
+optional user, port and starting path, plus a use count used to rank the list.
+.PP
+.B No passwords are stored.
+Authentication goes through the same ladder as always: ssh-agent, then
+\fB~/.ssh\fR keys, then a prompt.
+.PP
+A malformed file is reported and ignored rather than overwritten, so a typo can
+be corrected by hand instead of costing the whole list.
+.SH MOUSE
+The wheel scrolls the focused view; a left click focuses a panel and selects a
+row or treemap tile; a right click selects and opens. Mouse capture takes over
+the terminal's own click-drag selection, so \fBCtrl+N\fR releases and re-grabs
+it. Most terminals also honour Shift+drag while captured.
 .SH DIAGNOSTICS
-Setting \fBMYD_TRACE=1\fR makes myd append one timing line per keypress to
-\fB~/.cache/myd\-trace.log\fR (override the location with \fBMYD_TRACE_FILE\fR).
-Sorting additionally logs how long reordering, reflattening and the treemap
-rebuild each took; slow event-loop ticks and remote round trips over 100ms are
-logged too. This is for diagnosing sluggishness on slow or network
-filesystems, where the cause is otherwise hard to attribute; it is off by
-default and costs nothing when unset.
+Setting \fBMYD_TRACE=1\fR writes a log to \fB~/.cache/myd\-trace.log\fR (override
+with \fBMYD_TRACE_FILE\fR). \fBMYD_LOG\fR takes a filter directive instead, e.g.
+\fBMYD_LOG=myd::transfer=debug\fR for just the transfer engine;
+\fBMYD_LOG_FORMAT=json\fR makes the output machine-readable.
+.PP
+The log records key and event-loop timings, connection setup, the SFTP read
+limit the server negotiated, and one line per transferred file with the path
+taken, chunk size, window depth and achieved rate. Per-chunk latencies are
+accumulated into a histogram and summarised once per file, so tracing never
+becomes the bottleneck it is measuring. It is off by default and costs nothing
+when unset.
+.SH TUNING TRANSFERS
+Every performance-relevant setting is an environment variable, so a slow link
+can be diagnosed without a rebuild.
+.TP
+.B MYD_SSH_WINDOW
+SSH channel window in bytes (default 64 MiB). This is the hard ceiling on
+in-flight data: throughput cannot exceed \fBwindow / rtt\fR however deep the
+request pipeline is.
+.TP
+.B MYD_SSH_NODELAY
+Disable Nagle's algorithm on the SSH socket (default true).
+.TP
+.B MYD_SFTP_WRITE_LIMIT
+Outstanding bytes on the sequential write path (default 16 MiB).
+.TP
+.B MYD_SFTP_MAX_PENDING
+SFTP requests in flight on one connection (default 1024).
+.TP
+.B MYD_CHUNK_SIZE
+Bytes per chunk (default 256 KiB). On the parallel path one chunk is one wire
+request, so a value above the server's negotiated read limit becomes several
+serial requests rather than one larger one.
+.TP
+.B MYD_CHUNKS_IN_FLIGHT
+Concurrent chunk reads within one large file (default 32).
+.TP
+.B MYD_MAX_PARALLEL
+Concurrent transfers, and files per directory level (default 16).
+.TP
+.B MYD_GLOBAL_CONCURRENCY
+Ceiling on concurrent operations during a recursive copy (default 192). Without
+it the per-level windows multiply.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes:
 .TP

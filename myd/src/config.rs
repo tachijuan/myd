@@ -108,7 +108,13 @@ tunable! {
     ///
     /// Per-level windows would otherwise multiply: a tree `d` levels deep can
     /// reach `max_parallel^d` simultaneous operations without a shared bound.
-    transfer_global_concurrency: usize = "MYD_GLOBAL_CONCURRENCY", 64
+    ///
+    /// This is a safety valve, not a throttle, so it is set where the curve
+    /// flattens rather than as low as it will go. Measured on a 4-level tree at
+    /// 150 ms RTT: 64 → 30 MiB/s, 128 → 37.9, 192 → 42.1, 256 → 41.8, against
+    /// 48 unbounded. 192 keeps nearly all the throughput while holding peak
+    /// in-flight requests to roughly 225 instead of an unbounded 324.
+    transfer_global_concurrency: usize = "MYD_GLOBAL_CONCURRENCY", 192
 }
 
 #[cfg(test)]

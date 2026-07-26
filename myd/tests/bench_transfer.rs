@@ -303,6 +303,43 @@ async fn bench_deep_tree() {
     }
 }
 
+/// A recursive copy must not fan out without bound.
+///
+/// Each level of `transfer_dir` opens its own window, so without a shared budget
+/// a tree `d` levels deep reaches `max_parallel^d` simultaneous operations —
+/// measured at 324 in-flight requests on a 4-level tree, well past what the
+/// connection's request budget can absorb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_copy_fanout_stays_bounded() {
+    // Enough latency that operations actually overlap (a zero-latency mock
+    // completes each before the next starts, hiding any fan-out), and a tree
+    // wide and deep enough for the per-level windows to multiply.
+    let profile = LatencyProfile::with_rtt(Duration::from_millis(20));
+    let config = TransferConfig {
+        max_parallel: 8,
+        ..TransferConfig::default()
+    };
+    let row = bench_tree("fanout", profile, 3, 4, 6, 16 * 1024, config).await;
+
+    let peak = row.stats.max_concurrent_inflight.load(Ordering::Relaxed);
+    let ceiling = myd::config::transfer_global_concurrency();
+    // Without a shared budget this tree reaches max_parallel^depth concurrent
+    // operations. Each in-flight file holds a couple of requests (open, then
+    // read), so allow headroom over the raw permit count while still failing on
+    // genuinely unbounded growth.
+    // Each in-flight file may briefly hold more than one request (an open, then
+    // a read), so the observed peak sits somewhat above the permit count. The
+    // threshold is set from measurement: this tree peaks at ~224 with the shared
+    // budget and ~384 without it, so 1.5x the ceiling separates the two.
+    let limit = (ceiling as u64 * 3) / 2;
+    assert!(
+        peak <= limit,
+        "recursive copy reached {peak} in-flight requests against a {ceiling} permit budget \
+         (limit {limit}) — the per-level windows are multiplying ({})",
+        row.stats.summary()
+    );
+}
+
 /// The upload counterpart: writes must overlap too.
 ///
 /// Keying the path choice on the *source* backend alone sent every upload down
