@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::hosts::{HostCatalog, SavedHost};
 use crate::keybinding::{Action, KeyBindingHandler};
 use crate::panel::Panel;
 use crate::screen::Screen;
@@ -14,6 +15,7 @@ use crate::utils::sizes::CancelToken;
 use crate::vfs::{BackendRegistry, VPath};
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::render_help;
+use crate::widget::host_picker::{HostPicker, PickerOutcome};
 use crate::widget::input_dialog::InputDialog;
 use crate::widget::progress::{OpProgress, ProgressOverlay};
 use crate::widget::transfer_panel;
@@ -42,6 +44,10 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Prompt for the one-line saved-host form.
+const HOST_FORM_PROMPT: &str =
+    "Saved host  —  label = sftp://[user@]host[:port][/path]\n(no password is stored; keys and prompts work as usual)";
+
 /// Modal overlay state.
 pub enum Modal {
     None,
@@ -51,6 +57,9 @@ pub enum Modal {
     /// titles the overlay; live counts come from `FileBrowser::op_progress`.
     Operation { verb: &'static str },
     Help,
+    /// The dialing directory. Owns its own key handling (vi navigation and `/`
+    /// search), which is why it is a modal rather than a screen.
+    HostPicker(HostPicker),
 }
 
 /// Context for modal operations.
@@ -79,6 +88,11 @@ pub enum ModalTarget {
     /// Masked prompt for a key passphrase or account password, feeding a
     /// connection retry.
     Password,
+    /// Add or edit a saved host. `editing` is the label being replaced, so a
+    /// rename updates the right entry instead of adding a second one.
+    HostForm { editing: Option<String> },
+    /// Confirm removing a saved host.
+    HostDelete { label: String },
 }
 
 /// Main application state machine.
@@ -143,6 +157,13 @@ pub struct FileBrowser {
     connect_task: Option<ConnectTask>,
     /// Connection details being retried after a credential prompt.
     pending_connect: Option<PendingConnect>,
+    /// Saved remote locations, loaded once at startup and written back on every
+    /// change so a crash cannot lose an entry that was already confirmed.
+    hosts: HostCatalog,
+    /// Label of the host currently being connected to, promoted in the ranking
+    /// only once the connection actually succeeds — a host that never connects
+    /// should not climb the list.
+    connecting_label: Option<String>,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -211,6 +232,8 @@ impl FileBrowser {
             transfer_panel_override: None,
             connect_task: None,
             pending_connect: None,
+            hosts: HostCatalog::load(),
+            connecting_label: None,
         }
     }
 
@@ -378,11 +401,15 @@ impl FileBrowser {
 
         // Modals center on the whole terminal, not the tree column, so toggling
         // the sidebar doesn't shift a dialog under the cursor.
-        match &self.modal {
+        // Taken by value so the picker can render with `&mut self` (it keeps a
+        // scroll offset), then put back.
+        let op_progress = self.op_progress.clone();
+        match &mut self.modal {
             Modal::Confirm(d) => d.render(f, full),
             Modal::Input(d) => d.render(f, full),
+            Modal::HostPicker(p) => p.render(f, full),
             Modal::Operation { verb } => {
-                let overlay = match &self.op_progress {
+                let overlay = match &op_progress {
                     Some(p) => ProgressOverlay::for_operation(verb, p),
                     None => ProgressOverlay::new().with_message(*verb),
                 };
@@ -620,6 +647,44 @@ impl FileBrowser {
         self.resolve_deleting();
         self.resolve_copying();
         self.advance_transfers();
+    }
+
+    /// Which modal is up, as a stable name (for tests).
+    pub fn modal_kind_for_test(&self) -> &'static str {
+        match &self.modal {
+            Modal::None => "none",
+            Modal::Confirm(_) => "confirm",
+            Modal::Input(_) => "input",
+            Modal::Operation { .. } => "operation",
+            Modal::Help => "help",
+            Modal::HostPicker(_) => "host_picker",
+        }
+    }
+
+    /// The label of the host the picker has highlighted (for tests).
+    pub fn picker_selection_for_test(&self) -> Option<String> {
+        match &self.modal {
+            Modal::HostPicker(p) => p.selected().map(|h| h.label.clone()),
+            _ => None,
+        }
+    }
+
+    /// How many hosts the picker is currently showing (for tests).
+    pub fn picker_visible_count_for_test(&self) -> usize {
+        match &self.modal {
+            Modal::HostPicker(p) => p.visible_count(),
+            _ => 0,
+        }
+    }
+
+    /// Replace the host catalog, so tests don't touch the user's real one.
+    pub fn set_hosts_for_test(&mut self, hosts: HostCatalog) {
+        self.hosts = hosts;
+    }
+
+    /// The saved-host list (for tests).
+    pub fn hosts_for_test(&self) -> &HostCatalog {
+        &self.hosts
     }
 
     /// Whether a connection attempt is in flight (for tests).
@@ -903,11 +968,18 @@ impl FileBrowser {
                 true
             }
             Action::Connect => {
-                self.modal_target = Some(ModalTarget::Connect);
-                self.modal = Modal::Input(InputDialog::new(
-                    "Connect to (sftp://[user@]host[:port][/path]):",
-                    "sftp://host/path",
-                ));
+                // The dialing directory replaces what used to be a bare text
+                // prompt. With nothing saved yet it goes straight to that
+                // prompt, so a first run costs no extra keystroke.
+                if self.hosts.is_empty() {
+                    self.prompt_manual_connect();
+                } else {
+                    self.modal = Modal::HostPicker(HostPicker::quick(&self.hosts));
+                }
+                true
+            }
+            Action::HostDirectory => {
+                self.modal = Modal::HostPicker(HostPicker::full(&self.hosts));
                 true
             }
             Action::ChangeRoot => {
@@ -1167,7 +1239,8 @@ impl FileBrowser {
                     | Action::SearchPrev
                     | Action::ToggleTransferPanel
                     | Action::CancelTransfers
-                    | Action::Connect => unreachable!(),
+                    | Action::Connect
+                    | Action::HostDirectory => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -1175,6 +1248,14 @@ impl FileBrowser {
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
+        // The picker owns its keys outright — vi navigation and `/` search need
+        // j/k// to be local commands, and going through the chord detector would
+        // put its 500 ms timeout in front of every keystroke.
+        if let Modal::HostPicker(picker) = &mut self.modal {
+            let outcome = picker.handle_key(key);
+            return self.apply_picker_outcome(outcome);
+        }
+
         match &mut self.modal {
             Modal::Confirm(dialog) => {
                 use crate::widget::confirm_dialog::Answer;
@@ -1191,6 +1272,21 @@ impl FileBrowser {
                     match self.modal_target.take() {
                         Some(ModalTarget::Delete { paths }) if result => {
                             self.spawn_delete_batch(paths);
+                        }
+                        Some(ModalTarget::HostDelete { label }) => {
+                            if result {
+                                self.hosts.remove(&label);
+                                if let Err(e) = self.hosts.save() {
+                                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                                        "Could not save the host list: {}",
+                                        e
+                                    )));
+                                    return true;
+                                }
+                            }
+                            // Back to the list either way, so a mis-keyed delete
+                            // doesn't also close the picker.
+                            self.reopen_picker();
                         }
                         Some(ModalTarget::CopyOverwrite { src, dest }) => {
                             // Confirmed collisions join the approved batch; a
@@ -1284,9 +1380,16 @@ impl FileBrowser {
                             }
                             ModalTarget::Connect => {
                                 if !value.is_empty() {
+                                    // A typed target isn't a saved one, so
+                                    // nothing gets promoted in the ranking.
+                                    self.connecting_label = None;
                                     self.start_connect(&value);
                                 }
                             }
+                            ModalTarget::HostForm { editing } => {
+                                self.submit_host_form(&value, editing);
+                            }
+                            ModalTarget::HostDelete { .. } => {}
                             ModalTarget::Password => {
                                 if value.is_empty() {
                                     // An empty entry cancels the whole attempt.
@@ -1323,6 +1426,9 @@ impl FileBrowser {
                 self.modal = Modal::None;
                 true
             }
+            // Handled by the early return at the top of this function, which
+            // needs `&mut self` for the whole call and so can't sit in this match.
+            Modal::HostPicker(_) => true,
             Modal::None => true,
         }
     }
@@ -1331,6 +1437,128 @@ impl FileBrowser {
     /// connect runs in the background once the event loop starts.
     pub fn connect_on_start(&mut self, target: &str) {
         self.start_connect(target);
+    }
+
+    /// The free-text connect prompt, for a target that isn't saved.
+    fn prompt_manual_connect(&mut self) {
+        self.modal_target = Some(ModalTarget::Connect);
+        self.modal = Modal::Input(InputDialog::new(
+            "Connect to (sftp://[user@]host[:port][/path]):",
+            "sftp://host/path",
+        ));
+    }
+
+    /// Act on what the dialing directory decided.
+    fn apply_picker_outcome(&mut self, outcome: PickerOutcome) -> bool {
+        match outcome {
+            PickerOutcome::Continue => {}
+            PickerOutcome::Cancelled => self.modal = Modal::None,
+            PickerOutcome::Connect(url) => {
+                // Remember which entry this was so the ranking is updated only
+                // if the connection actually succeeds.
+                self.connecting_label = self
+                    .hosts
+                    .hosts()
+                    .iter()
+                    .find(|h| h.to_url() == url)
+                    .map(|h| h.label.clone());
+                self.modal = Modal::None;
+                self.start_connect(&url);
+            }
+            PickerOutcome::PromptManual => self.prompt_manual_connect(),
+            PickerOutcome::AddHost => {
+                self.modal_target = Some(ModalTarget::HostForm { editing: None });
+                self.modal = Modal::Input(
+                    InputDialog::new(HOST_FORM_PROMPT, "prod = sftp://juan@host:22/srv")
+                        .with_title("Add a saved host"),
+                );
+            }
+            PickerOutcome::EditHost(label) => {
+                let existing = self.hosts.find(&label).cloned();
+                let prefill = existing
+                    .as_ref()
+                    .map(|h| format!("{} = {}", h.label, h.to_url()))
+                    .unwrap_or_default();
+                self.modal_target = Some(ModalTarget::HostForm {
+                    editing: Some(label),
+                });
+                self.modal = Modal::Input(
+                    InputDialog::new(HOST_FORM_PROMPT, "")
+                        .with_title("Edit saved host")
+                        .with_default(prefill),
+                );
+            }
+            PickerOutcome::DeleteHost(label) => {
+                self.modal_target = Some(ModalTarget::HostDelete {
+                    label: label.clone(),
+                });
+                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    "Remove saved host '{}'? (the remote itself is untouched)",
+                    label
+                )));
+            }
+        }
+        true
+    }
+
+    /// Apply a submitted add/edit form.
+    ///
+    /// The form is one line — `label = url` — rather than a multi-field wizard:
+    /// `InputDialog` handles a single field, and the entry is short enough that
+    /// splitting it across prompts would be more ceremony than it saves.
+    fn submit_host_form(&mut self, value: &str, editing: Option<String>) {
+        let value = value.trim();
+        if value.is_empty() {
+            self.reopen_picker();
+            return;
+        }
+
+        let (label, url) = match value.split_once('=') {
+            Some((l, u)) => (l.trim().to_string(), u.trim().to_string()),
+            // No label given: name it after the host.
+            None => (String::new(), value.to_string()),
+        };
+
+        match SavedHost::from_url(&label, &url) {
+            Ok(mut host) => {
+                if host.label.is_empty() {
+                    host.label = host.host.clone();
+                }
+                // A rename replaces the old entry rather than leaving both.
+                if let Some(old) = editing {
+                    if old != host.label {
+                        self.hosts.remove(&old);
+                    }
+                }
+                self.hosts.upsert(host);
+                if let Err(e) = self.hosts.save() {
+                    self.modal_target = None;
+                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                        "Could not save the host list: {}",
+                        e
+                    )));
+                    return;
+                }
+                self.reopen_picker();
+            }
+            Err(e) => {
+                self.modal_target = None;
+                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    "Could not parse '{}': {}\n\nExpected: label = sftp://[user@]host[:port][/path]",
+                    url, e
+                )));
+            }
+        }
+    }
+
+    /// Return to the dialing directory after a management action.
+    fn reopen_picker(&mut self) {
+        self.modal_target = None;
+        self.modal = if self.hosts.is_empty() {
+            Modal::HostPicker(HostPicker::quick(&self.hosts))
+        } else {
+            Modal::HostPicker(HostPicker::full(&self.hosts))
+        };
     }
 
     /// Begin connecting to a remote host named by `target` (e.g.
@@ -1488,6 +1716,16 @@ impl FileBrowser {
                 let panel = target_panel.min(self.panels.len().saturating_sub(1));
                 self.panels[panel] = Panel::new_remote(source, home);
                 self.active = panel;
+
+                // Promote the saved host now that the connection actually
+                // worked. Doing it when the picker was dismissed would let a
+                // host that never connects climb the recent list.
+                if let Some(label) = self.connecting_label.take() {
+                    self.hosts.record_use(&label);
+                    if let Err(e) = self.hosts.save() {
+                        tracing::warn!(error = %e, "could not persist host usage");
+                    }
+                }
             }
             ConnectResult::NeedsCredential(target, creds, need) => {
                 self.prompt_for_credential(target, creds, need, target_panel);
@@ -1498,6 +1736,8 @@ impl FileBrowser {
                     msg
                 )));
                 self.pending_connect = None;
+                // A failed attempt must not promote the host in the ranking.
+                self.connecting_label = None;
             }
         }
     }

@@ -267,7 +267,7 @@ impl LatencyVfs {
         this
     }
 
-    fn build_level(&mut self, at: &PathBuf, depth: usize, dirs: usize, files: usize, size: u64) {
+    fn build_level(&mut self, at: &std::path::Path, depth: usize, dirs: usize, files: usize, size: u64) {
         for f in 0..files {
             let p = at.join(format!("file{}.bin", f));
             self.nodes.lock().unwrap().insert(

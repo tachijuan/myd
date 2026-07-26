@@ -4708,3 +4708,216 @@ async fn test_remote_sort_makes_no_backend_calls_at_all() {
     let _ = TreeMap::from_file_tree(&tree);
     SEALED.store(false, Ordering::SeqCst);
 }
+
+// ---------------------------------------------------------------------------
+// Dialing directory
+// ---------------------------------------------------------------------------
+
+/// Non-character keys for the picker tests.
+fn special_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+}
+
+/// A catalog with known contents, never touching the user's real hosts.toml.
+fn test_catalog() -> myd::hosts::HostCatalog {
+    use myd::hosts::SavedHost;
+    let mut hosts = Vec::new();
+    for (label, host, uses) in [
+        ("prod", "prod.example.com", 30u64),
+        ("backup", "10.0.0.5", 20),
+        ("scratch", "dev.local", 10),
+        ("france", "fr.example.com", 5),
+    ] {
+        let mut h = SavedHost::new(label, host);
+        h.uses = uses;
+        h.user = Some("juan".into());
+        hosts.push(h);
+    }
+    myd::hosts::HostCatalog::in_memory(hosts)
+}
+
+/// `gr` must open the saved-host picker, not the old free-text prompt.
+#[tokio::test]
+async fn gr_opens_the_dialing_directory() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('r'));
+
+    assert_eq!(app.modal_kind_for_test(), "host_picker");
+    // Ranked by use, so the most-used host is preselected.
+    assert_eq!(app.picker_selection_for_test().as_deref(), Some("prod"));
+    assert_eq!(
+        app.picker_visible_count_for_test(),
+        3,
+        "the quick view should offer the top three"
+    );
+}
+
+/// With nothing saved there is nothing to pick, so `gr` should go straight to
+/// the typed-address prompt rather than showing an empty list.
+#[tokio::test]
+async fn gr_with_an_empty_catalog_prompts_for_an_address() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::in_memory(vec![]));
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('r'));
+
+    assert_eq!(app.modal_kind_for_test(), "input");
+}
+
+/// `gs` opens the full list directly.
+#[tokio::test]
+async fn gs_opens_the_full_host_list() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+
+    assert_eq!(app.modal_kind_for_test(), "host_picker");
+    assert_eq!(app.picker_visible_count_for_test(), 4);
+}
+
+/// The picker owns j/k and `/` — they must navigate and search rather than
+/// reaching the global keybindings or the chord detector.
+#[tokio::test]
+async fn picker_vi_navigation_and_search_work_through_the_app() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+
+    // j moves the cursor (hosts are sorted by label in the full view).
+    let first = app.picker_selection_for_test().unwrap();
+    app.handle_key_for_test(char_key('j'));
+    assert_ne!(app.picker_selection_for_test().unwrap(), first);
+
+    // / filters incrementally, and the cursor maps back to the right host.
+    app.handle_key_for_test(char_key('/'));
+    for c in "fra".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    assert_eq!(app.picker_visible_count_for_test(), 1);
+    assert_eq!(app.picker_selection_for_test().as_deref(), Some("france"));
+
+    // Still the picker; none of those keys leaked into the file tree.
+    assert_eq!(app.modal_kind_for_test(), "host_picker");
+}
+
+/// Esc closes the picker without connecting.
+#[tokio::test]
+async fn esc_dismisses_the_picker() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('r'));
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Esc));
+
+    assert_eq!(app.modal_kind_for_test(), "none");
+    assert!(!app.is_connecting_for_test());
+}
+
+/// Adding a host goes through a form and lands in the catalog.
+#[tokio::test]
+async fn adding_a_host_stores_it_without_a_password() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::in_memory(vec![]));
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('a'));
+    assert_eq!(app.modal_kind_for_test(), "input");
+
+    for c in "edge = sftp://ops@edge.example.com:2222/srv".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Enter));
+
+    let saved = app.hosts_for_test().find("edge").expect("host not saved");
+    assert_eq!(saved.host, "edge.example.com");
+    assert_eq!(saved.port, Some(2222));
+    assert_eq!(saved.user.as_deref(), Some("ops"));
+    assert_eq!(saved.path.as_deref(), Some("/srv"));
+    // Back to the list so several can be added in a row.
+    assert_eq!(app.modal_kind_for_test(), "host_picker");
+}
+
+/// Deleting asks first, and removes only on confirmation.
+#[tokio::test]
+async fn deleting_a_host_requires_confirmation() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+    let doomed = app.picker_selection_for_test().unwrap();
+
+    app.handle_key_for_test(char_key('d'));
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+
+    // Decline: the host stays.
+    app.handle_key_for_test(char_key('n'));
+    assert!(app.hosts_for_test().find(&doomed).is_some());
+    assert_eq!(app.modal_kind_for_test(), "host_picker");
+
+    // Confirm: it goes.
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(char_key('y'));
+    assert!(app.hosts_for_test().find(&doomed).is_none());
+}
+
+/// A bad address is reported rather than silently dropped.
+#[tokio::test]
+async fn an_unparsable_host_form_reports_the_error() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::in_memory(vec![]));
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('a'));
+    for c in "bad = http://nope".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+    assert!(app.hosts_for_test().is_empty());
+}
+
+/// The picker must render at any terminal size without panicking.
+#[tokio::test]
+async fn picker_renders_at_realistic_sizes() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+
+    for (w, h) in [(120u16, 40u16), (80, 24), (40, 12), (20, 6)] {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_for_test(f)).unwrap();
+    }
+}
