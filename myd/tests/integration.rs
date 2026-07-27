@@ -8432,3 +8432,75 @@ fn a_malformed_config_is_never_seeded_over() {
         "and the file is left for the user to fix"
     );
 }
+
+#[tokio::test]
+async fn the_picker_accepts_a_tilde_path() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // `~/code` resolved to `/code`: stripping the `~` left an absolute
+    // remainder, and `PathBuf::push` *replaces* the buffer when given one, so
+    // the home prefix was discarded. Bare `~` still worked, which made this look
+    // like the shortcut had been partly removed.
+    //
+    // `HOME` is process-global and several other tests read it (the picker seeds
+    // from it, and `expand_tilde` consults it), so this runs under a mutex and
+    // restores the old value — including on a panic, via the guard, so one
+    // failure here cannot cascade into unrelated tests.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("code/untest")).unwrap();
+    let _env = HomeGuard::set(home.path());
+
+    let cfg = tempfile::tempdir().unwrap();
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(
+        &cfg.path().join("hosts.toml"),
+    ));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    for c in "~/code/untest".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.panel_current_dir(0),
+        Some(home.path().join("code/untest")),
+        "~/… must expand to the home directory, not the filesystem root"
+    );
+}
+
+/// Sets `HOME` for the duration of a test and restores it on drop.
+///
+/// Holds a process-wide lock: `set_var` is global, so two tests changing it at
+/// once would sabotage each other and anything else reading it. Restoring in
+/// `Drop` means a panicking test still leaves the environment as it found it.
+struct HomeGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeGuard {
+    fn set(home: &std::path::Path) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}

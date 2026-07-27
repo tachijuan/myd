@@ -949,13 +949,91 @@ impl super::ScreenState for DirPickerState {
     }
 }
 
+/// Expand a leading `~` to the user's home directory.
+///
+/// Only `~` alone and `~/…` expand. `~other` names another user's home, which
+/// this does not resolve — silently treating it as the *current* user's would
+/// open the wrong directory rather than reporting that it could not be found.
+///
+/// The remainder is joined manually rather than with `PathBuf::push`, which
+/// *replaces* the buffer when handed an absolute path: stripping `~` from
+/// `~/code` leaves `/code`, so pushing that discarded the home prefix entirely
+/// and the path resolved against the filesystem root.
 fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~") {
-        if let Some(home) = std::env::var_os("HOME") {
-            let mut p = PathBuf::from(home);
-            p.push(path.strip_prefix("~").unwrap_or(""));
-            return p;
-        }
+    let Some(rest) = path.strip_prefix('~') else {
+        return PathBuf::from(path);
+    };
+    // `~` or `~/…` only.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return PathBuf::from(path);
     }
-    PathBuf::from(path)
+    let Some(home) = std::env::var_os("HOME") else {
+        return PathBuf::from(path);
+    };
+    let home = PathBuf::from(home);
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `f` with `HOME` set to `home`, restoring it afterwards.
+    ///
+    /// `set_var` is process-global, so these run under one mutex rather than in
+    /// parallel — otherwise they would sabotage each other and any other test
+    /// that reads `HOME`.
+    fn with_home<T>(home: &str, f: impl FnOnce() -> T) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let out = f();
+        match previous {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        out
+    }
+
+    #[test]
+    fn tilde_expands_to_the_home_directory() {
+        // `PathBuf::push` *replaces* the buffer when given an absolute path, and
+        // stripping `~` from `~/code` leaves `/code` — so the home prefix was
+        // silently dropped and the path resolved against the filesystem root.
+        // Bare `~` still worked, which is why this looked like partial support.
+        with_home("/home/testuser", || {
+            assert_eq!(
+                expand_tilde("~/code"),
+                PathBuf::from("/home/testuser/code"),
+                "~/… must keep the home prefix"
+            );
+            assert_eq!(
+                expand_tilde("~/code/untest"),
+                PathBuf::from("/home/testuser/code/untest")
+            );
+            assert_eq!(expand_tilde("~"), PathBuf::from("/home/testuser"));
+            assert_eq!(expand_tilde("~/"), PathBuf::from("/home/testuser"));
+        });
+    }
+
+    #[test]
+    fn only_a_leading_tilde_path_segment_expands() {
+        with_home("/home/testuser", || {
+            // An absolute or relative path is untouched.
+            assert_eq!(expand_tilde("/etc"), PathBuf::from("/etc"));
+            assert_eq!(expand_tilde("code"), PathBuf::from("code"));
+            // A tilde inside the path is an ordinary character.
+            assert_eq!(expand_tilde("/tmp/~backup"), PathBuf::from("/tmp/~backup"));
+            // `~user` is another user's home, which this does not resolve — it
+            // must not be mistaken for the current user's.
+            assert_eq!(expand_tilde("~other/code"), PathBuf::from("~other/code"));
+        });
+    }
 }
