@@ -4881,8 +4881,19 @@ async fn gs_opens_the_full_host_list() {
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('s'));
 
-    assert_eq!(app.modal_kind_for_test(), "host_picker");
-    assert_eq!(app.picker_visible_count_for_test(), 4);
+    // `gs` opens the combined picker narrowed to hosts, rather than its own
+    // screen — the two lists were the same shape and answered the same question.
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => {
+            assert_eq!(p.scope(), myd::screen::PickerScope::HostsOnly);
+            assert_eq!(p.visible_count(), 4, "every saved host is listed");
+            assert!(
+                p.visible_options().iter().all(|o| o.is_host()),
+                "and only hosts"
+            );
+        }
+        _ => panic!("gs should open the picker"),
+    }
 }
 
 /// The picker owns j/k and `/` — they must navigate and search rather than
@@ -4896,22 +4907,42 @@ async fn picker_vi_navigation_and_search_work_through_the_app() {
 
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
 
-    // j moves the cursor (hosts are sorted by label in the full view).
-    let first = app.picker_selection_for_test().unwrap();
+    let label = |app: &FileBrowser| match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => {
+            p.selected().and_then(|o| o.host.as_ref()).map(|h| h.label.clone())
+        }
+        _ => None,
+    };
+
+    // j moves the cursor.
+    let first = label(&app).unwrap();
     app.handle_key_for_test(char_key('j'));
-    assert_ne!(app.picker_selection_for_test().unwrap(), first);
+    assert_ne!(label(&app).unwrap(), first);
 
     // / filters incrementally, and the cursor maps back to the right host.
+    // Browsing mirrored the row into the path field; one Backspace clears that
+    // (it was a suggestion, not typed) so `/` reads as search rather than as the
+    // start of an absolute path.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Backspace));
     app.handle_key_for_test(char_key('/'));
     for c in "fra".chars() {
         app.handle_key_for_test(char_key(c));
     }
-    assert_eq!(app.picker_visible_count_for_test(), 1);
-    assert_eq!(app.picker_selection_for_test().as_deref(), Some("france"));
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => {
+            assert_eq!(p.visible_count(), 1, "the search should narrow to one");
+        }
+        _ => panic!("expected the picker"),
+    }
+    assert_eq!(label(&app).as_deref(), Some("france"));
 
     // Still the picker; none of those keys leaked into the file tree.
-    assert_eq!(app.modal_kind_for_test(), "host_picker");
+    assert!(matches!(
+        app.current_screen(),
+        myd::screen::Screen::DirPicker(_)
+    ));
 }
 
 /// Esc closes the picker without connecting.
@@ -4940,9 +4971,12 @@ async fn adding_a_host_stores_it_without_a_password() {
 
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('s'));
+    // `a` needs the list focused; the path field starts focused.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
     app.handle_key_for_test(char_key('a'));
     assert_eq!(app.modal_kind_for_test(), "input");
 
+    // One prompt takes both kinds: a `label = sftp://…` line saves a host.
     for c in "edge = sftp://ops@edge.example.com:2222/srv".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -4954,7 +4988,11 @@ async fn adding_a_host_stores_it_without_a_password() {
     assert_eq!(saved.user.as_deref(), Some("ops"));
     assert_eq!(saved.path.as_deref(), Some("/srv"));
     // Back to the list so several can be added in a row.
-    assert_eq!(app.modal_kind_for_test(), "host_picker");
+    assert_eq!(app.modal_kind_for_test(), "none");
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "and still on the picker"
+    );
 }
 
 /// Deleting asks first, and removes only on confirmation.
@@ -4967,7 +5005,13 @@ async fn deleting_a_host_requires_confirmation() {
 
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('s'));
-    let doomed = app.picker_selection_for_test().unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    let doomed = match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => {
+            p.selected().and_then(|o| o.host.as_ref()).unwrap().label.clone()
+        }
+        _ => panic!("gs should open the picker"),
+    };
 
     app.handle_key_for_test(char_key('d'));
     assert_eq!(app.modal_kind_for_test(), "confirm");
@@ -4975,7 +5019,7 @@ async fn deleting_a_host_requires_confirmation() {
     // Decline: the host stays.
     app.handle_key_for_test(char_key('n'));
     assert!(app.hosts_for_test().find(&doomed).is_some());
-    assert_eq!(app.modal_kind_for_test(), "host_picker");
+    assert_eq!(app.modal_kind_for_test(), "none");
 
     // Confirm: it goes.
     app.handle_key_for_test(char_key('d'));
@@ -6973,10 +7017,48 @@ async fn typing_while_the_list_has_focus_returns_to_the_field() {
     ));
     assert_eq!(picker(&app).focus(), PickerFocus::List);
 
-    // `/` is not a list motion, so it starts a path.
-    type_str(&mut app, "/tm");
+    // A printable character that is not a list key starts a path. `/` is no
+    // longer such a character — it opens the search — so this uses `~`, which is
+    // how most typed paths begin anyway.
+    type_str(&mut app, "~/tm");
     assert_eq!(picker(&app).focus(), PickerFocus::Field);
-    assert_eq!(picker(&app).input_for_test(), "/tm");
+    assert_eq!(picker(&app).input_for_test(), "~/tm");
+}
+
+#[tokio::test]
+async fn slash_searches_the_list_rather_than_starting_a_path() {
+    use myd::screen::PickerFocus;
+
+    // `/` narrows the list, which is what it does everywhere else in the app.
+    // The path field is still reachable with Tab or any other character.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let all = picker(&app).visible_count();
+    assert!(all >= 3, "need a few rows to filter");
+
+    type_str(&mut app, "/alpha");
+    assert_eq!(
+        picker(&app).focus(),
+        PickerFocus::List,
+        "searching keeps the keyboard on the list"
+    );
+    assert_eq!(picker(&app).query(), "alpha");
+    assert!(
+        picker(&app).visible_count() < all,
+        "the list should have narrowed: {} of {}",
+        picker(&app).visible_count(),
+        all
+    );
+
+    // Esc abandons the search and restores the full list.
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(picker(&app).visible_count(), all, "Esc clears the filter");
 }
 
 #[tokio::test]

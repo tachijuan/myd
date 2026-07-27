@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.10.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.11.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -56,7 +56,13 @@ Move cursor to the parent directory.
 Prompt for a new root directory and navigate to it. The picker opens over the
 current view; \fBEsc\fR dismisses it and returns to where you were.
 .IP
-The picker has two halves: a path field and a list of directories.
+The picker lists local directories and saved remote hosts together, in two
+labelled sections \(em both answer "where do you want to go", and keeping two
+near-identical screens meant two places to fix every bug. \fBEnter\fR opens a
+directory or connects to a host, whichever the highlighted row is. \fBg s\fR
+opens the same list narrowed to hosts.
+.IP
+It has two halves: a path field and the list.
 \fBTab\fR moves the keyboard between them, and the focused one is outlined in
 cyan. With the field focused, type a path (\fB~\fR is expanded) and press
 \fBEnter\fR. With the list focused, \fBj\fR/\fBk\fR move through the
@@ -71,8 +77,11 @@ a subdirectory to a listed path.
 .IP
 Every directory opened through the picker is remembered, so a path typed once
 is a keystroke away afterwards. With the list focused, \fBa\fR prompts for a
-directory to keep and \fBd\fR forgets the highlighted one \(em the same keys
-the dialing directory uses.
+destination to keep \(em a path, or a \fBlabel = sftp://…\fR line to save a
+host \(em and \fBd\fR forgets the highlighted one. \fBe\fR edits a saved
+host's details, and \fB/\fR searches the whole list (\fBEsc\fR clears it).
+\fB/\fR only starts a search when the path field is empty, since that is also
+how most absolute paths begin.
 .IP
 Remembered directories are stored in the \fB[[favorite]]\fR section of
 \fB~/.config/myd/hosts.toml\fR beside the saved hosts, and shown in three

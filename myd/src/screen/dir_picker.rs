@@ -41,6 +41,22 @@ pub struct DirPickerState {
     input_is_suggestion: bool,
     /// Which half of the screen the keyboard drives.
     focus: PickerFocus,
+    /// Which kinds of row this picker lists.
+    scope: PickerScope,
+    /// Whether `/` has been pressed and typing is narrowing the list.
+    searching: bool,
+    /// Incremental search over the list, entered with `/`.
+    ///
+    /// Empty means "show everything". Kept separate from the path field: that
+    /// one is a destination you are composing, this one narrows what is on
+    /// screen, and conflating them made `/` ambiguous.
+    query: String,
+    /// Indices into `options` currently on screen, in display order.
+    ///
+    /// Filtering rewrites this rather than the list itself, so the cursor can
+    /// always be mapped back to the right row — acting on the wrong entry after
+    /// a search would be the obvious bug here.
+    visible: Vec<usize>,
     /// An in-progress `m` reorder: the path being moved and where it started, so
     /// Esc can put it back.
     ///
@@ -61,6 +77,8 @@ pub struct DirPickerState {
 pub enum PickerChoice {
     /// Open this directory.
     Open(PathBuf),
+    /// Connect to this remote target.
+    Connect(String),
     /// The typed path is not a directory, so nothing was opened.
     NotADirectory(PathBuf),
     /// Nothing typed and nothing to highlight.
@@ -88,6 +106,10 @@ pub enum FavoriteEdit {
     PromptAdd,
     /// Forget this path.
     Remove(PathBuf),
+    /// Open the form for this saved host.
+    EditHost(String),
+    /// Ask before forgetting this saved host.
+    DeleteHost(String),
     /// Pin this path to the bottom of the pinned block.
     Pin(PathBuf),
     /// Pin this path, then immediately begin moving it — `m` on an entry that
@@ -119,6 +141,55 @@ pub struct PickerOption {
     pub uses: u64,
     /// RFC 3339 last visit, or `None`. Drives the ordering.
     pub last_used: Option<String>,
+    /// A saved remote host, when this row is one.
+    ///
+    /// The picker lists local directories and saved hosts together, since both
+    /// answer "where do you want to go" and keeping two near-identical screens
+    /// meant two places to fix every bug. The kinds stay visually separate and a
+    /// few keys only apply to one of them, so the row has to know which it is.
+    pub host: Option<crate::hosts::SavedHost>,
+}
+
+impl PickerOption {
+    /// Whether this row is a saved remote host rather than a local directory.
+    pub fn is_host(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Which section this row is drawn under.
+    pub fn section(&self) -> PickerSection {
+        if self.is_host() {
+            PickerSection::Hosts
+        } else {
+            PickerSection::Directories
+        }
+    }
+
+    /// The text a search matches against: everything the row shows.
+    pub fn search_text(&self) -> String {
+        match &self.host {
+            Some(h) => format!("{} {} {}", h.label, h.to_url(), self.label),
+            None => format!("{} {}", self.label, self.path.display()),
+        }
+    }
+}
+
+/// The two groups the combined picker draws, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PickerSection {
+    Directories,
+    Hosts,
+}
+
+/// Which kinds of row the picker is showing.
+///
+/// `gd` opens on everything; `gs` opens filtered to hosts, so someone with many
+/// of both can still get straight to the remote list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickerScope {
+    #[default]
+    All,
+    HostsOnly,
 }
 
 impl Default for DirPickerState {
@@ -138,6 +209,43 @@ impl DirPickerState {
     /// actually use rises to the top whether or not it is one of the built-ins.
     /// A favourite that duplicates a built-in path replaces it rather than
     /// appearing twice.
+    /// Build the picker over an entire catalog: directories and saved hosts.
+    ///
+    /// `scope` decides which kinds are listed — `gd` shows everything, `gs`
+    /// shows only the hosts.
+    pub fn with_catalog(catalog: &crate::hosts::HostCatalog, scope: PickerScope) -> Self {
+        let mut picker = if scope == PickerScope::HostsOnly {
+            Self::with_favorites(&[])
+        } else {
+            Self::with_favorites(catalog.favorites())
+        };
+        if scope == PickerScope::HostsOnly {
+            // The synthesised working-directory row is a directory, so it has no
+            // place in a hosts-only view.
+            picker.options.clear();
+        }
+        picker.scope = scope;
+
+        // Hosts follow the directories, most recently connected first — the same
+        // ordering rule the directory tiers use.
+        for h in catalog.recent(usize::MAX) {
+            picker.options.push(PickerOption {
+                // A host's "path" is its URL, so every row still has one thing
+                // that identifies it and Enter has something to act on.
+                path: PathBuf::from(h.to_url()),
+                label: h.label.clone(),
+                is_favorite: true,
+                tier: crate::hosts::DirTier::Saved,
+                uses: h.uses,
+                last_used: h.last_used.clone(),
+                host: Some(h.clone()),
+            });
+        }
+        picker.cursor = 0;
+        picker.recompute_visible();
+        picker
+    }
+
     pub fn with_favorites(favorites: &[crate::hosts::SavedDir]) -> Self {
         // Every row comes from the catalog. The standard locations used to be a
         // separate hardcoded list merged in here, which made them look like
@@ -157,6 +265,7 @@ impl DirPickerState {
                 tier: f.tier(),
                 uses: f.uses,
                 last_used: f.last_used.clone(),
+                host: None,
             });
         }
         if cwd.is_dir() && !options.iter().any(|o| o.path == cwd) {
@@ -169,6 +278,7 @@ impl DirPickerState {
                 tier: crate::hosts::DirTier::Recent,
                 uses: 0,
                 last_used: None,
+                host: None,
             });
         }
 
@@ -219,7 +329,7 @@ impl DirPickerState {
         });
         let options: Vec<PickerOption> = indexed.into_iter().map(|(_, o)| o).collect();
 
-        Self {
+        let mut picker = Self {
             options,
             cursor: 0,
             input: String::new(),
@@ -228,9 +338,59 @@ impl DirPickerState {
             // The field starts focused: the picker exists to accept a path, and
             // the common directories are the shortcut, not the main event.
             focus: PickerFocus::Field,
+            scope: PickerScope::All,
+            searching: false,
+            query: String::new(),
+            visible: Vec::new(),
             moving: None,
             pending_edit: None,
+        };
+        // `visible` is what the cursor indexes and what render walks, so it has
+        // to be populated before the picker is handed out — an empty one leaves
+        // a list with rows that cannot be selected or drawn.
+        picker.recompute_visible();
+        picker
+    }
+
+    /// Rebuild the visible index list from the scope and the search query.
+    fn recompute_visible(&mut self) {
+        let query = self.query.to_lowercase();
+        self.visible = self
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| match self.scope {
+                PickerScope::All => true,
+                PickerScope::HostsOnly => o.is_host(),
+            })
+            .filter(|(_, o)| {
+                query.is_empty() || o.search_text().to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if self.cursor >= self.visible.len() {
+            self.cursor = self.visible.len().saturating_sub(1);
         }
+    }
+
+    /// Which kinds of row this picker is listing.
+    pub fn scope(&self) -> PickerScope {
+        self.scope
+    }
+
+    /// The active search query, for the title bar.
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Rows currently on screen, in display order.
+    pub fn visible_options(&self) -> Vec<&PickerOption> {
+        self.visible.iter().filter_map(|&i| self.options.get(i)).collect()
+    }
+
+    /// How many rows the filter is showing.
+    pub fn visible_count(&self) -> usize {
+        self.visible.len()
     }
 
     /// The reorder in progress, if any.
@@ -245,8 +405,13 @@ impl DirPickerState {
 
     /// The highlighted option, if any.
     pub fn selected(&self) -> Option<&PickerOption> {
-        self.options.get(self.cursor)
+        // `cursor` indexes the *visible* rows, so a search cannot leave it
+        // pointing at a row that is filtered out.
+        self.visible
+            .get(self.cursor)
+            .and_then(|&i| self.options.get(i))
     }
+
 
     /// Carry the keyboard state across a rebuild, so adding or removing a
     /// favourite does not dump the user back into the path field.
@@ -260,10 +425,14 @@ impl DirPickerState {
     /// Highlight the row for `path`, if it is still listed. Leaves the cursor
     /// alone otherwise, which is what happens to the row just removed.
     pub fn select_path(&mut self, path: &Path) {
-        if let Some(i) = self.options.iter().position(|o| o.path == path) {
+        if let Some(i) = self
+            .visible
+            .iter()
+            .position(|&i| self.options[i].path == path)
+        {
             self.cursor = i;
         } else {
-            self.cursor = self.cursor.min(self.options.len().saturating_sub(1));
+            self.cursor = self.cursor.min(self.visible.len().saturating_sub(1));
         }
     }
 
@@ -399,30 +568,30 @@ impl DirPickerState {
     /// Highlight option `index` and mirror it into the path field, so the field
     /// always shows what Enter would open.
     fn select(&mut self, index: usize) {
-        if self.options.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        self.cursor = index.min(self.options.len() - 1);
-        if let Some(opt) = self.options.get(self.cursor) {
+        self.cursor = index.min(self.visible.len() - 1);
+        if let Some(opt) = self.selected() {
             let shown = opt.path.to_string_lossy().to_string();
             self.set_suggestion(shown);
         }
     }
 
     fn select_next(&mut self) {
-        if self.options.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        let next = (self.cursor + 1) % self.options.len();
+        let next = (self.cursor + 1) % self.visible.len();
         self.select(next);
     }
 
     fn select_prev(&mut self) {
-        if self.options.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
         let prev = if self.cursor == 0 {
-            self.options.len() - 1
+            self.visible.len() - 1
         } else {
             self.cursor - 1
         };
@@ -434,7 +603,7 @@ impl DirPickerState {
     }
 
     fn select_last(&mut self) {
-        self.select(self.options.len().saturating_sub(1));
+        self.select(self.visible.len().saturating_sub(1));
     }
 
     /// Confirm the current selection.
@@ -453,7 +622,10 @@ impl DirPickerState {
         }
         // An empty field means "open what is highlighted", which is how Enter
         // picks an entry from the list.
-        match self.options.get(self.cursor) {
+        match self.selected() {
+            // A host row's Enter is a connect, not a directory open; the caller
+            // dispatches on the row's kind.
+            Some(opt) if opt.is_host() => PickerChoice::Connect(opt.path.to_string_lossy().to_string()),
             Some(opt) => PickerChoice::Open(opt.path.clone()),
             None => PickerChoice::Nothing,
         }
@@ -625,6 +797,51 @@ impl DirPickerState {
             return Some(self.handle_move_key(key.code));
         }
 
+        // While searching, printable keys narrow the list rather than doing
+        // whatever they normally would — otherwise typing "desktop" would fire
+        // `d` (delete), `e` (edit), `p` (pin) and the rest along the way.
+        if self.searching {
+            match key.code {
+                KeyCode::Char(c) => {
+                    self.query.push(c);
+                    self.recompute_visible();
+                    return Some(true);
+                }
+                KeyCode::Backspace => {
+                    // Backspacing past the start leaves search rather than
+                    // sitting in an empty prompt that swallows every key.
+                    if self.query.pop().is_none() {
+                        self.searching = false;
+                    }
+                    self.recompute_visible();
+                    return Some(true);
+                }
+                KeyCode::Esc => {
+                    // Abandon the search and show everything again.
+                    self.searching = false;
+                    self.query.clear();
+                    self.recompute_visible();
+                    return Some(true);
+                }
+                // Enter accepts the filter and hands the keys back, leaving the
+                // narrowed list in place to choose from.
+                KeyCode::Enter => {
+                    self.searching = false;
+                    return Some(true);
+                }
+                // Arrows still move, so a match can be picked without leaving.
+                KeyCode::Up => {
+                    self.select_prev();
+                    return Some(true);
+                }
+                KeyCode::Down => {
+                    self.select_next();
+                    return Some(true);
+                }
+                _ => return Some(true),
+            }
+        }
+
         if self.focus == PickerFocus::List {
             return match key.code {
                 // Text-editing keys mean the user wants the field, so hand it
@@ -659,6 +876,35 @@ impl DirPickerState {
                 }
                 KeyCode::Char('G') => {
                     self.select_last();
+                    Some(true)
+                }
+                // Incremental search over everything on screen — but only when
+                // the field is empty. Most typed paths start with `/`, and after
+                // browsing the list the field holds a suggestion the user is
+                // about to type over; hijacking that keystroke made absolute
+                // paths impossible to enter from the list.
+                //
+                // Only on an empty field. `/` is how nearly every absolute path
+                // starts, and browsing the list leaves a suggestion the user is
+                // usually about to type over — taking that keystroke would make
+                // "arrow to something nearby, then type the real path" impossible.
+                // From a suggestion, one Backspace clears the field (it was never
+                // typed) and `/` then searches.
+                KeyCode::Char('/') if self.input.is_empty() => {
+                    self.searching = true;
+                    self.query.clear();
+                    self.recompute_visible();
+                    Some(true)
+                }
+                // Edit a saved host's details. Directories have nothing to edit
+                // beyond their path, which `a` and `d` already cover.
+                KeyCode::Char('e') => {
+                    if let Some(opt) = self.selected() {
+                        if let Some(host) = &opt.host {
+                            self.pending_edit =
+                                Some(FavoriteEdit::EditHost(host.label.clone()));
+                        }
+                    }
                     Some(true)
                 }
                 // Pin the highlighted entry to the bottom of the pinned block,
@@ -711,8 +957,18 @@ impl DirPickerState {
                 }
                 KeyCode::Char('d') => {
                     if let Some(opt) = self.selected() {
-                        if opt.is_favorite {
-                            self.pending_edit = Some(FavoriteEdit::Remove(opt.path.clone()));
+                        match &opt.host {
+                            // Removing a host is destructive enough to confirm,
+                            // which the app does; a directory entry is only a
+                            // shortcut, so it goes immediately.
+                            Some(h) => {
+                                self.pending_edit =
+                                    Some(FavoriteEdit::DeleteHost(h.label.clone()))
+                            }
+                            None if opt.is_favorite => {
+                                self.pending_edit = Some(FavoriteEdit::Remove(opt.path.clone()))
+                            }
+                            None => {}
                         }
                     }
                     Some(true)
@@ -727,7 +983,13 @@ impl DirPickerState {
                     Some(true)
                 }
                 KeyCode::Backspace => {
-                    self.focus = PickerFocus::Field;
+                    // Clearing a suggestion is discarding text the user never
+                    // typed, so it is not the start of an edit and the keyboard
+                    // stays with the list. Backspacing over something they *did*
+                    // type is an edit, and hands the field back.
+                    if !self.input_is_suggestion {
+                        self.focus = PickerFocus::Field;
+                    }
                     self.input_backspace();
                     Some(true)
                 }
@@ -788,7 +1050,7 @@ impl super::ScreenState for DirPickerState {
 
         // Title.
         let title = Paragraph::new(Span::styled(
-            "Select a directory (Tab switches field/list, Esc to go back)",
+            "Go to (Tab switches field/list, Esc to go back)",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(title, vertical[0]);
@@ -858,72 +1120,100 @@ impl super::ScreenState for DirPickerState {
         );
         frame.render_widget(input_para, vertical[1]);
 
-        // Option list.
-        let lines: Text = self
-            .options
-            .iter()
-            .enumerate()
-            .map(|(i, opt)| {
-                // The marker says which tier a row is in, so it is obvious which
-                // rows `d` removes, `p` pins and `m` can reorder. A row being
-                // moved shows a grip instead, for live feedback.
-                let being_moved = self
-                    .moving
-                    .as_ref()
-                    .map(|m| m.path == opt.path)
-                    .unwrap_or(false);
-                let mark = if being_moved {
-                    "⠿ "
-                } else {
-                    match opt.tier {
-                        // Single-width glyphs only: an emoji pin renders two
-                        // columns wide and pushed pinned rows out of line with
-                        // the starred ones below them.
-                        crate::hosts::DirTier::Pinned => "▲ ",
-                        _ if opt.is_favorite => "★ ",
-                        _ => "  ",
-                    }
-                };
-                let count = if opt.uses > 0 {
-                    format!("  ({})", opt.uses)
-                } else {
-                    String::new()
-                };
-                let text = format!("{}{}{}", mark, opt.label, count);
-                if i == self.cursor {
-                    // Reversed only while the list is driving, so the highlight
-                    // marks "the keys move this" rather than just "last touched".
-                    let style = if field_focused {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::REVERSED)
-                    };
-                    Line::from(Span::styled(format!("> {}", text), style))
-                } else if being_moved {
-                    Line::from(Span::styled(
-                        format!("  {}", text),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                } else if opt.tier == crate::hosts::DirTier::Pinned {
-                    Line::from(Span::styled(
-                        format!("  {}", text),
-                        Style::default().fg(Color::Cyan),
-                    ))
-                } else if opt.is_favorite {
-                    Line::from(Span::styled(
-                        format!("  {}", text),
-                        Style::default().fg(Color::Green),
-                    ))
-                } else {
-                    Line::from(format!("  {}", text))
+        // Option list, drawn from the visible rows so a search shows only what
+        // it matched, with a header wherever the kind changes.
+        let mut rendered: Vec<Line> = Vec::new();
+        let mut last_section: Option<PickerSection> = None;
+        for (row, &oi) in self.visible.iter().enumerate() {
+            let opt = &self.options[oi];
+            let section = opt.section();
+            if last_section != Some(section) {
+                last_section = Some(section);
+                rendered.push(Line::from(Span::styled(
+                    match section {
+                        PickerSection::Directories => "  ── directories ──",
+                        PickerSection::Hosts => "  ── remote hosts ──",
+                    },
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            // The marker says which tier a row is in, so it is obvious which
+            // rows `d` removes, `p` pins and `m` can reorder. A row being moved
+            // shows a grip instead, for live feedback.
+            let being_moved = self
+                .moving
+                .as_ref()
+                .map(|m| m.path == opt.path)
+                .unwrap_or(false);
+            let mark = if being_moved {
+                "⠿ "
+            } else {
+                match opt.tier {
+                    // Single-width glyphs only: an emoji pin renders two columns
+                    // wide and pushed pinned rows out of line with starred ones.
+                    crate::hosts::DirTier::Pinned => "▲ ",
+                    _ if opt.is_favorite => "★ ",
+                    _ => "  ",
                 }
-            })
-            .collect();
+            };
+            let count = if opt.uses > 0 {
+                format!("  ({})", opt.uses)
+            } else {
+                String::new()
+            };
+            // A host shows where it actually goes, not just its label — two
+            // saved entries can easily carry the same short name.
+            let detail = match &opt.host {
+                Some(h) => format!("{}  {}", opt.label, h.to_url()),
+                None => opt.label.clone(),
+            };
+            let text = format!("{}{}{}", mark, detail, count);
+
+            rendered.push(if row == self.cursor {
+                // Reversed only while the list is driving, so the highlight marks
+                // "the keys move this" rather than just "last touched".
+                let style = if field_focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::REVERSED)
+                };
+                Line::from(Span::styled(format!("> {}", text), style))
+            } else if being_moved {
+                Line::from(Span::styled(
+                    format!("  {}", text),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else if opt.tier == crate::hosts::DirTier::Pinned {
+                Line::from(Span::styled(
+                    format!("  {}", text),
+                    Style::default().fg(Color::Cyan),
+                ))
+            } else if opt.is_favorite {
+                Line::from(Span::styled(
+                    format!("  {}", text),
+                    Style::default().fg(Color::Green),
+                ))
+            } else {
+                Line::from(format!("  {}", text))
+            });
+        }
+        if rendered.is_empty() {
+            rendered.push(Line::from(Span::styled(
+                if self.query.is_empty() {
+                    "  (nothing saved yet — type a path, or press a)".to_string()
+                } else {
+                    format!("  (nothing matches '{}')", self.query)
+                },
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let lines: Text = Text::from(rendered);
 
         let list = Paragraph::new(lines).block(
             Block::default()
@@ -938,11 +1228,15 @@ impl super::ScreenState for DirPickerState {
                 // navigate" unconditionally while the path field was swallowing
                 // both keys.
                 .title(if self.moving.is_some() {
-                    " Moving — j/k reposition · Enter confirm · Esc cancel "
+                    " Moving — j/k reposition · Enter confirm · Esc cancel ".to_string()
+                } else if self.searching {
+                    format!(" Search: {}_  ({} shown, Esc clears) ", self.query, self.visible.len())
+                } else if !self.query.is_empty() {
+                    format!(" Filtered: {}  ({} shown, / to change) ", self.query, self.visible.len())
                 } else if field_focused {
-                    " Directories (↑/↓, or Tab for j/k) "
+                    " Destinations (↑/↓, or Tab for j/k) ".to_string()
                 } else {
-                    " Directories (a save · d forget · p pin · u unpin · m move) "
+                    " a save · d forget · e edit · p pin · m move · / search ".to_string()
                 }),
         );
         frame.render_widget(list, vertical[2]);
