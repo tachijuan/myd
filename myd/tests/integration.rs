@@ -6768,6 +6768,17 @@ fn logging_initializes_and_writes_to_the_configured_file() {
 async fn picker_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
     let start = tempfile::tempdir().unwrap();
     let mut app = myd::app::FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    // An explicit catalog rather than the real one: these tests assert on list
+    // positions, and the machine's own home directory should not decide how many
+    // rows there are.
+    let cfg = tempfile::tempdir().unwrap();
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&cfg.path().join("hosts.toml"));
+    for name in ["alpha", "beta", "gamma"] {
+        let d = start.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        catalog.add_favorite(myd::hosts::SavedDir::saved(d.to_string_lossy().to_string()));
+    }
+    app.set_hosts_for_test(catalog);
     settle(&mut app).await;
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
@@ -7504,7 +7515,7 @@ async fn favorites_app() -> (tempfile::TempDir, tempfile::TempDir, FileBrowser) 
     // process-global and these tests run in parallel, so pointing the whole
     // process at one directory would make them trample each other.
     let cfg = tempfile::tempdir().unwrap();
-    let catalog = myd::hosts::HostCatalog::load_from(&cfg.path().join("hosts.toml"));
+    let catalog = myd::hosts::HostCatalog::load_from_unseeded(&cfg.path().join("hosts.toml"));
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("projects")).unwrap();
@@ -7680,7 +7691,7 @@ async fn a_visited_favourite_leads_the_picker_list() {
     let cfg = tempfile::tempdir().unwrap();
     let file = cfg.path().join("hosts.toml");
 
-    let mut catalog = myd::hosts::HostCatalog::load_from(&file);
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
     let stale = tempfile::tempdir().unwrap();
     let fresh = tempfile::tempdir().unwrap();
     catalog.add_favorite(myd::hosts::SavedDir {
@@ -7699,7 +7710,7 @@ async fn a_visited_favourite_leads_the_picker_list() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
-    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
     settle(&mut app).await;
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
@@ -7733,7 +7744,7 @@ async fn opening_a_saved_directory_records_a_visit() {
     let cfg = tempfile::tempdir().unwrap();
     let file = cfg.path().join("hosts.toml");
     let saved = tempfile::tempdir().unwrap();
-    let mut catalog = myd::hosts::HostCatalog::load_from(&file);
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
     catalog.add_favorite(myd::hosts::SavedDir::new(
         saved.path().to_string_lossy().to_string(),
     ));
@@ -7741,7 +7752,7 @@ async fn opening_a_saved_directory_records_a_visit() {
 
     let start = tempfile::tempdir().unwrap();
     let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
-    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
     settle(&mut app).await;
 
     app.handle_key_for_test(char_key('g'));
@@ -7882,7 +7893,22 @@ async fn arrows_keep_stepping_once_the_list_is_engaged() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     // The fix must not make Down idempotent: the second press has to advance.
-    let (_cfg, _dir, mut app) = favorites_app().await;
+    // `favorites_app` starts with an empty catalog, so seed a few rows to move
+    // between rather than depending on whatever the machine happens to have.
+    let (_cfg, dir, mut app) = favorites_app().await;
+    {
+        let mut catalog = app.hosts_for_test().clone();
+        for name in ["alpha", "beta", "gamma"] {
+            let d = dir.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            catalog.add_favorite(myd::hosts::SavedDir::saved(d.to_string_lossy().to_string()));
+        }
+        app.set_hosts_for_test(catalog);
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+
     let paths: Vec<std::path::PathBuf> = match app.current_screen() {
         myd::screen::Screen::DirPicker(s) => {
             s.options_for_test().iter().map(|o| o.path.clone()).collect()
@@ -8022,7 +8048,7 @@ async fn pin_app() -> (
     let file = cfg.path().join("hosts.toml");
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
 
-    let mut catalog = myd::hosts::HostCatalog::load_from(&file);
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
     for d in &dirs {
         catalog.add_favorite(myd::hosts::SavedDir::saved(
             d.path().to_string_lossy().to_string(),
@@ -8032,7 +8058,7 @@ async fn pin_app() -> (
 
     let start = tempfile::tempdir().unwrap();
     let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
-    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
     settle(&mut app).await;
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
@@ -8299,5 +8325,110 @@ async fn sliding_out_of_the_block_shows_the_change_before_it_is_committed() {
         app.hosts_for_test().pinned_dirs().len(),
         1,
         "committing after returning keeps it pinned"
+    );
+}
+
+#[tokio::test]
+async fn seeded_standard_directories_can_be_pinned_and_deleted() {
+    // The standard locations used to be a hardcoded list merged in at render
+    // time, so they looked like ordinary rows while `p`, `m` and `d` silently
+    // ignored them. They are seeded into the catalog now, which makes them
+    // ordinary rows in fact as well as in appearance.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let catalog = myd::hosts::HostCatalog::load_from(&file);
+    let seeded = catalog.favorites().len();
+    assert!(seeded > 0, "a fresh catalog seeds the standard locations");
+    assert!(
+        file.exists(),
+        "and writes them out, so the file matches what is shown"
+    );
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // Pin the first seeded row.
+    let first = match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => s.selected().unwrap().path.clone(),
+        _ => panic!("expected the picker"),
+    };
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(
+        pinned_paths(&app),
+        vec![first.to_string_lossy().to_string()],
+        "a standard location must be pinnable like any other entry"
+    );
+
+    // And deletable.
+    cursor_to(&mut app, &first);
+    app.handle_key_for_test(char_key('d'));
+    assert_eq!(
+        app.hosts_for_test().favorites().len(),
+        seeded - 1,
+        "and removable, which it never used to be"
+    );
+}
+
+#[test]
+fn seeding_leaves_an_existing_directory_list_alone() {
+    // Someone who already has directories saved has made choices; re-seeding
+    // over them would put back everything they deleted.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
+    catalog.add_favorite(myd::hosts::SavedDir::saved("/only/this"));
+    catalog.save().unwrap();
+
+    let reloaded = myd::hosts::HostCatalog::load_from(&file);
+    assert_eq!(
+        reloaded.favorites().len(),
+        1,
+        "an existing list is not topped up: {:?}",
+        reloaded.favorites()
+    );
+}
+
+#[test]
+fn a_host_only_config_gains_the_standard_directories() {
+    // The chosen rule: seed when there are no directory entries, even if the
+    // file exists. Otherwise anyone who had already saved a host would keep an
+    // un-pinnable list with no way to get the standard locations back.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    std::fs::write(
+        &file,
+        "[[host]]\nlabel = \"prod\"\nhost = \"prod.example.com\"\n",
+    )
+    .unwrap();
+
+    let catalog = myd::hosts::HostCatalog::load_from(&file);
+    assert_eq!(catalog.hosts().len(), 1, "the host survives");
+    assert!(
+        !catalog.favorites().is_empty(),
+        "and the directories are seeded alongside it"
+    );
+}
+
+#[test]
+fn a_malformed_config_is_never_seeded_over() {
+    // A file that does not parse holds something worth fixing. Seeding would
+    // overwrite the very content the warning tells the user to repair.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    std::fs::write(&file, "this is not valid toml {{{").unwrap();
+
+    let catalog = myd::hosts::HostCatalog::load_from(&file);
+    assert!(catalog.favorites().is_empty(), "nothing is seeded");
+    assert!(
+        std::fs::read_to_string(&file).unwrap().contains("not valid"),
+        "and the file is left for the user to fix"
     );
 }

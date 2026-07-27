@@ -220,6 +220,40 @@ pub enum DirTier {
     Recent,
 }
 
+/// The directories a fresh catalog starts with.
+///
+/// Seeded into the file rather than merged in at render time, so they are
+/// ordinary entries: pinnable, reorderable, and deletable like anything else.
+/// They used to be a separate hardcoded list, which meant `p` and `d` silently
+/// did nothing on them — the list looked uniform and did not behave that way.
+///
+/// The working directory is deliberately absent: it differs per launch, so an
+/// entry naming one particular directory would be wrong most of the time, and
+/// the app already starts there.
+pub fn seed_dirs() -> Vec<SavedDir> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut out = Vec::new();
+    let mut push = |path: PathBuf, label: &str| {
+        if path.is_dir() {
+            out.push(SavedDir {
+                path: path.to_string_lossy().to_string(),
+                label: Some(label.to_string()),
+                saved: true,
+                ..Default::default()
+            });
+        }
+    };
+    if let Some(home) = home {
+        push(home.clone(), "~ (Home)");
+        for name in ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"] {
+            push(home.join(name), name);
+        }
+    }
+    push(PathBuf::from("/"), "/ (Root)");
+    push(PathBuf::from("/tmp"), "/tmp");
+    out
+}
+
 /// How many automatically-recorded directories to keep.
 ///
 /// Enough that somewhere visited a few sessions ago is still one keystroke away,
@@ -285,21 +319,43 @@ impl HostCatalog {
     }
 
     pub fn load_from(path: &std::path::Path) -> Self {
-        let file = std::fs::read_to_string(path)
-            .ok()
+        let raw = std::fs::read_to_string(path).ok();
+        // A file that exists but does not parse is left strictly alone: the user
+        // has something in there worth fixing, and seeding over it would destroy
+        // the very content the warning is telling them to repair.
+        let mut malformed = false;
+        let file = raw
             .and_then(|s| match toml::from_str::<CatalogFile>(&s) {
                 Ok(f) => Some(f),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "ignoring malformed host catalog");
+                    malformed = true;
                     None
                 }
             })
             .unwrap_or_default();
-        Self {
+        let seeded = !malformed && file.favorites.is_empty();
+        let favorites = if seeded {
+            // A catalog with no directories yet — a first run, or a file that
+            // only ever held hosts. Seed the standard locations so every row in
+            // the picker is a real entry the user can pin, reorder or delete.
+            seed_dirs()
+        } else {
+            file.favorites
+        };
+        let catalog = Self {
             hosts: file.hosts,
-            favorites: file.favorites,
+            favorites,
             path: Some(path.to_path_buf()),
+        };
+        if seeded && !catalog.favorites.is_empty() {
+            // Write them out now, so the file the user edits matches the list
+            // they see rather than materialising only after some later change.
+            if let Err(e) = catalog.save() {
+                tracing::warn!(path = %path.display(), error = %e, "could not seed the catalog");
+            }
         }
+        catalog
     }
 
     /// An in-memory catalog that never persists. For tests.
@@ -308,6 +364,24 @@ impl HostCatalog {
             hosts,
             favorites: Vec::new(),
             path: None,
+        }
+    }
+
+    /// Load without seeding the standard locations.
+    ///
+    /// For tests that assert on the exact contents of a catalog and would
+    /// otherwise have to account for a dozen entries they did not put there.
+    pub fn load_from_unseeded(path: &std::path::Path) -> Self {
+        // Read the file directly: `load_from` would seed an absent or
+        // directory-less one, which is the behaviour this bypasses.
+        let file = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str::<CatalogFile>(&s).ok())
+            .unwrap_or_default();
+        Self {
+            hosts: file.hosts,
+            favorites: file.favorites,
+            path: Some(path.to_path_buf()),
         }
     }
 
@@ -818,6 +892,10 @@ mod tests {
         let path = dir.path().join("hosts.toml");
 
         let mut c = HostCatalog::load_from(&path);
+        // A fresh catalog is seeded with the standard locations; this test is
+        // about the two sections coexisting, so measure against that baseline
+        // rather than assuming an empty list.
+        let seeded = c.favorites().len();
         c.upsert(SavedHost::new("prod", "prod.example.com"));
         assert!(c.add_favorite(SavedDir::new("/home/juan/code")));
         c.save().unwrap();
@@ -829,17 +907,24 @@ mod tests {
         // Round-trip, change only the host side, and save again.
         let mut back = HostCatalog::load_from(&path);
         assert_eq!(back.hosts().len(), 1);
-        assert_eq!(back.favorites().len(), 1);
+        assert_eq!(
+            back.favorites().len(),
+            seeded + 1,
+            "a file that already has directories is not re-seeded"
+        );
         back.record_use("prod");
         back.save().unwrap();
 
         let after = HostCatalog::load_from(&path);
         assert_eq!(
             after.favorites().len(),
-            1,
+            seeded + 1,
             "saving a host change must not drop favourites"
         );
-        assert_eq!(after.favorites()[0].path, "/home/juan/code");
+        assert!(
+            after.favorites().iter().any(|f| f.path == "/home/juan/code"),
+            "the added directory survives"
+        );
     }
 
     #[test]
@@ -854,7 +939,16 @@ mod tests {
         .unwrap();
         let c = HostCatalog::load_from(&path);
         assert_eq!(c.hosts().len(), 1);
-        assert!(c.favorites().is_empty());
+        // A file with no directory entries gets the standard locations seeded,
+        // so the picker's rows are all real entries the user can act on.
+        assert!(
+            !c.favorites().is_empty(),
+            "a host-only file should be seeded with the standard directories"
+        );
+        assert!(
+            c.favorites().iter().all(|f| f.saved),
+            "seeded entries are saved, so history trimming never removes them"
+        );
     }
 
     #[test]
