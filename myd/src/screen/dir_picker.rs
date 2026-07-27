@@ -108,6 +108,8 @@ pub enum FavoriteEdit {
     Remove(PathBuf),
     /// Open the form for this saved host.
     EditHost(String),
+    /// Edit this saved directory's path.
+    EditDir(PathBuf),
     /// Ask before forgetting this saved host.
     DeleteHost(String),
     /// Pin this path to the bottom of the pinned block.
@@ -900,10 +902,16 @@ impl DirPickerState {
                 // beyond their path, which `a` and `d` already cover.
                 KeyCode::Char('e') => {
                     if let Some(opt) = self.selected() {
-                        if let Some(host) = &opt.host {
-                            self.pending_edit =
-                                Some(FavoriteEdit::EditHost(host.label.clone()));
-                        }
+                        self.pending_edit = match &opt.host {
+                            Some(host) => Some(FavoriteEdit::EditHost(host.label.clone())),
+                            // A saved directory is edited as its path, so a typo
+                            // or a moved directory can be corrected in place
+                            // rather than deleted and re-added.
+                            None if opt.is_favorite => {
+                                Some(FavoriteEdit::EditDir(opt.path.clone()))
+                            }
+                            None => None,
+                        };
                     }
                     Some(true)
                 }

@@ -145,7 +145,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("gd", "Go to — directories and saved hosts"),
                 ("  Tab", "  Switch the path field and the list"),
                 ("  a / d", "  Save a destination / forget the highlighted one"),
-                ("  e", "  Edit a saved host's details"),
+                ("  e", "  Edit the highlighted entry (path or host)"),
                 ("  /", "  Search the list (Esc clears)"),
                 ("  p / u", "  Pin to the top block / unpin"),
                 ("  m", "  Move an entry into place (Enter, Esc)"),

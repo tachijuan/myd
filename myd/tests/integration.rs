@@ -7696,16 +7696,23 @@ async fn a_prompts_for_a_directory_rather_than_saving_the_cursor_row() {
     }
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    let saved: Vec<String> = app
-        .hosts_for_test()
-        .favorites()
-        .iter()
-        .map(|f| f.path.clone())
-        .collect();
-    assert_eq!(
-        saved,
-        vec![target.to_string_lossy().to_string()],
-        "the typed path is saved, not the cursor row ({})",
+    // The panel's own starting directory is in the history (the user is there),
+    // so this checks that the *typed* path was saved and the cursor row was not.
+    let saved = app.hosts_for_test();
+    assert!(
+        saved
+            .favorites()
+            .iter()
+            .any(|f| f.path == target.to_string_lossy() && f.saved),
+        "the typed path should be saved: {:?}",
+        saved.favorites()
+    );
+    assert!(
+        !saved
+            .favorites()
+            .iter()
+            .any(|f| f.path == cursor_row.to_string_lossy() && f.saved),
+        "the cursor row ({}) must not have been saved",
         cursor_row.display()
     );
 
@@ -7730,8 +7737,12 @@ async fn saving_a_path_that_is_not_a_directory_is_refused() {
 
     assert_eq!(app.modal_kind_for_test(), "confirm", "should report the problem");
     assert!(
-        app.hosts_for_test().favorites().is_empty(),
-        "nothing should have been saved"
+        !app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == missing.to_string_lossy()),
+        "nothing should have been saved: {:?}",
+        app.hosts_for_test().favorites()
     );
 }
 
@@ -7767,12 +7778,19 @@ async fn d_forgets_a_saved_favourite() {
     app.handle_key_for_test(char_key('d'));
 
     assert!(
-        app.hosts_for_test().favorites().is_empty(),
+        !app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == target.to_string_lossy()),
         "the favourite should be gone: {:?}",
         app.hosts_for_test().favorites()
     );
     let body = std::fs::read_to_string(favorites_file(&cfg)).unwrap_or_default();
-    assert!(!body.contains("[[favorite]]"), "config should be empty: {}", body);
+    assert!(
+        !body.contains(&target.to_string_lossy().to_string()),
+        "the forgotten entry should be gone from the config: {}",
+        body
+    );
 }
 
 #[tokio::test]
@@ -7786,8 +7804,12 @@ async fn a_and_d_are_ordinary_characters_in_the_path_field() {
     match app.current_screen() {
         myd::screen::Screen::DirPicker(s) => {
             assert_eq!(s.input_for_test(), "/data");
+            // The starting directory is in the history, so check that nothing
+            // matching what was *typed* got saved.
             assert!(
-                s.options_for_test().iter().all(|o| !o.is_favorite),
+                !s.options_for_test()
+                    .iter()
+                    .any(|o| o.path.to_string_lossy() == "/data"),
                 "typing must not have saved anything"
             );
         }
@@ -7821,10 +7843,18 @@ async fn a_visited_favourite_leads_the_picker_list() {
     });
     catalog.save().unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    // Start the panel *in* the stale directory, so opening it is the most recent
+    // visit and the ordering under test is not decided by the fixture's own
+    // starting directory (every opened directory is recorded now).
+    let mut app = FileBrowser::new(Some(stale.path().to_path_buf()), None, false);
     app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
     settle(&mut app).await;
+    // …then re-point the fresh one at the top by recording it last.
+    {
+        let mut catalog = app.hosts_for_test().clone();
+        catalog.record_visit(&fresh.path().to_string_lossy());
+        app.set_hosts_for_test(catalog);
+    }
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
 
@@ -7877,9 +7907,11 @@ async fn opening_a_saved_directory_records_a_visit() {
     settle(&mut app).await;
 
     let after = app.hosts_for_test().favorites();
-    assert_eq!(after.len(), 1, "no new entries: {:?}", after);
-    assert_eq!(after[0].uses, 1, "the visit should be counted: {:?}", after);
-    assert!(after[0].last_used.is_some(), "and timestamped: {:?}", after);
+    let key = saved.path().to_string_lossy().to_string();
+    let matching: Vec<_> = after.iter().filter(|f| f.path == key).collect();
+    assert_eq!(matching.len(), 1, "not duplicated: {:?}", after);
+    assert_eq!(matching[0].uses, 1, "the visit should be counted: {:?}", after);
+    assert!(matching[0].last_used.is_some(), "and timestamped: {:?}", after);
 
     // It reached the file too.
     let body = std::fs::read_to_string(&file).unwrap();
@@ -7901,11 +7933,16 @@ async fn a_typed_path_is_remembered_for_next_time() {
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     settle(&mut app).await;
 
+    // The panel's own starting directory is recorded too, so find the one this
+    // test typed rather than assuming it is the only entry.
     let saved = app.hosts_for_test().favorites();
-    assert_eq!(saved.len(), 1, "the typed path should be remembered: {:?}", saved);
-    assert_eq!(saved[0].uses, 1);
+    let entry = saved
+        .iter()
+        .find(|f| f.path == target.to_string_lossy())
+        .unwrap_or_else(|| panic!("the typed path should be remembered: {:?}", saved));
+    assert_eq!(entry.uses, 1);
     assert!(
-        !saved[0].saved,
+        !entry.saved,
         "an automatically recorded path is history, not an explicit favourite"
     );
     assert!(
@@ -7964,9 +8001,11 @@ async fn saving_a_remembered_path_keeps_its_history() {
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     let saved = app.hosts_for_test().favorites();
-    assert_eq!(saved.len(), 1, "pinning must not duplicate: {:?}", saved);
-    assert!(saved[0].saved, "it should now be saved");
-    assert_eq!(saved[0].uses, 1, "and keep the visits it already had");
+    let key = target.to_string_lossy().to_string();
+    let matching: Vec<_> = saved.iter().filter(|f| f.path == key).collect();
+    assert_eq!(matching.len(), 1, "saving must not duplicate: {:?}", saved);
+    assert!(matching[0].saved, "it should now be saved");
+    assert_eq!(matching[0].uses, 1, "and keep the visits it already had");
 }
 
 #[tokio::test]
@@ -8094,9 +8133,14 @@ async fn a_nonexistent_typed_path_reports_an_error_and_keeps_the_field() {
         }
         _ => unreachable!(),
     }
-    // Nothing was recorded into the history either.
+    // The failed path was not recorded. (The panel's own starting directory is,
+    // since the user is there — so this checks for that path specifically
+    // rather than for an empty list.)
     assert!(
-        app.hosts_for_test().favorites().is_empty(),
+        !app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == missing.to_string_lossy()),
         "a failed open must not be remembered: {:?}",
         app.hosts_for_test().favorites()
     );
@@ -8257,9 +8301,11 @@ async fn u_unpins_but_keeps_the_entry() {
     cursor_to(&mut app, dirs[0].path());
     app.handle_key_for_test(char_key('u'));
     assert!(pinned_paths(&app).is_empty(), "no longer pinned");
-    assert_eq!(
-        app.hosts_for_test().favorites().len(),
-        3,
+    assert!(
+        app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == dirs[0].path().to_string_lossy()),
         "the entry itself survives unpinning"
     );
 }
@@ -8350,9 +8396,12 @@ async fn sliding_past_the_bottom_of_the_block_unpins() {
         !pinned.contains(&dirs[2].path().to_string_lossy().to_string()),
         "and it is the one that was slid out"
     );
-    assert_eq!(
-        app.hosts_for_test().favorites().len(),
-        3,
+    assert!(
+        dirs.iter().all(|d| app
+            .hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == d.path().to_string_lossy())),
         "unpinning by moving must not delete the entry"
     );
 }
@@ -8483,10 +8532,16 @@ async fn seeded_standard_directories_can_be_pinned_and_deleted() {
     // And deletable.
     cursor_to(&mut app, &first);
     app.handle_key_for_test(char_key('d'));
+    // One extra entry exists for the panel's own starting directory, recorded
+    // when it opened; the assertion is about the delta, not the total.
     assert_eq!(
-        app.hosts_for_test().favorites().len(),
-        seeded - 1,
-        "and removable, which it never used to be"
+        app.hosts_for_test()
+            .favorites()
+            .iter()
+            .filter(|f| f.path == first.to_string_lossy())
+            .count(),
+        0,
+        "the standard location should be removable, which it never used to be"
     );
 }
 
@@ -8902,5 +8957,170 @@ async fn o_on_a_remote_panel_refuses_rather_than_opening_a_local_path() {
         opener.opened(),
         "",
         "and the local file sharing that path must not have been opened"
+    );
+}
+
+#[tokio::test]
+async fn browsing_into_a_directory_records_it_in_the_history() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Only the picker's own confirm recorded visits, so a directory reached by
+    // pressing Enter in the tree — the ordinary way to move around — never
+    // entered the history and could not be found again from `gd`.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+
+    let mut app = FileBrowser::new(Some(root.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
+    settle(&mut app).await;
+
+    // Enter on the subdirectory, the same as browsing by hand.
+    for _ in 0..10 {
+        let on_dir = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s
+                .selected_path()
+                .map(|p| p.ends_with("alpha"))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if on_dir {
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+    assert_eq!(app.panel_current_dir(0), Some(root.path().join("alpha")));
+
+    assert!(
+        app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == root.path().join("alpha").to_string_lossy()),
+        "a directory reached by browsing must be remembered: {:?}",
+        app.hosts_for_test().favorites()
+    );
+    // And it reached the file, so the next session sees it.
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .contains("alpha"),
+        "the history must persist"
+    );
+}
+
+#[tokio::test]
+async fn e_edits_a_saved_directorys_path_in_place() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // `e` only opened the host form, so a directory entry could not be corrected
+    // at all — a typo or a moved directory meant deleting and re-adding, which
+    // throws away its visit history and its place in the pinned block.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let old_dir = tempfile::tempdir().unwrap();
+    let new_dir = tempfile::tempdir().unwrap();
+
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
+    catalog.add_favorite(myd::hosts::SavedDir::saved(
+        old_dir.path().to_string_lossy().to_string(),
+    ));
+    catalog.pin_dir(&old_dir.path().to_string_lossy());
+    catalog.record_visit(&old_dir.path().to_string_lossy());
+    catalog.save().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(special_key(KeyCode::Tab));
+    cursor_to(&mut app, old_dir.path());
+
+    app.handle_key_for_test(char_key('e'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "input",
+        "`e` should open an editable popup on a directory row"
+    );
+
+    // Replace the path with the new one.
+    for _ in 0..300 {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    for c in new_dir.path().to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let entry = app
+        .hosts_for_test()
+        .favorites()
+        .iter()
+        .find(|f| f.path == new_dir.path().to_string_lossy())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the path should have changed: {:?}",
+                app.hosts_for_test().favorites()
+            )
+        });
+    assert_eq!(entry.uses, 1, "the visit history is kept");
+    assert!(entry.is_pinned(), "and its place in the pinned block");
+    assert!(
+        !app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == old_dir.path().to_string_lossy()),
+        "the old path is gone, not duplicated"
+    );
+}
+
+#[tokio::test]
+async fn editing_a_directory_to_one_already_listed_is_refused() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Merging two entries silently would lose whichever history the user cared
+    // about, so this says so instead.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
+    for d in [&a, &b] {
+        catalog.add_favorite(myd::hosts::SavedDir::saved(
+            d.path().to_string_lossy().to_string(),
+        ));
+    }
+    catalog.save().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(special_key(KeyCode::Tab));
+    cursor_to(&mut app, a.path());
+
+    app.handle_key_for_test(char_key('e'));
+    for _ in 0..300 {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    for c in b.path().to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.modal_kind_for_test(), "confirm", "should say it is a duplicate");
+    assert!(
+        app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == a.path().to_string_lossy()),
+        "and leave the original alone"
     );
 }

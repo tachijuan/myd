@@ -119,6 +119,17 @@ impl Panel {
     /// Main screen. Returns `false` when a cancelled scan left this panel empty
     /// (nothing to fall back to).
     pub fn resolve_loading(&mut self) -> bool {
+        self.resolve_loading_reporting(&mut None)
+    }
+
+    /// As [`Self::resolve_loading`], reporting the directory that just opened.
+    ///
+    /// Every way of arriving somewhere — typing a path, picking from the list,
+    /// Enter in the tree, `gu`, a treemap tile — ends in a loading screen
+    /// resolving here. Recording the visit at this one seam is why browsing to a
+    /// directory now enters the history, which only the picker's own confirm
+    /// used to do.
+    pub fn resolve_loading_reporting(&mut self, opened: &mut Option<PathBuf>) -> bool {
         let prefs = self.view_prefs;
         let outcome = match self.screen_stack.last_mut() {
             Some(last) => last.poll_loading(),
@@ -127,6 +138,12 @@ impl Panel {
         match outcome {
             LoadingOutcome::Pending => true,
             LoadingOutcome::Done(path, tree) => {
+                // Only local directories are worth remembering: a remote path is
+                // meaningless without the connection it belongs to, and the saved
+                // host already records that.
+                if !tree.source.is_remote() {
+                    *opened = Some(path.clone());
+                }
                 let mut state = MainScreenState::from_tree(path, tree);
                 // Carry the panel's view preferences onto the new screen so
                 // entering a directory doesn't silently reset them.

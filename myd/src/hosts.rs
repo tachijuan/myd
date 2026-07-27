@@ -692,6 +692,35 @@ impl HostCatalog {
         })
     }
 
+    /// Change a saved directory's path, keeping everything else about it.
+    ///
+    /// The visit count, timestamp and position in the pinned block are the
+    /// entry's history; a correction to the path should not throw them away, as
+    /// deleting and re-adding would.
+    ///
+    /// Returns an error message when the new path is already saved — merging the
+    /// two entries silently would lose whichever history the user cared about.
+    pub fn rename_favorite(&mut self, from: &str, to: &str) -> Option<String> {
+        if from == to {
+            return None;
+        }
+        if self.favorites.iter().any(|f| f.path == to) {
+            return Some(format!("'{}' is already in the list.", to));
+        }
+        match self.favorites.iter_mut().find(|f| f.path == from) {
+            Some(entry) => {
+                entry.path = to.to_string();
+                // A label naming the old path would now be wrong; one the user
+                // chose is theirs to keep.
+                if entry.label.as_deref() == Some(from) {
+                    entry.label = None;
+                }
+                None
+            }
+            None => Some(format!("'{}' is no longer in the list.", from)),
+        }
+    }
+
     /// Forget a saved directory. Returns whether anything was removed.
     pub fn remove_favorite(&mut self, path: &str) -> bool {
         let before = self.favorites.len();
