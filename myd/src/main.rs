@@ -5,6 +5,12 @@ use myd::cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Diagnostics, when asked for via MYD_LOG / MYD_TRACE. Must happen here:
+    // without it no subscriber is installed and every tracing call in the app is
+    // a no-op, so `MYD_LOG=...` silently produced nothing. Output goes to a file
+    // (see `trace::trace_path`) because the TUI owns the terminal.
+    myd::trace::init();
+
     let cli = Cli::parse();
 
     // A leading `sftp://…` opens a remote panel; the left panel then falls back

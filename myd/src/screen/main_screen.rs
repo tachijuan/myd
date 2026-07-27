@@ -500,10 +500,14 @@ impl MainScreenState {
         }
     }
 
-    /// The directory a "create here" or "filter here" action targets: the
-    /// cursor line itself when it's a directory, otherwise its parent, falling
-    /// back to the pane root.
-    fn target_dir(&self) -> PathBuf {
+    /// The directory a "create here", "filter here", or "copy to here" action
+    /// targets: the cursor line itself when it's a directory, otherwise its
+    /// parent, falling back to the pane root.
+    ///
+    /// This is what the user means by "the current directory" — directories
+    /// expand in place, so the cursor routinely sits several levels below the
+    /// pane root while the root itself is no longer where anything is happening.
+    pub fn target_dir(&self) -> PathBuf {
         match self.tree.selected_line() {
             Some(line) if line.is_dir => line.resolved_path.clone(),
             Some(line) => line

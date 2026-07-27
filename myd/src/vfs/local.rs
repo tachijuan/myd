@@ -191,8 +191,20 @@ impl Vfs for LocalFs {
     async fn open_write(&self, path: &VPath, _len_hint: Option<u64>) -> Result<Box<dyn VWrite>> {
         // Create the parent so a transfer into a fresh subtree works, matching
         // the existing `copy_path` behavior.
+        //
+        // A failure is not returned: the directory may already exist, and the
+        // `File::create` below produces the better message either way. It is
+        // logged, though — an unwritable parent is the usual cause of the
+        // "permission denied" that follows, and silently dropping it left the
+        // real reason invisible.
         if let Some(parent) = path.path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                tracing::debug!(
+                    parent = %parent.display(),
+                    error = %e,
+                    "could not create the local destination directory"
+                );
+            }
         }
         let file = tokio::fs::File::create(&path.path)
             .await

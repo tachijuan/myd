@@ -624,7 +624,9 @@ impl FileBrowser {
             // plain delete, where the destination panel is the active one.
             let dest = self.copy_dest_panel;
             if let Some(panel) = self.panels.get_mut(dest) {
-                if let Some(dir) = panel.current_dir() {
+                // Reload where the entries actually landed, which is the cursor's
+                // directory — the same place `dest_dir` sent them.
+                if let Some(dir) = panel.dest_dir() {
                     if let Screen::Main(state) = panel.current_screen_mut() {
                         state.reload_dir_public(&dir);
                     }
@@ -2449,8 +2451,11 @@ impl FileBrowser {
 
         match self.other_index() {
             Some(other) => {
-                // Dual mode: copy into the other panel's current directory.
-                let Some(dest_dir) = self.panels[other].current_dir() else {
+                // Dual mode: copy into the directory the other panel's cursor is
+                // in. Not its root — a pane whose cursor is inside an expanded
+                // subdirectory would otherwise receive the copy several levels
+                // above where the user is looking.
+                let Some(dest_dir) = self.panels[other].dest_dir() else {
                     return;
                 };
                 let source = self.active;
@@ -2514,6 +2519,17 @@ impl FileBrowser {
             let is_dir = kinds.get(i).copied().unwrap_or(false);
             let src_vpath = VPath::new(src_backend, src);
             let dest_vpath = VPath::new(dest_backend, dest_dir.join(name));
+            // The resolved endpoints, logged before anything is queued: a transfer
+            // that writes somewhere unexpected is indistinguishable from one that
+            // fails to write, and this is the line that tells them apart.
+            tracing::debug!(
+                src = %src_vpath,
+                dest = %dest_vpath,
+                is_dir,
+                src_backend = src_backend.0,
+                dest_backend = dest_backend.0,
+                "queueing cross-backend transfer"
+            );
             // Total is unknown here; the worker re-stats the source and fills it
             // in, so the panel shows a real percentage once it starts.
             self.transfers.enqueue_kind(src_vpath, dest_vpath, 0, is_dir);
@@ -2628,7 +2644,8 @@ impl FileBrowser {
             ));
             return;
         };
-        let Some(dest_dir) = self.panels[other].current_dir() else {
+        // The cursor's directory, matching copy — see `Panel::dest_dir`.
+        let Some(dest_dir) = self.panels[other].dest_dir() else {
             return;
         };
 

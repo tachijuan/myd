@@ -752,3 +752,160 @@ sftp_test!(real_remote_directories_report_unknown_sizes, env, {
         }
     }
 });
+
+sftp_test!(download_from_left_remote_to_right_local_lands_in_the_right_pane, env, {
+    // Reproduces a user report: copying with the REMOTE in the left pane and the
+    // LOCAL in the right produced a permission error. That direction is a
+    // download, which writes to the local disk — the less-exercised direction.
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("l.txt"), "l").unwrap();
+    let mut app = myd::app::FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    assert_eq!(app.panel_count(), 2);
+    assert_eq!(app.active_panel_index(), 0, "left panel active at start");
+
+    // Put the remote in the LEFT pane (index 0), replacing the local dir there.
+    let target = format!(
+        "sftp://{}@{}:{}{}",
+        whoami(), env.host, env.port, env.remote_dir.display()
+    );
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote never opened in the left pane");
+
+    // Left pane is active and remote; right pane is local. Pick a real remote
+    // FILE to copy (skip the root row and any directory).
+    let name = {
+        let myd::screen::Screen::Main(state) = app.current_screen() else {
+            panic!("expected a main screen");
+        };
+        let line = state
+            .tree
+            .lines
+            .iter()
+            .find(|l| l.depth == 1 && !l.is_dir)
+            .expect("the harness dir should contain a file");
+        line.name.clone()
+    };
+    // Move the cursor onto that file.
+    for _ in 0..200 {
+        let on_it = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s
+                .tree
+                .selected_line()
+                .map(|l| l.name == name && !l.is_dir)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if on_it { break; }
+        app.handle_key_for_test(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    // Copy: left (remote, active) -> right (local).
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // Let the transfer queue run to completion.
+    for _ in 0..2000 {
+        app.tick_for_test();
+        if right.path().join(&name).exists() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let landed = right.path().join(&name);
+    // What actually went wrong, reported usefully: list where things ended up.
+    let right_listing: Vec<String> = std::fs::read_dir(right.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        landed.exists(),
+        "downloaded file should be in the RIGHT (local) pane at {}; \
+         right pane contains {:?}",
+        landed.display(),
+        right_listing
+    );
+    // And it must not have been written into the left pane's local dir, which is
+    // no longer even displayed.
+    assert!(
+        !left.path().join(&name).exists(),
+        "file was written to the left pane's old local directory {}",
+        left.path().display()
+    );
+});
+
+sftp_test!(a_download_into_an_unwritable_local_dir_reports_the_real_cause, env, {
+    // Diagnostic quality, not routing: when the local destination cannot be
+    // written, the reported error must name the permission problem and the path.
+    let fs = connect(&env).await;
+    let remote: Arc<dyn Vfs> = Arc::new(fs);
+    let local: Arc<dyn Vfs> = Arc::new(myd::vfs::LocalFs::new());
+
+    let dir = tempfile::tempdir().unwrap();
+    let ro = dir.path().join("readonly");
+    std::fs::create_dir_all(&ro).unwrap();
+    let mut perms = std::fs::metadata(&ro).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o555);
+    }
+    std::fs::set_permissions(&ro, perms).unwrap();
+
+    let progress = Arc::new(TransferProgress::new(0));
+    let outcome = run_transfer(TransferJob {
+        id: TransferId(1),
+        src_fs: remote,
+        dest_fs: local,
+        src: VPath::new(myd::vfs::BackendId(1), env.remote_dir.join("greeting.txt")),
+        dest: VPath::local(ro.join("greeting.txt")),
+        progress,
+        cancel: CancelToken::new(),
+        config: TransferConfig::default(),
+    })
+    .await;
+    let err = match outcome {
+        Err(e) => e,
+        Ok(_) => panic!("writing into a read-only directory must fail"),
+    };
+
+    let chain: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+    let text = chain.join(" | ");
+    assert!(
+        text.to_lowercase().contains("permission denied"),
+        "the cause must survive to the top-level error: {}",
+        text
+    );
+    assert!(
+        text.contains("greeting.txt"),
+        "the error must name the file it could not write: {}",
+        text
+    );
+
+    // Cleanup so the tempdir can be removed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+});

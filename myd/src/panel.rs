@@ -173,6 +173,21 @@ impl Panel {
         }
     }
 
+    /// Where a copy or move into this panel should land: the directory the
+    /// cursor is actually in, not the pane root.
+    ///
+    /// These differ whenever the user has expanded a subdirectory and moved into
+    /// it, which is most of the time. Using the root sent copies to a directory
+    /// the user was no longer looking at — and on a remote host that is often one
+    /// they cannot write to, so it surfaced as a confusing permission error
+    /// rather than as a misplaced file.
+    pub fn dest_dir(&self) -> Option<PathBuf> {
+        match self.current_screen() {
+            Screen::Main(state) => Some(state.target_dir()),
+            _ => None,
+        }
+    }
+
     /// The resolved (canonicalized) path currently selected in this panel's top
     /// Main screen — the source of a cross-panel copy.
     pub fn selected_resolved_path(&self) -> Option<PathBuf> {
