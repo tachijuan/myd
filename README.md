@@ -12,7 +12,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
 - **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
-- **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the current directory to a regex, masking everything that doesn't match.
+- **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
@@ -124,9 +124,9 @@ Tagged files are highlighted; `c`, `m` and `D` operate on the whole tagged set (
 | `/`       | Search names by regex (case-insensitive)   |
 | `n`       | Jump to the next match (down the tree)     |
 | `p`       | Jump to the previous match (up the tree)   |
-| `f`       | Filter the current directory by regex      |
+| `f`       | Filter the tree by regex                   |
 
-Search wraps around at the ends. Filtering masks non-matching entries in the cursor's directory; an empty pattern (or `Esc`) clears it.
+Search wraps around at the ends. Filtering hides non-matching entries at every level of the tree; an empty pattern (or `Esc`) clears it. Both are case-insensitive, and a pattern that isn't valid regex is reported instead of being silently ignored.
 
 ### View
 
@@ -282,7 +282,7 @@ Large copies and deletes show a progress overlay with an item-by-item count and 
 
 Press **`/`** to search entry names with a regular expression (case-insensitive). The cursor jumps to the first match; **`n`** and **`p`** then step to the next and previous matches, wrapping around at the ends.
 
-Press **`f`** to *filter* the cursor's current directory: enter a regex and only the entries whose names match remain visible. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing.
+Press **`f`** to *filter* the tree: enter a regex and only entries whose names match remain visible, at every level. A directory is kept when something beneath it matches, so matching files stay reachable. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing.
 
 ## Dual-Panel Mode
 

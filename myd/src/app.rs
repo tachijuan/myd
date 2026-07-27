@@ -1962,12 +1962,26 @@ impl FileBrowser {
                             }
                             ModalTarget::Search => {
                                 if !value.is_empty() {
-                                    self.active_panel_mut().current_screen_mut().search(&value);
+                                    let failure = self
+                                        .active_panel_mut()
+                                        .current_screen_mut()
+                                        .search(&value);
+                                    if let Some(msg) = failure {
+                                        self.modal =
+                                            Modal::Confirm(ConfirmDialog::new(msg));
+                                    }
                                 }
                             }
                             ModalTarget::Filter => {
-                                // Empty pattern clears the filter (handled downstream).
-                                self.active_panel_mut().current_screen_mut().filter(&value);
+                                // Empty pattern clears the filter (handled downstream);
+                                // a malformed one says so rather than doing nothing.
+                                let failure = self
+                                    .active_panel_mut()
+                                    .current_screen_mut()
+                                    .filter(&value);
+                                if let Some(msg) = failure {
+                                    self.modal = Modal::Confirm(ConfirmDialog::new(msg));
+                                }
                             }
                             ModalTarget::CreateDir => {
                                 let failure = self

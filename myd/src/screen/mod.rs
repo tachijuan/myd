@@ -252,7 +252,8 @@ pub trait ScreenState {
     fn toggle_times(&mut self) -> bool { true }
     fn collapse_all(&mut self) -> bool { true }
     fn expand_all(&mut self) -> bool { true }
-    fn search(&mut self, _pattern: &str) -> bool { true }
+    /// Jump to a match; returns an error message to surface, or `None`.
+    fn search(&mut self, _pattern: &str) -> Option<String> { None }
     fn toggle_view(&mut self) -> bool { true }
     fn render(&mut self, frame: &mut Frame, area: Rect);
 }
@@ -413,17 +414,18 @@ impl Screen {
             Screen::Loading(_) => true,
         }
     }
-    pub fn search(&mut self, pattern: &str) -> bool {
+    pub fn search(&mut self, pattern: &str) -> Option<String> {
         match self {
             Screen::DirPicker(s) => s.search(pattern),
             Screen::Main(s) => s.search(pattern),
-            Screen::Loading(_) => true,
+            Screen::Loading(_) => None,
         }
     }
-    pub fn filter(&mut self, pattern: &str) -> bool {
+    /// Filter the cursor's directory; returns an error message to surface.
+    pub fn filter(&mut self, pattern: &str) -> Option<String> {
         match self {
             Screen::Main(s) => s.filter(pattern),
-            _ => true,
+            _ => None,
         }
     }
     /// Create a directory; returns an error message to surface, or `None`.

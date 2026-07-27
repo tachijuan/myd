@@ -513,10 +513,13 @@ pub struct FileTree {
     /// Visual-mode anchor: `Some(cursor_index)` while `V` is active. Motion keys
     /// then tag every line between the anchor and the cursor.
     visual_anchor: Option<usize>,
-    /// Active regex filter as `(directory, pattern)`. Only entries whose parent
-    /// is `directory` and whose name fails to match are hidden; other levels are
-    /// untouched. Applied as a retain step in `reflatten`.
-    filter: Option<(PathBuf, regex::Regex)>,
+    /// Active name filter, applied to the whole tree as a retain step in
+    /// `reflatten`.
+    ///
+    /// It used to be scoped to one directory, which meant that filtering with the
+    /// cursor inside an expanded subdirectory left every other level untouched —
+    /// indistinguishable from the filter not working at all.
+    filter: Option<regex::Regex>,
     /// Where this tree's data comes from: the local filesystem, or a remote
     /// backend. Local trees behave exactly as before; a remote tree routes every
     /// listing and size query through its backend.
@@ -743,15 +746,30 @@ impl FileTree {
     /// directory itself, and entries in other directories are always kept, so
     /// the mask stays scoped to the one level the user filtered.
     fn apply_filter(&mut self) {
-        if let Some((ref dir, ref re)) = self.filter {
-            self.lines.retain(|line| {
-                if line.resolved_path.parent() == Some(dir.as_path()) {
-                    re.is_match(&line.name)
-                } else {
-                    true
+        let Some(re) = self.filter.clone() else {
+            return;
+        };
+
+        // A directory is kept when it matches *or* when something beneath it does,
+        // otherwise a matching file would be hidden along with its parent and
+        // become unreachable. Ancestors are collected first, then one retain pass
+        // keeps matches, their ancestors, and the root.
+        let mut keep: HashSet<PathBuf> = HashSet::new();
+        for line in &self.lines {
+            if line.depth > 0 && re.is_match(&line.name) {
+                let mut p = line.path.as_path();
+                while let Some(parent) = p.parent() {
+                    if !keep.insert(parent.to_path_buf()) {
+                        break; // this ancestor chain is already recorded
+                    }
+                    p = parent;
                 }
-            });
+            }
         }
+
+        self.lines.retain(|line| {
+            line.depth == 0 || re.is_match(&line.name) || keep.contains(&line.path)
+        });
     }
 
     /// Recompute cached render data (sizes, sibling totals, expanded status).
@@ -1069,9 +1087,14 @@ impl FileTree {
 
     /// Apply a regex filter scoped to `dir`; only entries directly under `dir`
     /// whose names match survive. Replaces any previous filter.
-    pub fn set_filter(&mut self, dir: PathBuf, re: regex::Regex) {
-        self.filter = Some((dir, re));
+    pub fn set_filter(&mut self, re: regex::Regex) {
+        self.filter = Some(re);
         self.reflatten();
+    }
+
+    /// The active filter's pattern, for the title bar and for tests.
+    pub fn filter_pattern(&self) -> Option<&str> {
+        self.filter.as_ref().map(|re| re.as_str())
     }
 
     /// Clear the active filter, restoring the full view.
@@ -1834,7 +1857,7 @@ mod tests {
         assert_eq!(before, 4); // root + 3
 
         let re = regex::Regex::new(r"\.log$").unwrap();
-        tree.set_filter(tree.root.resolved_path.clone(), re);
+        tree.set_filter(re);
         // root + 2 matching = 3
         assert_eq!(tree.lines.len(), 3);
         assert!(tree.lines.iter().all(|l| l.depth == 0 || l.name.ends_with(".log")));
