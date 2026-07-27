@@ -176,10 +176,48 @@ pub struct SavedDir {
     /// automatically from a typed path.
     ///
     /// History is convenience — it should not accumulate forever, and it is
-    /// trimmed to the most recent [`MAX_HISTORY`]. An explicitly saved favourite
-    /// is a decision and is never trimmed, so the two have to be told apart.
+    /// trimmed to the most recent [`MAX_HISTORY`]. A saved entry is a decision
+    /// and is never trimmed, so the two have to be told apart.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pinned: bool,
+    pub saved: bool,
+    /// Position in the pinned block, which sits above everything else in an
+    /// order the user controls rather than one recency decides.
+    ///
+    /// `None` for the great majority of entries. Stored as an explicit rank so
+    /// the order survives a reload; the ranks are renumbered on every change, so
+    /// they stay dense and a hand-edited file with gaps or duplicates still
+    /// produces a sensible order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_rank: Option<u32>,
+}
+
+impl SavedDir {
+    /// Whether this entry sits in the pinned block.
+    pub fn is_pinned(&self) -> bool {
+        self.pin_rank.is_some()
+    }
+
+    /// Which tier this entry belongs to, for display and ordering.
+    pub fn tier(&self) -> DirTier {
+        if self.is_pinned() {
+            DirTier::Pinned
+        } else if self.saved {
+            DirTier::Saved
+        } else {
+            DirTier::Recent
+        }
+    }
+}
+
+/// The three groups the picker shows, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DirTier {
+    /// Pinned to the top, in the user's own order.
+    Pinned,
+    /// Explicitly saved, never trimmed, ordered by recency.
+    Saved,
+    /// Automatically remembered, trimmed to [`MAX_HISTORY`].
+    Recent,
 }
 
 /// How many automatically-recorded directories to keep.
@@ -198,10 +236,10 @@ impl SavedDir {
     }
 
     /// A directory the user explicitly asked to keep.
-    pub fn pinned(path: impl Into<String>) -> Self {
+    pub fn saved(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            pinned: true,
+            saved: true,
             ..Default::default()
         }
     }
@@ -418,10 +456,10 @@ impl HostCatalog {
         // pinning the same place typed a different way (a symlinked route, or
         // macOS's `/tmp` vs `/private/tmp`) must promote that entry rather than
         // add a second one for the same directory.
-        let pin = dir.pinned;
+        let want_saved = dir.saved;
         if let Some(existing) = self.find_dir_mut(&dir.path) {
-            if pin && !existing.pinned {
-                existing.pinned = true;
+            if want_saved && !existing.saved {
+                existing.saved = true;
                 return true;
             }
             return false;
@@ -451,12 +489,98 @@ impl HostCatalog {
         self.trim_history();
     }
 
+    /// Entries in the pinned block, in the user's chosen order.
+    pub fn pinned_dirs(&self) -> Vec<&SavedDir> {
+        let mut v: Vec<&SavedDir> = self.favorites.iter().filter(|f| f.is_pinned()).collect();
+        v.sort_by_key(|f| f.pin_rank.unwrap_or(u32::MAX));
+        v
+    }
+
+    /// Pin `path` to the bottom of the pinned block.
+    ///
+    /// A new pin goes below the existing ones rather than on top: the block is
+    /// an order the user arranged, and inserting into the middle of it uninvited
+    /// would disturb that. Returns false when it is already pinned or unknown.
+    pub fn pin_dir(&mut self, path: &str) -> bool {
+        let next = self
+            .favorites
+            .iter()
+            .filter_map(|f| f.pin_rank)
+            .max()
+            .map(|r| r + 1)
+            .unwrap_or(0);
+        let Some(entry) = self.find_dir_mut(path) else {
+            return false;
+        };
+        if entry.is_pinned() {
+            return false;
+        }
+        entry.pin_rank = Some(next);
+        // Pinning is at least as deliberate as saving, so it implies it — an
+        // entry the user arranged by hand must not be trimmed as history.
+        entry.saved = true;
+        self.renumber_pins();
+        true
+    }
+
+    /// Remove `path` from the pinned block, leaving it as a saved entry.
+    pub fn unpin_dir(&mut self, path: &str) -> bool {
+        let Some(entry) = self.find_dir_mut(path) else {
+            return false;
+        };
+        if !entry.is_pinned() {
+            return false;
+        }
+        entry.pin_rank = None;
+        self.renumber_pins();
+        true
+    }
+
+    /// Move a pinned entry to `index` within the pinned block.
+    ///
+    /// Returns false when the path is not pinned. An index past the end lands it
+    /// last rather than failing, so a caller can clamp loosely.
+    pub fn move_pin_to(&mut self, path: &str, index: usize) -> bool {
+        let mut order: Vec<String> = self.pinned_dirs().iter().map(|f| f.path.clone()).collect();
+        let Some(from) = order.iter().position(|p| p == path) else {
+            return false;
+        };
+        let entry = order.remove(from);
+        let to = index.min(order.len());
+        order.insert(to, entry);
+        self.apply_pin_order(&order);
+        true
+    }
+
+    /// Set the pinned block's order from a list of paths.
+    pub fn apply_pin_order(&mut self, order: &[String]) {
+        for (rank, path) in order.iter().enumerate() {
+            if let Some(f) = self.favorites.iter_mut().find(|f| &f.path == path) {
+                f.pin_rank = Some(rank as u32);
+            }
+        }
+        self.renumber_pins();
+    }
+
+    /// Renumber pin ranks to 0..n in their current order.
+    ///
+    /// Keeps the ranks dense after any change, so a hand-edited file with gaps
+    /// or duplicate ranks still yields a stable, sensible order.
+    fn renumber_pins(&mut self) {
+        let order: Vec<String> = self.pinned_dirs().iter().map(|f| f.path.clone()).collect();
+        for (rank, path) in order.iter().enumerate() {
+            if let Some(f) = self.favorites.iter_mut().find(|f| &f.path == path) {
+                f.pin_rank = Some(rank as u32);
+            }
+        }
+    }
+
     /// Drop the oldest automatically-recorded entries beyond [`MAX_HISTORY`].
     fn trim_history(&mut self) {
         let mut unpinned: Vec<(String, String)> = self
             .favorites
             .iter()
-            .filter(|f| !f.pinned)
+            .filter(|f| !f.saved && !f.is_pinned())
             .map(|f| {
                 (
                     f.path.clone(),
@@ -475,7 +599,7 @@ impl HostCatalog {
             .map(|(p, _)| p)
             .collect();
         self.favorites
-            .retain(|f| f.pinned || !doomed.contains(&f.path));
+            .retain(|f| f.saved || f.is_pinned() || !doomed.contains(&f.path));
     }
 
     /// The entry for `path`, matching canonical forms as well as literal ones.
@@ -766,7 +890,94 @@ mod tests {
     }
 
     #[test]
-    fn pinning_an_existing_history_entry_promotes_it() {
+    fn a_new_pin_goes_below_the_existing_ones() {
+        // The block is an order the user arranged; a new pin must not barge into
+        // the middle of it.
+        let mut c = HostCatalog::in_memory_dirs(vec![
+            SavedDir::saved("/a"),
+            SavedDir::saved("/b"),
+            SavedDir::saved("/c"),
+        ]);
+        assert!(c.pin_dir("/a"));
+        assert!(c.pin_dir("/b"));
+        assert!(c.pin_dir("/c"));
+        let order: Vec<&str> = c.pinned_dirs().iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(order, vec!["/a", "/b", "/c"]);
+        assert!(!c.pin_dir("/a"), "pinning twice reports nothing done");
+    }
+
+    #[test]
+    fn pinning_implies_saving_so_it_is_never_trimmed() {
+        let mut c = HostCatalog::in_memory_dirs(vec![]);
+        c.record_visit("/history");
+        assert!(!c.favorites()[0].saved);
+        assert!(c.pin_dir("/history"));
+        assert!(
+            c.favorites()[0].saved,
+            "an entry arranged by hand must survive history trimming"
+        );
+    }
+
+    #[test]
+    fn moving_a_pin_reorders_within_the_block() {
+        let mut c = HostCatalog::in_memory_dirs(vec![
+            SavedDir::saved("/a"),
+            SavedDir::saved("/b"),
+            SavedDir::saved("/c"),
+        ]);
+        for p in ["/a", "/b", "/c"] {
+            c.pin_dir(p);
+        }
+        // Send the first entry to the end.
+        assert!(c.move_pin_to("/a", 2));
+        let order: Vec<&str> = c.pinned_dirs().iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(order, vec!["/b", "/c", "/a"]);
+
+        // And back to the top.
+        assert!(c.move_pin_to("/a", 0));
+        let order: Vec<&str> = c.pinned_dirs().iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(order, vec!["/a", "/b", "/c"]);
+
+        // An index past the end clamps rather than failing.
+        assert!(c.move_pin_to("/a", 99));
+        assert_eq!(c.pinned_dirs().last().unwrap().path, "/a");
+        assert!(!c.move_pin_to("/not-pinned", 0));
+    }
+
+    #[test]
+    fn unpinning_keeps_the_entry_as_a_saved_one() {
+        let mut c = HostCatalog::in_memory_dirs(vec![SavedDir::saved("/a")]);
+        c.pin_dir("/a");
+        assert!(c.unpin_dir("/a"));
+        assert!(c.pinned_dirs().is_empty());
+        assert_eq!(c.favorites().len(), 1, "the entry itself survives");
+        assert!(c.favorites()[0].saved, "and stays saved, not demoted to history");
+        assert!(!c.unpin_dir("/a"), "unpinning twice reports nothing done");
+    }
+
+    #[test]
+    fn pin_ranks_stay_dense_and_survive_a_round_trip() {
+        // A hand-edited file can have gaps or duplicate ranks; the order must
+        // still be stable and the ranks renumbered on the next change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.toml");
+        let mut c = HostCatalog::load_from(&path);
+        for p in ["/a", "/b", "/c"] {
+            c.add_favorite(SavedDir::saved(p));
+            c.pin_dir(p);
+        }
+        c.move_pin_to("/c", 0);
+        c.save().unwrap();
+
+        let back = HostCatalog::load_from(&path);
+        let order: Vec<&str> = back.pinned_dirs().iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(order, vec!["/c", "/a", "/b"], "order survives a reload");
+        let ranks: Vec<u32> = back.pinned_dirs().iter().filter_map(|f| f.pin_rank).collect();
+        assert_eq!(ranks, vec![0, 1, 2], "ranks are dense");
+    }
+
+    #[test]
+    fn saving_an_existing_history_entry_promotes_it() {
         // `a` on somewhere history already recorded should promote that entry,
         // keeping its visit count, rather than adding a second one.
         let d = tempfile::tempdir().unwrap();
@@ -774,26 +985,26 @@ mod tests {
         let mut c = HostCatalog::in_memory_dirs(vec![]);
         c.record_visit(&p);
         assert_eq!(c.favorites().len(), 1);
-        assert!(!c.favorites()[0].pinned, "a visit is history, not a favourite");
+        assert!(!c.favorites()[0].saved, "a visit is history, not a favourite");
 
-        assert!(c.add_favorite(SavedDir::pinned(p)), "pinning reports a change");
+        assert!(c.add_favorite(SavedDir::saved(p)), "saving reports a change");
         assert_eq!(c.favorites().len(), 1, "and does not duplicate");
-        assert!(c.favorites()[0].pinned);
+        assert!(c.favorites()[0].saved);
         assert_eq!(c.favorites()[0].uses, 1, "history is kept");
     }
 
     #[test]
-    fn history_is_capped_but_pinned_entries_are_never_trimmed() {
+    fn history_is_capped_but_saved_entries_are_never_trimmed() {
         let mut c = HostCatalog::in_memory_dirs(vec![]);
-        c.add_favorite(SavedDir::pinned("/pinned"));
+        c.add_favorite(SavedDir::saved("/kept"));
         // More automatic entries than the cap allows.
         for i in 0..(MAX_HISTORY + 8) {
             c.record_visit(&format!("/auto/{:03}", i));
         }
-        let unpinned = c.favorites().iter().filter(|f| !f.pinned).count();
+        let unpinned = c.favorites().iter().filter(|f| !f.saved).count();
         assert_eq!(unpinned, MAX_HISTORY, "history is trimmed to the cap");
         assert!(
-            c.favorites().iter().any(|f| f.path == "/pinned"),
+            c.favorites().iter().any(|f| f.path == "/kept"),
             "an explicitly saved entry survives trimming"
         );
         // The oldest automatic entries are the ones dropped.

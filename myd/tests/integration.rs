@@ -7587,7 +7587,7 @@ async fn a_prompts_for_a_directory_rather_than_saving_the_cursor_row() {
 
     let body = std::fs::read_to_string(favorites_file(&cfg)).unwrap();
     assert!(body.contains("[[favorite]]"), "config: {}", body);
-    assert!(body.contains("pinned = true"), "an explicit save is pinned: {}", body);
+    assert!(body.contains("saved = true"), "an explicit save is marked: {}", body);
 }
 
 #[tokio::test]
@@ -7781,7 +7781,7 @@ async fn a_typed_path_is_remembered_for_next_time() {
     assert_eq!(saved.len(), 1, "the typed path should be remembered: {:?}", saved);
     assert_eq!(saved[0].uses, 1);
     assert!(
-        !saved[0].pinned,
+        !saved[0].saved,
         "an automatically recorded path is history, not an explicit favourite"
     );
     assert!(
@@ -7809,7 +7809,7 @@ async fn a_typed_path_is_remembered_for_next_time() {
 }
 
 #[tokio::test]
-async fn pinning_a_remembered_path_keeps_its_history() {
+async fn saving_a_remembered_path_keeps_its_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     // Saving something history already recorded should promote that entry, not
@@ -7841,7 +7841,7 @@ async fn pinning_a_remembered_path_keeps_its_history() {
 
     let saved = app.hosts_for_test().favorites();
     assert_eq!(saved.len(), 1, "pinning must not duplicate: {:?}", saved);
-    assert!(saved[0].pinned, "it should now be pinned");
+    assert!(saved[0].saved, "it should now be saved");
     assert_eq!(saved[0].uses, 1, "and keep the visits it already had");
 }
 
@@ -7977,7 +7977,7 @@ async fn confirming_with_an_empty_field_opens_the_highlighted_entry() {
     // Seed a favourite so the highlighted entry is a directory we control.
     {
         let mut catalog = app.hosts_for_test().clone();
-        catalog.add_favorite(myd::hosts::SavedDir::pinned(
+        catalog.add_favorite(myd::hosts::SavedDir::saved(
             dir.path().to_string_lossy().to_string(),
         ));
         app.set_hosts_for_test(catalog);
@@ -8006,4 +8006,234 @@ async fn confirming_with_an_empty_field_opens_the_highlighted_entry() {
         }
         _ => unreachable!(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned directories: a top block in an order the user arranges.
+// ---------------------------------------------------------------------------
+
+/// A picker over three saved directories, none pinned yet.
+async fn pin_app() -> (
+    tempfile::TempDir,
+    Vec<tempfile::TempDir>,
+    FileBrowser,
+) {
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    let mut catalog = myd::hosts::HostCatalog::load_from(&file);
+    for d in &dirs {
+        catalog.add_favorite(myd::hosts::SavedDir::saved(
+            d.path().to_string_lossy().to_string(),
+        ));
+    }
+    catalog.save().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    // `cfg` is returned so the catalog file outlives the test body; dropping it
+    // here would delete the directory the app is still saving into.
+    (cfg, dirs, app)
+}
+
+/// Paths in the pinned block, in display order.
+fn pinned_paths(app: &FileBrowser) -> Vec<String> {
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => s
+            .options_for_test()
+            .iter()
+            .filter(|o| o.tier == myd::hosts::DirTier::Pinned)
+            .map(|o| o.path.to_string_lossy().to_string())
+            .collect(),
+        _ => panic!("expected the picker"),
+    }
+}
+
+/// Move the cursor onto `path`.
+fn cursor_to(app: &mut FileBrowser, path: &std::path::Path) {
+    for _ in 0..30 {
+        let on = match app.current_screen() {
+            myd::screen::Screen::DirPicker(s) => {
+                s.selected().map(|o| o.path == path).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if on {
+            return;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    panic!("never reached {}", path.display());
+}
+
+#[tokio::test]
+async fn p_pins_to_the_bottom_of_the_pinned_block() {
+    // A new pin goes below the existing ones: the block is an order the user
+    // arranged, and barging into the middle of it would disturb that.
+    let (_cfg, dirs, mut app) = pin_app().await;
+
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        app.handle_key_for_test(char_key('p'));
+    }
+
+    assert_eq!(
+        pinned_paths(&app),
+        dirs.iter()
+            .map(|d| d.path().to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "pins accumulate in the order they were made"
+    );
+    // Pinned entries lead the list.
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            let tiers: Vec<myd::hosts::DirTier> =
+                s.options_for_test().iter().map(|o| o.tier).collect();
+            assert!(
+                tiers.windows(2).all(|w| w[0] <= w[1]),
+                "tiers must be grouped, pinned first: {:?}",
+                tiers
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn u_unpins_but_keeps_the_entry() {
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(pinned_paths(&app).len(), 1);
+
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('u'));
+    assert!(pinned_paths(&app).is_empty(), "no longer pinned");
+    assert_eq!(
+        app.hosts_for_test().favorites().len(),
+        3,
+        "the entry itself survives unpinning"
+    );
+}
+
+#[tokio::test]
+async fn m_reorders_within_the_pinned_block_and_enter_commits() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        app.handle_key_for_test(char_key('p'));
+    }
+    let before = pinned_paths(&app);
+
+    // Move the first entry down one.
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('m'));
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(s) if s.moving().is_some()),
+        "m should start a move"
+    );
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let after = pinned_paths(&app);
+    assert_eq!(
+        after,
+        vec![before[1].clone(), before[0].clone(), before[2].clone()],
+        "the moved entry swapped with the one below it"
+    );
+    // And it persisted.
+    let reloaded: Vec<String> = app
+        .hosts_for_test()
+        .pinned_dirs()
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    assert_eq!(reloaded, after, "the new order must be saved");
+}
+
+#[tokio::test]
+async fn esc_restores_the_original_position() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // A cancelled move must put the entry back exactly where it started, not
+    // merely stop moving it.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        app.handle_key_for_test(char_key('p'));
+    }
+    let before = pinned_paths(&app);
+
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('m'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(pinned_paths(&app), before, "Esc restores the original order");
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(s) if s.moving().is_none()),
+        "and ends the move"
+    );
+}
+
+#[tokio::test]
+async fn sliding_past_the_bottom_of_the_block_unpins() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        app.handle_key_for_test(char_key('p'));
+    }
+    assert_eq!(pinned_paths(&app).len(), 3);
+
+    // Take the last pinned entry one step further down, out of the block.
+    cursor_to(&mut app, dirs[2].path());
+    app.handle_key_for_test(char_key('m'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let pinned = pinned_paths(&app);
+    assert_eq!(pinned.len(), 2, "the entry left the block: {:?}", pinned);
+    assert!(
+        !pinned.contains(&dirs[2].path().to_string_lossy().to_string()),
+        "and it is the one that was slid out"
+    );
+    assert_eq!(
+        app.hosts_for_test().favorites().len(),
+        3,
+        "unpinning by moving must not delete the entry"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_order_survives_a_reload() {
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        app.handle_key_for_test(char_key('p'));
+    }
+    let order = pinned_paths(&app);
+
+    // Rebuild a picker from the saved catalog, as a fresh session would.
+    let rebuilt = myd::screen::DirPickerState::with_favorites(app.hosts_for_test().favorites());
+    let seen: Vec<String> = rebuilt
+        .options_for_test()
+        .iter()
+        .filter(|o| o.tier == myd::hosts::DirTier::Pinned)
+        .map(|o| o.path.to_string_lossy().to_string())
+        .collect();
+    assert_eq!(seen, order, "the arranged order must survive a reload");
 }
