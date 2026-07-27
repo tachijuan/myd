@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.9.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.9.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -85,8 +85,12 @@ so the places you actually use rise to the top.
 the block is an order you arranged, so a new pin does not barge into the middle
 of it \(em and \fBu\fR takes it out again, keeping the entry. \fBm\fR starts a
 reorder: \fBj\fR/\fBk\fR (or the arrows) reposition the entry, \fBEnter\fR
-confirms and \fBEsc\fR puts it back where it started. Sliding an entry past the
-bottom of the block unpins it.
+confirms and \fBEsc\fR puts it back where it started. \fBm\fR on an entry that
+is not yet pinned pins it first, so positioning something never needs two keys.
+.IP
+Sliding an entry one step past the bottom of the block takes it out: the row's
+marker changes as it leaves, so what \fBEnter\fR will do is visible before it
+is committed, and \fBk\fR brings it back in.
 .IP
 Automatically remembered directories are trimmed to the most recent twenty.
 Anything saved with \fBa\fR or pinned with \fBp\fR is never trimmed.

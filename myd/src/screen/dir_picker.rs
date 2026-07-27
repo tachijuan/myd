@@ -90,6 +90,9 @@ pub enum FavoriteEdit {
     Remove(PathBuf),
     /// Pin this path to the bottom of the pinned block.
     Pin(PathBuf),
+    /// Pin this path, then immediately begin moving it — `m` on an entry that
+    /// is not yet in the pinned block.
+    PinAndMove(PathBuf),
     /// Remove this path from the pinned block, keeping it saved.
     Unpin(PathBuf),
     /// Commit a reorder: the pinned block's new order, and any path that was
@@ -470,6 +473,21 @@ impl DirPickerState {
         }
     }
 
+    /// Begin reordering `path`, which must already be in the pinned block.
+    ///
+    /// Public counterpart of [`Self::begin_move`], for the app to call after it
+    /// has pinned an entry and rebuilt the list.
+    pub fn start_move(&mut self, path: &Path) {
+        if self
+            .options
+            .iter()
+            .any(|o| o.path == path && o.tier == crate::hosts::DirTier::Pinned)
+        {
+            self.focus = PickerFocus::List;
+            self.begin_move(path.to_path_buf());
+        }
+    }
+
     /// Begin reordering `path` within the pinned block.
     fn begin_move(&mut self, path: PathBuf) {
         let original: Vec<String> = self
@@ -500,29 +518,33 @@ impl DirPickerState {
         };
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
-                let last = self.pinned_count().saturating_sub(1);
-                if self.cursor >= last {
-                    // Sliding past the bottom of the block takes the entry out of
-                    // it, which is how a move doubles as an unpin.
+                let last_pinned = self.pinned_count().saturating_sub(1);
+                if self.cursor < last_pinned {
+                    self.swap_rows(self.cursor, self.cursor + 1);
+                    self.cursor += 1;
+                } else if !state.unpinning && self.cursor < self.options.len() - 1 {
+                    // One step past the bottom of the block takes the entry out
+                    // of it — a move doubles as an unpin. The row's tier changes
+                    // with it, so the marker and colour show what will happen
+                    // before Enter commits to it.
                     if let Some(m) = self.moving.as_mut() {
                         m.unpinning = true;
                     }
-                    self.cursor = (self.cursor + 1).min(self.options.len().saturating_sub(1));
-                } else {
-                    self.swap_rows(self.cursor, self.cursor + 1);
-                    self.cursor += 1;
+                    if let Some(row) = self.options.get_mut(self.cursor) {
+                        row.tier = crate::hosts::DirTier::Saved;
+                    }
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(m) = self.moving.as_mut() {
-                    if m.unpinning {
-                        // Back into the block.
+                if state.unpinning {
+                    // Back into the block it just left.
+                    if let Some(m) = self.moving.as_mut() {
                         m.unpinning = false;
-                        self.cursor = self.pinned_count().saturating_sub(1);
-                        return true;
                     }
-                }
-                if self.cursor > 0 {
+                    if let Some(row) = self.options.get_mut(self.cursor) {
+                        row.tier = crate::hosts::DirTier::Pinned;
+                    }
+                } else if self.cursor > 0 {
                     self.swap_rows(self.cursor - 1, self.cursor);
                     self.cursor -= 1;
                 }
@@ -671,12 +693,26 @@ impl DirPickerState {
                     }
                     Some(true)
                 }
-                // Start a reorder. Only a pinned entry has an order to change.
+                // Start a reorder.
+                //
+                // Only the pinned block has an order to arrange, so `m` on an
+                // entry outside it pins that entry first and moves the new pin.
+                // Requiring `p` beforehand made `m` do nothing at all on most
+                // rows, with no feedback to say why — "move this" is a clear
+                // enough request to act on.
                 KeyCode::Char('m') => {
-                    if let Some(opt) = self.selected() {
-                        if opt.tier == crate::hosts::DirTier::Pinned {
-                            self.begin_move(opt.path.clone());
+                    match self.selected() {
+                        Some(opt) if opt.tier == crate::hosts::DirTier::Pinned => {
+                            let path = opt.path.clone();
+                            self.begin_move(path);
                         }
+                        // A built-in location has nothing saved to pin; `a` adds
+                        // it first. Everything else can be pinned in place.
+                        Some(opt) if opt.is_favorite => {
+                            let path = opt.path.clone();
+                            self.pending_edit = Some(FavoriteEdit::PinAndMove(path));
+                        }
+                        _ => {}
                     }
                     Some(true)
                 }
