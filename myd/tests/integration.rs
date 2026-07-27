@@ -7521,49 +7521,108 @@ fn focus_list(app: &mut FileBrowser) {
 }
 
 #[tokio::test]
-async fn a_saves_the_highlighted_directory_as_a_favourite() {
-    let (cfg, _dir, mut app) = favorites_app().await;
+async fn a_prompts_for_a_directory_rather_than_saving_the_cursor_row() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // `a` used to bookmark whatever the cursor happened to be on, which is
+    // rarely the directory the user wants to save — the point is to name a new
+    // place. It now opens a prompt.
+    let (cfg, dir, mut app) = favorites_app().await;
+    let target = dir.path().join("projects");
     focus_list(&mut app);
 
-    let before = picker_rows(&app);
-    assert!(
-        before.iter().all(|r| r.starts_with(' ')),
-        "nothing should be a favourite yet: {:?}",
-        before
-    );
-    let target = match app.current_screen() {
+    let cursor_row = match app.current_screen() {
         myd::screen::Screen::DirPicker(s) => s.selected().unwrap().path.clone(),
         _ => unreachable!(),
     };
 
     app.handle_key_for_test(char_key('a'));
-
-    let after = picker_rows(&app);
-    assert!(
-        after.iter().any(|r| r == &format!("*{}", target.display())),
-        "the highlighted directory should be starred: {:?}",
-        after
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "input",
+        "`a` must ask which directory to save"
     );
 
-    // And it reached the same file the host picker uses.
+    // Type a path that is *not* the highlighted row.
+    for c in target.to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let saved: Vec<String> = app
+        .hosts_for_test()
+        .favorites()
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    assert_eq!(
+        saved,
+        vec![target.to_string_lossy().to_string()],
+        "the typed path is saved, not the cursor row ({})",
+        cursor_row.display()
+    );
+
     let body = std::fs::read_to_string(favorites_file(&cfg)).unwrap();
     assert!(body.contains("[[favorite]]"), "config: {}", body);
-    assert!(body.contains(&target.to_string_lossy().to_string()), "config: {}", body);
+    assert!(body.contains("pinned = true"), "an explicit save is pinned: {}", body);
+}
+
+#[tokio::test]
+async fn saving_a_path_that_is_not_a_directory_is_refused() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (_cfg, dir, mut app) = favorites_app().await;
+    focus_list(&mut app);
+    app.handle_key_for_test(char_key('a'));
+
+    let missing = dir.path().join("does-not-exist");
+    for c in missing.to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.modal_kind_for_test(), "confirm", "should report the problem");
+    assert!(
+        app.hosts_for_test().favorites().is_empty(),
+        "nothing should have been saved"
+    );
 }
 
 #[tokio::test]
 async fn d_forgets_a_saved_favourite() {
-    let (cfg, _dir, mut app) = favorites_app().await;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (cfg, dir, mut app) = favorites_app().await;
+    let target = dir.path().join("projects");
+
+    // Save one through the prompt.
     focus_list(&mut app);
     app.handle_key_for_test(char_key('a'));
+    for c in target.to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(picker_rows(&app).iter().any(|r| r.starts_with('*')));
 
-    // The cursor stays on the row it just starred, so `d` removes that one.
+    // Put the cursor on it and forget it.
+    for _ in 0..15 {
+        let on = match app.current_screen() {
+            myd::screen::Screen::DirPicker(s) => {
+                s.selected().map(|o| o.path == target).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if on {
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
     app.handle_key_for_test(char_key('d'));
+
     assert!(
-        picker_rows(&app).iter().all(|r| r.starts_with(' ')),
+        app.hosts_for_test().favorites().is_empty(),
         "the favourite should be gone: {:?}",
-        picker_rows(&app)
+        app.hosts_for_test().favorites()
     );
     let body = std::fs::read_to_string(favorites_file(&cfg)).unwrap_or_default();
     assert!(!body.contains("[[favorite]]"), "config should be empty: {}", body);
@@ -7678,4 +7737,87 @@ async fn opening_a_saved_directory_records_a_visit() {
     // It reached the file too.
     let body = std::fs::read_to_string(&file).unwrap();
     assert!(body.contains("last_used"), "visit not persisted: {}", body);
+}
+
+#[tokio::test]
+async fn a_typed_path_is_remembered_for_next_time() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Typing a full path is the slow way in; doing it once should be enough.
+    // Opening a directory records it, so it is one keystroke away afterwards.
+    let (cfg, dir, mut app) = favorites_app().await;
+    let target = dir.path().join("projects");
+
+    for c in target.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+
+    let saved = app.hosts_for_test().favorites();
+    assert_eq!(saved.len(), 1, "the typed path should be remembered: {:?}", saved);
+    assert_eq!(saved[0].uses, 1);
+    assert!(
+        !saved[0].pinned,
+        "an automatically recorded path is history, not an explicit favourite"
+    );
+    assert!(
+        std::fs::read_to_string(favorites_file(&cfg))
+            .unwrap()
+            .contains("[[favorite]]"),
+        "history must persist"
+    );
+
+    // It now appears in the picker, at the top since it is the most recent.
+    // `gd` needs a settled Main screen underneath to push the picker over.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "gd should have opened the picker"
+    );
+    let rows = picker_rows(&app);
+    assert_eq!(
+        rows.first().map(String::as_str),
+        Some(format!("*{}", target.display()).as_str()),
+        "the just-visited directory should lead the list: {:?}",
+        rows
+    );
+}
+
+#[tokio::test]
+async fn pinning_a_remembered_path_keeps_its_history() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Saving something history already recorded should promote that entry, not
+    // create a second one or reset its visit count.
+    let (_cfg, dir, mut app) = favorites_app().await;
+    let target = dir.path().join("projects");
+
+    for c in target.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+    assert_eq!(app.hosts_for_test().favorites()[0].uses, 1);
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    focus_list(&mut app);
+    app.handle_key_for_test(char_key('a'));
+    assert_eq!(app.modal_kind_for_test(), "input", "`a` should prompt");
+    // The prompt is seeded with the path field's contents; clear it first so the
+    // typed path is the whole value.
+    for _ in 0..200 {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    for c in target.to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let saved = app.hosts_for_test().favorites();
+    assert_eq!(saved.len(), 1, "pinning must not duplicate: {:?}", saved);
+    assert!(saved[0].pinned, "it should now be pinned");
+    assert_eq!(saved[0].uses, 1, "and keep the visits it already had");
 }
