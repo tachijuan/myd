@@ -478,9 +478,11 @@ fn test_treemap_from_real_directory() {
         })
         .unwrap();
 
-    // Tiles are labelled with the basename only — no path noise like "//...///aaa".
+    // Tiles are labelled with the basename only — no path noise like
+    // "//...///aaa" — and a directory carries a trailing slash, as in `ls -F`,
+    // so a tile says whether Enter will open it.
     let labels: Vec<&str> = tm.cells.iter().map(|c| c.label.as_str()).collect();
-    assert_eq!(labels, vec!["aaa", "bbb", "ccc", "ddd"]);
+    assert_eq!(labels, vec!["aaa/", "bbb/", "ccc/", "ddd/"]);
 
     // Bigger directories get bigger tiles.
     let areas: Vec<u32> = tm
@@ -639,7 +641,9 @@ fn test_directory_tiles_take_dominant_content_color() {
     let cat_of = |name: &str| {
         tm.cells
             .iter()
-            .find(|c| c.label == name)
+            // Matched on the path rather than the label: the label is display
+            // text and now marks directories with a trailing slash.
+            .find(|c| c.path.file_name().map(|n| n == name).unwrap_or(false))
             .unwrap_or_else(|| panic!("no tile named {}", name))
             .category
     };
@@ -827,7 +831,10 @@ fn test_info_panel_follows_focused_view_for_same_named_entries() {
     let ti = st
         .treemap_cells()
         .iter()
-        .position(|c| c.label == "data" && c.path.to_string_lossy().contains("small"))
+        .position(|c| {
+            c.path.file_name().map(|n| n == "data").unwrap_or(false)
+                && c.path.to_string_lossy().contains("small")
+        })
         .expect("small/data tile");
     st.set_treemap_cursor(ti);
     let tm_info = info_panel_text(&mut st, 100, 20);
@@ -4513,7 +4520,7 @@ async fn test_treemap_rebuild_does_no_filesystem_io() {
     let colour_of = |tm: &TreeMap, name: &str| {
         tm.cells
             .iter()
-            .find(|c| c.label == name)
+            .find(|c| c.path.file_name().map(|n| n == name).unwrap_or(false))
             .unwrap_or_else(|| panic!("no tile named {}", name))
             .category
     };
@@ -8503,4 +8510,138 @@ impl Drop for HomeGuard {
             None => unsafe { std::env::remove_var("HOME") },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Treemap: navigation, directory marking, and carrying the selection to the tree.
+// ---------------------------------------------------------------------------
+
+/// A directory of three sized subdirectories plus a loose file.
+async fn treemap_app() -> (tempfile::TempDir, FileBrowser) {
+    let dir = tempfile::tempdir().unwrap();
+    for (n, sz) in [("alpha", 90_000usize), ("beta", 40_000), ("gamma", 20_000)] {
+        std::fs::create_dir_all(dir.path().join(n)).unwrap();
+        std::fs::write(dir.path().join(n).join("f.bin"), vec![0u8; sz]).unwrap();
+    }
+    std::fs::write(dir.path().join("loose.txt"), vec![0u8; 5_000]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    (dir, app)
+}
+
+fn focused_selection(app: &FileBrowser) -> Option<String> {
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => s
+            .selected_path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn enter_navigates_into_a_directory_from_the_treemap() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Confirm read `tree.selected_line()` directly, so with the treemap focused
+    // it consulted the *tree's* cursor — a different entry entirely — and Enter
+    // on a tile did nothing.
+    let (dir, mut app) = treemap_app().await;
+    // Put the tree's cursor on the *file*, so consulting it instead of the
+    // treemap gives "not a directory" and Enter does nothing. Without this the
+    // two cursors coincide and the bug is invisible.
+    for _ in 0..20 {
+        let on_file = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s
+                .tree
+                .selected_line()
+                .map(|l| !l.is_dir)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if on_file {
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::Main(s)
+            if s.tree.selected_line().map(|l| !l.is_dir).unwrap_or(false)),
+        "the tree cursor should be on a file"
+    );
+
+    app.handle_key_for_test(char_key('v'));
+    // Point the treemap at a directory tile, which the tree is not on.
+    let tile = focused_selection(&app).expect("a tile is selected");
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::Main(s) if s.selected_is_dir()),
+        "the treemap should be on a directory"
+    );
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.panel_current_dir(0),
+        Some(dir.path().join(&tile)),
+        "Enter on a directory tile must open that directory, not consult the tree"
+    );
+}
+
+#[tokio::test]
+async fn directory_tiles_are_marked_with_a_trailing_slash() {
+    // A tile gave no clue whether Enter would open something or do nothing.
+    let (_dir, mut app) = treemap_app().await;
+    app.handle_key_for_test(char_key('v'));
+
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => {
+            let labels: Vec<String> =
+                s.treemap_cells().iter().map(|c| c.label.clone()).collect();
+            assert!(
+                labels.iter().all(|l| l.ends_with('/')),
+                "every directory tile should be marked: {:?}",
+                labels
+            );
+        }
+        _ => panic!("expected a main screen"),
+    }
+}
+
+#[tokio::test]
+async fn v_carries_the_selection_between_the_two_views() {
+    // The views kept independent cursors, so toggling landed on whatever each
+    // was last pointing at — find a directory in the treemap, press `v`, and end
+    // up somewhere unrelated in the tree.
+    let (_dir, mut app) = treemap_app().await;
+
+    app.handle_key_for_test(char_key('v'));
+    // Move within the treemap so the two cursors genuinely differ.
+    app.handle_key_for_test(char_key('l'));
+    let in_map = focused_selection(&app).expect("a tile is selected");
+
+    app.handle_key_for_test(char_key('v'));
+    assert_eq!(
+        focused_selection(&app),
+        Some(in_map.clone()),
+        "`v` back to the tree should land on the entry the treemap was showing"
+    );
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => assert_eq!(
+            s.focus,
+            myd::widget::treemap::FocusTarget::Tree,
+            "and focus should be the tree"
+        ),
+        _ => unreachable!(),
+    }
+
+    // And back the other way.
+    app.handle_key_for_test(char_key('j'));
+    let in_tree = focused_selection(&app).expect("a row is selected");
+    app.handle_key_for_test(char_key('v'));
+    assert_eq!(
+        focused_selection(&app),
+        Some(in_tree),
+        "and the tree's selection carries into the treemap"
+    );
 }

@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.9.3" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.9.4" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -139,8 +139,14 @@ cached and reused as you navigate, so this is how to pick up on-disk changes.
 .SS View
 .TP
 .B v
-Toggle between the tree view and the treemap view. The chosen view persists as
-you navigate between directories.
+Toggle between the tree view and the treemap view, carrying the selection over
+so the entry you were looking at in one is the one highlighted in the other. The
+chosen view persists as you navigate between directories.
+.IP
+\fBEnter\fR opens the selected directory in either view. Treemap tiles for
+directories end in a slash, as in
+.BR ls (1),
+so a tile says whether there is anything to open.
 .TP
 .B Ctrl+p
 Toggle the info panel sidebar. Hidden by default.

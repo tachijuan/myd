@@ -75,7 +75,14 @@ impl TreeMap {
         let mut cells = items
             .into_iter()
             .map(|(info, size)| {
-                let label = truncate_path(&info.path, info.depth);
+                // A trailing slash marks a directory, the same convention `ls -F`
+                // uses. Without it a tile gives no clue whether Enter will open
+                // something or do nothing.
+                let label = if info.is_dir {
+                    format!("{}/", truncate_path(&info.path, info.depth))
+                } else {
+                    truncate_path(&info.path, info.depth)
+                };
                 // Decided in `collect_items` from the tree's own data — never by
                 // touching the filesystem, since this runs on every sort.
                 let category = info.category;

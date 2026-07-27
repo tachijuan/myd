@@ -688,6 +688,64 @@ impl MainScreenState {
         }
     }
 
+    /// Switch between the tree and the treemap, carrying the selection over.
+    ///
+    /// Without this the two views keep independent cursors, so toggling landed
+    /// on whatever each was last pointing at — you would find a directory in the
+    /// treemap, press `v`, and be somewhere unrelated in the tree.
+    ///
+    /// A path present in one view may be absent from the other (the treemap only
+    /// shows the expanded level, the tree may have it collapsed), in which case
+    /// the destination keeps its own cursor rather than jumping to an arbitrary
+    /// row.
+    pub fn toggle_view(&mut self) {
+        let selected = self.selected_path().cloned();
+        self.focus = match self.focus {
+            FocusTarget::Tree => FocusTarget::Treemap,
+            FocusTarget::Treemap => FocusTarget::Tree,
+        };
+        if let Some(path) = selected {
+            self.select_path(&path);
+        }
+        // The info panel describes the focused view's selection.
+        self.cached_info_key = None;
+    }
+
+    /// Move the focused view's cursor to `path`, if it is showing it.
+    fn select_path(&mut self, path: &std::path::Path) {
+        match self.focus {
+            FocusTarget::Tree => {
+                if let Some(i) = self.tree.lines.iter().position(|l| l.path == path) {
+                    self.tree.set_cursor(i);
+                }
+            }
+            FocusTarget::Treemap => {
+                if let Some(i) = self.treemap.cells.iter().position(|c| c.path == path) {
+                    self.treemap.cursor = i;
+                }
+            }
+        }
+    }
+
+    /// Whether the focused view's selection is a directory.
+    ///
+    /// Focus-aware, like [`Self::selected_path`]. Reading `tree.selected_line()`
+    /// directly answered for the *tree's* cursor even while the treemap was
+    /// focused, so Enter on a treemap tile consulted an unrelated row.
+    ///
+    /// Uses the entry's own `is_dir` from the listing rather than
+    /// `Path::is_dir()`, which is always false for a remote path.
+    pub fn selected_is_dir(&self) -> bool {
+        match self.focus {
+            FocusTarget::Tree => self.tree.selected_line().map(|l| l.is_dir).unwrap_or(false),
+            FocusTarget::Treemap => self
+                .treemap
+                .selected_cell()
+                .map(|c| c.is_dir)
+                .unwrap_or(false),
+        }
+    }
+
     /// Get the currently selected resolved (canonicalized) path.
     pub fn selected_resolved_path(&self) -> Option<&PathBuf> {
         match self.focus {
