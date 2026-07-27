@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.8.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.8.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -60,9 +60,14 @@ The picker has two halves: a path field and a list of directories.
 \fBTab\fR moves the keyboard between them, and the focused one is outlined in
 cyan. With the field focused, type a path (\fB~\fR is expanded) and press
 \fBEnter\fR. With the list focused, \fBj\fR/\fBk\fR move through the
-entries; the arrow keys work from either half. Selecting an entry offers its
-path in the field, and typing then replaces that offer \(em move the caret into
-it first (\fBEnd\fR, or an arrow) to extend it instead.
+entries. The arrow keys reach the list from the field too: the first press
+selects the entry already highlighted rather than stepping past it, and further
+presses move. \fBHome\fR, \fBEnd\fR and the left/right arrows hand the
+keyboard back to the field.
+.IP
+Selecting an entry offers its path in the field, and typing then replaces that
+offer \(em press \fBEnd\fR first to extend it instead, which is how you append
+a subdirectory to a listed path.
 .IP
 Every directory opened through the picker is remembered, so a path typed once
 is a keystroke away afterwards. With the list focused, \fBa\fR prompts for a
