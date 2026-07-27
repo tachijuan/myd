@@ -25,6 +25,12 @@ pub struct ConfirmDialog {
     cursor: usize,
     /// Letters this dialog accepts instead of y/n. Empty for a yes/no dialog.
     choices: Vec<char>,
+    /// A statement rather than a question: one OK button, no choice to make.
+    ///
+    /// Most of this dialog's uses report something ("could not save…", "not a
+    /// directory") rather than asking anything, and offering Yes/No there
+    /// invites the reader to wonder what "No" would decline.
+    notice: bool,
 }
 
 impl ConfirmDialog {
@@ -34,6 +40,7 @@ impl ConfirmDialog {
             message: message.into(),
             cursor: 0,
             choices: Vec::new(),
+            notice: false,
         }
     }
 
@@ -42,6 +49,17 @@ impl ConfirmDialog {
     /// Used where "no" isn't a single thing — a move collision can be skipped or
     /// can abandon the rest of the batch, and silently picking one of those
     /// would be a poor guess.
+    /// Present this as a notice: a single OK button, dismissed by Enter or Esc.
+    pub fn notice(message: impl Into<String>) -> Self {
+        Self {
+            title: "Notice",
+            message: message.into(),
+            cursor: 0,
+            choices: Vec::new(),
+            notice: true,
+        }
+    }
+
     pub fn with_choices(mut self, choices: &[char]) -> Self {
         self.choices = choices.to_vec();
         self
@@ -49,6 +67,14 @@ impl ConfirmDialog {
 
     /// Handle a key; `None` while the dialog is still waiting for a valid one.
     pub fn handle_key_answer(&mut self, key: char) -> Option<Answer> {
+        // A notice has nothing to decide: any of the usual dismissals closes it,
+        // and the caller reads that as "acknowledged" rather than as consent.
+        if self.notice {
+            return match key {
+                '\n' | ' ' | 'y' | 'o' => Some(Answer::Yes),
+                _ => None,
+            };
+        }
         if !self.choices.is_empty() {
             let lowered = key.to_ascii_lowercase();
             if self.choices.contains(&lowered) {
@@ -94,7 +120,12 @@ impl ConfirmDialog {
         }
         frame.render_widget(Clear, center);
 
-        let buttons = if self.choices.is_empty() {
+        let buttons = if self.notice {
+            Line::from(Span::styled(
+                " [ OK ] ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+        } else if self.choices.is_empty() {
             Line::from(vec![
                 if self.cursor == 0 {
                     Span::styled(
@@ -209,4 +240,51 @@ fn centered(r: Rect, area: Rect) -> Rect {
         w,
         h,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_notice_is_dismissed_but_asks_nothing() {
+        // Errors and status messages are statements. Offering Yes/No invites the
+        // reader to wonder what declining would mean.
+        let mut d = ConfirmDialog::notice("'/no/such/place' is not a directory.");
+        assert_eq!(d.title, "Notice");
+        // The usual dismissals all close it.
+        for k in ['\n', ' ', 'y'] {
+            assert_eq!(
+                ConfirmDialog::notice("x").handle_key_answer(k),
+                Some(Answer::Yes),
+                "{:?} should dismiss a notice",
+                k
+            );
+        }
+        // "No" is not a meaningful reply to a statement, so it is ignored rather
+        // than reported as a decision the caller has to interpret.
+        assert_eq!(d.handle_key_answer('n'), None);
+    }
+
+    #[test]
+    fn a_question_still_answers_yes_and_no() {
+        let mut d = ConfirmDialog::new("Delete 3 items?");
+        assert_eq!(d.title, "Confirm");
+        assert_eq!(d.handle_key_answer('y'), Some(Answer::Yes));
+        assert_eq!(d.handle_key_answer('n'), Some(Answer::No));
+    }
+
+    #[test]
+    fn a_notice_renders_one_ok_button() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        let d = ConfirmDialog::notice("something went wrong");
+        term.draw(|f| d.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..12)
+            .map(|y| (0..70).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(text.contains("[ OK ]"), "notice needs an OK button: {}", text);
+        assert!(!text.contains("Yes"), "and no Yes/No: {}", text);
+    }
 }

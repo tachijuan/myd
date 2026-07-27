@@ -49,6 +49,17 @@ pub struct DirPickerState {
     pending_edit: Option<FavoriteEdit>,
 }
 
+/// What confirming the picker asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerChoice {
+    /// Open this directory.
+    Open(PathBuf),
+    /// The typed path is not a directory, so nothing was opened.
+    NotADirectory(PathBuf),
+    /// Nothing typed and nothing to highlight.
+    Nothing,
+}
+
 /// A requested change to the saved directory list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FavoriteEdit {
@@ -372,17 +383,33 @@ impl DirPickerState {
         self.select(self.options.len().saturating_sub(1));
     }
 
-    /// Confirm the current selection and return the path.
-    pub fn confirm(&self) -> Option<PathBuf> {
-        if !self.input.is_empty() {
-            if let Some(p) = self.resolve_path(&self.input) {
-                return Some(p);
-            }
+    /// Confirm the current selection.
+    ///
+    /// The three outcomes are distinct on purpose. A typed path that does not
+    /// resolve used to fall through to the highlighted list entry, so a typo
+    /// silently opened somewhere else — worse than doing nothing, because the
+    /// user believes they arrived where they asked.
+    pub fn confirm(&self) -> PickerChoice {
+        let typed = self.input.trim();
+        if !typed.is_empty() {
+            return match self.resolve_path(typed) {
+                Some(p) => PickerChoice::Open(p),
+                None => PickerChoice::NotADirectory(expand_tilde(typed)),
+            };
         }
-        if let Some(opt) = self.options.get(self.cursor) {
-            return Some(opt.path.clone());
+        // An empty field means "open what is highlighted", which is how Enter
+        // picks an entry from the list.
+        match self.options.get(self.cursor) {
+            Some(opt) => PickerChoice::Open(opt.path.clone()),
+            None => PickerChoice::Nothing,
         }
-        None
+    }
+
+    /// Put the keyboard back in the path field, for correcting a bad entry.
+    pub fn focus_field(&mut self) {
+        self.focus = PickerFocus::Field;
+        self.input_is_suggestion = false;
+        self.input_cursor = self.input_len();
     }
 
     /// Handle a raw key event for the dir picker's input field.

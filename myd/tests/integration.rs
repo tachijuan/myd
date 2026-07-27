@@ -6812,7 +6812,7 @@ async fn a_typed_path_is_honoured_after_browsing_the_list() {
 
     assert_eq!(
         picker(&app).confirm(),
-        Some(target.clone()),
+        myd::screen::PickerChoice::Open(target.clone()),
         "the typed path must win; field held {:?}",
         picker(&app).input_for_test()
     );
@@ -7910,6 +7910,100 @@ async fn arrows_keep_stepping_once_the_list_is_engaged() {
             s.selected().map(|o| o.path.clone()),
             Some(paths[0].clone())
         ),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn a_nonexistent_typed_path_reports_an_error_and_keeps_the_field() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // A path that does not resolve used to fall through to the highlighted list
+    // entry, so a typo silently opened somewhere else entirely — the one
+    // outcome worse than doing nothing, since the user believes they went where
+    // they asked. It must say so and leave the field focused for a correction.
+    let (_cfg, dir, mut app) = favorites_app().await;
+    let missing = dir.path().join("no-such-directory");
+
+    for c in missing.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a path that does not exist must be reported"
+    );
+    // Still on the picker, not opening some other directory.
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "must not navigate anywhere"
+    );
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            assert_eq!(
+                s.focus(),
+                myd::screen::PickerFocus::Field,
+                "the keyboard belongs back in the field to fix the typo"
+            );
+            assert_eq!(
+                s.input_for_test(),
+                missing.to_string_lossy(),
+                "and what was typed is kept, not cleared"
+            );
+        }
+        _ => unreachable!(),
+    }
+    // Nothing was recorded into the history either.
+    assert!(
+        app.hosts_for_test().favorites().is_empty(),
+        "a failed open must not be remembered: {:?}",
+        app.hosts_for_test().favorites()
+    );
+}
+
+#[tokio::test]
+async fn confirming_with_an_empty_field_opens_the_highlighted_entry() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The fallback to the list is right when the field is *empty* — that is how
+    // Enter picks an entry. Only a non-empty path that fails to resolve is an
+    // error. Asserted through `confirm` rather than by opening the directory,
+    // since the highlighted entry is the real home directory and scanning it
+    // would make this test as slow as the machine's disk.
+    let (_cfg, dir, mut app) = favorites_app().await;
+
+    // Seed a favourite so the highlighted entry is a directory we control.
+    {
+        let mut catalog = app.hosts_for_test().clone();
+        catalog.add_favorite(myd::hosts::SavedDir::pinned(
+            dir.path().to_string_lossy().to_string(),
+        ));
+        app.set_hosts_for_test(catalog);
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let target = match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => s.selected().unwrap().path.clone(),
+        _ => panic!("expected the picker"),
+    };
+    // Down mirrors the entry into the field; clear it to test the empty case.
+    for _ in 0..300 {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            assert_eq!(s.input_for_test(), "", "field should be empty");
+            assert_eq!(
+                s.confirm(),
+                myd::screen::PickerChoice::Open(target),
+                "an empty field opens the highlighted entry"
+            );
+        }
         _ => unreachable!(),
     }
 }
