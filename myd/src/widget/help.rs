@@ -138,6 +138,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("D", "Delete tagged / selected"),
                 ("R", "Rename selected"),
                 ("N", "New directory here"),
+                ("o", "Open with the system default app"),
                 ("r", "Refresh"),
                 ("/", "Search by name (regex)"),
                 ("n / p", "Next / previous search match"),

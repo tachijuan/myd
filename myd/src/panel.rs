@@ -188,6 +188,17 @@ impl Panel {
         }
     }
 
+    /// The path currently selected in this panel's top Main screen, as displayed.
+    ///
+    /// Not the resolved form: canonicalising would hand a consumer the symlink's
+    /// target rather than the entry the user is looking at.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        match self.current_screen() {
+            Screen::Main(state) => state.selected_path().cloned(),
+            _ => None,
+        }
+    }
+
     /// The resolved (canonicalized) path currently selected in this panel's top
     /// Main screen — the source of a cross-panel copy.
     pub fn selected_resolved_path(&self) -> Option<PathBuf> {
