@@ -406,13 +406,25 @@ impl DirPickerState {
 
         // Arrows always drive the list, whichever half has focus: they are
         // unambiguous, and they were the only way to browse before Tab existed.
+        //
+        // The first press from the path field *engages* the list at the row
+        // already highlighted rather than stepping past it. The cursor starts at
+        // index 0, so an unconditional step made arrowing down out of the field
+        // land on the second entry and the first one unreachable that way. Tab
+        // was unaffected, since it only moves focus.
         match key.code {
-            KeyCode::Up => {
-                self.select_prev();
-                return Some(true);
-            }
-            KeyCode::Down => {
-                self.select_next();
+            KeyCode::Up | KeyCode::Down => {
+                let engaging = self.focus == PickerFocus::Field;
+                self.focus = PickerFocus::List;
+                if engaging {
+                    // Mirror the highlighted row into the field, which
+                    // `select_*` would otherwise have done.
+                    self.select(self.cursor);
+                } else if key.code == KeyCode::Down {
+                    self.select_next();
+                } else {
+                    self.select_prev();
+                }
                 return Some(true);
             }
             _ => {}
@@ -420,6 +432,22 @@ impl DirPickerState {
 
         if self.focus == PickerFocus::List {
             return match key.code {
+                // Text-editing keys mean the user wants the field, so hand it
+                // back rather than ignoring them. `End` after arrowing to an
+                // entry is how you append a subdirectory to a listed path.
+                KeyCode::Home | KeyCode::End | KeyCode::Left | KeyCode::Right => {
+                    self.focus = PickerFocus::Field;
+                    match key.code {
+                        KeyCode::Home => self.input_cursor = 0,
+                        KeyCode::End => {
+                            self.input_is_suggestion = false;
+                            self.input_cursor = self.input_len();
+                        }
+                        KeyCode::Left => self.input_left(),
+                        _ => self.input_right(),
+                    }
+                    Some(true)
+                }
                 // vi motion over the list — what the screen has always claimed
                 // these keys did, while the field was in fact swallowing them.
                 KeyCode::Char('j') => {

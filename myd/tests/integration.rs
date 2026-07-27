@@ -6938,15 +6938,38 @@ async fn typing_while_the_list_has_focus_returns_to_the_field() {
 }
 
 #[tokio::test]
-async fn arrow_keys_still_navigate_from_either_focus() {
+async fn arrow_keys_navigate_the_list_from_the_field() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::screen::PickerFocus;
 
-    // Arrows were the only working navigation before, so they must keep working
-    // from the field — that is the habit users already have.
+    // Arrows were the only working navigation before Tab existed, so they must
+    // keep reaching the list from the field — that is the habit users have.
+    //
+    // The first press engages the list on the row already highlighted rather
+    // than stepping past it; only subsequent presses move. This was reported as
+    // "arrowing down skips the first entry".
     let (_start, mut app) = picker_app().await;
+    assert_eq!(picker(&app).focus(), PickerFocus::Field);
     let start_cursor = picker(&app).cursor_for_test();
+
     app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_ne!(picker(&app).cursor_for_test(), start_cursor);
+    assert_eq!(
+        picker(&app).cursor_for_test(),
+        start_cursor,
+        "the first Down engages the list where it already is"
+    );
+    assert_eq!(
+        picker(&app).focus(),
+        PickerFocus::List,
+        "and hands the keyboard to the list"
+    );
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_ne!(
+        picker(&app).cursor_for_test(),
+        start_cursor,
+        "the second Down moves"
+    );
     app.handle_key_for_test(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(picker(&app).cursor_for_test(), start_cursor);
 }
@@ -7820,4 +7843,73 @@ async fn pinning_a_remembered_path_keeps_its_history() {
     assert_eq!(saved.len(), 1, "pinning must not duplicate: {:?}", saved);
     assert!(saved[0].pinned, "it should now be pinned");
     assert_eq!(saved[0].uses, 1, "and keep the visits it already had");
+}
+
+#[tokio::test]
+async fn arrow_down_from_the_field_lands_on_the_first_entry() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Arrowing down out of the path field skipped the first entry: the cursor
+    // already sits at index 0, and Down moved it on regardless, so the list
+    // appeared to start at its second row. Tab was unaffected because it only
+    // changes focus.
+    let (_cfg, _dir, mut app) = favorites_app().await;
+
+    let first = match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            assert_eq!(s.focus(), myd::screen::PickerFocus::Field, "field starts focused");
+            s.options_for_test()[0].path.clone()
+        }
+        _ => panic!("expected the picker"),
+    };
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            assert_eq!(
+                s.selected().map(|o| o.path.clone()),
+                Some(first),
+                "the first Down must select the first entry, not the second"
+            );
+        }
+        _ => panic!("expected the picker"),
+    }
+}
+
+#[tokio::test]
+async fn arrows_keep_stepping_once_the_list_is_engaged() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The fix must not make Down idempotent: the second press has to advance.
+    let (_cfg, _dir, mut app) = favorites_app().await;
+    let paths: Vec<std::path::PathBuf> = match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            s.options_for_test().iter().map(|o| o.path.clone()).collect()
+        }
+        _ => panic!("expected the picker"),
+    };
+    assert!(paths.len() >= 3, "need a few entries");
+
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    app.handle_key_for_test(down());
+    app.handle_key_for_test(down());
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => assert_eq!(
+            s.selected().map(|o| o.path.clone()),
+            Some(paths[1].clone()),
+            "the second Down advances to the second entry"
+        ),
+        _ => unreachable!(),
+    }
+
+    // And Up from the first entry still wraps, as it did before.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => assert_eq!(
+            s.selected().map(|o| o.path.clone()),
+            Some(paths[0].clone())
+        ),
+        _ => unreachable!(),
+    }
 }
