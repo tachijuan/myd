@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.9.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.9.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -77,8 +77,14 @@ the dialing directory uses.
 Remembered directories are stored in the \fB[[favorite]]\fR section of
 \fB~/.config/myd/hosts.toml\fR beside the saved hosts, and shown in three
 groups: pinned entries (\fB\(ua\fR) at the top in an order you arrange, saved
-entries (\fB\(*\fR) next, then automatically remembered ones and the built-in
-locations. Within the last two groups the order is most-recently-visited first,
+entries (\fB\(*\fR) next, then automatically remembered ones.
+.IP
+A catalog with no directories in it \(em a first run, or a file that only ever
+held hosts \(em is seeded with the usual locations (home, Desktop, Documents,
+Downloads, Pictures, Music, Videos, / and /tmp) and written out. They are
+ordinary entries from then on: pin, reorder and delete them like any other. A
+file that already lists directories is left alone, and a file that does not
+parse is never written over. Within the last two groups the order is most-recently-visited first,
 so the places you actually use rise to the top.
 .IP
 \fBp\fR pins the highlighted entry to the \fIbottom\fR of the pinned block \(em

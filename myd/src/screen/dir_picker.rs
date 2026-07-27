@@ -139,27 +139,16 @@ impl DirPickerState {
     /// A favourite that duplicates a built-in path replaces it rather than
     /// appearing twice.
     pub fn with_favorites(favorites: &[crate::hosts::SavedDir]) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        // Every row comes from the catalog. The standard locations used to be a
+        // separate hardcoded list merged in here, which made them look like
+        // ordinary entries while `p`, `m` and `d` silently ignored them; they
+        // are seeded into the catalog now instead (see `hosts::seed_dirs`).
+        //
+        // One exception is still synthesised: the working directory, which
+        // differs per launch and so cannot sensibly be stored.
         let cwd = std::env::current_dir().unwrap_or(PathBuf::from("."));
 
-        let common: [(PathBuf, String); 10] = [
-            (home.clone(), "~ (Home)".into()),
-            (cwd.clone(), format!(". (Current: {})", cwd.display())),
-            (home.join("Desktop"), "Desktop".into()),
-            (home.join("Documents"), "Documents".into()),
-            (home.join("Downloads"), "Downloads".into()),
-            (home.join("Pictures"), "Pictures".into()),
-            (home.join("Music"), "Music".into()),
-            (home.join("Videos"), "Videos".into()),
-            (PathBuf::from("/"), "/ (Root)".into()),
-            (PathBuf::from("/tmp"), "/tmp".into()),
-        ];
-
         let mut options: Vec<PickerOption> = Vec::new();
-
-        // Saved directories first, so a favourite wins the de-duplication
-        // against a built-in naming the same place — it carries the visit
-        // history, which the built-in does not.
         for f in favorites {
             options.push(PickerOption {
                 path: PathBuf::from(&f.path),
@@ -170,15 +159,12 @@ impl DirPickerState {
                 last_used: f.last_used.clone(),
             });
         }
-        for (path, label) in common {
-            // A missing directory is not worth offering; a saved favourite that
-            // has gone away is still listed, so it can be removed.
-            if !path.is_dir() || options.iter().any(|o| o.path == path) {
-                continue;
-            }
+        if cwd.is_dir() && !options.iter().any(|o| o.path == cwd) {
             options.push(PickerOption {
-                path,
-                label,
+                path: cwd.clone(),
+                label: format!(". (Current: {})", cwd.display()),
+                // Not a catalog entry, so it cannot be pinned or removed — but
+                // `a` saves it, which turns it into one.
                 is_favorite: false,
                 tier: crate::hosts::DirTier::Recent,
                 uses: 0,
