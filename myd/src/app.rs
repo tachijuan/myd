@@ -1302,6 +1302,34 @@ impl FileBrowser {
             FavoriteEdit::Remove(path) => {
                 self.hosts.remove_favorite(&path.to_string_lossy())
             }
+            FavoriteEdit::DeleteHost(label) => {
+                self.modal_target = Some(ModalTarget::HostDelete {
+                    label: label.clone(),
+                });
+                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    "Remove saved host '{}'? (the remote itself is untouched)",
+                    label
+                )));
+                return;
+            }
+            FavoriteEdit::EditHost(label) => {
+                // Reuses the dialing directory's form, so a host is edited the
+                // same way whichever list it was reached from.
+                let existing = self.hosts.find(label).cloned();
+                let prefill = existing
+                    .as_ref()
+                    .map(|h| format!("{} = {}", h.label, h.to_url()))
+                    .unwrap_or_default();
+                self.modal_target = Some(ModalTarget::HostForm {
+                    editing: Some(label.clone()),
+                });
+                self.modal = Modal::Input(
+                    InputDialog::new(HOST_FORM_PROMPT, "")
+                        .with_title("Edit saved host")
+                        .with_default(prefill),
+                );
+                return;
+            }
             FavoriteEdit::Pin(path) => self.hosts.pin_dir(&path.to_string_lossy()),
             FavoriteEdit::PinAndMove(path) => {
                 // `m` on an entry outside the pinned block: pin it, then start
@@ -1350,16 +1378,31 @@ impl FileBrowser {
         self.rebuild_dir_picker();
     }
 
+    /// Push the combined picker onto the active panel.
+    ///
+    /// Pushed rather than replacing the current screen, so dismissing it returns
+    /// to what was underneath instead of leaving the panel with nothing to show.
+    fn open_dir_picker(&mut self, scope: crate::screen::PickerScope) {
+        let picker = crate::screen::DirPickerState::with_catalog(&self.hosts, scope);
+        self.active_panel_mut()
+            .screen_stack
+            .push(Screen::DirPicker(picker));
+    }
+
     /// Rebuild the open directory picker over the current catalog.
     ///
     /// Keeps the keyboard focus and the cursor's path where they still exist:
     /// adding or removing an entry should not fling the cursor to the top of the
     /// list or dump the user back into the path field.
     fn rebuild_dir_picker(&mut self) {
-        let favorites = self.hosts.favorites().to_vec();
+        let catalog = self.hosts.clone();
+        let scope = match self.active_panel().current_screen() {
+            Screen::DirPicker(state) => state.scope(),
+            _ => crate::screen::PickerScope::All,
+        };
         if let Screen::DirPicker(state) = self.active_panel_mut().current_screen_mut() {
             let keep = state.selected().map(|o| o.path.clone());
-            let mut rebuilt = crate::screen::DirPickerState::with_favorites(&favorites);
+            let mut rebuilt = crate::screen::DirPickerState::with_catalog(&catalog, scope);
             rebuilt.adopt_focus_from(state);
             if let Some(path) = keep {
                 rebuilt.select_path(&path);
@@ -1653,6 +1696,13 @@ impl FileBrowser {
                                 path.display()
                             )));
                         }
+                        crate::screen::PickerChoice::Connect(url) => {
+                            // A saved host: leave the picker and dial it, the
+                            // same path `gr` takes.
+                            self.pop_screen();
+                            self.connecting_label = label_for_url(&self.hosts, &url);
+                            self.start_connect(&url);
+                        }
                         crate::screen::PickerChoice::Nothing => {}
                     }
                     return true;
@@ -1713,7 +1763,10 @@ impl FileBrowser {
                 true
             }
             Action::HostDirectory => {
-                self.modal = Modal::HostPicker(HostPicker::full(&self.hosts));
+                // The same picker `gd` opens, narrowed to the remote entries —
+                // useful with many of both kinds, and it keeps the chord people
+                // already have in their fingers working.
+                self.open_dir_picker(crate::screen::PickerScope::HostsOnly);
                 true
             }
             Action::ToggleMouse => {
@@ -1866,11 +1919,7 @@ impl FileBrowser {
                     // current view. Replacing discarded the tree underneath,
                     // which left `q` nothing to return to — declining `gd` then
                     // had to quit the app.
-                    let favorites = self.hosts.favorites().to_vec();
-                    let panel = self.active_panel_mut();
-                    panel.screen_stack.push(Screen::DirPicker(
-                        crate::screen::DirPickerState::with_favorites(&favorites),
-                    ));
+                    self.open_dir_picker(crate::screen::PickerScope::All);
                 }
                 true
             }
@@ -2148,11 +2197,25 @@ impl FileBrowser {
                                 }
                             }
                             ModalTarget::FavoriteAdd => {
+                                let typed = value.trim();
+                                // One prompt for both kinds of destination: a
+                                // `label = sftp://…` line saves a host, anything
+                                // else is a directory path. Two prompts would
+                                // have meant knowing which you wanted before you
+                                // could say what it was.
+                                if typed.contains("sftp://") {
+                                    // Reuses the dialing directory's own parser
+                                    // and validation, so a host saved from here
+                                    // is identical to one saved from the form.
+                                    self.submit_host_form(typed, None);
+                                    self.rebuild_dir_picker();
+                                    return true;
+                                }
                                 // `~` is expanded; the path is otherwise saved as
                                 // typed, so it stays meaningful on the machine
                                 // that will open it.
-                                let dir = PathBuf::from(value.trim()).expand_user();
-                                if value.trim().is_empty() {
+                                let dir = PathBuf::from(typed).expand_user();
+                                if typed.is_empty() {
                                     // Nothing typed: treat as a cancel.
                                 } else if !dir.is_dir() {
                                     self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
@@ -2448,11 +2511,19 @@ impl FileBrowser {
     /// Return to the dialing directory after a management action.
     fn reopen_picker(&mut self) {
         self.modal_target = None;
-        self.modal = if self.hosts.is_empty() {
-            Modal::HostPicker(HostPicker::quick(&self.hosts))
-        } else {
-            Modal::HostPicker(HostPicker::full(&self.hosts))
-        };
+        self.modal = Modal::None;
+        // Return to whichever list the edit came from. When the combined picker
+        // is already open — the usual case now — refresh it in place rather than
+        // stacking the old modal on top of it.
+        if matches!(
+            self.active_panel().current_screen(),
+            Screen::DirPicker(_)
+        ) {
+            self.rebuild_dir_picker();
+            return;
+        }
+        // Reached from `gr`'s quick connect, which has no picker underneath.
+        self.modal = Modal::HostPicker(HostPicker::quick(&self.hosts));
     }
 
     /// Begin connecting to a remote host named by `target` (e.g.
@@ -3288,6 +3359,15 @@ pub fn copy_needs_transfer_queue(
     dest: crate::vfs::BackendId,
 ) -> bool {
     !src.is_local() || !dest.is_local()
+}
+
+/// The saved label for `url`, so a successful connect promotes the right entry.
+fn label_for_url(catalog: &HostCatalog, url: &str) -> Option<String> {
+    catalog
+        .hosts()
+        .iter()
+        .find(|h| h.to_url() == url)
+        .map(|h| h.label.clone())
 }
 
 pub fn credential_prompt_for_test(need: &crate::vfs::sftp::AuthNeed) -> String {
