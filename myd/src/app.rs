@@ -1622,16 +1622,12 @@ impl FileBrowser {
                     return true;
                 }
                 // Enter on a directory in main screen → navigate into it.
-                // Extract the path first to avoid double borrow. Use the tree
-                // line's own `is_dir` (from the listing) rather than a local
-                // `Path::is_dir()`, which is always false for a remote path.
+                // Extract the path first to avoid double borrow. `selected_is_dir`
+                // answers for whichever view has focus — asking the tree directly
+                // meant Enter on a treemap tile consulted the tree's cursor, which
+                // is somewhere else entirely.
                 let target = if let Screen::Main(state) = panel.current_screen() {
-                    let is_dir = state
-                        .tree
-                        .selected_line()
-                        .map(|l| l.is_dir)
-                        .unwrap_or(false);
-                    if is_dir {
+                    if state.selected_is_dir() {
                         state.selected_path().cloned().map(|p| {
                             (
                                 p,

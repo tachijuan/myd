@@ -10,7 +10,6 @@ pub use loading::LoadingState;
 pub use main_screen::MainScreenState;
 
 use crate::widget::file_tree::FileTree;
-use crate::widget::treemap::FocusTarget;
 
 /// Result of polling a loading screen.
 pub enum LoadingOutcome {
@@ -487,10 +486,7 @@ impl Screen {
         match self {
             Screen::DirPicker(_) => true,
             Screen::Main(s) => {
-                s.focus = match s.focus {
-                    FocusTarget::Tree => FocusTarget::Treemap,
-                    FocusTarget::Treemap => FocusTarget::Tree,
-                };
+                s.toggle_view();
                 true
             }
             Screen::Loading(_) => true,

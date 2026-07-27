@@ -8,7 +8,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 
 - **vi-style navigation** — `j`/`k` to move, `h`/`l` to collapse/expand, `gg`/`G` to jump to top/bottom, and more.
 - **File tree with size visualization** — each entry shows a proportional size bar (green / amber / red) and human-readable file size.
-- **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree.
+- **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree, `Enter` to open a directory, and `v` again to return to the tree with the same entry highlighted. Directory tiles end in a `/`.
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
 - **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
