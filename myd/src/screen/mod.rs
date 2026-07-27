@@ -160,11 +160,16 @@ impl Screen {
         path: std::path::PathBuf,
         cache: Option<crate::utils::sizes::SizeCache>,
     ) -> Self {
-        Self::loading_remote_sorted(source, path, cache, SortMode::default())
+        Self::loading_with_source_sorted(source, path, cache, SortMode::default())
     }
 
     /// As [`loading_remote`], built in a given sort order.
-    pub fn loading_remote_sorted(
+    /// As [`loading_sorted`], building through an explicit [`Source`].
+    ///
+    /// Not remote-specific despite the name it grew up with: a local source in
+    /// shallow mode goes through here too, since what it changes is how sizes are
+    /// obtained rather than where the files are.
+    pub fn loading_with_source_sorted(
         source: crate::widget::source::Source,
         path: std::path::PathBuf,
         cache: Option<crate::utils::sizes::SizeCache>,

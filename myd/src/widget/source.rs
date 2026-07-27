@@ -62,13 +62,42 @@ pub(crate) fn mode_of(_meta: &std::fs::Metadata) -> Option<u32> {
 pub enum Source {
     #[default]
     Local,
+    /// A local filesystem browsed *without* measuring directory sizes.
+    ///
+    /// The recursive walk is the slowest thing this app does; on a network mount
+    /// or a directory of millions of files it is not worth waiting for merely to
+    /// look around. Carried on the source rather than passed down through
+    /// `load_children` and its callers, because this is precisely a statement
+    /// about how sizes are obtained.
+    LocalShallow,
     Remote(RemoteSource),
+}
+
+impl Source {
+    /// This source with directory measuring turned on or off.
+    ///
+    /// A remote source is returned unchanged: it has no recursive walk to skip,
+    /// and pretending otherwise would let the UI offer a toggle that does
+    /// nothing.
+    pub fn with_shallow(&self, shallow: bool) -> Self {
+        match (self, shallow) {
+            (Source::Local | Source::LocalShallow, true) => Source::LocalShallow,
+            (Source::Local | Source::LocalShallow, false) => Source::Local,
+            (Source::Remote(r), _) => Source::Remote(r.clone()),
+        }
+    }
+
+    /// Whether this source skips the directory-measuring walk.
+    pub fn is_shallow(&self) -> bool {
+        matches!(self, Source::LocalShallow)
+    }
 }
 
 impl std::fmt::Debug for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Source::Local => write!(f, "Source::Local"),
+            Source::LocalShallow => write!(f, "Source::LocalShallow"),
             Source::Remote(r) => write!(f, "Source::Remote({:?})", r.backend),
         }
     }
@@ -239,7 +268,7 @@ impl Source {
     /// The backend id these paths belong to (local = [`BackendId::LOCAL`]).
     pub fn backend(&self) -> BackendId {
         match self {
-            Source::Local => BackendId::LOCAL,
+            Source::Local | Source::LocalShallow => BackendId::LOCAL,
             Source::Remote(r) => r.backend,
         }
     }
@@ -259,7 +288,7 @@ impl Source {
     /// before. Remote issues one `READDIR`.
     pub fn read_dir(&self, dir: &Path) -> Vec<SourceEntry> {
         match self {
-            Source::Local => {
+            Source::Local | Source::LocalShallow => {
                 let mut out = Vec::new();
                 if let Ok(rd) = std::fs::read_dir(dir) {
                     for entry in rd.flatten() {
@@ -326,7 +355,7 @@ impl Source {
     /// Whether `path` is a directory.
     pub fn is_dir(&self, path: &Path) -> bool {
         match self {
-            Source::Local => path.is_dir(),
+            Source::Local | Source::LocalShallow => path.is_dir(),
             Source::Remote(r) => r.stat(self.vpath(path)).map(|m| m.is_dir).unwrap_or(false),
         }
     }
@@ -338,7 +367,7 @@ impl Source {
     /// per-entry walks that must stay off the event loop.
     pub fn create_dir_all(&self, path: &Path) -> anyhow::Result<()> {
         match self {
-            Source::Local => Ok(std::fs::create_dir_all(path)?),
+            Source::Local | Source::LocalShallow => Ok(std::fs::create_dir_all(path)?),
             Source::Remote(r) => r.create_dir_all(self.vpath(path)),
         }
     }
@@ -346,7 +375,7 @@ impl Source {
     /// Size of a single file.
     pub fn file_size(&self, path: &Path) -> u64 {
         match self {
-            Source::Local => sizes::get_file_size(path),
+            Source::Local | Source::LocalShallow => sizes::get_file_size(path),
             Source::Remote(r) => r.stat(self.vpath(path)).map(|m| m.len).unwrap_or(0),
         }
     }
@@ -371,6 +400,11 @@ impl Source {
                 }
                 None => sizes::get_dir_size_caching(path, cache),
             },
+            // The whole point of shallow mode: no walk at all. Zero rather than
+            // the directory inode's own length, so the size reads as *unknown*
+            // and is displayed and sorted as such — a plausible-looking 4 KB
+            // would be worse than an honest dash.
+            Source::LocalShallow => 0,
             Source::Remote(r) => {
                 let cancel = cancel.cloned().unwrap_or_default();
                 r.dir_size(self.vpath(path), cache.clone(), cancel, progress.cloned())
@@ -378,11 +412,16 @@ impl Source {
         }
     }
 
-    /// Whether directory sizes from this source are true recursive totals. The
-    /// treemap uses this to explain uniformly small remote directory tiles.
+    /// Whether directory sizes from this source *can* be true recursive totals.
+    ///
+    /// A property of the backend, not of the user's preference: a local
+    /// filesystem can be walked, a remote one cannot afford to be. Whether the
+    /// walk actually happens is [`FileTree::measures_directories`], which also
+    /// consults the tree's shallow toggle.
     pub fn has_recursive_sizes(&self) -> bool {
         match self {
             Source::Local => true,
+            Source::LocalShallow => false,
             Source::Remote(r) => r.vfs.has_recursive_sizes(),
         }
     }

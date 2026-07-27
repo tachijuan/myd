@@ -9124,3 +9124,140 @@ async fn editing_a_directory_to_one_already_listed_is_refused() {
         "and leave the original alone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shallow traversal: browse without measuring directory sizes.
+// ---------------------------------------------------------------------------
+
+/// A directory of sized subdirectories, plus an isolated catalog.
+async fn shallow_app() -> (tempfile::TempDir, tempfile::TempDir, FileBrowser) {
+    let cfg = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (n, sz) in [("alpha", 90_000usize), ("beta", 40_000)] {
+        std::fs::create_dir_all(root.path().join(n)).unwrap();
+        std::fs::write(root.path().join(n).join("f.bin"), vec![0u8; sz]).unwrap();
+    }
+    std::fs::write(root.path().join("loose.txt"), vec![0u8; 5_000]).unwrap();
+
+    let mut app = FileBrowser::new(Some(root.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(
+        &cfg.path().join("hosts.toml"),
+    ));
+    settle(&mut app).await;
+    (cfg, root, app)
+}
+
+fn tree_is_shallow(app: &FileBrowser) -> bool {
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tree.is_shallow(),
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn s_stops_measuring_directories() {
+    // Shallow mode reports directory sizes as unknown — the same display the
+    // SFTP backend already uses — rather than as the inode's own size, which
+    // would look measured and would not be.
+    let (_cfg, _root, mut app) = shallow_app().await;
+    assert!(!tree_is_shallow(&app), "starts measured");
+
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "S turns measuring off");
+
+    let text = app_screen_text(&mut app, 100, 14);
+    assert!(text.contains("SHALLOW"), "the title must say so: {}", text);
+    // Directory rows show a dash; the file keeps its real size.
+    assert!(text.contains('—'), "unmeasured directories show a dash: {}", text);
+    assert!(text.contains("4.9KB"), "files are still sized: {}", text);
+}
+
+#[tokio::test]
+async fn returning_to_full_measurement_asks_first() {
+    // Going shallow is instant. Going back walks the whole tree, which is the
+    // reason the user turned it off, so it must not happen on a keystroke.
+    let (_cfg, _root, mut app) = shallow_app().await;
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app));
+
+    app.handle_key_for_test(char_key('S'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "returning to full measurement must ask"
+    );
+    // Declining leaves it shallow.
+    app.handle_key_for_test(char_key('n'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "declining keeps it shallow");
+
+    // Confirming measures again.
+    app.handle_key_for_test(char_key('S'));
+    app.handle_key_for_test(char_key('y'));
+    settle(&mut app).await;
+    assert!(!tree_is_shallow(&app), "confirming measures the tree");
+}
+
+#[tokio::test]
+async fn the_traversal_mode_is_remembered_per_directory() {
+    let (cfg, root, mut app) = shallow_app().await;
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+
+    let body = std::fs::read_to_string(cfg.path().join("hosts.toml")).unwrap();
+    assert!(
+        body.contains("shallow = true"),
+        "the choice must persist: {}",
+        body
+    );
+
+    // A fresh session on the same directory honours it, even though the panel is
+    // built before the catalog is reachable.
+    let mut next = FileBrowser::new(Some(root.path().to_path_buf()), None, false);
+    next.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(
+        &cfg.path().join("hosts.toml"),
+    ));
+    settle(&mut next).await;
+    // One more tick: the preference is applied when the load resolves.
+    for _ in 0..50 {
+        next.tick_for_test();
+        next.resolve_loading_for_test();
+        if tree_is_shallow(&next) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    assert!(
+        tree_is_shallow(&next),
+        "a directory marked shallow should open that way next time"
+    );
+}
+
+#[tokio::test]
+async fn shallow_directories_sort_as_unknown() {
+    // The same rule remote directories follow: unmeasured sorts last rather than
+    // masquerading as small.
+    let (_cfg, _root, mut app) = shallow_app().await;
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => {
+            let names: Vec<String> = s
+                .tree
+                .lines
+                .iter()
+                .filter(|l| l.depth == 1)
+                .map(|l| l.name.clone())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["loose.txt", "alpha", "beta"],
+                "the measured file leads; unmeasured directories follow"
+            );
+        }
+        _ => panic!("expected a main screen"),
+    }
+}
