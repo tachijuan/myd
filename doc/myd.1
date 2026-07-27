@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.7.4" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.8.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -56,13 +56,21 @@ Move cursor to the parent directory.
 Prompt for a new root directory and navigate to it. The picker opens over the
 current view; \fBEsc\fR dismisses it and returns to where you were.
 .IP
-The picker has two halves: a path field and a list of common directories.
+The picker has two halves: a path field and a list of directories.
 \fBTab\fR moves the keyboard between them, and the focused one is outlined in
 cyan. With the field focused, type a path (\fB~\fR is expanded) and press
 \fBEnter\fR. With the list focused, \fBj\fR/\fBk\fR move through the
 entries; the arrow keys work from either half. Selecting an entry offers its
 path in the field, and typing then replaces that offer \(em move the caret into
 it first (\fBEnd\fR, or an arrow) to extend it instead.
+.IP
+With the list focused, \fBa\fR saves the highlighted directory as a favourite
+and \fBd\fR forgets one \(em the same keys the dialing directory uses. Saved
+directories are marked with a star, carry a visit count, and are stored in the
+\fB[[favorite]]\fR section of \fB~/.config/myd/hosts.toml\fR beside the saved
+hosts. They are listed alongside the built-in locations (home, downloads, root
+and so on) in one list ordered most-recently-visited first, so the places you
+actually use rise to the top.
 .TP
 .B 0
 Collapse all expanded directories.

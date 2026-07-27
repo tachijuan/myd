@@ -144,14 +144,58 @@ impl SavedHost {
 /// The on-disk shape. A wrapper struct because TOML needs a named array.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CatalogFile {
-    #[serde(default, rename = "host")]
+    // Empty arrays are omitted rather than written as `host = []`, which is
+    // noise in a file the user is invited to edit by hand.
+    #[serde(default, rename = "host", skip_serializing_if = "Vec::is_empty")]
     hosts: Vec<SavedHost>,
+    /// Saved local directories for the `gd` picker. A separate array from
+    /// `host`, so the two kinds of entry stay legible in a hand-edited file.
+    #[serde(default, rename = "favorite", skip_serializing_if = "Vec::is_empty")]
+    favorites: Vec<SavedDir>,
+}
+
+/// One saved local directory, for the `gd` picker's shortcut list.
+///
+/// Deliberately not a [`SavedHost`] with an empty `host`: a place on this machine
+/// and a remote to dial are different things, and a reader of the config file
+/// should not have to infer which one an entry is from a missing field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedDir {
+    /// Absolute path to the directory. The identity of the entry.
+    pub path: String,
+    /// Optional display name; the path is shown when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Times opened. Shown in the picker; does not affect ordering.
+    #[serde(default)]
+    pub uses: u64,
+    /// RFC 3339 timestamp of the last visit — what the list is ordered by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<String>,
+}
+
+impl SavedDir {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            ..Default::default()
+        }
+    }
+
+    /// What the picker shows for this entry.
+    pub fn display(&self) -> &str {
+        match &self.label {
+            Some(l) if !l.is_empty() => l,
+            _ => &self.path,
+        }
+    }
 }
 
 /// The saved-host list, backed by a TOML file.
 #[derive(Debug, Default, Clone)]
 pub struct HostCatalog {
     hosts: Vec<SavedHost>,
+    favorites: Vec<SavedDir>,
     path: Option<PathBuf>,
 }
 
@@ -179,10 +223,10 @@ impl HostCatalog {
     }
 
     pub fn load_from(path: &std::path::Path) -> Self {
-        let hosts = std::fs::read_to_string(path)
+        let file = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| match toml::from_str::<CatalogFile>(&s) {
-                Ok(f) => Some(f.hosts),
+                Ok(f) => Some(f),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "ignoring malformed host catalog");
                     None
@@ -190,14 +234,28 @@ impl HostCatalog {
             })
             .unwrap_or_default();
         Self {
-            hosts,
+            hosts: file.hosts,
+            favorites: file.favorites,
             path: Some(path.to_path_buf()),
         }
     }
 
     /// An in-memory catalog that never persists. For tests.
     pub fn in_memory(hosts: Vec<SavedHost>) -> Self {
-        Self { hosts, path: None }
+        Self {
+            hosts,
+            favorites: Vec::new(),
+            path: None,
+        }
+    }
+
+    /// An in-memory catalog of saved directories. For tests.
+    pub fn in_memory_dirs(favorites: Vec<SavedDir>) -> Self {
+        Self {
+            hosts: Vec::new(),
+            favorites,
+            path: None,
+        }
     }
 
     /// Write the catalog out.
@@ -212,8 +270,11 @@ impl HostCatalog {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
+        // Both arrays are written every time. Serialising only one of them would
+        // silently drop the other from the file on the next save.
         let body = toml::to_string_pretty(&CatalogFile {
             hosts: self.hosts.clone(),
+            favorites: self.favorites.clone(),
         })
         .context("could not serialise the host catalog")?;
 
@@ -293,6 +354,78 @@ impl HostCatalog {
         if let Some(h) = self.hosts.iter_mut().find(|h| h.label == label) {
             h.uses += 1;
             h.last_used = Some(chrono::Utc::now().to_rfc3339());
+        }
+    }
+
+    /// Every saved directory, in file order.
+    pub fn favorites(&self) -> &[SavedDir] {
+        &self.favorites
+    }
+
+    /// Saved directories, most recently visited first.
+    ///
+    /// Ordered exactly as [`Self::recent`] orders hosts, including sinking
+    /// never-visited entries below dated ones rather than letting `None` sort
+    /// first and head a "recent" list.
+    pub fn favorites_by_recency(&self) -> Vec<&SavedDir> {
+        let mut refs: Vec<&SavedDir> = self.favorites.iter().collect();
+        refs.sort_by(|a, b| {
+            let (ak, bk) = (
+                a.last_used.as_deref().unwrap_or(""),
+                b.last_used.as_deref().unwrap_or(""),
+            );
+            bk.cmp(ak).then_with(|| a.path.cmp(&b.path))
+        });
+        refs
+    }
+
+    /// Whether `path` is already saved.
+    pub fn is_favorite(&self, path: &str) -> bool {
+        self.favorites.iter().any(|f| f.path == path)
+    }
+
+    /// Save a directory. Returns false when it was already there, so the caller
+    /// can say so rather than silently doing nothing.
+    pub fn add_favorite(&mut self, dir: SavedDir) -> bool {
+        if self.is_favorite(&dir.path) {
+            return false;
+        }
+        self.favorites.push(dir);
+        true
+    }
+
+    /// Forget a saved directory. Returns whether anything was removed.
+    pub fn remove_favorite(&mut self, path: &str) -> bool {
+        let before = self.favorites.len();
+        self.favorites.retain(|f| f.path != path);
+        self.favorites.len() != before
+    }
+
+    /// Note a visit, promoting the directory in the ranking.
+    ///
+    /// Only touches paths that are already saved: visiting an arbitrary
+    /// directory should not silently add it to the favourites list.
+    ///
+    /// Matches on the canonical form as well as the literal one. The picker
+    /// resolves what the user typed before opening it, so a favourite saved as
+    /// `/tmp/work` would otherwise never match the `/private/tmp/work` that
+    /// comes back on macOS — or the resolved target of any symlinked path.
+    pub fn record_dir_use(&mut self, path: &str) {
+        let canonical = std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let entry = self.favorites.iter_mut().find(|f| {
+            f.path == path
+                || canonical.as_deref() == Some(f.path.as_str())
+                || std::fs::canonicalize(&f.path)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .as_deref()
+                    == Some(path)
+        });
+        if let Some(f) = entry {
+            f.uses += 1;
+            f.last_used = Some(chrono::Utc::now().to_rfc3339());
         }
     }
 }
@@ -457,11 +590,111 @@ mod tests {
         let c = HostCatalog::in_memory(sample());
         let body = toml::to_string_pretty(&CatalogFile {
             hosts: c.hosts().to_vec(),
+            favorites: Vec::new(),
         })
         .unwrap();
         let lower = body.to_lowercase();
         assert!(!lower.contains("password"), "catalog must never hold secrets");
         assert!(!lower.contains("passphrase"));
+    }
+
+    #[test]
+    fn favorites_and_hosts_share_one_file_without_clobbering_each_other() {
+        // Both arrays are serialised on every save. Writing only one of them
+        // would drop the other from the file the next time anything changed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.toml");
+
+        let mut c = HostCatalog::load_from(&path);
+        c.upsert(SavedHost::new("prod", "prod.example.com"));
+        assert!(c.add_favorite(SavedDir::new("/home/juan/code")));
+        c.save().unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("[[host]]"), "hosts section missing: {}", body);
+        assert!(body.contains("[[favorite]]"), "favourites section missing: {}", body);
+
+        // Round-trip, change only the host side, and save again.
+        let mut back = HostCatalog::load_from(&path);
+        assert_eq!(back.hosts().len(), 1);
+        assert_eq!(back.favorites().len(), 1);
+        back.record_use("prod");
+        back.save().unwrap();
+
+        let after = HostCatalog::load_from(&path);
+        assert_eq!(
+            after.favorites().len(),
+            1,
+            "saving a host change must not drop favourites"
+        );
+        assert_eq!(after.favorites()[0].path, "/home/juan/code");
+    }
+
+    #[test]
+    fn a_host_only_file_still_loads() {
+        // Existing configs have no [[favorite]] array at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.toml");
+        std::fs::write(
+            &path,
+            "[[host]]\nlabel = \"prod\"\nhost = \"prod.example.com\"\n",
+        )
+        .unwrap();
+        let c = HostCatalog::load_from(&path);
+        assert_eq!(c.hosts().len(), 1);
+        assert!(c.favorites().is_empty());
+    }
+
+    #[test]
+    fn favorites_rank_by_recency_not_frequency() {
+        let c = HostCatalog::in_memory_dirs(vec![
+            SavedDir {
+                path: "/often".into(),
+                uses: 50,
+                last_used: Some("2026-06-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            SavedDir {
+                path: "/yesterday".into(),
+                uses: 1,
+                last_used: Some("2026-07-26T00:00:00Z".into()),
+                ..Default::default()
+            },
+            SavedDir {
+                path: "/never".into(),
+                ..Default::default()
+            },
+        ]);
+        let order: Vec<&str> = c
+            .favorites_by_recency()
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["/yesterday", "/often", "/never"],
+            "recency wins over use count, and never-visited sinks last"
+        );
+    }
+
+    #[test]
+    fn adding_a_duplicate_favorite_is_refused() {
+        let mut c = HostCatalog::in_memory_dirs(vec![]);
+        assert!(c.add_favorite(SavedDir::new("/a")));
+        assert!(!c.add_favorite(SavedDir::new("/a")), "no duplicates");
+        assert_eq!(c.favorites().len(), 1);
+        assert!(c.remove_favorite("/a"));
+        assert!(!c.remove_favorite("/a"), "removing twice reports nothing done");
+    }
+
+    #[test]
+    fn recording_a_visit_only_touches_saved_directories() {
+        let mut c = HostCatalog::in_memory_dirs(vec![SavedDir::new("/saved")]);
+        c.record_dir_use("/not-saved");
+        assert_eq!(c.favorites().len(), 1, "visiting must not add entries");
+        c.record_dir_use("/saved");
+        assert_eq!(c.favorites()[0].uses, 1);
+        assert!(c.favorites()[0].last_used.is_some());
     }
 
     #[test]
