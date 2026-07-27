@@ -1256,6 +1256,55 @@ impl FileBrowser {
         is_double
     }
 
+    /// Apply a favourite add/remove the directory picker asked for, persist it,
+    /// and rebuild the picker so the change is visible immediately.
+    fn apply_favorite_edit(&mut self) {
+        use crate::screen::FavoriteEdit;
+
+        let edit = match self.active_panel_mut().current_screen_mut() {
+            Screen::DirPicker(state) => state.take_favorite_edit(),
+            _ => None,
+        };
+        let Some(edit) = edit else {
+            return;
+        };
+
+        let changed = match &edit {
+            FavoriteEdit::Add(path) => {
+                let key = path.to_string_lossy().to_string();
+                self.hosts
+                    .add_favorite(crate::hosts::SavedDir::new(key))
+            }
+            FavoriteEdit::Remove(path) => {
+                self.hosts.remove_favorite(&path.to_string_lossy())
+            }
+        };
+        if !changed {
+            return;
+        }
+        if let Err(e) = self.hosts.save() {
+            self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                "Could not save the favourites list: {}",
+                e
+            )));
+            return;
+        }
+
+        // Rebuild over the new list, keeping the cursor on the same path where
+        // it still exists — removing an entry should not fling the cursor to the
+        // top of the list.
+        let favorites = self.hosts.favorites().to_vec();
+        if let Screen::DirPicker(state) = self.active_panel_mut().current_screen_mut() {
+            let keep = state.selected().map(|o| o.path.clone());
+            let mut rebuilt = crate::screen::DirPickerState::with_favorites(&favorites);
+            rebuilt.adopt_focus_from(state);
+            if let Some(path) = keep {
+                rebuilt.select_path(&path);
+            }
+            *state = rebuilt;
+        }
+    }
+
     /// Scroll the view under the pointer by `delta` rows.
     ///
     /// The wheel moves the *cursor*, not the viewport, so it stays consistent
@@ -1306,6 +1355,9 @@ impl FileBrowser {
             .current_screen_mut()
             .handle_raw_key(key)
         {
+            // The picker cannot reach the catalog, so it records a requested
+            // favourite change and the app applies and persists it here.
+            self.apply_favorite_edit();
             return result;
         }
 
@@ -1489,7 +1541,21 @@ impl FileBrowser {
                 // Confirm dir picker selection → push loading screen.
                 if let Screen::DirPicker(state) = panel.current_screen_mut() {
                     if let Some(path) = state.confirm() {
-                        panel.screen_stack.push(Screen::loading(path));
+                        panel.screen_stack.push(Screen::loading(path.clone()));
+                        // Promote it in the list for next time. Only saved
+                        // directories are tracked, so opening an arbitrary path
+                        // does not quietly add it to the favourites.
+                        // `record_dir_use` matches canonical forms too, so a
+                        // favourite saved as `/tmp/x` is still credited when the
+                        // picker resolves it to `/private/tmp/x`.
+                        let key = path.to_string_lossy().to_string();
+                        let before = self.hosts.favorites().to_vec();
+                        self.hosts.record_dir_use(&key);
+                        if self.hosts.favorites() != before.as_slice() {
+                            if let Err(e) = self.hosts.save() {
+                                tracing::warn!(error = %e, "could not persist directory usage");
+                            }
+                        }
                     }
                     return true;
                 }
@@ -1696,7 +1762,11 @@ impl FileBrowser {
                     // current view. Replacing discarded the tree underneath,
                     // which left `q` nothing to return to — declining `gd` then
                     // had to quit the app.
-                    panel.screen_stack.push(Screen::dir_picker());
+                    let favorites = self.hosts.favorites().to_vec();
+                    let panel = self.active_panel_mut();
+                    panel.screen_stack.push(Screen::DirPicker(
+                        crate::screen::DirPickerState::with_favorites(&favorites),
+                    ));
                 }
                 true
             }

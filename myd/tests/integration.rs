@@ -7469,3 +7469,213 @@ async fn the_filter_indicator_survives_a_narrow_terminal() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Directory favourites in the `gd` picker.
+// ---------------------------------------------------------------------------
+
+/// Open the picker with an isolated config directory, so the real
+/// `~/.config/myd/hosts.toml` is never touched.
+async fn favorites_app() -> (tempfile::TempDir, tempfile::TempDir, FileBrowser) {
+    // A catalog backed by this test's own file. `XDG_CONFIG_HOME` is
+    // process-global and these tests run in parallel, so pointing the whole
+    // process at one directory would make them trample each other.
+    let cfg = tempfile::tempdir().unwrap();
+    let catalog = myd::hosts::HostCatalog::load_from(&cfg.path().join("hosts.toml"));
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(catalog);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    (cfg, dir, app)
+}
+
+/// The catalog file this test's app writes to.
+fn favorites_file(cfg: &tempfile::TempDir) -> std::path::PathBuf {
+    cfg.path().join("hosts.toml")
+}
+
+fn picker_rows(app: &FileBrowser) -> Vec<String> {
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => s
+            .options_for_test()
+            .iter()
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    if o.is_favorite { "*" } else { " " },
+                    o.path.display()
+                )
+            })
+            .collect(),
+        _ => panic!("expected the directory picker"),
+    }
+}
+
+fn focus_list(app: &mut FileBrowser) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+}
+
+#[tokio::test]
+async fn a_saves_the_highlighted_directory_as_a_favourite() {
+    let (cfg, _dir, mut app) = favorites_app().await;
+    focus_list(&mut app);
+
+    let before = picker_rows(&app);
+    assert!(
+        before.iter().all(|r| r.starts_with(' ')),
+        "nothing should be a favourite yet: {:?}",
+        before
+    );
+    let target = match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => s.selected().unwrap().path.clone(),
+        _ => unreachable!(),
+    };
+
+    app.handle_key_for_test(char_key('a'));
+
+    let after = picker_rows(&app);
+    assert!(
+        after.iter().any(|r| r == &format!("*{}", target.display())),
+        "the highlighted directory should be starred: {:?}",
+        after
+    );
+
+    // And it reached the same file the host picker uses.
+    let body = std::fs::read_to_string(favorites_file(&cfg)).unwrap();
+    assert!(body.contains("[[favorite]]"), "config: {}", body);
+    assert!(body.contains(&target.to_string_lossy().to_string()), "config: {}", body);
+}
+
+#[tokio::test]
+async fn d_forgets_a_saved_favourite() {
+    let (cfg, _dir, mut app) = favorites_app().await;
+    focus_list(&mut app);
+    app.handle_key_for_test(char_key('a'));
+    assert!(picker_rows(&app).iter().any(|r| r.starts_with('*')));
+
+    // The cursor stays on the row it just starred, so `d` removes that one.
+    app.handle_key_for_test(char_key('d'));
+    assert!(
+        picker_rows(&app).iter().all(|r| r.starts_with(' ')),
+        "the favourite should be gone: {:?}",
+        picker_rows(&app)
+    );
+    let body = std::fs::read_to_string(favorites_file(&cfg)).unwrap_or_default();
+    assert!(!body.contains("[[favorite]]"), "config should be empty: {}", body);
+}
+
+#[tokio::test]
+async fn a_and_d_are_ordinary_characters_in_the_path_field() {
+    // The field starts focused, so these must type rather than edit favourites —
+    // plenty of real paths contain an `a` or a `d`.
+    let (_cfg, _dir, mut app) = favorites_app().await;
+    for c in "/data".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => {
+            assert_eq!(s.input_for_test(), "/data");
+            assert!(
+                s.options_for_test().iter().all(|o| !o.is_favorite),
+                "typing must not have saved anything"
+            );
+        }
+        _ => panic!("expected the picker"),
+    }
+}
+
+#[tokio::test]
+async fn a_visited_favourite_leads_the_picker_list() {
+    // Favourites are merged with the built-ins into one recency-ordered list, so
+    // a directory you actually use rises to the top. The visit itself is
+    // recorded on confirm (covered by `hosts::record_dir_use`); this pins the
+    // ordering the picker presents.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+
+    let mut catalog = myd::hosts::HostCatalog::load_from(&file);
+    let stale = tempfile::tempdir().unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    catalog.add_favorite(myd::hosts::SavedDir {
+        path: stale.path().to_string_lossy().to_string(),
+        uses: 99,
+        last_used: Some("2026-01-01T00:00:00Z".into()),
+        ..Default::default()
+    });
+    catalog.add_favorite(myd::hosts::SavedDir {
+        path: fresh.path().to_string_lossy().to_string(),
+        uses: 1,
+        last_used: Some("2026-07-26T00:00:00Z".into()),
+        ..Default::default()
+    });
+    catalog.save().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+
+    let rows = picker_rows(&app);
+    assert_eq!(
+        rows.first().map(String::as_str),
+        Some(format!("*{}", fresh.path().display()).as_str()),
+        "the most recently visited favourite leads, ahead of the more-used one: {:?}",
+        rows
+    );
+    assert_eq!(
+        rows.get(1).map(String::as_str),
+        Some(format!("*{}", stale.path().display()).as_str()),
+        "then the older favourite, still ahead of the built-ins: {:?}",
+        rows
+    );
+    assert!(
+        rows[2..].iter().all(|r| r.starts_with(' ')),
+        "built-ins have no timestamp and settle below: {:?}",
+        rows
+    );
+}
+
+#[tokio::test]
+async fn opening_a_saved_directory_records_a_visit() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Confirming a path that is saved promotes it; confirming one that is not
+    // must not quietly add it.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let saved = tempfile::tempdir().unwrap();
+    let mut catalog = myd::hosts::HostCatalog::load_from(&file);
+    catalog.add_favorite(myd::hosts::SavedDir::new(
+        saved.path().to_string_lossy().to_string(),
+    ));
+    catalog.save().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from(&file));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    for c in saved.path().to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+
+    let after = app.hosts_for_test().favorites();
+    assert_eq!(after.len(), 1, "no new entries: {:?}", after);
+    assert_eq!(after[0].uses, 1, "the visit should be counted: {:?}", after);
+    assert!(after[0].last_used.is_some(), "and timestamped: {:?}", after);
+
+    // It reached the file too.
+    let body = std::fs::read_to_string(&file).unwrap();
+    assert!(body.contains("last_used"), "visit not persisted: {}", body);
+}

@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which half of the picker has the keyboard.
 ///
@@ -24,7 +24,7 @@ pub enum PickerFocus {
 
 /// State for the directory picker startup screen.
 pub struct DirPickerState {
-    options: Vec<(PathBuf, String)>,
+    options: Vec<PickerOption>,
     cursor: usize,
     /// Current input value (typed path).
     input: String,
@@ -41,6 +41,36 @@ pub struct DirPickerState {
     input_is_suggestion: bool,
     /// Which half of the screen the keyboard drives.
     focus: PickerFocus,
+    /// A favourite the user asked to add or remove, awaiting the app.
+    ///
+    /// The picker cannot persist anything itself — the catalog and its file live
+    /// on the app — so an edit is recorded here and drained on the next key
+    /// dispatch, in the same spirit as the loading screens' pending results.
+    pending_edit: Option<FavoriteEdit>,
+}
+
+/// A requested change to the saved directory list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FavoriteEdit {
+    /// Save this path.
+    Add(PathBuf),
+    /// Forget this path.
+    Remove(PathBuf),
+}
+
+/// One row of the picker's shortcut list.
+#[derive(Debug, Clone)]
+pub struct PickerOption {
+    pub path: PathBuf,
+    pub label: String,
+    /// Whether this row came from the saved favourites rather than the built-in
+    /// locations. Only a favourite can be removed, and only a non-favourite can
+    /// be added.
+    pub is_favorite: bool,
+    /// Times visited, for the trailing count. Zero for an unvisited built-in.
+    pub uses: u64,
+    /// RFC 3339 last visit, or `None`. Drives the ordering.
+    pub last_used: Option<String>,
 }
 
 impl Default for DirPickerState {
@@ -51,10 +81,20 @@ impl Default for DirPickerState {
 
 impl DirPickerState {
     pub fn new() -> Self {
+        Self::with_favorites(&[])
+    }
+
+    /// Build the picker over `favorites` plus the built-in locations.
+    ///
+    /// The two are merged into one list ordered by recency, so a directory you
+    /// actually use rises to the top whether or not it is one of the built-ins.
+    /// A favourite that duplicates a built-in path replaces it rather than
+    /// appearing twice.
+    pub fn with_favorites(favorites: &[crate::hosts::SavedDir]) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         let cwd = std::env::current_dir().unwrap_or(PathBuf::from("."));
 
-        let common = [
+        let common: [(PathBuf, String); 10] = [
             (home.clone(), "~ (Home)".into()),
             (cwd.clone(), format!(". (Current: {})", cwd.display())),
             (home.join("Desktop"), "Desktop".into()),
@@ -67,10 +107,56 @@ impl DirPickerState {
             (PathBuf::from("/tmp"), "/tmp".into()),
         ];
 
-        let options: Vec<(PathBuf, String)> = common
-            .into_iter()
-            .filter(|(p, _)| p.is_dir())
+        let mut options: Vec<PickerOption> = Vec::new();
+
+        // Saved directories first, so a favourite wins the de-duplication
+        // against a built-in naming the same place — it carries the visit
+        // history, which the built-in does not.
+        for f in favorites {
+            options.push(PickerOption {
+                path: PathBuf::from(&f.path),
+                label: f.display().to_string(),
+                is_favorite: true,
+                uses: f.uses,
+                last_used: f.last_used.clone(),
+            });
+        }
+        for (path, label) in common {
+            // A missing directory is not worth offering; a saved favourite that
+            // has gone away is still listed, so it can be removed.
+            if !path.is_dir() || options.iter().any(|o| o.path == path) {
+                continue;
+            }
+            options.push(PickerOption {
+                path,
+                label,
+                is_favorite: false,
+                uses: 0,
+                last_used: None,
+            });
+        }
+
+        // One merged list, most recently visited first. Built-ins have no
+        // timestamp and so settle below anything actually used, in their
+        // original order rather than alphabetically — "Home" before "/tmp"
+        // reads better than the reverse.
+        let order: std::collections::HashMap<&Path, usize> = options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.path.as_path(), i))
             .collect();
+        let mut indexed: Vec<(usize, PickerOption)> = options
+            .iter()
+            .map(|o| (order[o.path.as_path()], o.clone()))
+            .collect();
+        indexed.sort_by(|(ai, a), (bi, b)| {
+            let (ak, bk) = (
+                a.last_used.as_deref().unwrap_or(""),
+                b.last_used.as_deref().unwrap_or(""),
+            );
+            bk.cmp(ak).then_with(|| ai.cmp(bi))
+        });
+        let options: Vec<PickerOption> = indexed.into_iter().map(|(_, o)| o).collect();
 
         Self {
             options,
@@ -81,6 +167,36 @@ impl DirPickerState {
             // The field starts focused: the picker exists to accept a path, and
             // the common directories are the shortcut, not the main event.
             focus: PickerFocus::Field,
+            pending_edit: None,
+        }
+    }
+
+    /// Take the pending favourite edit, if the user asked for one.
+    pub fn take_favorite_edit(&mut self) -> Option<FavoriteEdit> {
+        self.pending_edit.take()
+    }
+
+    /// The highlighted option, if any.
+    pub fn selected(&self) -> Option<&PickerOption> {
+        self.options.get(self.cursor)
+    }
+
+    /// Carry the keyboard state across a rebuild, so adding or removing a
+    /// favourite does not dump the user back into the path field.
+    pub fn adopt_focus_from(&mut self, other: &Self) {
+        self.focus = other.focus;
+        self.input.clone_from(&other.input);
+        self.input_cursor = other.input_cursor;
+        self.input_is_suggestion = other.input_is_suggestion;
+    }
+
+    /// Highlight the row for `path`, if it is still listed. Leaves the cursor
+    /// alone otherwise, which is what happens to the row just removed.
+    pub fn select_path(&mut self, path: &Path) {
+        if let Some(i) = self.options.iter().position(|o| o.path == path) {
+            self.cursor = i;
+        } else {
+            self.cursor = self.cursor.min(self.options.len().saturating_sub(1));
         }
     }
 
@@ -123,6 +239,11 @@ impl DirPickerState {
     /// The current contents of the path field. Test hook.
     pub fn input_for_test(&self) -> &str {
         &self.input
+    }
+
+    /// The shortcut list, in display order. Test hook.
+    pub fn options_for_test(&self) -> &[PickerOption] {
+        &self.options
     }
 
     /// The index of the highlighted option. Test hook.
@@ -215,8 +336,8 @@ impl DirPickerState {
             return;
         }
         self.cursor = index.min(self.options.len() - 1);
-        if let Some((path, _)) = self.options.get(self.cursor) {
-            let shown = path.to_string_lossy().to_string();
+        if let Some(opt) = self.options.get(self.cursor) {
+            let shown = opt.path.to_string_lossy().to_string();
             self.set_suggestion(shown);
         }
     }
@@ -256,8 +377,8 @@ impl DirPickerState {
                 return Some(p);
             }
         }
-        if let Some((path, _)) = self.options.get(self.cursor) {
-            return Some(path.clone());
+        if let Some(opt) = self.options.get(self.cursor) {
+            return Some(opt.path.clone());
         }
         None
     }
@@ -313,6 +434,25 @@ impl DirPickerState {
                 }
                 KeyCode::Char('G') => {
                     self.select_last();
+                    Some(true)
+                }
+                // Save / forget, matching the dialing directory's a and d.
+                // Only bound while the list has focus, so typing a path that
+                // contains either letter is unaffected.
+                KeyCode::Char('a') => {
+                    if let Some(opt) = self.selected() {
+                        if !opt.is_favorite {
+                            self.pending_edit = Some(FavoriteEdit::Add(opt.path.clone()));
+                        }
+                    }
+                    Some(true)
+                }
+                KeyCode::Char('d') => {
+                    if let Some(opt) = self.selected() {
+                        if opt.is_favorite {
+                            self.pending_edit = Some(FavoriteEdit::Remove(opt.path.clone()));
+                        }
+                    }
                     Some(true)
                 }
                 // Anything else printable is the start of a path, so move the
@@ -461,7 +601,16 @@ impl super::ScreenState for DirPickerState {
             .options
             .iter()
             .enumerate()
-            .map(|(i, (_path, label))| {
+            .map(|(i, opt)| {
+                // A star marks a saved favourite, so it is obvious which rows
+                // `d` can remove and which `a` would add.
+                let mark = if opt.is_favorite { "★ " } else { "  " };
+                let count = if opt.uses > 0 {
+                    format!("  ({})", opt.uses)
+                } else {
+                    String::new()
+                };
+                let text = format!("{}{}{}", mark, opt.label, count);
                 if i == self.cursor {
                     // Reversed only while the list is driving, so the highlight
                     // marks "the keys move this" rather than just "last touched".
@@ -472,9 +621,14 @@ impl super::ScreenState for DirPickerState {
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::REVERSED)
                     };
-                    Line::from(Span::styled(format!("> {}", label), style))
+                    Line::from(Span::styled(format!("> {}", text), style))
+                } else if opt.is_favorite {
+                    Line::from(Span::styled(
+                        format!("  {}", text),
+                        Style::default().fg(Color::Green),
+                    ))
                 } else {
-                    Line::from(format!("  {}", label))
+                    Line::from(format!("  {}", text))
                 }
             })
             .collect();
@@ -492,9 +646,9 @@ impl super::ScreenState for DirPickerState {
                 // navigate" unconditionally while the path field was swallowing
                 // both keys.
                 .title(if field_focused {
-                    " Common Directories (↑/↓, or Tab for j/k) "
+                    " Directories (↑/↓, or Tab for j/k) "
                 } else {
-                    " Common Directories (j/k to navigate) "
+                    " Directories (j/k move · a save · d forget) "
                 }),
         );
         frame.render_widget(list, vertical[2]);
