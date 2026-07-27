@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.7.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.7.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -175,8 +175,9 @@ re-grab it.
 Show or hide the transfer panel.
 .TP
 .B Tab
-Cycles the browser panels and then the transfer panel. Only one pane shows the
-bright focus border at a time. While the transfer
+Rotates through every visible pane in turn \(em each browser panel from left to
+right, then the transfer panel \(em and wraps back to the first. Only one pane
+shows the bright focus border at a time. While the transfer
 panel has focus, \fBj\fR / \fBK\fR move between transfers, \fBk\fR or
 \fBDelete\fR cancels the selected one (after a confirmation), and \fBEsc\fR
 returns to the tree. A double-click on a transfer also cancels it.

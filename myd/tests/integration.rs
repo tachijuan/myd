@@ -7107,3 +7107,150 @@ fn a_single_panel_copy_from_a_remote_panel_routes_through_the_transfer_queue() {
     assert!(myd::app::copy_needs_transfer_queue(BackendId(1), BackendId::LOCAL));
     assert!(myd::app::copy_needs_transfer_queue(BackendId::LOCAL, BackendId(1)));
 }
+
+#[tokio::test]
+async fn tab_cycles_through_both_panels_and_the_transfer_sidebar() {
+    // With two panels open, Tab only alternated between the second panel and the
+    // sidebar: leaving the sidebar cleared `transfer_focused` but never reset
+    // `active`, so focus returned to whichever panel it came from and the first
+    // panel dropped out of the rotation entirely.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("l.txt"), b"l").unwrap();
+    std::fs::write(right.path().join("r.txt"), b"r").unwrap();
+    let src = left.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 4096]).unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    assert_eq!(app.panel_count(), 2);
+
+    // Queue a transfer so the sidebar is shown, and draw so it records its rect
+    // (focus_transfers is a no-op until the sidebar has actually been laid out).
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(right.path().join("payload.bin")),
+    );
+    let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    assert!(app.is_transfer_panel_visible(), "the sidebar should be shown");
+
+    let tab = || KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    // Describe focus as one value so the rotation reads as a sequence.
+    let focus = |app: &FileBrowser| -> String {
+        if app.transfer_focused_for_test() {
+            "transfers".to_string()
+        } else {
+            format!("panel{}", app.active_panel_index())
+        }
+    };
+
+    assert_eq!(focus(&app), "panel0", "starts on the left panel");
+
+    let mut seen = vec![focus(&app)];
+    for _ in 0..3 {
+        app.handle_key_for_test(tab());
+        term.draw(|f| app.render_for_test(f)).unwrap();
+        seen.push(focus(&app));
+    }
+
+    assert_eq!(
+        seen,
+        vec!["panel0", "panel1", "transfers", "panel0"],
+        "Tab must visit every pane and wrap back to the first"
+    );
+
+    // And it keeps cycling rather than settling into a two-pane loop.
+    for _ in 0..3 {
+        app.handle_key_for_test(tab());
+        term.draw(|f| app.render_for_test(f)).unwrap();
+        seen.push(focus(&app));
+    }
+    assert_eq!(
+        &seen[4..],
+        &["panel1", "transfers", "panel0"],
+        "the rotation must repeat, not alternate between two panes"
+    );
+}
+
+#[tokio::test]
+async fn tab_with_one_panel_toggles_between_it_and_the_sidebar() {
+    // The single-panel rotation: two stops, so Tab alternates. Guards the
+    // `stops > 1` arithmetic against an off-by-one that would strand focus.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 4096]).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dir.path().join("out/payload.bin")),
+    );
+    let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    let tab = || KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(!app.transfer_focused_for_test());
+    app.handle_key_for_test(tab());
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    assert!(app.transfer_focused_for_test(), "Tab reaches the sidebar");
+    app.handle_key_for_test(tab());
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    assert!(!app.transfer_focused_for_test(), "and comes back");
+    assert_eq!(app.active_panel_index(), 0);
+}
+
+#[tokio::test]
+async fn tab_still_alternates_panels_when_the_sidebar_is_hidden() {
+    // With no sidebar on screen the rotation is just the two panels. Previously
+    // this was the only case that worked; it must keep working.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("l.txt"), b"l").unwrap();
+    std::fs::write(right.path().join("r.txt"), b"r").unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    // Nothing queued, so the sidebar is not drawn.
+    assert!(!app.is_transfer_panel_visible());
+    let tab = || KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.active_panel_index(), 0);
+    app.handle_key_for_test(tab());
+    assert_eq!(app.active_panel_index(), 1);
+    app.handle_key_for_test(tab());
+    assert_eq!(app.active_panel_index(), 0, "wraps back with no sidebar");
+    assert!(!app.transfer_focused_for_test());
+}
