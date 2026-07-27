@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.12.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.12.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -82,7 +82,10 @@ destination to keep \(em a path, or a \fBlabel = sftp://…\fR line to save a
 host \(em and \fBd\fR forgets the highlighted one. \fBe\fR edits the highlighted
 entry \(em a directory's path, or a host's details \(em in a popup, keeping its
 visit history and its place in the pinned block rather than making a correction
-mean deleting and re-adding. \fB/\fR searches the whole list (\fBEsc\fR
+mean deleting and re-adding. \fBS\fR turns measuring on or off for the
+highlighted directory without opening it \(em marking somewhere known to be slow
+should not require paying for the walk first \(em and the row shows
+\fB(shallow)\fR when it is off. \fB/\fR searches the whole list (\fBEsc\fR
 clears it).
 \fB/\fR only starts a search when the path field is empty, since that is also
 how most absolute paths begin.
@@ -223,6 +226,33 @@ Quit, with the same confirmation as \fBq\fR.
 .TP
 .B Ctrl+o
 Go back to the parent directory.
+.TP
+.B o
+Open the selected file or directory with the system's default application \(em
+.BR open (1)
+on macOS,
+.BR xdg\-open (1)
+elsewhere. The launcher is started and myd carries on; it is not waited for, and
+its output is discarded so it cannot corrupt the display.
+.IP
+Remote entries are refused: those launchers only understand local paths, and a
+remote path either fails or opens an unrelated local file that happens to share
+it. Copy the file across first with \fBc\fR.
+.TP
+.B S
+Browse without measuring directory sizes, and back again.
+.IP
+Measuring means a recursive walk, which is the slowest thing this program does;
+over a large archive or a network mount it is not worth waiting for merely to
+look around. In shallow mode directory sizes read as unknown \(em a dash and an
+empty bar, exactly as remote directories do \(em and sort last rather than
+masquerading as small. The title bar reads \fBSHALLOW\fR so a tree of dashes is
+never mistaken for a broken one.
+.IP
+Turning measuring back on asks first, since that is the walk you avoided. The
+choice is remembered per directory in \fB~/.config/myd/hosts.toml\fR, so
+somewhere you have decided not to measure opens that way next time. It can also
+be set from the picker with \fBS\fR, without opening the directory at all.
 .TP
 .B Ctrl+r
 Rescan the file tree.
