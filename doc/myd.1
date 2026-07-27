@@ -11,9 +11,8 @@ visualize disk usage at a glance.
 .PP
 Built with \fBratatui\fR and \fBcrossterm\fR.
 .PP
-If \fIPATH\fR is provided, the browser starts at that directory. Otherwise,
-a directory picker screen is shown with common locations (home, desktop,
-downloads, etc.).
+If \fIPATH\fR is provided, the browser starts at that directory; otherwise it
+starts in the current directory. The directory picker is reached with \fBg d\fR.
 .SH KEY BINDINGS
 .SS Navigation
 .TP
@@ -56,6 +55,14 @@ Move cursor to the parent directory.
 .B g d
 Prompt for a new root directory and navigate to it. The picker opens over the
 current view; \fBEsc\fR dismisses it and returns to where you were.
+.IP
+The picker has two halves: a path field and a list of common directories.
+\fBTab\fR moves the keyboard between them, and the focused one is outlined in
+cyan. With the field focused, type a path (\fB~\fR is expanded) and press
+\fBEnter\fR. With the list focused, \fBj\fR/\fBk\fR move through the
+entries; the arrow keys work from either half. Selecting an entry offers its
+path in the field, and typing then replaces that offer \(em move the caret into
+it first (\fBEnd\fR, or an arrow) to extend it instead.
 .TP
 .B 0
 Collapse all expanded directories.
