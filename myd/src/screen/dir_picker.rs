@@ -52,8 +52,10 @@ pub struct DirPickerState {
 /// A requested change to the saved directory list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FavoriteEdit {
-    /// Save this path.
-    Add(PathBuf),
+    /// Ask the user which directory to save. `a` is "add a favourite", not
+    /// "bookmark whatever the cursor happens to be on" — the point is to save a
+    /// place you know about, which is usually not one already on the list.
+    PromptAdd,
     /// Forget this path.
     Remove(PathBuf),
 }
@@ -440,11 +442,7 @@ impl DirPickerState {
                 // Only bound while the list has focus, so typing a path that
                 // contains either letter is unaffected.
                 KeyCode::Char('a') => {
-                    if let Some(opt) = self.selected() {
-                        if !opt.is_favorite {
-                            self.pending_edit = Some(FavoriteEdit::Add(opt.path.clone()));
-                        }
-                    }
+                    self.pending_edit = Some(FavoriteEdit::PromptAdd);
                     Some(true)
                 }
                 KeyCode::Char('d') => {

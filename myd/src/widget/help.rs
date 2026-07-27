@@ -143,7 +143,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("n / p", "Next / previous search match"),
                 ("gd", "Go to directory picker"),
                 ("  Tab", "  Switch the path field and the list"),
-                ("  a / d", "  Save / forget the highlighted directory"),
+                ("  a / d", "  Save a directory / forget the highlighted one"),
             ],
         },
         HelpCategory {

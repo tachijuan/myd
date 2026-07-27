@@ -172,12 +172,36 @@ pub struct SavedDir {
     /// RFC 3339 timestamp of the last visit — what the list is ordered by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<String>,
+    /// Whether the user asked for this entry (`a`) rather than it being recorded
+    /// automatically from a typed path.
+    ///
+    /// History is convenience — it should not accumulate forever, and it is
+    /// trimmed to the most recent [`MAX_HISTORY`]. An explicitly saved favourite
+    /// is a decision and is never trimmed, so the two have to be told apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
+/// How many automatically-recorded directories to keep.
+///
+/// Enough that somewhere visited a few sessions ago is still one keystroke away,
+/// small enough that the list stays scannable and the config file stays short.
+pub const MAX_HISTORY: usize = 20;
+
 impl SavedDir {
+    /// An automatically recorded visit.
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A directory the user explicitly asked to keep.
+    pub fn pinned(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            pinned: true,
             ..Default::default()
         }
     }
@@ -386,12 +410,88 @@ impl HostCatalog {
 
     /// Save a directory. Returns false when it was already there, so the caller
     /// can say so rather than silently doing nothing.
+    ///
+    /// Pinning an entry that history already recorded is not a duplicate — it
+    /// promotes that entry, keeping its visit count.
     pub fn add_favorite(&mut self, dir: SavedDir) -> bool {
-        if self.is_favorite(&dir.path) {
+        // Matched canonically: history records the path the picker resolved, so
+        // pinning the same place typed a different way (a symlinked route, or
+        // macOS's `/tmp` vs `/private/tmp`) must promote that entry rather than
+        // add a second one for the same directory.
+        let pin = dir.pinned;
+        if let Some(existing) = self.find_dir_mut(&dir.path) {
+            if pin && !existing.pinned {
+                existing.pinned = true;
+                return true;
+            }
             return false;
         }
         self.favorites.push(dir);
         true
+    }
+
+    /// Record a directory the user opened by typing its path.
+    ///
+    /// Creates the entry when it is new, so the places you actually go
+    /// accumulate without having to be saved by hand, and promotes it when it is
+    /// not. Automatically recorded entries are then trimmed to [`MAX_HISTORY`];
+    /// entries the user pinned with `a` are never trimmed.
+    pub fn record_visit(&mut self, path: &str) {
+        if let Some(f) = self.find_dir_mut(path) {
+            f.uses += 1;
+            f.last_used = Some(chrono::Utc::now().to_rfc3339());
+        } else {
+            self.favorites.push(SavedDir {
+                path: path.to_string(),
+                uses: 1,
+                last_used: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
+            });
+        }
+        self.trim_history();
+    }
+
+    /// Drop the oldest automatically-recorded entries beyond [`MAX_HISTORY`].
+    fn trim_history(&mut self) {
+        let mut unpinned: Vec<(String, String)> = self
+            .favorites
+            .iter()
+            .filter(|f| !f.pinned)
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    f.last_used.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        if unpinned.len() <= MAX_HISTORY {
+            return;
+        }
+        // Newest first, then drop everything past the cap.
+        unpinned.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let doomed: std::collections::HashSet<String> = unpinned
+            .into_iter()
+            .skip(MAX_HISTORY)
+            .map(|(p, _)| p)
+            .collect();
+        self.favorites
+            .retain(|f| f.pinned || !doomed.contains(&f.path));
+    }
+
+    /// The entry for `path`, matching canonical forms as well as literal ones.
+    fn find_dir_mut(&mut self, path: &str) -> Option<&mut SavedDir> {
+        let canonical = std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        self.favorites.iter_mut().find(|f| {
+            f.path == path
+                || canonical.as_deref() == Some(f.path.as_str())
+                || std::fs::canonicalize(&f.path)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .as_deref()
+                    == Some(path)
+        })
     }
 
     /// Forget a saved directory. Returns whether anything was removed.
@@ -411,19 +511,7 @@ impl HostCatalog {
     /// `/tmp/work` would otherwise never match the `/private/tmp/work` that
     /// comes back on macOS — or the resolved target of any symlinked path.
     pub fn record_dir_use(&mut self, path: &str) {
-        let canonical = std::fs::canonicalize(path)
-            .ok()
-            .map(|p| p.to_string_lossy().to_string());
-        let entry = self.favorites.iter_mut().find(|f| {
-            f.path == path
-                || canonical.as_deref() == Some(f.path.as_str())
-                || std::fs::canonicalize(&f.path)
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .as_deref()
-                    == Some(path)
-        });
-        if let Some(f) = entry {
+        if let Some(f) = self.find_dir_mut(path) {
             f.uses += 1;
             f.last_used = Some(chrono::Utc::now().to_rfc3339());
         }
@@ -674,6 +762,44 @@ mod tests {
             order,
             vec!["/yesterday", "/often", "/never"],
             "recency wins over use count, and never-visited sinks last"
+        );
+    }
+
+    #[test]
+    fn pinning_an_existing_history_entry_promotes_it() {
+        // `a` on somewhere history already recorded should promote that entry,
+        // keeping its visit count, rather than adding a second one.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().to_string_lossy().to_string();
+        let mut c = HostCatalog::in_memory_dirs(vec![]);
+        c.record_visit(&p);
+        assert_eq!(c.favorites().len(), 1);
+        assert!(!c.favorites()[0].pinned, "a visit is history, not a favourite");
+
+        assert!(c.add_favorite(SavedDir::pinned(p)), "pinning reports a change");
+        assert_eq!(c.favorites().len(), 1, "and does not duplicate");
+        assert!(c.favorites()[0].pinned);
+        assert_eq!(c.favorites()[0].uses, 1, "history is kept");
+    }
+
+    #[test]
+    fn history_is_capped_but_pinned_entries_are_never_trimmed() {
+        let mut c = HostCatalog::in_memory_dirs(vec![]);
+        c.add_favorite(SavedDir::pinned("/pinned"));
+        // More automatic entries than the cap allows.
+        for i in 0..(MAX_HISTORY + 8) {
+            c.record_visit(&format!("/auto/{:03}", i));
+        }
+        let unpinned = c.favorites().iter().filter(|f| !f.pinned).count();
+        assert_eq!(unpinned, MAX_HISTORY, "history is trimmed to the cap");
+        assert!(
+            c.favorites().iter().any(|f| f.path == "/pinned"),
+            "an explicitly saved entry survives trimming"
+        );
+        // The oldest automatic entries are the ones dropped.
+        assert!(
+            !c.favorites().iter().any(|f| f.path == "/auto/000"),
+            "the oldest history entry should have been trimmed"
         );
     }
 
