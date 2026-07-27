@@ -5,7 +5,7 @@ mod main_screen;
 use ratatui::{Frame, layout::Rect};
 use crossterm::event::KeyEvent;
 
-pub use dir_picker::{DirPickerState, FavoriteEdit, PickerFocus, PickerOption};
+pub use dir_picker::{DirPickerState, FavoriteEdit, PickerChoice, PickerFocus, PickerOption};
 pub use loading::LoadingState;
 pub use main_screen::MainScreenState;
 

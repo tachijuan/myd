@@ -1294,7 +1294,7 @@ impl FileBrowser {
             return;
         }
         if let Err(e) = self.hosts.save() {
-            self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                 "Could not save the favourites list: {}",
                 e
             )));
@@ -1557,22 +1557,34 @@ impl FileBrowser {
                 let panel = self.active_panel_mut();
                 // Confirm dir picker selection → push loading screen.
                 if let Screen::DirPicker(state) = panel.current_screen_mut() {
-                    if let Some(path) = state.confirm() {
-                        panel.screen_stack.push(Screen::loading(path.clone()));
-                        // Promote it in the list for next time. Only saved
-                        // directories are tracked, so opening an arbitrary path
-                        // does not quietly add it to the favourites.
-                        // Every directory opened through the picker is recorded,
-                        // creating the entry when it is new — so the places the
-                        // user types accumulate into the list instead of having to
-                        // be saved by hand. Matches canonical forms too, so an
-                        // entry saved as `/tmp/x` is credited when the picker
-                        // resolves it to `/private/tmp/x`.
-                        let key = path.to_string_lossy().to_string();
-                        self.hosts.record_visit(&key);
-                        if let Err(e) = self.hosts.save() {
-                            tracing::warn!(error = %e, "could not persist directory history");
+                    match state.confirm() {
+                        crate::screen::PickerChoice::Open(path) => {
+                            panel.screen_stack.push(Screen::loading(path.clone()));
+                            // Every directory opened through the picker is
+                            // recorded, creating the entry when it is new — so the
+                            // places the user types accumulate into the list
+                            // instead of having to be saved by hand. Matches
+                            // canonical forms too, so an entry saved as `/tmp/x`
+                            // is credited when the picker resolves it to
+                            // `/private/tmp/x`.
+                            let key = path.to_string_lossy().to_string();
+                            self.hosts.record_visit(&key);
+                            if let Err(e) = self.hosts.save() {
+                                tracing::warn!(error = %e, "could not persist directory history");
+                            }
                         }
+                        crate::screen::PickerChoice::NotADirectory(path) => {
+                            // Say so and hand the field back, with what was typed
+                            // intact so a typo is a correction rather than a
+                            // retype. Falling through to the highlighted entry
+                            // would have opened somewhere the user never asked for.
+                            state.focus_field();
+                            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                                "'{}' is not a directory.",
+                                path.display()
+                            )));
+                        }
+                        crate::screen::PickerChoice::Nothing => {}
                     }
                     return true;
                 }
@@ -2073,7 +2085,7 @@ impl FileBrowser {
                                 if value.trim().is_empty() {
                                     // Nothing typed: treat as a cancel.
                                 } else if !dir.is_dir() {
-                                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                                         "'{}' is not a directory.",
                                         dir.display()
                                     )));
@@ -2085,13 +2097,13 @@ impl FileBrowser {
                                     if added {
                                         if let Err(e) = self.hosts.save() {
                                             self.modal =
-                                                Modal::Confirm(ConfirmDialog::new(format!(
+                                                Modal::Confirm(ConfirmDialog::notice(format!(
                                                     "Could not save the favourites list: {}",
                                                     e
                                                 )));
                                         }
                                     } else {
-                                        self.modal = Modal::Confirm(ConfirmDialog::new(
+                                        self.modal = Modal::Confirm(ConfirmDialog::notice(
                                             format!("'{}' is already saved.", dir.display()),
                                         ));
                                     }
