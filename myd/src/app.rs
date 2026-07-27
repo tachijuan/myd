@@ -98,6 +98,8 @@ pub enum ModalTarget {
     HostDelete { label: String },
     /// Prompt for a directory to save as a favourite.
     FavoriteAdd,
+    /// Edit a saved directory's path in place, keeping its history and position.
+    FavoriteEdit { original: PathBuf },
     /// Confirm cancelling a running or queued transfer.
     CancelTransfer { id: crate::transfer::TransferId },
     /// Confirm quitting while transfers are still in flight.
@@ -579,8 +581,12 @@ impl FileBrowser {
     /// empties in dual mode, drop the split rather than quitting.
     fn resolve_loading(&mut self) -> bool {
         let mut keep_running = true;
+        // Directories that finished loading this tick, recorded below. Collected
+        // first because the catalog cannot be borrowed while a panel is.
+        let mut opened: Vec<PathBuf> = Vec::new();
         for i in 0..self.panels.len() {
-            if !self.panels[i].resolve_loading() {
+            let mut just_opened = None;
+            if !self.panels[i].resolve_loading_reporting(&mut just_opened) {
                 // This panel has nothing left to show.
                 if self.panels.len() == 2 {
                     // Collapse to the surviving panel rather than quitting.
@@ -591,6 +597,21 @@ impl FileBrowser {
                 if i == self.active {
                     keep_running = false;
                 }
+            }
+            if let Some(path) = just_opened {
+                opened.push(path);
+            }
+        }
+
+        // Remember where the user actually went. Every route lands here, so
+        // browsing into a directory now builds the history that only typing a
+        // path into the picker used to.
+        if !opened.is_empty() {
+            for path in opened {
+                self.hosts.record_visit(&path.to_string_lossy());
+            }
+            if let Err(e) = self.hosts.save() {
+                tracing::warn!(error = %e, "could not persist directory history");
             }
         }
         keep_running
@@ -1302,6 +1323,20 @@ impl FileBrowser {
             FavoriteEdit::Remove(path) => {
                 self.hosts.remove_favorite(&path.to_string_lossy())
             }
+            FavoriteEdit::EditDir(path) => {
+                // A popup pre-filled with the current path, so correcting a typo
+                // or a moved directory is an edit rather than a delete and a
+                // retype.
+                self.modal_target = Some(ModalTarget::FavoriteEdit {
+                    original: path.clone(),
+                });
+                self.modal = Modal::Input(
+                    InputDialog::new("Edit directory path:", "/path/to/directory")
+                        .with_title("Edit saved directory")
+                        .with_default(path.to_string_lossy().to_string()),
+                );
+                return;
+            }
             FavoriteEdit::DeleteHost(label) => {
                 self.modal_target = Some(ModalTarget::HostDelete {
                     label: label.clone(),
@@ -1671,19 +1706,11 @@ impl FileBrowser {
                 if let Screen::DirPicker(state) = panel.current_screen_mut() {
                     match state.confirm() {
                         crate::screen::PickerChoice::Open(path) => {
+                            // The visit is recorded when the load resolves, in
+                            // `resolve_loading` — one seam covering every way of
+                            // arriving somewhere. Recording it here as well would
+                            // count picker openings twice.
                             panel.screen_stack.push(Screen::loading(path.clone()));
-                            // Every directory opened through the picker is
-                            // recorded, creating the entry when it is new — so the
-                            // places the user types accumulate into the list
-                            // instead of having to be saved by hand. Matches
-                            // canonical forms too, so an entry saved as `/tmp/x`
-                            // is credited when the picker resolves it to
-                            // `/private/tmp/x`.
-                            let key = path.to_string_lossy().to_string();
-                            self.hosts.record_visit(&key);
-                            if let Err(e) = self.hosts.save() {
-                                tracing::warn!(error = %e, "could not persist directory history");
-                            }
                         }
                         crate::screen::PickerChoice::NotADirectory(path) => {
                             // Say so and hand the field back, with what was typed
@@ -2194,6 +2221,30 @@ impl FileBrowser {
                                         self.modal =
                                             Modal::Confirm(ConfirmDialog::new(msg));
                                     }
+                                }
+                            }
+                            ModalTarget::FavoriteEdit { original } => {
+                                let typed = value.trim();
+                                let dir = PathBuf::from(typed).expand_user();
+                                if typed.is_empty() {
+                                    // Nothing typed: treat as a cancel.
+                                } else if !dir.is_dir() {
+                                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                                        "'{}' is not a directory.",
+                                        dir.display()
+                                    )));
+                                } else if let Some(msg) = self
+                                    .hosts
+                                    .rename_favorite(&original.to_string_lossy(), &dir.to_string_lossy())
+                                {
+                                    self.modal = Modal::Confirm(ConfirmDialog::notice(msg));
+                                } else {
+                                    if let Err(e) = self.hosts.save() {
+                                        self.modal = Modal::Confirm(ConfirmDialog::notice(
+                                            format!("Could not save the list: {}", e),
+                                        ));
+                                    }
+                                    self.rebuild_dir_picker();
                                 }
                             }
                             ModalTarget::FavoriteAdd => {
