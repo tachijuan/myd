@@ -8237,3 +8237,67 @@ async fn a_pinned_order_survives_a_reload() {
         .collect();
     assert_eq!(seen, order, "the arranged order must survive a reload");
 }
+
+#[tokio::test]
+async fn m_on_an_unpinned_entry_pins_it_and_starts_moving() {
+    // Reported as "the move command does nothing". `m` only acted on entries
+    // already in the pinned block, so on every other row it was silently a
+    // no-op — and since a fresh list has nothing pinned, that was most of them.
+    // The earlier tests all pressed `m` on a pinned row and so never saw it.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    assert!(pinned_paths(&app).is_empty(), "nothing pinned yet");
+
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('m'));
+
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(s) if s.moving().is_some()),
+        "m must start a move rather than doing nothing"
+    );
+    assert_eq!(
+        pinned_paths(&app),
+        vec![dirs[0].path().to_string_lossy().to_string()],
+        "and pin the entry it is about to position"
+    );
+}
+
+#[tokio::test]
+async fn sliding_out_of_the_block_shows_the_change_before_it_is_committed() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Sliding past the bottom sets "will unpin", and the row's own marker has to
+    // follow — otherwise the list still draws it as pinned while Enter is about
+    // to do the opposite. A second `j` also must not run away down the list.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('p'));
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(char_key('m'));
+    assert_eq!(pinned_paths(&app).len(), 1);
+
+    // One step past the bottom of a one-entry block.
+    app.handle_key_for_test(char_key('j'));
+    assert!(
+        pinned_paths(&app).is_empty(),
+        "the row should already read as unpinned while moving"
+    );
+    // Further presses are a no-op rather than dragging it down the list.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('j'));
+    assert!(pinned_paths(&app).is_empty());
+
+    // k puts it back into the block, still mid-move.
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(
+        pinned_paths(&app).len(),
+        1,
+        "k should bring it back into the block"
+    );
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.hosts_for_test().pinned_dirs().len(),
+        1,
+        "committing after returning keeps it pinned"
+    );
+}

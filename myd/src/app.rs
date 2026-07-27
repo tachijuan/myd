@@ -1290,6 +1290,27 @@ impl FileBrowser {
                 self.hosts.remove_favorite(&path.to_string_lossy())
             }
             FavoriteEdit::Pin(path) => self.hosts.pin_dir(&path.to_string_lossy()),
+            FavoriteEdit::PinAndMove(path) => {
+                // `m` on an entry outside the pinned block: pin it, then start
+                // the move on the rebuilt picker so the entry is where the move
+                // logic expects to find it.
+                let pinned = self.hosts.pin_dir(&path.to_string_lossy());
+                if pinned {
+                    if let Err(e) = self.hosts.save() {
+                        tracing::warn!(error = %e, "could not persist the pin");
+                    }
+                    self.rebuild_dir_picker();
+                    let path = path.clone();
+                    if let Screen::DirPicker(state) =
+                        self.active_panel_mut().current_screen_mut()
+                    {
+                        state.select_path(&path);
+                        state.start_move(&path);
+                    }
+                }
+                // Already saved and rebuilt above; nothing further to do.
+                return;
+            }
             FavoriteEdit::Unpin(path) => self.hosts.unpin_dir(&path.to_string_lossy()),
             FavoriteEdit::Reorder { order, unpin } => {
                 // Applied as one step: the order first, then any entry the user

@@ -145,7 +145,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("  Tab", "  Switch the path field and the list"),
                 ("  a / d", "  Save a directory / forget the highlighted one"),
                 ("  p / u", "  Pin to the top block / unpin"),
-                ("  m", "  Reorder a pinned entry (Enter, Esc)"),
+                ("  m", "  Move an entry into place (Enter, Esc)"),
             ],
         },
         HelpCategory {
