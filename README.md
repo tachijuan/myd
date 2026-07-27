@@ -126,7 +126,7 @@ Tagged files are highlighted; `c`, `m` and `D` operate on the whole tagged set (
 | `p`       | Jump to the previous match (up the tree)   |
 | `f`       | Filter the tree by regex                   |
 
-Search wraps around at the ends. Filtering hides non-matching entries at every level of the tree; an empty pattern (or `Esc`) clears it. Both are case-insensitive, and a pattern that isn't valid regex is reported instead of being silently ignored.
+Search wraps around at the ends. Filtering hides non-matching entries at every level of the tree; an empty pattern (or `Esc`) clears it. While a filter is active the title bar reads `FILTERED` and the footer shows the pattern, so a masked view is never mistaken for the real contents. Both are case-insensitive, and a pattern that isn't valid regex is reported instead of being silently ignored.
 
 ### View
 
@@ -282,7 +282,7 @@ Large copies and deletes show a progress overlay with an item-by-item count and 
 
 Press **`/`** to search entry names with a regular expression (case-insensitive). The cursor jumps to the first match; **`n`** and **`p`** then step to the next and previous matches, wrapping around at the ends.
 
-Press **`f`** to *filter* the tree: enter a regex and only entries whose names match remain visible, at every level. A directory is kept when something beneath it matches, so matching files stay reachable. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing.
+Press **`f`** to *filter* the tree: enter a regex and only entries whose names match remain visible, at every level. A directory is kept when something beneath it matches, so matching files stay reachable. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing. An active filter is always visible: the title bar reads `FILTERED` and shows how many entries are shown rather than how many exist, and the footer carries the pattern.
 
 ## Dual-Panel Mode
 

@@ -7403,3 +7403,69 @@ async fn filtering_is_case_insensitive_like_search() {
         visible_names(&app)
     );
 }
+
+#[tokio::test]
+async fn a_filtered_view_says_so_on_screen() {
+    // A filter hides rows, and without an indicator the tree just looks wrong —
+    // there was no way to tell a filtered view from a directory that had lost
+    // files. Both the title bar and the footer now carry it.
+    let (_dir, mut app) = filter_app().await;
+
+    let before = app_screen_text(&mut app, 110, 14);
+    assert!(!before.contains("FILTERED"), "no badge before filtering");
+
+    apply_filter(&mut app, ".*p$");
+
+    let after = app_screen_text(&mut app, 110, 14);
+    assert!(
+        after.contains("FILTERED"),
+        "the title bar must mark a filtered view: {}",
+        after
+    );
+    assert!(
+        after.contains("filter: .*p$"),
+        "the footer badge must name the active pattern: {}",
+        after
+    );
+    assert!(
+        after.contains("shown"),
+        "the counts describe what is visible while filtering: {}",
+        after
+    );
+
+    // Clearing removes every trace of it.
+    apply_filter(&mut app, "");
+    let cleared = app_screen_text(&mut app, 110, 14);
+    assert!(
+        !cleared.contains("FILTERED") && !cleared.contains("filter: "),
+        "clearing the filter must remove the indicator: {}",
+        cleared
+    );
+}
+
+#[tokio::test]
+async fn the_filter_indicator_survives_a_narrow_terminal() {
+    // The badge carries a pattern and a hint, which together are wider than a
+    // small terminal's footer. It drops the hint, then the pattern, rather than
+    // crowding out the keybindings — but "filtering is on" always survives,
+    // since that is the part the rows themselves cannot convey.
+    let (_dir, mut app) = filter_app().await;
+    apply_filter(&mut app, ".*p$");
+
+    for width in [110u16, 80, 56, 44] {
+        let text = app_screen_text(&mut app, width, 10);
+        assert!(
+            text.contains("FILTERED") || text.contains("filter: "),
+            "the filtered state must be visible at width {}: {}",
+            width,
+            text
+        );
+        // The keybindings must not be pushed entirely off screen.
+        assert!(
+            text.contains("[TREE]"),
+            "the footer keys must survive at width {}: {}",
+            width,
+            text
+        );
+    }
+}

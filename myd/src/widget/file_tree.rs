@@ -15,6 +15,11 @@ use crate::widget::source::Source;
 /// reversed cursor. Shared with the footer's "N tagged" badge.
 pub const TAG_COLOR: Color = Color::Rgb(255, 170, 40);
 
+/// Colour for the "filtering" badge — a green distinct from the amber tags, the
+/// magenta visual-mode badge and the teal ghost rows, so the three transient
+/// footer indicators never read as the same thing.
+pub const FILTER_COLOR: Color = Color::Rgb(120, 200, 120);
+
 /// Color for "ghost" rows — a transfer in progress toward that location. A muted
 /// teal, distinct from the amber tags and blue directories, so an in-flight copy
 /// reads as provisional rather than real.
