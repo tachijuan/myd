@@ -773,13 +773,29 @@ impl MainScreenState {
         let total = self.tree.lines.len().saturating_sub(1); // subtract root
         let dirs = self.tree.dir_count();
         let files = self.tree.file_count();
-        let prefix = format!(
-            " File Tree ({}) | {} items | {} dirs | {} files | ",
-            self.root_path.display(),
-            total,
-            dirs,
-            files,
-        );
+        // While filtering, the counts describe what is *visible*, so say so —
+        // otherwise "12 items" over a masked tree reads as the directory having
+        // lost files.
+        let prefix = if self.tree.filter_pattern().is_some() {
+            // "FILTERED" leads, because ratatui truncates a title at the right
+            // border: on a narrow terminal the tail is the first thing lost, and
+            // this is the part that must not be.
+            format!(
+                " FILTERED | File Tree ({}) | {} shown | {} dirs | {} files | ",
+                self.root_path.display(),
+                total,
+                dirs,
+                files,
+            )
+        } else {
+            format!(
+                " File Tree ({}) | {} items | {} dirs | {} files | ",
+                self.root_path.display(),
+                total,
+                dirs,
+                files,
+            )
+        };
         let sort_text = format!("Sort: {} ▾ ", self.tree.sort_mode.label());
         let title = format!("{}{}", prefix, sort_text);
 
@@ -1010,6 +1026,33 @@ impl MainScreenState {
                         Style::default()
                             .fg(Color::Black)
                             .bg(crate::widget::file_tree::TAG_COLOR)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                // A filter hides rows with nothing else on screen to say so, which
+                // leaves the tree looking wrong rather than filtered. The badge
+                // carries the pattern and how to get rid of it — dropping the hint,
+                // then truncating the pattern, as the terminal narrows, so the
+                // badge never crowds out the keybindings entirely.
+                if let Some(pattern) = self.tree.filter_pattern() {
+                    let width = area.width as usize;
+                    const HINT: &str = "  (f to change, empty to clear)";
+                    // Keep at least this much room for the keybindings that follow.
+                    let budget = width.saturating_sub(46);
+                    let label = if budget >= pattern.chars().count() + HINT.chars().count() + 11 {
+                        format!(" ⧉ filter: {}{} ", pattern, HINT)
+                    } else if budget >= pattern.chars().count() + 11 {
+                        format!(" ⧉ filter: {} ", pattern)
+                    } else {
+                        // Even the pattern will not fit; say that filtering is on,
+                        // which is the part the user cannot infer from the rows.
+                        " ⧉ FILTERED ".to_string()
+                    };
+                    spans.push(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(crate::widget::file_tree::FILTER_COLOR)
                             .add_modifier(Modifier::BOLD),
                     ));
                 }

@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.7.3" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.7.4" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -140,6 +140,12 @@ Filter the tree by a case-insensitive regular expression: entries whose names
 do not match are hidden, at every level. A directory is kept when something
 beneath it matches, so matching files stay reachable. The filter is a view mask
 \(em the tree itself is untouched \(em and an empty pattern clears it.
+.IP
+While a filter is active the title bar reads \fBFILTERED\fR and reports how
+many entries are \fIshown\fR rather than how many exist, and the footer carries
+the pattern \(em a masked view is never mistaken for the directory's real
+contents. On a narrow terminal the footer badge drops its hint, then the
+pattern, but never the fact that filtering is on.
 .IP
 A pattern that is not valid regular expression syntax is reported. Note that
 \fB*p$\fR is not valid (there is nothing for \fB*\fR to repeat); the pattern
