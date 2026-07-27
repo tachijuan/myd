@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.12.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.12.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -75,9 +75,12 @@ Selecting an entry offers its path in the field, and typing then replaces that
 offer \(em press \fBEnd\fR first to extend it instead, which is how you append
 a subdirectory to a listed path.
 .IP
-Every directory you open is remembered \(em whether typed into the picker,
-chosen from the list, or reached by browsing the tree \(em so anywhere you have
-been is a keystroke away afterwards. With the list focused, \fBa\fR prompts for a
+Every directory opened through this dialog is remembered, whether typed or
+chosen from the list, so a path typed once is a keystroke away afterwards.
+Directories reached by browsing the tree are not: the list is for destinations
+you chose, and recording every directory drilled into would bury them.
+.IP
+With the list focused, \fBa\fR prompts for a
 destination to keep \(em a path, or a \fBlabel = sftp://…\fR line to save a
 host \(em and \fBd\fR forgets the highlighted one. \fBe\fR edits the highlighted
 entry \(em a directory's path, or a host's details \(em in a popup, keeping its
