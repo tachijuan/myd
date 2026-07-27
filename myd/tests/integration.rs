@@ -6596,3 +6596,166 @@ fn a_remote_root_reports_no_local_metadata() {
         "a remote root must not borrow local mode bits"
     );
 }
+
+#[tokio::test]
+async fn copy_targets_the_destination_panes_cursor_directory() {
+    // A copy's destination is the OTHER pane's `current_dir()`, which is that
+    // pane's *root* — not where its cursor actually is. Directories expand in
+    // place, so after expanding a subdirectory and putting the cursor inside it,
+    // the visible "current directory" and the copy destination disagree.
+    //
+    // `N` (create directory) already resolves this correctly via `target_dir()`;
+    // copy does not, so a copy lands one or more levels above where the user is
+    // looking.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("payload.txt"), b"data").unwrap();
+
+    let dst = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dst.path().join("inbox")).unwrap();
+    std::fs::write(dst.path().join("inbox/keep.txt"), b"k").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(
+        Some(src.path().to_path_buf()),
+        Some(dst.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    // Focus the right pane and open "inbox", leaving the cursor inside it.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.active_panel_index(), 1);
+    for _ in 0..40 {
+        let on_inbox = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s
+                .tree
+                .selected_line()
+                .map(|l| l.name == "inbox")
+                .unwrap_or(false),
+            _ => false,
+        };
+        if on_inbox {
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    // Expand it in place, then step onto a child so the cursor is *inside* inbox.
+    app.handle_key_for_test(char_key('l'));
+    app.handle_key_for_test(char_key('j'));
+
+    let cursor_dir = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s
+            .tree
+            .selected_line()
+            .map(|l| {
+                if l.is_dir {
+                    l.resolved_path.clone()
+                } else {
+                    l.resolved_path.parent().unwrap().to_path_buf()
+                }
+            })
+            .unwrap(),
+        _ => panic!("expected a main screen"),
+    };
+    assert_eq!(
+        cursor_dir.file_name().unwrap(),
+        "inbox",
+        "the right pane's cursor should be inside inbox"
+    );
+
+    // Back to the left pane, select the file, and copy.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for _ in 0..40 {
+        let on_it = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s
+                .tree
+                .selected_line()
+                .map(|l| l.name == "payload.txt")
+                .unwrap_or(false),
+            _ => false,
+        };
+        if on_it {
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    app.handle_key_for_test(char_key('c'));
+    for _ in 0..200 {
+        app.tick_for_test();
+        app.resolve_loading_for_test();
+        if dst.path().join("inbox/payload.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    assert!(
+        dst.path().join("inbox/payload.txt").exists(),
+        "the copy should land in the directory the destination pane's cursor is in \
+         (inbox), but inbox contains {:?} and the pane root contains {:?}",
+        std::fs::read_dir(dst.path().join("inbox"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>(),
+        std::fs::read_dir(dst.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn logging_initializes_and_writes_to_the_configured_file() {
+    // `trace::init()` was only called by the myd-transfer helper, never by the
+    // TUI, so MYD_LOG / MYD_TRACE silently did nothing for the app itself. This
+    // asserts a subscriber actually installs and reaches the file.
+    //
+    // Runs the real binary: init() is idempotent per-process and other tests may
+    // already have set the global dispatcher, so checking it in-process would
+    // prove nothing.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    let log = dir.path().join("trace.log");
+
+    let exe = env!("CARGO_BIN_EXE_myd");
+    let mut child = std::process::Command::new(exe)
+        .arg(dir.path())
+        .env("MYD_LOG", "myd=debug")
+        .env("MYD_TRACE_FILE", &log)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("myd should start");
+
+    // Give it a moment to install the subscriber and write the startup line.
+    let mut found = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if std::fs::read_to_string(&log)
+            .map(|s| s.contains("diagnostics started"))
+            .unwrap_or(false)
+        {
+            found = true;
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        found,
+        "MYD_LOG should install a subscriber and write to MYD_TRACE_FILE; log was {:?}",
+        std::fs::read_to_string(&log).ok()
+    );
+}
