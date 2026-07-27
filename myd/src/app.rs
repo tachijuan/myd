@@ -1289,6 +1289,18 @@ impl FileBrowser {
             FavoriteEdit::Remove(path) => {
                 self.hosts.remove_favorite(&path.to_string_lossy())
             }
+            FavoriteEdit::Pin(path) => self.hosts.pin_dir(&path.to_string_lossy()),
+            FavoriteEdit::Unpin(path) => self.hosts.unpin_dir(&path.to_string_lossy()),
+            FavoriteEdit::Reorder { order, unpin } => {
+                // Applied as one step: the order first, then any entry the user
+                // slid out of the block. Doing it the other way round would
+                // renumber around a path that is about to leave.
+                self.hosts.apply_pin_order(order);
+                if let Some(path) = unpin {
+                    self.hosts.unpin_dir(&path.to_string_lossy());
+                }
+                true
+            }
         };
         if !changed {
             return;
@@ -2093,7 +2105,7 @@ impl FileBrowser {
                                     let key = dir.to_string_lossy().to_string();
                                     let added = self
                                         .hosts
-                                        .add_favorite(crate::hosts::SavedDir::pinned(key));
+                                        .add_favorite(crate::hosts::SavedDir::saved(key));
                                     if added {
                                         if let Err(e) = self.hosts.save() {
                                             self.modal =

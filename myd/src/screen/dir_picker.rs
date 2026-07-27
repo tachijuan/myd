@@ -41,6 +41,13 @@ pub struct DirPickerState {
     input_is_suggestion: bool,
     /// Which half of the screen the keyboard drives.
     focus: PickerFocus,
+    /// An in-progress `m` reorder: the path being moved and where it started, so
+    /// Esc can put it back.
+    ///
+    /// Held here rather than committed per keystroke because a cancelled move
+    /// has to restore the original position exactly, and the catalog would
+    /// otherwise have already been renumbered several times.
+    moving: Option<MoveState>,
     /// A favourite the user asked to add or remove, awaiting the app.
     ///
     /// The picker cannot persist anything itself — the catalog and its file live
@@ -60,6 +67,18 @@ pub enum PickerChoice {
     Nothing,
 }
 
+/// An in-progress reorder of the pinned block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveState {
+    /// The entry being moved.
+    pub path: PathBuf,
+    /// The pinned order as it stood when the move began, for Esc.
+    pub original: Vec<String>,
+    /// Whether the entry has been slid out of the pinned block entirely, which
+    /// unpins it on confirm.
+    pub unpinning: bool,
+}
+
 /// A requested change to the saved directory list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FavoriteEdit {
@@ -69,6 +88,16 @@ pub enum FavoriteEdit {
     PromptAdd,
     /// Forget this path.
     Remove(PathBuf),
+    /// Pin this path to the bottom of the pinned block.
+    Pin(PathBuf),
+    /// Remove this path from the pinned block, keeping it saved.
+    Unpin(PathBuf),
+    /// Commit a reorder: the pinned block's new order, and any path that was
+    /// slid out of it.
+    Reorder {
+        order: Vec<String>,
+        unpin: Option<PathBuf>,
+    },
 }
 
 /// One row of the picker's shortcut list.
@@ -80,6 +109,9 @@ pub struct PickerOption {
     /// locations. Only a favourite can be removed, and only a non-favourite can
     /// be added.
     pub is_favorite: bool,
+    /// Which group this row belongs to: pinned, saved, or recent history. A
+    /// built-in location is `Recent`.
+    pub tier: crate::hosts::DirTier,
     /// Times visited, for the trailing count. Zero for an unvisited built-in.
     pub uses: u64,
     /// RFC 3339 last visit, or `None`. Drives the ordering.
@@ -130,6 +162,7 @@ impl DirPickerState {
                 path: PathBuf::from(&f.path),
                 label: f.display().to_string(),
                 is_favorite: true,
+                tier: f.tier(),
                 uses: f.uses,
                 last_used: f.last_used.clone(),
             });
@@ -144,30 +177,56 @@ impl DirPickerState {
                 path,
                 label,
                 is_favorite: false,
+                tier: crate::hosts::DirTier::Recent,
                 uses: 0,
                 last_used: None,
             });
         }
 
-        // One merged list, most recently visited first. Built-ins have no
-        // timestamp and so settle below anything actually used, in their
-        // original order rather than alphabetically — "Home" before "/tmp"
-        // reads better than the reverse.
-        let order: std::collections::HashMap<&Path, usize> = options
+        // Grouped by tier, then ordered within each. The pinned block keeps the
+        // order the user arranged; the other two are most-recently-visited
+        // first. Built-ins have no timestamp and so settle below anything
+        // actually used, in their original order rather than alphabetically —
+        // "Home" before "/tmp" reads better than the reverse.
+        let declared: std::collections::HashMap<&Path, usize> = options
             .iter()
             .enumerate()
             .map(|(i, o)| (o.path.as_path(), i))
             .collect();
+        // Rank within the pinned block, taken from the catalog's order.
+        let pin_rank: std::collections::HashMap<&str, usize> = favorites
+            .iter()
+            .filter(|f| f.is_pinned())
+            .map(|f| (f.path.as_str(), f.pin_rank.unwrap_or(u32::MAX) as usize))
+            .collect();
+
         let mut indexed: Vec<(usize, PickerOption)> = options
             .iter()
-            .map(|o| (order[o.path.as_path()], o.clone()))
+            .map(|o| (declared[o.path.as_path()], o.clone()))
             .collect();
         indexed.sort_by(|(ai, a), (bi, b)| {
-            let (ak, bk) = (
-                a.last_used.as_deref().unwrap_or(""),
-                b.last_used.as_deref().unwrap_or(""),
-            );
-            bk.cmp(ak).then_with(|| ai.cmp(bi))
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| {
+                    if a.tier == crate::hosts::DirTier::Pinned {
+                        let ar = pin_rank
+                            .get(a.path.to_string_lossy().as_ref())
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        let br = pin_rank
+                            .get(b.path.to_string_lossy().as_ref())
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        ar.cmp(&br)
+                    } else {
+                        let (ak, bk) = (
+                            a.last_used.as_deref().unwrap_or(""),
+                            b.last_used.as_deref().unwrap_or(""),
+                        );
+                        bk.cmp(ak)
+                    }
+                })
+                .then_with(|| ai.cmp(bi))
         });
         let options: Vec<PickerOption> = indexed.into_iter().map(|(_, o)| o).collect();
 
@@ -180,8 +239,14 @@ impl DirPickerState {
             // The field starts focused: the picker exists to accept a path, and
             // the common directories are the shortcut, not the main event.
             focus: PickerFocus::Field,
+            moving: None,
             pending_edit: None,
         }
+    }
+
+    /// The reorder in progress, if any.
+    pub fn moving(&self) -> Option<&MoveState> {
+        self.moving.as_ref()
     }
 
     /// Take the pending favourite edit, if the user asked for one.
@@ -405,6 +470,94 @@ impl DirPickerState {
         }
     }
 
+    /// Begin reordering `path` within the pinned block.
+    fn begin_move(&mut self, path: PathBuf) {
+        let original: Vec<String> = self
+            .options
+            .iter()
+            .filter(|o| o.tier == crate::hosts::DirTier::Pinned)
+            .map(|o| o.path.to_string_lossy().to_string())
+            .collect();
+        self.moving = Some(MoveState {
+            path,
+            original,
+            unpinning: false,
+        });
+    }
+
+    /// Number of rows currently in the pinned block.
+    fn pinned_count(&self) -> usize {
+        self.options
+            .iter()
+            .filter(|o| o.tier == crate::hosts::DirTier::Pinned)
+            .count()
+    }
+
+    /// Drive an in-progress reorder. Returns whether the app keeps running.
+    fn handle_move_key(&mut self, code: KeyCode) -> bool {
+        let Some(state) = self.moving.clone() else {
+            return true;
+        };
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let last = self.pinned_count().saturating_sub(1);
+                if self.cursor >= last {
+                    // Sliding past the bottom of the block takes the entry out of
+                    // it, which is how a move doubles as an unpin.
+                    if let Some(m) = self.moving.as_mut() {
+                        m.unpinning = true;
+                    }
+                    self.cursor = (self.cursor + 1).min(self.options.len().saturating_sub(1));
+                } else {
+                    self.swap_rows(self.cursor, self.cursor + 1);
+                    self.cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(m) = self.moving.as_mut() {
+                    if m.unpinning {
+                        // Back into the block.
+                        m.unpinning = false;
+                        self.cursor = self.pinned_count().saturating_sub(1);
+                        return true;
+                    }
+                }
+                if self.cursor > 0 {
+                    self.swap_rows(self.cursor - 1, self.cursor);
+                    self.cursor -= 1;
+                }
+            }
+            KeyCode::Enter => {
+                let order: Vec<String> = self
+                    .options
+                    .iter()
+                    .filter(|o| o.tier == crate::hosts::DirTier::Pinned)
+                    .map(|o| o.path.to_string_lossy().to_string())
+                    .collect();
+                let unpin = state.unpinning.then(|| state.path.clone());
+                self.moving = None;
+                self.pending_edit = Some(FavoriteEdit::Reorder { order, unpin });
+            }
+            KeyCode::Esc => {
+                // Put the block back exactly as it was.
+                self.moving = None;
+                self.pending_edit = Some(FavoriteEdit::Reorder {
+                    order: state.original.clone(),
+                    unpin: None,
+                });
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Swap two rows in the displayed order, for live feedback during a move.
+    fn swap_rows(&mut self, a: usize, b: usize) {
+        if a < self.options.len() && b < self.options.len() {
+            self.options.swap(a, b);
+        }
+    }
+
     /// Put the keyboard back in the path field, for correcting a bad entry.
     pub fn focus_field(&mut self) {
         self.focus = PickerFocus::Field;
@@ -457,6 +610,13 @@ impl DirPickerState {
             _ => {}
         }
 
+        // A reorder in progress owns the keyboard: j/k slide the entry, Enter
+        // commits, Esc puts it back. Everything else is ignored rather than
+        // acted on half-way through a move.
+        if self.moving.is_some() {
+            return Some(self.handle_move_key(key.code));
+        }
+
         if self.focus == PickerFocus::List {
             return match key.code {
                 // Text-editing keys mean the user wants the field, so hand it
@@ -491,6 +651,33 @@ impl DirPickerState {
                 }
                 KeyCode::Char('G') => {
                     self.select_last();
+                    Some(true)
+                }
+                // Pin the highlighted entry to the bottom of the pinned block,
+                // or take it out of that block again.
+                KeyCode::Char('p') => {
+                    if let Some(opt) = self.selected() {
+                        if opt.is_favorite && opt.tier != crate::hosts::DirTier::Pinned {
+                            self.pending_edit = Some(FavoriteEdit::Pin(opt.path.clone()));
+                        }
+                    }
+                    Some(true)
+                }
+                KeyCode::Char('u') => {
+                    if let Some(opt) = self.selected() {
+                        if opt.tier == crate::hosts::DirTier::Pinned {
+                            self.pending_edit = Some(FavoriteEdit::Unpin(opt.path.clone()));
+                        }
+                    }
+                    Some(true)
+                }
+                // Start a reorder. Only a pinned entry has an order to change.
+                KeyCode::Char('m') => {
+                    if let Some(opt) = self.selected() {
+                        if opt.tier == crate::hosts::DirTier::Pinned {
+                            self.begin_move(opt.path.clone());
+                        }
+                    }
                     Some(true)
                 }
                 // Save / forget, matching the dialing directory's a and d.
@@ -655,9 +842,26 @@ impl super::ScreenState for DirPickerState {
             .iter()
             .enumerate()
             .map(|(i, opt)| {
-                // A star marks a saved favourite, so it is obvious which rows
-                // `d` can remove and which `a` would add.
-                let mark = if opt.is_favorite { "★ " } else { "  " };
+                // The marker says which tier a row is in, so it is obvious which
+                // rows `d` removes, `p` pins and `m` can reorder. A row being
+                // moved shows a grip instead, for live feedback.
+                let being_moved = self
+                    .moving
+                    .as_ref()
+                    .map(|m| m.path == opt.path)
+                    .unwrap_or(false);
+                let mark = if being_moved {
+                    "⠿ "
+                } else {
+                    match opt.tier {
+                        // Single-width glyphs only: an emoji pin renders two
+                        // columns wide and pushed pinned rows out of line with
+                        // the starred ones below them.
+                        crate::hosts::DirTier::Pinned => "▲ ",
+                        _ if opt.is_favorite => "★ ",
+                        _ => "  ",
+                    }
+                };
                 let count = if opt.uses > 0 {
                     format!("  ({})", opt.uses)
                 } else {
@@ -675,6 +879,19 @@ impl super::ScreenState for DirPickerState {
                             .add_modifier(Modifier::REVERSED)
                     };
                     Line::from(Span::styled(format!("> {}", text), style))
+                } else if being_moved {
+                    Line::from(Span::styled(
+                        format!("  {}", text),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else if opt.tier == crate::hosts::DirTier::Pinned {
+                    Line::from(Span::styled(
+                        format!("  {}", text),
+                        Style::default().fg(Color::Cyan),
+                    ))
                 } else if opt.is_favorite {
                     Line::from(Span::styled(
                         format!("  {}", text),
@@ -698,10 +915,12 @@ impl super::ScreenState for DirPickerState {
                 // Only claim j/k when they actually work. The title said "j/k to
                 // navigate" unconditionally while the path field was swallowing
                 // both keys.
-                .title(if field_focused {
+                .title(if self.moving.is_some() {
+                    " Moving — j/k reposition · Enter confirm · Esc cancel "
+                } else if field_focused {
                     " Directories (↑/↓, or Tab for j/k) "
                 } else {
-                    " Directories (j/k move · a save · d forget) "
+                    " Directories (a save · d forget · p pin · u unpin · m move) "
                 }),
         );
         frame.render_widget(list, vertical[2]);

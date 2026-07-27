@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.8.3" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.9.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -74,15 +74,22 @@ is a keystroke away afterwards. With the list focused, \fBa\fR prompts for a
 directory to keep and \fBd\fR forgets the highlighted one \(em the same keys
 the dialing directory uses.
 .IP
-Remembered directories are marked with a star, carry a visit count, and are
-stored in the \fB[[favorite]]\fR section of \fB~/.config/myd/hosts.toml\fR
-beside the saved hosts. They are listed alongside the built-in locations (home,
-downloads, root and so on) in one list ordered most-recently-visited first, so
-the places you actually use rise to the top.
+Remembered directories are stored in the \fB[[favorite]]\fR section of
+\fB~/.config/myd/hosts.toml\fR beside the saved hosts, and shown in three
+groups: pinned entries (\fB\(ua\fR) at the top in an order you arrange, saved
+entries (\fB\(*\fR) next, then automatically remembered ones and the built-in
+locations. Within the last two groups the order is most-recently-visited first,
+so the places you actually use rise to the top.
+.IP
+\fBp\fR pins the highlighted entry to the \fIbottom\fR of the pinned block \(em
+the block is an order you arranged, so a new pin does not barge into the middle
+of it \(em and \fBu\fR takes it out again, keeping the entry. \fBm\fR starts a
+reorder: \fBj\fR/\fBk\fR (or the arrows) reposition the entry, \fBEnter\fR
+confirms and \fBEsc\fR puts it back where it started. Sliding an entry past the
+bottom of the block unpins it.
 .IP
 Automatically remembered directories are trimmed to the most recent twenty.
-Anything saved deliberately with \fBa\fR is marked \fBpinned\fR in the config
-and is never trimmed.
+Anything saved with \fBa\fR or pinned with \fBp\fR is never trimmed.
 .TP
 .B 0
 Collapse all expanded directories.
