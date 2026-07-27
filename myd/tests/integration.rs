@@ -8961,53 +8961,62 @@ async fn o_on_a_remote_panel_refuses_rather_than_opening_a_local_path() {
 }
 
 #[tokio::test]
-async fn browsing_into_a_directory_records_it_in_the_history() {
+async fn browsing_does_not_fill_the_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    // Only the picker's own confirm recorded visits, so a directory reached by
-    // pressing Enter in the tree — the ordinary way to move around — never
-    // entered the history and could not be found again from `gd`.
+    // The list is for destinations the user chose, so only what the picker opens
+    // goes into it. Recording every resolved load — which is what happened
+    // briefly — swept in each directory drilled into while browsing and buried
+    // the handful of places actually picked.
     let cfg = tempfile::tempdir().unwrap();
     let file = cfg.path().join("hosts.toml");
     let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+    std::fs::create_dir_all(root.path().join("alpha/beta")).unwrap();
 
     let mut app = FileBrowser::new(Some(root.path().to_path_buf()), None, false);
     app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
     settle(&mut app).await;
 
-    // Enter on the subdirectory, the same as browsing by hand.
-    for _ in 0..10 {
-        let on_dir = match app.current_screen() {
-            myd::screen::Screen::Main(s) => s
-                .selected_path()
-                .map(|p| p.ends_with("alpha"))
-                .unwrap_or(false),
-            _ => false,
-        };
-        if on_dir {
-            break;
+    // Drill down two levels the ordinary way.
+    for _ in 0..2 {
+        for _ in 0..10 {
+            let on_dir = match app.current_screen() {
+                myd::screen::Screen::Main(s) => s.selected_is_dir()
+                    && s.selected_path().map(|p| p.parent().is_some()).unwrap_or(false),
+                _ => false,
+            };
+            if on_dir {
+                break;
+            }
+            app.handle_key_for_test(char_key('j'));
         }
-        app.handle_key_for_test(char_key('j'));
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        settle(&mut app).await;
+    }
+
+    assert!(
+        app.hosts_for_test().favorites().is_empty(),
+        "browsing must not fill the list: {:?}",
+        app.hosts_for_test().favorites()
+    );
+
+    // Opening the same place through the picker *is* a choice, and is recorded.
+    let target = root.path().join("alpha");
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    for c in target.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
     }
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     settle(&mut app).await;
-    assert_eq!(app.panel_current_dir(0), Some(root.path().join("alpha")));
 
     assert!(
         app.hosts_for_test()
             .favorites()
             .iter()
-            .any(|f| f.path == root.path().join("alpha").to_string_lossy()),
-        "a directory reached by browsing must be remembered: {:?}",
+            .any(|f| f.path == target.to_string_lossy()),
+        "a directory opened from the picker is remembered: {:?}",
         app.hosts_for_test().favorites()
-    );
-    // And it reached the file, so the next session sees it.
-    assert!(
-        std::fs::read_to_string(&file)
-            .unwrap_or_default()
-            .contains("alpha"),
-        "the history must persist"
     );
 }
 

@@ -605,9 +605,14 @@ impl FileBrowser {
             }
         }
 
-        // Remember where the user actually went. Every route lands here, so
-        // browsing into a directory now builds the history that only typing a
-        // path into the picker used to.
+        // Directories opened this tick still need the shallow preference applied
+        // — that must hold however the user arrived, including at startup before
+        // the catalog was reachable.
+        //
+        // History is deliberately *not* recorded here. It was, briefly, which
+        // swept in every directory drilled into while browsing and buried the
+        // handful of places the user had actually chosen. The picker records
+        // what the picker opens; see `Action::Confirm`.
         if !opened.is_empty() {
             // A directory the user marked shallow may have been loaded the
             // ordinary way — at startup, before the catalog was reachable.
@@ -635,12 +640,6 @@ impl FileBrowser {
                         );
                     }
                 }
-            }
-            for path in opened {
-                self.hosts.record_visit(&path.to_string_lossy());
-            }
-            if let Err(e) = self.hosts.save() {
-                tracing::warn!(error = %e, "could not persist directory history");
             }
         }
         keep_running
@@ -1809,12 +1808,20 @@ impl FileBrowser {
                 if let Screen::DirPicker(state) = panel.current_screen_mut() {
                     match state.confirm() {
                         crate::screen::PickerChoice::Open(path) => {
-                            // The visit is recorded when the load resolves, in
-                            // `resolve_loading` — one seam covering every way of
-                            // arriving somewhere. Recording it here as well would
-                            // count picker openings twice.
-                            // Same remembered preference as browsing: a
-                            // directory opened from the picker honours it too.
+                            // Recorded here rather than where loads resolve, so
+                            // only what the user *chose* in this dialog enters
+                            // the list. Recording every resolved load swept in
+                            // each directory drilled into while browsing, which
+                            // buried the handful of places actually picked.
+                            self.hosts.record_visit(&path.to_string_lossy());
+                            if let Err(e) = self.hosts.save() {
+                                tracing::warn!(
+                                    error = %e,
+                                    "could not persist directory history"
+                                );
+                            }
+                            // A directory opened from the picker honours the
+                            // remembered traversal mode too.
                             let shallow =
                                 self.hosts.dir_is_shallow(&path.to_string_lossy());
                             let panel = self.active_panel_mut();
