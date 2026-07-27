@@ -110,6 +110,8 @@ pub enum FavoriteEdit {
     EditHost(String),
     /// Edit this saved directory's path.
     EditDir(PathBuf),
+    /// Flip whether this directory is browsed without measuring its sizes.
+    ToggleShallow(PathBuf),
     /// Ask before forgetting this saved host.
     DeleteHost(String),
     /// Pin this path to the bottom of the pinned block.
@@ -143,6 +145,11 @@ pub struct PickerOption {
     pub uses: u64,
     /// RFC 3339 last visit, or `None`. Drives the ordering.
     pub last_used: Option<String>,
+    /// Whether this directory is browsed without measuring its sizes.
+    ///
+    /// Shown on the row, so the toggle has something to point at — a preference
+    /// that only takes effect on the next open is invisible otherwise.
+    pub shallow: bool,
     /// A saved remote host, when this row is one.
     ///
     /// The picker lists local directories and saved hosts together, since both
@@ -240,6 +247,7 @@ impl DirPickerState {
                 tier: crate::hosts::DirTier::Saved,
                 uses: h.uses,
                 last_used: h.last_used.clone(),
+                shallow: false,
                 host: Some(h.clone()),
             });
         }
@@ -267,6 +275,7 @@ impl DirPickerState {
                 tier: f.tier(),
                 uses: f.uses,
                 last_used: f.last_used.clone(),
+                shallow: f.shallow,
                 host: None,
             });
         }
@@ -280,6 +289,7 @@ impl DirPickerState {
                 tier: crate::hosts::DirTier::Recent,
                 uses: 0,
                 last_used: None,
+                shallow: false,
                 host: None,
             });
         }
@@ -915,6 +925,19 @@ impl DirPickerState {
                     }
                     Some(true)
                 }
+                // Flip whether this directory is browsed with its sizes
+                // measured. Reachable from here as well as from the tree, so a
+                // directory known to be slow can be marked before opening it
+                // rather than after waiting for the walk it was meant to avoid.
+                KeyCode::Char('S') => {
+                    if let Some(opt) = self.selected() {
+                        if !opt.is_host() && opt.is_favorite {
+                            self.pending_edit =
+                                Some(FavoriteEdit::ToggleShallow(opt.path.clone()));
+                        }
+                    }
+                    Some(true)
+                }
                 // Pin the highlighted entry to the bottom of the pinned block,
                 // or take it out of that block again.
                 KeyCode::Char('p') => {
@@ -1174,6 +1197,7 @@ impl super::ScreenState for DirPickerState {
             // saved entries can easily carry the same short name.
             let detail = match &opt.host {
                 Some(h) => format!("{}  {}", opt.label, h.to_url()),
+                None if opt.shallow => format!("{}  (shallow)", opt.label),
                 None => opt.label.clone(),
             };
             let text = format!("{}{}{}", mark, detail, count);
@@ -1244,7 +1268,7 @@ impl super::ScreenState for DirPickerState {
                 } else if field_focused {
                     " Destinations (↑/↓, or Tab for j/k) ".to_string()
                 } else {
-                    " a save · d forget · e edit · p pin · m move · / search ".to_string()
+                    " a save · d forget · e edit · p pin · m move · S shallow · / search ".to_string()
                 }),
         );
         frame.render_widget(list, vertical[2]);

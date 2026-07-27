@@ -148,6 +148,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("  a / d", "  Save a destination / forget the highlighted one"),
                 ("  e", "  Edit the highlighted entry (path or host)"),
                 ("  /", "  Search the list (Esc clears)"),
+                ("  S", "  Toggle measuring for the highlighted directory"),
                 ("  p / u", "  Pin to the top block / unpin"),
                 ("  m", "  Move an entry into place (Enter, Esc)"),
             ],

@@ -1394,6 +1394,12 @@ impl FileBrowser {
                 );
                 return;
             }
+            FavoriteEdit::ToggleShallow(path) => {
+                let key = path.to_string_lossy().to_string();
+                let now = !self.hosts.dir_is_shallow(&key);
+                self.hosts.set_dir_shallow(&key, now);
+                true
+            }
             FavoriteEdit::Pin(path) => self.hosts.pin_dir(&path.to_string_lossy()),
             FavoriteEdit::PinAndMove(path) => {
                 // `m` on an entry outside the pinned block: pin it, then start

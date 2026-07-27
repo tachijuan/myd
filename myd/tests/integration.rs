@@ -9261,3 +9261,89 @@ async fn shallow_directories_sort_as_unknown() {
         _ => panic!("expected a main screen"),
     }
 }
+
+#[tokio::test]
+async fn s_toggles_a_saved_directorys_traversal_mode_from_the_picker() {
+    use crossterm::event::KeyCode;
+
+    // The shallow flag was only reachable by opening the directory and pressing
+    // `S` there — which means paying the very walk the flag exists to avoid. It
+    // can now be set from the list, before opening it.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let target = tempfile::tempdir().unwrap();
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
+    catalog.add_favorite(myd::hosts::SavedDir::saved(
+        target.path().to_string_lossy().to_string(),
+    ));
+    catalog.save().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(special_key(KeyCode::Tab));
+    cursor_to(&mut app, target.path());
+
+    let key = target.path().to_string_lossy().to_string();
+    assert!(!app.hosts_for_test().dir_is_shallow(&key), "starts measured");
+
+    app.handle_key_for_test(char_key('S'));
+    assert!(
+        app.hosts_for_test().dir_is_shallow(&key),
+        "S should mark it shallow"
+    );
+    // The row says so, or the toggle is invisible until the next open.
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => assert!(
+            p.selected().map(|o| o.shallow).unwrap_or(false),
+            "the row should show the new state"
+        ),
+        _ => panic!("expected the picker"),
+    }
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("shallow = true"),
+        "and it must persist"
+    );
+
+    // Pressing it again turns measuring back on. No prompt here: nothing is
+    // being walked, since this only takes effect the next time it is opened.
+    app.handle_key_for_test(char_key('S'));
+    assert!(
+        !app.hosts_for_test().dir_is_shallow(&key),
+        "S again should clear it"
+    );
+}
+
+#[tokio::test]
+async fn s_does_nothing_on_a_host_row() {
+    use crossterm::event::KeyCode;
+
+    // Remote directories are never measured, so the toggle has no meaning there
+    // and must not write a flag onto a host entry.
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("hosts.toml");
+    let mut catalog = myd::hosts::HostCatalog::load_from_unseeded(&file);
+    catalog.upsert(myd::hosts::SavedHost::new("prod", "prod.example.com"));
+    catalog.save().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s')); // hosts only
+    app.handle_key_for_test(special_key(KeyCode::Tab));
+
+    let before = std::fs::read_to_string(&file).unwrap();
+    app.handle_key_for_test(char_key('S'));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        before,
+        "S on a host row must change nothing"
+    );
+}
