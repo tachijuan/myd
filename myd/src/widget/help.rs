@@ -116,6 +116,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("click Sort:", "Pick a sort order from a numbered menu"),
                 ("H", "Toggle hidden files"),
                 ("b", "Toggle size bars"),
+                ("S", "Browse without measuring directories"),
                 ("P", "Toggle permissions column"),
                 ("T", "Toggle modification-time column"),
                 ("Ctrl+P", "Toggle info panel"),

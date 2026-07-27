@@ -180,6 +180,13 @@ pub struct SavedDir {
     /// and is never trimmed, so the two have to be told apart.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub saved: bool,
+    /// Browse this directory without measuring its subdirectories.
+    ///
+    /// Remembered per directory: somewhere you have decided is not worth walking
+    /// — a huge archive, a network mount — stays that way next time you open it,
+    /// rather than making you toggle again on arrival.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shallow: bool,
     /// Position in the pinned block, which sits above everything else in an
     /// order the user controls rather than one recency decides.
     ///
@@ -690,6 +697,33 @@ impl HostCatalog {
                     .as_deref()
                     == Some(path)
         })
+    }
+
+    /// Remember whether this directory should be browsed without measuring.
+    ///
+    /// Creates the entry when it is new, so choosing shallow somewhere you have
+    /// not saved still sticks — the same reasoning as recording a visit.
+    pub fn set_dir_shallow(&mut self, path: &str, shallow: bool) {
+        match self.find_dir_mut(path) {
+            Some(entry) => entry.shallow = shallow,
+            None => self.favorites.push(SavedDir {
+                path: path.to_string(),
+                shallow,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Whether this directory was last browsed without measuring.
+    pub fn dir_is_shallow(&self, path: &str) -> bool {
+        let canonical = std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        self.favorites
+            .iter()
+            .find(|f| f.path == path || canonical.as_deref() == Some(f.path.as_str()))
+            .map(|f| f.shallow)
+            .unwrap_or(false)
     }
 
     /// Change a saved directory's path, keeping everything else about it.

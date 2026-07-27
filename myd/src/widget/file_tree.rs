@@ -1467,7 +1467,21 @@ impl FileTree {
     /// though its one-level sum is genuine — that sum is exactly the half-truth
     /// this avoids.
     fn size_is_unknown(&self, line: &TreeLine) -> bool {
-        line.is_dir && !self.source.has_recursive_sizes()
+        line.is_dir && !self.measures_directories()
+    }
+
+    /// Whether this tree's directory sizes are real recursive totals.
+    ///
+    /// False for a remote backend, which cannot afford the walk, and for a local
+    /// tree the user has put in shallow mode. One predicate so the size column,
+    /// the sort order and the treemap cannot disagree about it.
+    pub fn measures_directories(&self) -> bool {
+        self.source.has_recursive_sizes()
+    }
+
+    /// Whether this tree is browsing without measuring directories.
+    pub fn is_shallow(&self) -> bool {
+        self.source.is_shallow()
     }
 }
 

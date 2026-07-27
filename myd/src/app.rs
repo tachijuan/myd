@@ -98,6 +98,8 @@ pub enum ModalTarget {
     HostDelete { label: String },
     /// Prompt for a directory to save as a favourite.
     FavoriteAdd,
+    /// Confirm walking the tree to measure directory sizes.
+    MeasureDirs,
     /// Edit a saved directory's path in place, keeping its history and position.
     FavoriteEdit { original: PathBuf },
     /// Confirm cancelling a running or queued transfer.
@@ -607,6 +609,33 @@ impl FileBrowser {
         // browsing into a directory now builds the history that only typing a
         // path into the picker used to.
         if !opened.is_empty() {
+            // A directory the user marked shallow may have been loaded the
+            // ordinary way — at startup, before the catalog was reachable.
+            // Re-open it in shallow mode rather than leaving a measured tree the
+            // preference says they did not want.
+            let needs_shallow: Vec<PathBuf> = opened
+                .iter()
+                .filter(|p| self.hosts.dir_is_shallow(&p.to_string_lossy()))
+                .cloned()
+                .collect();
+            for path in needs_shallow {
+                for panel in self.panels.iter_mut() {
+                    let already_shallow = match panel.current_screen() {
+                        Screen::Main(s) => {
+                            s.root_path() == &path && !s.tree.is_shallow()
+                        }
+                        _ => false,
+                    };
+                    if already_shallow {
+                        *panel.current_screen_mut() = Screen::loading_with_source_sorted(
+                            crate::widget::source::Source::LocalShallow,
+                            path.clone(),
+                            None,
+                            crate::screen::SortMode::default(),
+                        );
+                    }
+                }
+            }
             for path in opened {
                 self.hosts.record_visit(&path.to_string_lossy());
             }
@@ -1446,6 +1475,74 @@ impl FileBrowser {
         }
     }
 
+    /// Turn directory measuring off, or ask before turning it back on.
+    ///
+    /// Going shallow is instant — there is nothing to compute. Going back means
+    /// walking the tree, which is the slowest thing this app does and the reason
+    /// the user turned it off, so it asks first rather than freezing on a
+    /// keystroke.
+    fn toggle_shallow(&mut self) {
+        let panel = self.active_panel();
+        if !panel.backend.is_local() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Remote directories are never measured — a recursive walk over \
+                 SFTP is one round trip per directory.",
+            ));
+            return;
+        }
+        let Screen::Main(state) = panel.current_screen() else {
+            return;
+        };
+        if state.tree.is_shallow() {
+            let root = state.root_path().clone();
+            self.modal_target = Some(ModalTarget::MeasureDirs);
+            self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                "Measure every directory under {}? This walks the whole tree.",
+                root.display()
+            )));
+            return;
+        }
+        self.set_shallow(true);
+    }
+
+    /// Rebuild the active panel's tree with measuring on or off, and remember
+    /// the choice for this directory.
+    fn set_shallow(&mut self, shallow: bool) {
+        let Screen::Main(state) = self.active_panel().current_screen() else {
+            return;
+        };
+        let root = state.root_path().clone();
+        let source = state.tree.source.with_shallow(shallow);
+        let sort_mode = state.tree.sort_mode;
+
+        // A fresh scan rather than an in-place edit: the sizes are what changed,
+        // and they are computed during the walk. Going shallow discards the cache
+        // too, since its entries are the totals now being disowned.
+        let cache = if shallow {
+            None
+        } else {
+            Some(state.tree.size_cache.clone())
+        };
+        self.active_panel_mut()
+            .screen_stack
+            .push(Screen::loading_with_source_sorted(
+                source,
+                root.clone(),
+                cache,
+                sort_mode,
+            ));
+
+        // Remembered per directory, so somewhere you have decided not to measure
+        // stays that way the next time you open it. Keyed on the root captured
+        // above: reading it back now would ask the *loading* screen, which has no
+        // directory yet, and the preference would silently go nowhere.
+        self.hosts
+            .set_dir_shallow(&root.to_string_lossy(), shallow);
+        if let Err(e) = self.hosts.save() {
+            tracing::warn!(error = %e, "could not persist the traversal mode");
+        }
+    }
+
     /// Hand the focused selection to the desktop's default application.
     ///
     /// Refuses on a remote panel: `open` and `xdg-open` only understand local
@@ -1710,7 +1807,21 @@ impl FileBrowser {
                             // `resolve_loading` — one seam covering every way of
                             // arriving somewhere. Recording it here as well would
                             // count picker openings twice.
-                            panel.screen_stack.push(Screen::loading(path.clone()));
+                            // Same remembered preference as browsing: a
+                            // directory opened from the picker honours it too.
+                            let shallow =
+                                self.hosts.dir_is_shallow(&path.to_string_lossy());
+                            let panel = self.active_panel_mut();
+                            if shallow {
+                                panel.screen_stack.push(Screen::loading_with_source_sorted(
+                                    crate::widget::source::Source::LocalShallow,
+                                    path.clone(),
+                                    None,
+                                    crate::screen::SortMode::default(),
+                                ));
+                            } else {
+                                panel.screen_stack.push(Screen::loading(path.clone()));
+                            }
                         }
                         crate::screen::PickerChoice::NotADirectory(path) => {
                             // Say so and hand the field back, with what was typed
@@ -1762,18 +1873,33 @@ impl FileBrowser {
                     // blocking pool; expanding it in place would run the network
                     // round trips on the event-loop thread and freeze the UI.
                     if source.is_remote() {
-                        panel.screen_stack.push(Screen::loading_remote_sorted(
+                        panel.screen_stack.push(Screen::loading_with_source_sorted(
                             source,
                             path,
                             Some(cache),
                             sort_mode,
                         ));
                     } else {
-                        panel.screen_stack.push(Screen::loading_sorted(
-                            path,
-                            Some(cache),
-                            sort_mode,
-                        ));
+                        // Honour whatever was decided for this directory last
+                        // time: somewhere not worth walking stays that way
+                        // instead of measuring again on every arrival.
+                        let shallow =
+                            self.hosts.dir_is_shallow(&path.to_string_lossy());
+                        let panel = self.active_panel_mut();
+                        if shallow {
+                            panel.screen_stack.push(Screen::loading_with_source_sorted(
+                                source.with_shallow(true),
+                                path,
+                                None,
+                                sort_mode,
+                            ));
+                        } else {
+                            panel.screen_stack.push(Screen::loading_sorted(
+                                path,
+                                Some(cache),
+                                sort_mode,
+                            ));
+                        }
                     }
                 }
                 true
@@ -1802,6 +1928,10 @@ impl FileBrowser {
             }
             Action::OpenWithDefaultApp => {
                 self.open_selection_externally();
+                true
+            }
+            Action::ToggleShallow => {
+                self.toggle_shallow();
                 true
             }
             Action::ChangeRoot => {
@@ -2090,7 +2220,8 @@ impl FileBrowser {
                     | Action::Connect
                     | Action::HostDirectory
                     | Action::ToggleMouse
-                    | Action::OpenWithDefaultApp => unreachable!(),
+                    | Action::OpenWithDefaultApp
+                    | Action::ToggleShallow => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -2135,6 +2266,9 @@ impl FileBrowser {
                         }
                         Some(ModalTarget::CancelTransfer { id }) if result => {
                             self.transfers.cancel(id);
+                        }
+                        Some(ModalTarget::MeasureDirs) if result => {
+                            self.set_shallow(false);
                         }
                         Some(ModalTarget::HostDelete { label }) => {
                             if result {
@@ -2373,6 +2507,7 @@ impl FileBrowser {
                             }
                             ModalTarget::HostDelete { .. }
                             | ModalTarget::CancelTransfer { .. }
+                            | ModalTarget::MeasureDirs
                             | ModalTarget::QuitConfirm => {}
                             ModalTarget::Password => {
                                 if value.is_empty() {

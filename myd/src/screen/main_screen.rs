@@ -834,12 +834,21 @@ impl MainScreenState {
         // While filtering, the counts describe what is *visible*, so say so —
         // otherwise "12 items" over a masked tree reads as the directory having
         // lost files.
+        // Shallow browsing leads the title for the same reason FILTERED does: the
+        // sizes on screen are dashes rather than measurements, and a title that
+        // does not say so leaves the tree looking broken.
+        let shallow_mark = if self.tree.is_shallow() {
+            " SHALLOW |"
+        } else {
+            ""
+        };
         let prefix = if self.tree.filter_pattern().is_some() {
             // "FILTERED" leads, because ratatui truncates a title at the right
             // border: on a narrow terminal the tail is the first thing lost, and
             // this is the part that must not be.
             format!(
-                " FILTERED | File Tree ({}) | {} shown | {} dirs | {} files | ",
+                "{} FILTERED | File Tree ({}) | {} shown | {} dirs | {} files | ",
+                shallow_mark,
                 self.root_path.display(),
                 total,
                 dirs,
@@ -847,7 +856,8 @@ impl MainScreenState {
             )
         } else {
             format!(
-                " File Tree ({}) | {} items | {} dirs | {} files | ",
+                "{} File Tree ({}) | {} items | {} dirs | {} files | ",
+                shallow_mark,
                 self.root_path.display(),
                 total,
                 dirs,
