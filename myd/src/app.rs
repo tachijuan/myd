@@ -115,6 +115,9 @@ pub struct FileBrowser {
     copy_task: Option<tokio::task::JoinHandle<()>>,
     /// Panel to refresh when `copy_task` finishes.
     copy_dest_panel: usize,
+    /// The directory the most recent copy batch was addressed to. Kept so a test
+    /// can assert the *address* used, not just that bytes appeared somewhere.
+    copy_dest_dir: Option<PathBuf>,
     /// Colliding (src, dest) pairs awaiting a per-file overwrite confirmation.
     pending_copies: Vec<(PathBuf, PathBuf)>,
     /// (src, dest) pairs cleared to copy — spawned as one batch once every
@@ -253,6 +256,7 @@ impl FileBrowser {
             modal_target: None,
             copy_task: None,
             copy_dest_panel: 0,
+            copy_dest_dir: None,
             op_progress: None,
             op_cancel: None,
             move_results: None,
@@ -740,6 +744,11 @@ impl FileBrowser {
     /// Whether the transfer sidebar is showing (for tests).
     pub fn is_transfer_panel_visible(&self) -> bool {
         self.transfer_panel_visible()
+    }
+
+    /// The directory the most recent copy batch was addressed to (for tests).
+    pub fn copy_dest_for_test(&self) -> Option<PathBuf> {
+        self.copy_dest_dir.clone()
     }
 
     /// Read-only view of the transfer queue (for tests).
@@ -1952,15 +1961,49 @@ impl FileBrowser {
                                 }
                             }
                             ModalTarget::CopyDest { srcs } => {
-                                let dir = PathBuf::from(&value)
-                                    .expand_user()
-                                    .canonicalize()
-                                    .unwrap_or_else(|_| PathBuf::from(&value));
-                                if dir.is_dir() {
-                                    // Copy into the chosen directory, refreshing
-                                    // the active panel (single-panel mode).
+                                // `~` is expanded, but the path is otherwise used
+                                // exactly as typed. Canonicalising it here resolved
+                                // it against the *local* disk: on macOS a typed
+                                // `/tmp` became `/private/tmp`, which was then sent
+                                // to a remote server that has no `/private`.
+                                let dir = PathBuf::from(&value).expand_user();
+                                // Only a local destination can be checked from
+                                // here; a remote one is validated by the transfer
+                                // itself, which now reports a missing destination
+                                // directory as exactly that.
+                                let backend = self.active_panel().backend;
+                                let is_local = backend.is_local();
+                                if !is_local || dir.is_dir() {
                                     let active = self.active;
-                                    self.begin_copy_batch(srcs, dir, active, active);
+                                    if copy_needs_transfer_queue(backend, backend) {
+                                        // Both endpoints are the same remote
+                                        // panel, so this is a server-side copy and
+                                        // belongs on the queue. `begin_copy_batch`
+                                        // spawns `copy_path`, which is plain
+                                        // `std::fs` and would have operated on the
+                                        // local disk under remote paths.
+                                        let kinds: Vec<bool> = if let Screen::Main(state) =
+                                            self.panels[active].current_screen()
+                                        {
+                                            srcs.iter()
+                                                .map(|p| state.is_dir_of(p).unwrap_or(false))
+                                                .collect()
+                                        } else {
+                                            vec![false; srcs.len()]
+                                        };
+                                        self.enqueue_cross_backend_copy(
+                                            srcs, kinds, backend, dir, backend, active,
+                                        );
+                                    } else {
+                                        // Copy into the chosen directory, refreshing
+                                        // the active panel (single-panel mode).
+                                        self.begin_copy_batch(srcs, dir, active, active);
+                                    }
+                                } else {
+                                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                                        "'{}' is not a directory.",
+                                        dir.display()
+                                    )));
                                 }
                             }
                             ModalTarget::Connect => {
@@ -2465,7 +2508,7 @@ impl FileBrowser {
                 // modal copy overlay.
                 let src_backend = self.panels[source].backend;
                 let dest_backend = self.panels[other].backend;
-                if !src_backend.is_local() || !dest_backend.is_local() {
+                if copy_needs_transfer_queue(src_backend, dest_backend) {
                     // Look up each source's directory-ness from the source panel's
                     // tree (no I/O), so the destination ghost draws the right icon.
                     let kinds: Vec<bool> = if let Screen::Main(state) =
@@ -2512,6 +2555,9 @@ impl FileBrowser {
         source_panel: usize,
     ) {
         use crate::vfs::VPath;
+        // Recorded for the same reason `begin_copy_batch` records it: so the
+        // address a copy was sent to can be asserted, not just its side effects.
+        self.copy_dest_dir = Some(dest_dir.clone());
         for (i, src) in srcs.into_iter().enumerate() {
             let Some(name) = src.file_name().map(|n| n.to_owned()) else {
                 continue;
@@ -2553,6 +2599,7 @@ impl FileBrowser {
     ) {
         self.copy_dest_panel = dest_panel;
         self.copy_source_panel = source_panel;
+        self.copy_dest_dir = Some(dest_dir.clone());
         self.approved_copies.clear();
         self.pending_copies.clear();
 
@@ -2990,6 +3037,19 @@ fn credential_prompt(need: &crate::vfs::sftp::AuthNeed) -> String {
 }
 
 /// Test hook for [`credential_prompt`], so the retry wording is covered.
+/// Whether a copy between these backends has to go through the transfer queue.
+///
+/// True whenever either endpoint is remote. A plain `std::fs` copy would read and
+/// write the *local* disk under paths that name files on a server — silently
+/// touching the wrong machine. Shared by the dual-panel and single-panel copy
+/// paths, which previously disagreed: only the former checked.
+pub fn copy_needs_transfer_queue(
+    src: crate::vfs::BackendId,
+    dest: crate::vfs::BackendId,
+) -> bool {
+    !src.is_local() || !dest.is_local()
+}
+
 pub fn credential_prompt_for_test(need: &crate::vfs::sftp::AuthNeed) -> String {
     credential_prompt(need)
 }
