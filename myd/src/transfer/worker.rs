@@ -105,17 +105,20 @@ pub async fn run_transfer(job: TransferJob) -> Result<TransferOutcome> {
 
     progress.set_total(meta.len);
 
-    // A failure here is not fatal on its own — the directory may already exist,
-    // and open_write creates parents too — but it is the usual precursor to a
-    // confusing write error, so record why it failed rather than dropping it.
+    // The destination directory has to exist before anything is written. If it
+    // cannot be created, fail here naming *that* — continuing produced a
+    // NoSuchFile against the `.myd-part-…` file instead, which reads as a bug in
+    // the transfer rather than as "the destination directory does not exist".
+    //
+    // A directory that is already there is the common case and costs one cached
+    // round trip; `create_dir_all` succeeds for it.
     if let Some(parent) = dest.parent() {
-        if let Err(e) = dest_fs.create_dir_all(&parent).await {
-            tracing::debug!(
-                dest_parent = %parent,
-                error = %e,
-                "could not pre-create the destination directory; continuing"
-            );
-        }
+        dest_fs.create_dir_all(&parent).await.with_context(|| {
+            format!(
+                "destination directory {} does not exist and could not be created",
+                parent
+            )
+        })?;
     }
 
     let part = part_path(&dest, id);

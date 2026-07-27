@@ -909,3 +909,45 @@ sftp_test!(a_download_into_an_unwritable_local_dir_reports_the_real_cause, env, 
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 });
+
+sftp_test!(an_uncreatable_destination_directory_is_reported_as_such, env, {
+    // From a user's log: the destination parent could not be created, the
+    // transfer continued anyway, and the reported failure was a NoSuchFile
+    // against the `.myd-part-…` file — which reads as a transfer bug rather than
+    // "that directory does not exist". The real cause must lead the error.
+    let fs = connect(&env).await;
+    let remote: Arc<dyn Vfs> = Arc::new(fs);
+
+    // /proc is present on Linux and refuses mkdir, so the parent genuinely
+    // cannot be created.
+    let dest_parent = PathBuf::from("/proc/myd-cannot-create-this/nested");
+    let progress = Arc::new(TransferProgress::new(0));
+    let outcome = run_transfer(TransferJob {
+        id: TransferId(1),
+        src_fs: remote.clone(),
+        dest_fs: remote,
+        src: VPath::new(myd::vfs::BackendId(1), env.remote_dir.join("greeting.txt")),
+        dest: VPath::new(myd::vfs::BackendId(1), dest_parent.join("greeting.txt")),
+        progress,
+        cancel: CancelToken::new(),
+        config: TransferConfig::default(),
+    })
+    .await;
+
+    let err = match outcome {
+        Err(e) => e,
+        Ok(_) => panic!("a transfer into an uncreatable directory must fail"),
+    };
+    let text: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+    let joined = text.join(" | ");
+    assert!(
+        joined.contains("destination directory"),
+        "the error must name the destination directory as the cause: {}",
+        joined
+    );
+    assert!(
+        !joined.contains(".myd-part-"),
+        "the part file is an implementation detail and must not lead the error: {}",
+        joined
+    );
+});
