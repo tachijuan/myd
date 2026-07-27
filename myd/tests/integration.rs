@@ -6111,6 +6111,30 @@ impl myd::vfs::Vfs for ShallowDirs {
     }
 }
 
+/// A remote tree over [`ShallowDirs`] rooted at `root`.
+///
+/// Used to build a remote panel whose paths also exist on the local disk, which
+/// is what makes "did this operate on the wrong machine?" observable.
+fn remote_tree_rooted_at(root: &std::path::Path) -> ShallowTree {
+    use myd::widget::source::Source;
+
+    let vfs: std::sync::Arc<dyn myd::vfs::Vfs> = std::sync::Arc::new(ShallowDirs);
+    let source = Source::Remote(
+        myd::widget::source::RemoteSource::new(myd::vfs::BackendId(1), vfs).unwrap(),
+    );
+    ShallowTree::with_source_cancellable_progress(
+        source,
+        root.to_path_buf(),
+        ShallowSortMode::Largest,
+        true,
+        true,
+        ShallowCache::new(),
+        &ShallowCancel::new(),
+        &ShallowProgress::new(),
+    )
+    .expect("remote tree should build")
+}
+
 /// A remote tree over [`ShallowDirs`], sorted by `mode`.
 fn shallow_remote_tree(mode: ShallowSortMode) -> ShallowTree {
     use myd::widget::source::Source;
@@ -8643,5 +8667,158 @@ async fn v_carries_the_selection_between_the_two_views() {
         focused_selection(&app),
         Some(in_tree),
         "and the tree's selection carries into the treemap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `o`: hand the selection to the desktop's default application.
+// ---------------------------------------------------------------------------
+
+/// Put a fake launcher named after this platform's opener first on `PATH`, so a
+/// test can see what myd asked to open without launching anything real.
+///
+/// Returns the guard (restoring `PATH` on drop) and the file the fake writes to.
+#[cfg(unix)]
+struct FakeOpener {
+    _dir: tempfile::TempDir,
+    log: std::path::PathBuf,
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl FakeOpener {
+    fn install() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        // `PATH` is process-global, so these serialise like the HOME tests.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("opened.txt");
+        let script = dir.path().join(myd::utils::opener::OPENER);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$1\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let previous = std::env::var_os("PATH");
+        let joined = format!(
+            "{}:{}",
+            dir.path().display(),
+            previous.clone().unwrap_or_default().to_string_lossy()
+        );
+        unsafe { std::env::set_var("PATH", joined) };
+        Self {
+            _dir: dir,
+            log,
+            previous,
+            _lock: lock,
+        }
+    }
+
+    /// What the launcher was handed, waiting briefly for the spawned child.
+    fn opened(&self) -> String {
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&self.log) {
+                if !s.trim().is_empty() {
+                    return s.trim().to_string();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        String::new()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeOpener {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn o_hands_the_selection_to_the_platform_opener() {
+    let opener = FakeOpener::install();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("report.pdf"), b"x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+
+    let selected = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.selected_path().cloned().unwrap(),
+        _ => panic!("expected a main screen"),
+    };
+    app.handle_key_for_test(char_key('o'));
+
+    assert_eq!(
+        opener.opened(),
+        selected.to_string_lossy(),
+        "the launcher should receive the selected path"
+    );
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "a successful open says nothing"
+    );
+}
+
+#[test]
+fn the_opener_is_chosen_for_the_platform() {
+    // macOS has `open`; Linux and the BSDs go through the freedesktop helper.
+    assert_eq!(
+        myd::utils::opener::OPENER,
+        if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        }
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn o_on_a_remote_panel_refuses_rather_than_opening_a_local_path() {
+    // `open`/`xdg-open` only understand local paths. A remote one would either
+    // fail with the launcher's own message or — worse — open an unrelated local
+    // file that happens to share the path, the same trap that sent remote copies
+    // to the wrong place. Uses the counting mock rather than the gated SFTP
+    // harness: this is about the routing decision, not about SFTP.
+    let opener = FakeOpener::install();
+
+    // The remote tree is rooted at a path that ALSO exists locally. That is the
+    // dangerous case and the only one that tests the guard: rooted somewhere
+    // absent, the opener's own existence check refuses anyway and the test would
+    // pass with the guard removed.
+    let local_twin = tempfile::tempdir().unwrap();
+    std::fs::write(local_twin.path().join("big_file"), b"local decoy").unwrap();
+    let tree = remote_tree_rooted_at(local_twin.path());
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.replace_panel_with_remote_for_test(tree);
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('o'));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a remote entry must be refused with a message"
+    );
+    assert_eq!(
+        opener.opened(),
+        "",
+        "and the local file sharing that path must not have been opened"
     );
 }

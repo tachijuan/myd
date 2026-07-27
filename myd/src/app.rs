@@ -753,6 +753,19 @@ impl FileBrowser {
         self.copy_dest_dir.clone()
     }
 
+    /// Replace the active panel with one showing `tree` on its source's backend.
+    ///
+    /// Test hook. Making a panel remote otherwise needs a live connection, which
+    /// puts anything that merely depends on "this panel is remote" behind the
+    /// gated SFTP harness.
+    pub fn replace_panel_with_remote_for_test(&mut self, tree: crate::widget::file_tree::FileTree) {
+        let backend = tree.source.backend();
+        let root = tree.root.path.clone();
+        let panel = self.active_panel_mut();
+        *panel = crate::panel::Panel::from_tree(root, tree);
+        panel.backend = backend;
+    }
+
     /// Read-only view of the transfer queue (for tests).
     pub fn transfer_queue(&self) -> &TransferQueue {
         &self.transfers
@@ -1355,6 +1368,29 @@ impl FileBrowser {
         }
     }
 
+    /// Hand the focused selection to the desktop's default application.
+    ///
+    /// Refuses on a remote panel: `open` and `xdg-open` only understand local
+    /// paths, so a remote one would either fail with the launcher's own message
+    /// or — worse — open an unrelated local file that happens to share the path,
+    /// which is the same trap that made remote copies land in the wrong place.
+    fn open_selection_externally(&mut self) {
+        let panel = self.active_panel();
+        if !panel.backend.is_local() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot open remote files with a local application. Copy it across first (c).",
+            ));
+            return;
+        }
+        let Some(path) = panel.selected_path() else {
+            return;
+        };
+        if let Err(e) = crate::utils::opener::open_path(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "could not open externally");
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!("{}", e)));
+        }
+    }
+
     /// Scroll the view under the pointer by `delta` rows.
     ///
     /// The wheel moves the *cursor*, not the viewport, so it stays consistent
@@ -1684,6 +1720,10 @@ impl FileBrowser {
                 self.toggle_mouse_capture();
                 true
             }
+            Action::OpenWithDefaultApp => {
+                self.open_selection_externally();
+                true
+            }
             Action::ChangeRoot => {
                 self.modal_target = Some(ModalTarget::ChangeRoot);
                 self.modal =
@@ -1973,7 +2013,8 @@ impl FileBrowser {
                     | Action::CancelTransfers
                     | Action::Connect
                     | Action::HostDirectory
-                    | Action::ToggleMouse => unreachable!(),
+                    | Action::ToggleMouse
+                    | Action::OpenWithDefaultApp => unreachable!(),
                     Action::None => true,
                 }
             }
