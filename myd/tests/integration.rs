@@ -6759,3 +6759,232 @@ fn logging_initializes_and_writes_to_the_configured_file() {
         std::fs::read_to_string(&log).ok()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Directory picker: typed paths are honoured, and Tab moves focus.
+// ---------------------------------------------------------------------------
+
+/// Open the picker over a temp dir via the `gd` chord.
+async fn picker_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
+    let start = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "gd should open the directory picker"
+    );
+    (start, app)
+}
+
+fn picker(app: &myd::app::FileBrowser) -> &myd::screen::DirPickerState {
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(s) => s,
+        _ => panic!("expected the directory picker"),
+    }
+}
+
+fn type_str(app: &mut myd::app::FileBrowser, s: &str) {
+    for c in s.chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+}
+
+#[tokio::test]
+async fn a_typed_path_is_honoured_after_browsing_the_list() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The reported bug. Browsing the list wrote the option's path into the field
+    // but left the text cursor at 0, so everything typed afterwards was inserted
+    // *in front of* it. The field read "<typed><option>" and resolved to the
+    // option — the typed path was silently discarded.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("projects/kanban");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let (_start, mut app) = picker_app().await;
+
+    // Look at the list first, as the screen invites.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    // Then type a real path over it.
+    type_str(&mut app, &target.to_string_lossy());
+
+    assert_eq!(
+        picker(&app).confirm(),
+        Some(target.clone()),
+        "the typed path must win; field held {:?}",
+        picker(&app).input_for_test()
+    );
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+    assert_eq!(
+        app.panel_current_dir(0),
+        Some(target),
+        "Enter should open the typed path"
+    );
+}
+
+#[tokio::test]
+async fn typing_replaces_a_path_offered_by_the_list() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The mechanism behind the bug above. Browsing mirrors the option into the
+    // field as a *suggestion*; the first typed character replaces it. Previously
+    // the text cursor stayed at 0 so typing prepended, giving
+    // "<typed><option>" — which resolved to whichever half happened to exist.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let filled = picker(&app).input_for_test().to_string();
+    assert!(!filled.is_empty(), "browsing should fill the field");
+
+    app.handle_key_for_test(char_key('/'));
+    assert_eq!(
+        picker(&app).input_for_test(),
+        "/",
+        "typing must replace the list's suggestion, not extend it"
+    );
+}
+
+#[tokio::test]
+async fn a_suggestion_can_still_be_edited_deliberately() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Replacing on the first keystroke must not make the suggestion un-editable:
+    // moving the caret into it means the user wants to keep and adjust it, which
+    // is how you append a subdirectory to a listed favourite.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let filled = picker(&app).input_for_test().to_string();
+
+    // End is a deliberate move into the text; now typing appends.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    type_str(&mut app, "/sub");
+    assert_eq!(
+        picker(&app).input_for_test(),
+        format!("{}/sub", filled),
+        "after moving the caret, typing should extend the path"
+    );
+}
+
+#[tokio::test]
+async fn tab_switches_focus_and_j_k_then_navigate_the_list() {
+    use myd::screen::PickerFocus;
+
+    // The screen advertised "j/k to navigate" while the path field swallowed both
+    // keys, so the only way to move was the arrows.
+    let (_start, mut app) = picker_app().await;
+    assert_eq!(
+        picker(&app).focus(),
+        PickerFocus::Field,
+        "the field starts focused — the picker exists to take a path"
+    );
+
+    // In the field, j/k are text.
+    type_str(&mut app, "jk");
+    assert_eq!(picker(&app).input_for_test(), "jk");
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Backspace,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Backspace,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    // Tab hands the keyboard to the list, where j/k move.
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(picker(&app).focus(), PickerFocus::List);
+
+    let before = picker(&app).cursor_for_test();
+    app.handle_key_for_test(char_key('j'));
+    let after_j = picker(&app).cursor_for_test();
+    assert_ne!(after_j, before, "j must move the list once it has focus");
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(
+        picker(&app).cursor_for_test(),
+        before,
+        "k must move back"
+    );
+
+    // Tab is never typed into the path.
+    assert!(
+        !picker(&app).input_for_test().contains('\t'),
+        "Tab must not reach the field"
+    );
+}
+
+#[tokio::test]
+async fn typing_while_the_list_has_focus_returns_to_the_field() {
+    use myd::screen::PickerFocus;
+
+    // Typing a path is the picker's purpose; it must not be a no-op just because
+    // the list happens to hold focus.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(picker(&app).focus(), PickerFocus::List);
+
+    // `/` is not a list motion, so it starts a path.
+    type_str(&mut app, "/tm");
+    assert_eq!(picker(&app).focus(), PickerFocus::Field);
+    assert_eq!(picker(&app).input_for_test(), "/tm");
+}
+
+#[tokio::test]
+async fn arrow_keys_still_navigate_from_either_focus() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Arrows were the only working navigation before, so they must keep working
+    // from the field — that is the habit users already have.
+    let (_start, mut app) = picker_app().await;
+    let start_cursor = picker(&app).cursor_for_test();
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_ne!(picker(&app).cursor_for_test(), start_cursor);
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(picker(&app).cursor_for_test(), start_cursor);
+}
+
+#[test]
+fn the_picker_field_handles_multibyte_paths() {
+    use myd::screen::DirPickerState;
+
+    // input_cursor counts characters (the renderer indexes it with char_indices)
+    // while the edit operations used it as a byte offset. Any non-ASCII character
+    // would have panicked or corrupted the string.
+    let mut p = DirPickerState::new();
+    for c in "/tmp/café/naïve".chars() {
+        p.input_char(c);
+    }
+    assert_eq!(p.input_for_test(), "/tmp/café/naïve");
+
+    // Walk left past the multibyte `ï` and `é` and delete the separator between
+    // them, which is only reachable correctly if the cursor counts characters.
+    for _ in 0..5 {
+        p.input_left();
+    }
+    p.input_backspace();
+    assert_eq!(p.input_for_test(), "/tmp/cafénaïve");
+
+    // Deleting forward at a multibyte boundary must also hold. Back to the start,
+    // then remove the leading slash.
+    for _ in 0..40 {
+        p.input_left();
+    }
+    p.input_delete();
+    assert_eq!(p.input_for_test(), "tmp/cafénaïve");
+
+    // And a character typed mid-string lands where the caret is, not at a byte
+    // offset that would fall inside `é`.
+    for _ in 0..8 {
+        p.input_right();
+    }
+    p.input_char('X');
+    assert_eq!(p.input_for_test(), "tmp/caféXnaïve");
+}
