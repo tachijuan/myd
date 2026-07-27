@@ -7254,3 +7254,152 @@ async fn tab_still_alternates_panels_when_the_sidebar_is_hidden() {
     assert_eq!(app.active_panel_index(), 0, "wraps back with no sidebar");
     assert!(!app.transfer_focused_for_test());
 }
+
+
+// ---------------------------------------------------------------------------
+// Filter: applies to the whole tree, and says so when the pattern is bad.
+// ---------------------------------------------------------------------------
+
+/// A tree with matching and non-matching names at two depths.
+async fn filter_app() -> (tempfile::TempDir, FileBrowser) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    for n in ["sitemap", "backup", "notes.txt"] {
+        std::fs::write(dir.path().join(n), b"x").unwrap();
+    }
+    for n in ["inner_map", "inner.txt"] {
+        std::fs::write(dir.path().join("sub").join(n), b"x").unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    (dir, app)
+}
+
+fn visible_names(app: &FileBrowser) -> Vec<String> {
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => s
+            .tree
+            .lines
+            .iter()
+            .filter(|l| l.depth > 0)
+            .map(|l| l.name.clone())
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn apply_filter(app: &mut FileBrowser, pattern: &str) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key_for_test(char_key('f'));
+    for c in pattern.chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+#[tokio::test]
+async fn a_filter_applies_to_every_level_of_the_tree() {
+    // The filter was scoped to the cursor's directory alone. With the cursor
+    // inside an expanded subdirectory, every other level was left untouched — so
+    // filtering appeared to do nothing at all.
+    let (_dir, mut app) = filter_app().await;
+    app.handle_key_for_test(char_key('*')); // expand everything
+
+    // Put the cursor inside `sub`, which is where the old scoping went wrong.
+    for _ in 0..10 {
+        let on = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s
+                .tree
+                .selected_line()
+                .map(|l| l.name == "inner.txt")
+                .unwrap_or(false),
+            _ => false,
+        };
+        if on {
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+
+    apply_filter(&mut app, ".*p$");
+
+    let mut names = visible_names(&app);
+    names.sort();
+    // Directories are kept so their matching children stay reachable.
+    assert_eq!(
+        names,
+        vec!["backup", "inner_map", "sitemap", "sub"],
+        "the filter must hide non-matching names at every depth"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_filter_pattern_restores_the_whole_tree() {
+    let (_dir, mut app) = filter_app().await;
+    app.handle_key_for_test(char_key('*'));
+    let before = visible_names(&app).len();
+
+    apply_filter(&mut app, ".*p$");
+    assert!(visible_names(&app).len() < before, "the filter should hide something");
+
+    apply_filter(&mut app, "");
+    assert_eq!(
+        visible_names(&app).len(),
+        before,
+        "an empty pattern must clear the filter"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_filter_pattern_says_so_instead_of_doing_nothing() {
+    // `*p$` is not valid regex — there is nothing for `*` to repeat. It used to
+    // be discarded silently, which is indistinguishable from a filter that ran
+    // and matched everything.
+    let (_dir, mut app) = filter_app().await;
+    let before = visible_names(&app);
+
+    apply_filter(&mut app, "*p$");
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a malformed pattern must be reported, not swallowed"
+    );
+    assert_eq!(
+        visible_names(&app),
+        before,
+        "and the view must be left alone"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_search_pattern_says_so_too() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Search had the same silent `Err(_) => return` as the filter.
+    let (_dir, mut app) = filter_app().await;
+    app.handle_key_for_test(char_key('/'));
+    for c in "*p$".chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a malformed search pattern must be reported"
+    );
+}
+
+#[tokio::test]
+async fn filtering_is_case_insensitive_like_search() {
+    // Search built its regex case-insensitively and the filter did not, so the
+    // same pattern behaved differently depending on which prompt you used.
+    let (_dir, mut app) = filter_app().await;
+    apply_filter(&mut app, "SITEMAP");
+    assert!(
+        visible_names(&app).iter().any(|n| n == "sitemap"),
+        "filter should ignore case, as search does: {:?}",
+        visible_names(&app)
+    );
+}

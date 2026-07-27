@@ -64,6 +64,23 @@ pub struct MainScreenState {
     pub sort_area: Option<Rect>,
 }
 
+/// A user-facing explanation of why a regex would not compile.
+///
+/// `regex`'s own error is several lines of caret-annotated detail aimed at a
+/// programmer; the first line carries the actual reason ("repetition operator
+/// missing expression" and the like), which is what someone who typed `*p$`
+/// needs to see.
+fn bad_pattern_message(pattern: &str, err: &regex::Error) -> String {
+    let reason = err
+        .to_string()
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && !l.starts_with('^') && !l.contains("regex parse error"))
+        .unwrap_or("invalid pattern")
+        .to_string();
+    format!("Invalid pattern '{}': {}", pattern, reason)
+}
+
 /// Lines a page motion moves before the first frame has been drawn and the real
 /// viewport height is known. The value the page motions used unconditionally
 /// before they were taught to measure the terminal.
@@ -418,25 +435,27 @@ impl MainScreenState {
     /// Search line names with the regex engine and move the cursor to the first
     /// match. The pattern is treated as a case-insensitive regex; an invalid
     /// pattern is ignored (cursor stays put).
-    pub fn search(&mut self, pattern: &str) -> bool {
+    /// Jump to the first name matching `pattern`.
+    ///
+    /// Returns an error message to surface, or `None` on success.
+    pub fn search(&mut self, pattern: &str) -> Option<String> {
         let pattern = pattern.trim();
         if pattern.is_empty() {
-            return true;
+            return None;
         }
-        // Case-insensitive by default so search stays forgiving; a bad regex is
-        // a no-op rather than an error.
+        // Case-insensitive by default so search stays forgiving.
         let re = match regex::RegexBuilder::new(pattern)
             .case_insensitive(true)
             .build()
         {
             Ok(re) => re,
-            Err(_) => return true,
+            Err(e) => return Some(bad_pattern_message(pattern, &e)),
         };
         // Remember the pattern so `n` / `p` can repeat it.
         self.last_search = Some(re.clone());
         // Jump to the first match at or after the current cursor, wrapping.
         self.jump_to_match(&re, true);
-        true
+        None
     }
 
     /// Move the cursor to the next match of the last search (down the tree,
@@ -616,19 +635,30 @@ impl MainScreenState {
     /// Filter the cursor's current directory by regex. An empty pattern clears
     /// the filter; an invalid pattern is ignored. The "current directory" is the
     /// cursor line itself if it's a directory, otherwise its parent.
-    pub fn filter(&mut self, pattern: &str) -> bool {
+    /// Filter the cursor's directory by `pattern`.
+    ///
+    /// Returns an error message to surface, or `None` on success. A malformed
+    /// pattern used to be discarded silently, which was indistinguishable from a
+    /// pattern that simply matched everything — `*p$` is not valid regex (nothing
+    /// to repeat) and looked like the filter was broken.
+    ///
+    /// Case-insensitive, matching `search`; having one of the two ignore case and
+    /// the other not was a difference nobody could see.
+    pub fn filter(&mut self, pattern: &str) -> Option<String> {
         let pattern = pattern.trim();
         if pattern.is_empty() {
             self.tree.clear_filter();
-            return true;
+            return None;
         }
-        let re = match regex::Regex::new(pattern) {
+        let re = match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
             Ok(re) => re,
-            Err(_) => return true, // ignore bad patterns
+            Err(e) => return Some(bad_pattern_message(pattern, &e)),
         };
-        let dir = self.target_dir();
-        self.tree.set_filter(dir, re);
-        true
+        self.tree.set_filter(re);
+        None
     }
 
     /// The treemap's tiles, in layout order.

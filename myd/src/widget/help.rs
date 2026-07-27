@@ -119,7 +119,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("P", "Toggle permissions column"),
                 ("T", "Toggle modification-time column"),
                 ("Ctrl+P", "Toggle info panel"),
-                ("f", "Filter directory (regex)"),
+                ("f", "Filter the tree (regex, empty clears)"),
             ],
         },
         HelpCategory {
