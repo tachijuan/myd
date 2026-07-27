@@ -6988,3 +6988,40 @@ fn the_picker_field_handles_multibyte_paths() {
     p.input_char('X');
     assert_eq!(p.input_for_test(), "tmp/caféXnaïve");
 }
+
+#[test]
+fn a_copy_destination_is_not_canonicalized_against_the_local_disk() {
+    // From a user's log: a copy's destination came out as `remote:/private/tmp`.
+    // `/private/tmp` is macOS's canonicalisation of `/tmp` — a *local* resolution
+    // applied to a path that was then sent to a Linux server, where `/private`
+    // does not exist (the server answered NoSuchFile).
+    //
+    // `target_dir` returned `resolved_path`, which is canonicalised for local
+    // trees. A destination directory has to be the path as the *destination
+    // machine* names it, so it must come from `path`, not `resolved_path`.
+    use myd::screen::SortMode;
+    use myd::widget::file_tree::FileTree;
+
+    let real = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(real.path().join("actual")).unwrap();
+    std::fs::write(real.path().join("actual/f.txt"), b"x").unwrap();
+
+    // A symlinked route to the same directory stands in for /tmp -> /private/tmp.
+    let link_base = tempfile::tempdir().unwrap();
+    let link = link_base.path().join("via_link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(real.path().join("actual"), &link).unwrap();
+
+    let tree = FileTree::new(link.clone(), SortMode::Largest, true, false);
+    let mut st = myd::screen::MainScreenState::from_tree(link.clone(), tree);
+    st.tree.set_cursor(0);
+
+    let dest = st.target_dir();
+    assert_eq!(
+        dest, link,
+        "the destination must stay the path the user is browsing ({}), not its \
+         local canonicalisation ({})",
+        link.display(),
+        dest.display()
+    );
+}

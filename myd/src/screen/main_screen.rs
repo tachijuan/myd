@@ -507,11 +507,18 @@ impl MainScreenState {
     /// This is what the user means by "the current directory" — directories
     /// expand in place, so the cursor routinely sits several levels below the
     /// pane root while the root itself is no longer where anything is happening.
+    /// Uses `path`, the entry as its own filesystem names it, rather than
+    /// `resolved_path`. `resolved_path` is canonicalised *against the local
+    /// disk*, which is right for a cache key and wrong for a destination: on
+    /// macOS it rewrites `/tmp` to `/private/tmp`, and sending that to a Linux
+    /// server asks it to write under a `/private` that does not exist. It also
+    /// silently redirects a copy through a symlink's target instead of the
+    /// directory the user is actually looking at.
     pub fn target_dir(&self) -> PathBuf {
         match self.tree.selected_line() {
-            Some(line) if line.is_dir => line.resolved_path.clone(),
+            Some(line) if line.is_dir => line.path.clone(),
             Some(line) => line
-                .resolved_path
+                .path
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.root_path.clone()),
