@@ -7025,3 +7025,85 @@ fn a_copy_destination_is_not_canonicalized_against_the_local_disk() {
         dest.display()
     );
 }
+
+#[tokio::test]
+async fn a_single_panel_copy_destination_is_not_canonicalized_locally() {
+    // From a user's log on macOS: a copy from a remote panel ended up targeting
+    // `remote:/private/tmp`. Typing `/tmp` into the single-panel "Copy to
+    // directory:" prompt ran `.canonicalize()` on it — a *local* resolution —
+    // turning it into macOS's `/private/tmp`, which was then handed to the remote
+    // server where `/private` does not exist.
+    //
+    // A destination directory has to be the path the destination filesystem uses,
+    // so it must not be resolved against the local disk.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let real = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(real.path().join("actual")).unwrap();
+
+    // A symlinked route to a directory stands in for /tmp -> /private/tmp.
+    let link_base = tempfile::tempdir().unwrap();
+    let link = link_base.path().join("via_link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(real.path().join("actual"), &link).unwrap();
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("payload.txt"), b"data").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(src.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    // Single panel: `c` prompts for a destination directory.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "input", "expected the destination prompt");
+
+    for ch in link.to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    for _ in 0..200 {
+        app.tick_for_test();
+        app.resolve_loading_for_test();
+        if link.join("payload.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    // The copy must be addressed through the path the user typed. Reading it back
+    // through the link proves the bytes landed, and `copy_dest_for_test` proves
+    // the address itself was not rewritten.
+    assert_eq!(
+        app.copy_dest_for_test(),
+        Some(link.clone()),
+        "the typed destination must not be canonicalized against the local disk"
+    );
+}
+
+#[test]
+fn a_single_panel_copy_from_a_remote_panel_routes_through_the_transfer_queue() {
+    // The single-panel copy prompt fed `begin_copy_batch` unconditionally, which
+    // spawns `copy_path` — plain `std::fs`. From a remote panel that reads and
+    // writes the LOCAL disk under remote-looking paths, so it either fails oddly
+    // or silently touches the wrong machine. Only the dual-panel path checked the
+    // backends.
+    //
+    // The queue is the correct route whenever either endpoint is remote; this
+    // asserts the routing decision itself, which is what the log's
+    // `src_backend="sftp" dest_backend="sftp"` made visible.
+    use myd::vfs::BackendId;
+
+    // A local endpoint pair stays off the queue.
+    assert!(
+        !myd::app::copy_needs_transfer_queue(BackendId::LOCAL, BackendId::LOCAL),
+        "a local-to-local copy is a plain filesystem copy"
+    );
+    // Anything touching a remote backend belongs on the queue.
+    assert!(
+        myd::app::copy_needs_transfer_queue(BackendId(1), BackendId(1)),
+        "a remote-to-remote copy must not go through local std::fs"
+    );
+    assert!(myd::app::copy_needs_transfer_queue(BackendId(1), BackendId::LOCAL));
+    assert!(myd::app::copy_needs_transfer_queue(BackendId::LOCAL, BackendId(1)));
+}

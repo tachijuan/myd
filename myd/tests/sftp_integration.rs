@@ -951,3 +951,88 @@ sftp_test!(an_uncreatable_destination_directory_is_reported_as_such, env, {
         joined
     );
 });
+
+sftp_test!(a_single_panel_remote_copy_uses_the_typed_path_verbatim, env, {
+    // The user's scenario end to end: one remote panel, `c`, and a destination
+    // typed into the prompt. Two bugs met here — the typed path was canonicalised
+    // against the LOCAL disk (macOS turned `/tmp` into `/private/tmp`, which the
+    // Linux server rejected with NoSuchFile), and the copy was routed to
+    // `copy_path`, plain std::fs, which would have worked on the local machine.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..400 {
+        app.tick_for_test();
+        if matches!(app.current_screen(), myd::screen::Screen::Main(_)) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let target = format!(
+        "sftp://{}@{}:{}{}",
+        whoami(), env.host, env.port, env.remote_dir.display()
+    );
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) { opened = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "remote panel never opened");
+    assert_eq!(app.panel_count(), 1, "this is the single-panel path");
+
+    // Put the cursor on a real remote file.
+    let name = {
+        let myd::screen::Screen::Main(state) = app.current_screen() else { panic!() };
+        state.tree.lines.iter()
+            .find(|l| l.depth == 1 && !l.is_dir && l.name.ends_with(".txt"))
+            .expect("harness provides a .txt file").name.clone()
+    };
+    for _ in 0..200 {
+        let on_it = match app.current_screen() {
+            myd::screen::Screen::Main(s) => s.tree.selected_line()
+                .map(|l| l.name == name && !l.is_dir).unwrap_or(false),
+            _ => false,
+        };
+        if on_it { break; }
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    }
+
+    // `c` prompts for a destination; type a real REMOTE directory.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert_eq!(app.modal_kind_for_test(), "input", "expected the destination prompt");
+    // Address the destination through the harness's `link_subdir` symlink. On the
+    // server that is a real directory; canonicalising it against the LOCAL disk
+    // rewrites it to `real_subdir` (or fails outright), which is the same class of
+    // rewrite that turned a typed `/tmp` into macOS's `/private/tmp`. The typed
+    // path has to reach the server verbatim.
+    let typed_dir = env.remote_dir.join("link_subdir");
+    let dest_dir = env.remote_dir.join("real_subdir");
+    for ch in typed_dir.to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // The transfer must actually land the file on the server.
+    let landed = dest_dir.join(&name);
+    let mut ok = false;
+    for _ in 0..600 {
+        app.tick_for_test();
+        if landed.exists() { ok = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        ok,
+        "a single-panel remote copy should land {} on the server; \
+         destination addressed as {:?}",
+        landed.display(),
+        app.copy_dest_for_test()
+    );
+    assert_eq!(
+        app.copy_dest_for_test(),
+        Some(typed_dir.clone()),
+        "the typed path must reach the server verbatim, not locally canonicalised"
+    );
+    std::fs::remove_file(&landed).ok();
+});
