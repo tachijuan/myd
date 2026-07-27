@@ -27,7 +27,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Dialing directory** — `gr` offers your three most recently used remote locations (most recent first); `gs` opens the full saved list with vi navigation (`j`/`k`/`g`/`G`), `/` to search, and `a`/`e`/`d` to add, edit and delete entries. Saved to `~/.config/myd/hosts.toml`, which you can edit by hand. **Passwords are never stored** — an entry holds only where to connect and as whom, and authentication still goes through `ssh-agent`, your `~/.ssh` keys, or a prompt.
 - **Mouse support** — scroll with the wheel, click to focus a panel and select a row or treemap tile, right-click to open a directory. Press `Ctrl+N` to release the mouse when you want your terminal's own text selection back.
 - **Non-blocking transfers** — copy (`c`) tagged files between a remote panel and a local one and the transfer runs in the background: the interface stays fully interactive, so you can keep browsing and queue more. Up to 16 transfers run at once and the rest stack up, and the files within a directory are copied concurrently — which is what makes a folder of small files usable over a high-latency link.
-- **Transfer panel** — a right-hand sidebar that appears once you start a copy (and stays while transfers remain) showing queued, active, and finished transfers with per-transfer progress bars, transfer rate, and ETA. `Tab` focuses it after the browser panels; `j`/`K` move between transfers and `k` (or a double-click) cancels the selected one after a confirmation. Toggle it any time with `Ctrl+t`; cancel everything outstanding with `gx`. Quitting with transfers still running asks for confirmation first (`Ctrl+C` still force-quits).
+- **Transfer panel** — a right-hand sidebar that appears once you start a copy (and stays while transfers remain) showing queued, active, and finished transfers with per-transfer progress bars, transfer rate, and ETA. `Tab` reaches it after the browser panels, then wraps back to the first; `j`/`K` move between transfers and `k` (or a double-click) cancels the selected one after a confirmation. Toggle it any time with `Ctrl+t`; cancel everything outstanding with `gx`. Quitting with transfers still running asks for confirmation first (`Ctrl+C` still force-quits).
 - **Fast SFTP engine** — transfers are built around round trips rather than bandwidth, which is what governs a long link. Large files move through a deep pipeline of concurrent positioned reads (and, for uploads, positioned writes), the SSH channel window is sized so it isn't itself the ceiling, and Nagle is disabled. Against a simulated 150 ms link: downloads 12.7 → 37.9 MiB/s, uploads 1.3 → 14.9 MiB/s. Reproduce with `cargo test --release --test bench_transfer -- --ignored --nocapture`, or compare against the `sftp` binary on your own link with `scripts/compare_sftp.sh user@host 512M`.
 
 ## Requirements
@@ -146,7 +146,7 @@ Search wraps around at the ends. Filtering masks non-matching entries in the cur
 | Key       | Action                                          |
 |-----------|-------------------------------------------------|
 | `\|`      | Toggle single / dual-panel layout               |
-| `Tab`     | Switch the active panel                          |
+| `Tab`     | Rotate focus: each panel, then the transfer panel |
 | `c`       | Copy tagged / selected into the other panel      |
 
 A copy where one panel is remote runs as a background **transfer** instead of a blocking copy — see below.
@@ -297,7 +297,7 @@ Run `myd` with `--dual` (or pass two directory paths) to view two independent tr
 +---------------------------+---------------------------+
 ```
 
-- **`Tab`** switches which panel is active; the active panel has a bright border, the inactive one a dimmed border.
+- **`Tab`** rotates focus through every visible pane — each panel left to right, then the transfer sidebar — and wraps around; the focused pane has a bright border, the others dimmed.
 - **`|`** toggles the split. Splitting opens the new panel at the active panel's current directory and focuses it; unsplitting drops the inactive panel and keeps the one you were on.
 - **`c`** copies the tagged files (or, if none are tagged, the item under the cursor) in the active panel into the **directory the other panel is currently viewing**. Each name collision is confirmed individually. Directories are copied recursively, and the destination panel refreshes automatically when the copy completes.
 - **`m`** moves them instead. Within one filesystem that's a rename, so it finishes instantly however large the files are. Between two different hosts the bytes are copied through the transfer queue and each source is removed only once its own copy has landed — a failed or cancelled copy leaves the source untouched. A name already taken at the destination prompts you to overwrite it, skip that file, or cancel the whole move.

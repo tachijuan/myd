@@ -1396,18 +1396,36 @@ impl FileBrowser {
                 false
             }
             Action::SwitchPanel => {
-                // Tab cycles the browser panels and then the transfer sidebar,
-                // so everything focusable is reachable from one key rather than
-                // the sidebar needing its own.
-                if self.transfer_focused {
-                    self.transfer_focused = false;
-                    self.transfer_cursor = None;
-                } else if self.transfer_area.is_some()
-                    && (self.other_index().is_none() || self.active + 1 == self.panels.len())
-                {
-                    self.focus_transfers();
-                } else if let Some(other) = self.other_index() {
-                    self.active = other;
+                // Tab rotates through every focusable pane in layout order — each
+                // browser panel left to right, then the transfer sidebar — and
+                // wraps around. Everything focusable is reachable from one key
+                // rather than the sidebar needing its own.
+                //
+                // This has to be a rotation over the whole set, not a pair of
+                // special cases: leaving the sidebar used to clear its focus
+                // without moving `active`, so focus fell back to whichever panel
+                // it came from. With two panels open that alternated between the
+                // second panel and the sidebar forever, and the first panel was
+                // unreachable by Tab.
+                let panels = self.panels.len();
+                let sidebar = self.transfer_area.is_some();
+                // Position in the rotation: 0..panels are the browser panels, and
+                // `panels` is the sidebar when it is on screen.
+                let current = if self.transfer_focused {
+                    panels
+                } else {
+                    self.active.min(panels.saturating_sub(1))
+                };
+                let stops = panels + usize::from(sidebar);
+                if stops > 1 {
+                    let next = (current + 1) % stops;
+                    if next == panels {
+                        self.focus_transfers();
+                    } else {
+                        self.transfer_focused = false;
+                        self.transfer_cursor = None;
+                        self.active = next;
+                    }
                 }
                 true
             }
