@@ -22,7 +22,12 @@ async fn main() -> Result<()> {
         .and_then(|p| p.to_str())
         .map(str::to_string);
 
-    let mut browser = if let Some(target) = remote {
+    let mut browser = if cli.goto {
+        // Asked to be shown the picker, so nothing is opened until a destination
+        // is chosen. Clap rejects a path alongside the flag, so there is no
+        // argument being ignored here.
+        FileBrowser::new_on_picker()
+    } else if let Some(target) = remote {
         let local = std::env::current_dir().ok();
         let mut b = FileBrowser::new(local, None, false);
         b.connect_on_start(&target);

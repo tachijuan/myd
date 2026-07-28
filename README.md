@@ -65,6 +65,9 @@ myd
 myd ~/Documents
 myd /var/log
 
+# Start on the "go to" picker instead, and choose from there
+myd --goto                    # or -g; takes no path, since it asks for one
+
 # Dual-panel mode — two independent views side by side
 myd --dual                    # split; left panel picks a directory
 myd ~/Documents --dual        # left panel at ~/Documents, right picks a directory

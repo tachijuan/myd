@@ -3162,6 +3162,56 @@ async fn no_arg_startup_opens_current_directory_not_the_picker() {
     assert!(rooted, "panel should be rooted at the current directory");
 }
 
+/// `--goto` opens the picker instead of a directory.
+#[tokio::test]
+async fn goto_flag_starts_on_the_picker() {
+    // Serialize with other cwd-mutating tests (the cwd is process-global).
+    let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    let mut app = FileBrowser::new_on_picker();
+
+    assert!(
+        matches!(app.current_screen(), Screen::DirPicker(_)),
+        "--goto should open the picker"
+    );
+    // Nothing was scanned on the way: the picker is the only screen, so `q`
+    // quits rather than dropping into a tree the user never asked for.
+    assert_eq!(app.panel_depth_for_test(0), 1, "no directory underneath");
+
+    // No `settle` here: there is deliberately no load in flight, and waiting for
+    // one is how this test first "failed". A tick must leave the picker alone.
+    app.resolve_loading_for_test();
+    assert!(
+        matches!(app.current_screen(), Screen::DirPicker(_)),
+        "the picker must not be replaced by a background load"
+    );
+}
+
+/// The `--goto` picker lists the catalog, which is the whole point of the flag —
+/// an empty picker would be no better than the path field alone.
+#[tokio::test]
+async fn goto_flag_lists_the_saved_catalog() {
+    let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    // The real catalog is whatever this machine happens to have, so the picker
+    // is built over a known one — it is populated during construction, which is
+    // exactly the behaviour under test.
+    let app = FileBrowser::new_on_picker_with_hosts_for_test(test_catalog());
+
+    match app.current_screen() {
+        Screen::DirPicker(p) => {
+            let hosts = p.visible_options().iter().filter(|o| o.is_host()).count();
+            assert_eq!(hosts, 4, "the saved hosts should be listed");
+        }
+        _ => panic!("expected the picker"),
+    }
+}
+
 #[tokio::test]
 async fn gd_chord_opens_the_directory_picker() {
     let dir = tempfile::tempdir().unwrap();
