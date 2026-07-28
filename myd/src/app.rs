@@ -1849,7 +1849,18 @@ impl FileBrowser {
                         crate::screen::PickerChoice::Connect(url) => {
                             // A saved host: leave the picker and dial it, the
                             // same path a typed URL takes.
-                            self.pop_screen();
+                            //
+                            // Only when there is something to leave it *for*.
+                            // Under `--goto` the picker is the panel's only
+                            // screen, and popping it emptied the stack — the
+                            // next redraw then panicked on `current_screen`.
+                            // A successful connect replaces the whole panel
+                            // anyway, so keeping the picker costs nothing and
+                            // means a failed one returns to the list it was
+                            // picked from rather than to a blank panel.
+                            if self.active_panel().depth() > 1 {
+                                self.pop_screen();
+                            }
                             self.connecting_label = label_for_url(&self.hosts, &url);
                             self.start_connect(&url);
                         }
