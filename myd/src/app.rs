@@ -76,6 +76,12 @@ pub enum ModalTarget {
     CopyDest { srcs: Vec<PathBuf> },
     /// Per-file overwrite confirmation while draining `pending_copies`.
     CopyOverwrite { src: PathBuf, dest: PathBuf },
+    /// Per-file overwrite confirmation for a queued cross-backend transfer.
+    ///
+    /// Carries `is_dir` rather than the destination path: the batch already
+    /// knows the destination directory, and the worker needs the kind to decide
+    /// whether to expand the entry.
+    TransferOverwrite { src: PathBuf, is_dir: bool },
     /// Per-file overwrite/skip/cancel choice while draining `pending_moves`.
     MoveOverwrite {
         src: PathBuf,
@@ -125,6 +131,15 @@ pub struct FileBrowser {
     approved_copies: Vec<(PathBuf, PathBuf)>,
     /// Panel whose tags to clear when the current copy batch completes.
     copy_source_panel: usize,
+    /// A queued transfer batch waiting on overwrite confirmations.
+    ///
+    /// The queued path needs the same per-file prompt the local one has: the
+    /// worker replaces an existing destination on the stated assumption that
+    /// "the overwrite decision was made by the caller before queueing", and the
+    /// cross-backend caller was not making it — a remote-to-local copy silently
+    /// overwrote. Held here because the answer arrives over several key events,
+    /// exactly like `pending_copies`.
+    pending_transfer: Option<PendingTransferBatch>,
     /// Live progress for the in-flight copy or delete batch, shared with its
     /// background task and read by the render loop.
     op_progress: Option<OpProgress>,
@@ -239,6 +254,22 @@ struct PendingConnect {
     target_panel: usize,
 }
 
+/// A cross-backend copy batch part-way through its overwrite confirmations.
+///
+/// Everything `enqueue_cross_backend_copy` needs, held while the colliding files
+/// are put to the user one at a time. `approved` collects what survives; the
+/// batch is enqueued only once `pending` is empty.
+struct PendingTransferBatch {
+    /// Colliding (src, is_dir) entries still to be asked about.
+    pending: Vec<(PathBuf, bool)>,
+    /// (src, is_dir) entries cleared to transfer.
+    approved: Vec<(PathBuf, bool)>,
+    src_backend: crate::vfs::BackendId,
+    dest_dir: PathBuf,
+    dest_backend: crate::vfs::BackendId,
+    source_panel: usize,
+}
+
 impl FileBrowser {
     /// Build the app. `left`/`right` are the two panels' starting directories;
     /// dual mode is enabled by the `--dual` flag *or* by supplying a right path.
@@ -277,6 +308,7 @@ impl FileBrowser {
             move_dest_dir: PathBuf::new(),
             pending_copies: Vec::new(),
             approved_copies: Vec::new(),
+            pending_transfer: None,
             copy_source_panel: 0,
             backends: BackendRegistry::new(),
             transfers: TransferQueue::default(),
@@ -2300,6 +2332,16 @@ impl FileBrowser {
                             }
                             self.prompt_next_copy();
                         }
+                        Some(ModalTarget::TransferOverwrite { src, is_dir }) => {
+                            // Same rule for a queued transfer: confirmed files
+                            // join the batch, declined ones are dropped.
+                            if result {
+                                if let Some(batch) = self.pending_transfer.as_mut() {
+                                    batch.approved.push((src, is_dir));
+                                }
+                            }
+                            self.prompt_next_transfer();
+                        }
                         Some(ModalTarget::MoveOverwrite { src, dest, is_dir }) => {
                             match answer {
                                 // Overwrite: the batch clears the destination
@@ -2500,8 +2542,13 @@ impl FileBrowser {
                                         } else {
                                             vec![false; srcs.len()]
                                         };
-                                        self.enqueue_cross_backend_copy(
+                                        // No panel shows the typed destination,
+                                        // so there is no listing to check for
+                                        // collisions against — `None` skips the
+                                        // prompt rather than inventing an answer.
+                                        self.begin_transfer_batch(
                                             srcs, kinds, src_backend, dir, dest_backend, active,
+                                            None,
                                         );
                                     } else {
                                         // Copy into the chosen directory, refreshing
@@ -2533,6 +2580,7 @@ impl FileBrowser {
                             // Confirm-modal targets; unreachable from an input.
                             ModalTarget::Delete { .. }
                             | ModalTarget::CopyOverwrite { .. }
+                            | ModalTarget::TransferOverwrite { .. }
                             | ModalTarget::MoveOverwrite { .. } => {}
                         }
                     }
@@ -2978,13 +3026,14 @@ impl FileBrowser {
                     } else {
                         vec![false; srcs.len()]
                     };
-                    self.enqueue_cross_backend_copy(
+                    self.begin_transfer_batch(
                         srcs,
                         kinds,
                         src_backend,
                         dest_dir,
                         dest_backend,
                         source,
+                        Some(other),
                     );
                     return;
                 }
@@ -2997,6 +3046,100 @@ impl FileBrowser {
                 self.modal = Modal::Input(InputDialog::new("Copy to directory:", "Enter path..."));
             }
         }
+    }
+
+    /// Confirm any overwrites, then queue a cross-backend copy.
+    ///
+    /// The local copy path has always asked before replacing a file; the queued
+    /// one went straight to the worker, which replaces the destination because
+    /// "the overwrite decision was made by the caller before queueing" — a
+    /// caller that was not making it. A remote-to-local copy therefore destroyed
+    /// an existing file without a word.
+    ///
+    /// `dest_panel` is the pane showing the destination, whose loaded listing
+    /// answers the collision question without a round trip. `None` means nothing
+    /// on screen shows that directory (a destination typed into the single-panel
+    /// prompt), so there is nothing to check and the batch goes straight out.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_transfer_batch(
+        &mut self,
+        srcs: Vec<PathBuf>,
+        kinds: Vec<bool>,
+        src_backend: crate::vfs::BackendId,
+        dest_dir: PathBuf,
+        dest_backend: crate::vfs::BackendId,
+        source_panel: usize,
+        dest_panel: Option<usize>,
+    ) {
+        let mut pending: Vec<(PathBuf, bool)> = Vec::new();
+        let mut approved: Vec<(PathBuf, bool)> = Vec::new();
+
+        for (i, src) in srcs.into_iter().enumerate() {
+            let is_dir = kinds.get(i).copied().unwrap_or(false);
+            let collides = match (dest_panel, src.file_name()) {
+                (Some(p), Some(name)) => {
+                    let dest = dest_dir.join(name);
+                    match self.panels[p].current_screen() {
+                        Screen::Main(state) => state.has_entry(&dest),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if collides {
+                pending.push((src, is_dir));
+            } else {
+                approved.push((src, is_dir));
+            }
+        }
+
+        self.pending_transfer = Some(PendingTransferBatch {
+            pending,
+            approved,
+            src_backend,
+            dest_dir,
+            dest_backend,
+            source_panel,
+        });
+        self.prompt_next_transfer();
+    }
+
+    /// Ask about the next colliding transfer, or enqueue once none are left.
+    fn prompt_next_transfer(&mut self) {
+        let Some(batch) = self.pending_transfer.as_mut() else {
+            return;
+        };
+        if let Some((src, is_dir)) = batch.pending.pop() {
+            let name = src
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.modal_target = Some(ModalTarget::TransferOverwrite { src, is_dir });
+            self.modal =
+                Modal::Confirm(ConfirmDialog::new(format!("'{}' exists. Overwrite?", name)));
+            return;
+        }
+
+        // Every collision answered: send what survived.
+        let Some(batch) = self.pending_transfer.take() else {
+            return;
+        };
+        if batch.approved.is_empty() {
+            // Nothing left to do, but the tags were still the operation's input.
+            self.panels[batch.source_panel]
+                .current_screen_mut()
+                .clear_tags();
+            return;
+        }
+        let (srcs, kinds): (Vec<PathBuf>, Vec<bool>) = batch.approved.into_iter().unzip();
+        self.enqueue_cross_backend_copy(
+            srcs,
+            kinds,
+            batch.src_backend,
+            batch.dest_dir,
+            batch.dest_backend,
+            batch.source_panel,
+        );
     }
 
     /// Queue a copy where at least one side is remote. Each source becomes one

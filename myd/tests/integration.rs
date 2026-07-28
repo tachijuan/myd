@@ -7461,6 +7461,112 @@ async fn a_remote_second_argument_builds_a_split_with_the_local_path_left() {
     );
 }
 
+/// A queued remote-to-local copy must ask before replacing an existing file.
+#[tokio::test]
+async fn a_transfer_onto_an_existing_file_asks_first() {
+    // Reported: `myd /tmp sftp://gb10`, copied a file from the remote pane to
+    // /tmp where a file of that name already existed, and it was overwritten
+    // with no warning.
+    //
+    // The local copy path has always prompted. The queued path went straight to
+    // the worker, which replaces the destination on the stated assumption that
+    // "the overwrite decision was made by the caller before queueing" — and the
+    // cross-backend caller never made it.
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("big_file"), b"original").unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(dest.path().to_path_buf()),
+        Some(dest.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+
+    // Panel 0 becomes the remote source, holding a file of the same name.
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    // Copy the remote file into the local pane, which already has that name.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "an existing destination must be confirmed, not silently replaced"
+    );
+    assert!(
+        app.transfer_queue().transfers().is_empty(),
+        "and nothing may be queued until the answer comes back"
+    );
+
+    // Declining leaves the file alone and queues nothing.
+    app.handle_key_for_test(char_key('n'));
+    assert!(
+        app.transfer_queue().transfers().is_empty(),
+        "a declined overwrite must not transfer"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("big_file")).unwrap(),
+        b"original",
+        "the existing file must be untouched"
+    );
+}
+
+/// Accepting the overwrite still queues the transfer, and a non-colliding file
+/// is never asked about at all.
+#[tokio::test]
+async fn a_confirmed_transfer_overwrite_proceeds_and_a_clear_name_is_not_asked() {
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("big_file"), b"original").unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(dest.path().to_path_buf()),
+        Some(dest.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+    app.handle_key_for_test(char_key('y'));
+
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        1,
+        "a confirmed overwrite must go through"
+    );
+
+    // A name with no collision goes straight to the queue: the prompt exists for
+    // data that would be destroyed, and asking about everything would train the
+    // habit of dismissing it.
+    let fresh = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(
+        Some(fresh.path().to_path_buf()),
+        Some(fresh.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+    let twin2 = tempfile::tempdir().unwrap();
+    std::fs::write(twin2.path().join("only_there"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin2.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "a name that does not collide must not prompt"
+    );
+    assert_eq!(app.transfer_queue().transfers().len(), 1);
+}
+
 /// Navigating a remote panel to a local directory must clear its remote tag.
 #[tokio::test]
 async fn a_remote_panel_navigated_to_a_local_path_stops_being_remote() {

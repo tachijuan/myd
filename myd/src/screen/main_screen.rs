@@ -627,6 +627,21 @@ impl MainScreenState {
             .map(|l| l.is_dir)
     }
 
+    /// Whether this tree already shows an entry at `path`.
+    ///
+    /// Read from the loaded lines for the same reason as [`Self::is_dir_of`]: a
+    /// remote `stat` is a round trip, and the collision check runs once per file
+    /// in a batch from a synchronous key handler. Only what the panel has listed
+    /// counts, so a collapsed or not-yet-loaded subdirectory reports nothing —
+    /// the destination directory itself is always listed, which is the case that
+    /// matters for a copy landing in it.
+    pub fn has_entry(&self, path: &std::path::Path) -> bool {
+        self.tree
+            .lines
+            .iter()
+            .any(|l| l.resolved_path == path || l.path == path)
+    }
+
     /// Number of tagged files (for the footer indicator).
     pub fn tagged_count(&self) -> usize {
         self.tree.tagged.len()
