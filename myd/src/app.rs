@@ -361,7 +361,7 @@ impl FileBrowser {
         browser
     }
 
-    /// Start on the "go to" picker rather than a directory, for `myd --goto`.
+    /// Start on the picker rather than a directory, for `myd --directory`.
     ///
     /// Built here rather than in `Panel::new` because the picker has to list the
     /// saved directories and hosts, and the catalog is not loaded until this
@@ -1915,7 +1915,7 @@ impl FileBrowser {
                             // same path a typed URL takes.
                             //
                             // Only when there is something to leave it *for*.
-                            // Under `--goto` the picker is the panel's only
+                            // Under `--directory` the picker is the panel's only
                             // screen, and popping it emptied the stack — the
                             // next redraw then panicked on `current_screen`.
                             // A successful connect replaces the whole panel

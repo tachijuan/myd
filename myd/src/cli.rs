@@ -19,11 +19,14 @@ pub struct Cli {
     pub dual: bool,
 
     /// Choose from your saved directories and hosts instead of opening a path.
+    // `-d` to match the `gd` chord that opens the same picker in the app. `-2`
+    // already holds the short form for --dual, so the letter was free.
+    //
     // Conflicts with a path rather than overriding one: the flag asks to be
     // prompted for a destination, so supplying one too is a contradiction, and
     // reporting it beats silently honouring whichever happened to win.
-    #[arg(long, short = 'g', conflicts_with_all = ["path", "right"])]
-    pub goto: bool,
+    #[arg(long, short = 'd', conflicts_with_all = ["path", "right"])]
+    pub directory: bool,
 }
 
 /// Whether a path-like argument is actually a remote target (`sftp://…` or
@@ -70,7 +73,7 @@ impl Cli {
                 .map(str::to_string)
         };
 
-        if self.goto {
+        if self.directory {
             return Startup::Picker;
         }
         // Either positional may be the remote one. Checking only the first left
@@ -195,23 +198,28 @@ mod tests {
         );
 
         // The flag wins over everything else.
-        let cli = Cli::try_parse_from(["myd", "--goto"]).unwrap();
+        let cli = Cli::try_parse_from(["myd", "--directory"]).unwrap();
         assert_eq!(cli.startup(None), Startup::Picker);
     }
 
     #[test]
-    fn goto_takes_no_path() {
+    fn directory_takes_no_path() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
 
-        let cli = Cli::try_parse_from(["myd", "--goto"]).expect("--goto alone is valid");
-        assert!(cli.goto);
+        let cli =
+            Cli::try_parse_from(["myd", "--directory"]).expect("--directory alone is valid");
+        assert!(cli.directory);
         assert!(cli.path.is_none());
-        assert!(Cli::try_parse_from(["myd", "-g"]).unwrap().goto);
+        // `-d` matches the `gd` chord; `-2` still holds --dual's short form, so
+        // the two do not collide.
+        assert!(Cli::try_parse_from(["myd", "-d"]).unwrap().directory);
+        assert!(Cli::try_parse_from(["myd", "-2"]).unwrap().dual);
+        assert!(!Cli::try_parse_from(["myd", "-2"]).unwrap().directory);
 
         // A path alongside it is a contradiction — being asked where to go and
         // told at the same time — so it is reported rather than half-honoured.
-        assert!(Cli::try_parse_from(["myd", "--goto", "/tmp"]).is_err());
-        assert!(Cli::try_parse_from(["myd", "--goto", "/tmp", "/var"]).is_err());
+        assert!(Cli::try_parse_from(["myd", "--directory", "/tmp"]).is_err());
+        assert!(Cli::try_parse_from(["myd", "--directory", "/tmp", "/var"]).is_err());
     }
 }

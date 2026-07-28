@@ -249,8 +249,8 @@ impl Panel {
     ///
     /// [`new`] always begins loading something, so building a panel and then
     /// replacing its screen would leave a full walk of the current directory
-    /// running for a tree nobody is going to see. Used for `--goto`, which opens
-    /// on the picker instead.
+    /// running for a tree nobody is going to see. Used for `--directory`, which
+    /// opens on the picker instead.
     pub fn new_on_screen(screen: Screen) -> Self {
         Self {
             screen_stack: vec![screen],

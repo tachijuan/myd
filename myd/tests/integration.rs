@@ -3162,9 +3162,9 @@ async fn no_arg_startup_opens_current_directory_not_the_picker() {
     assert!(rooted, "panel should be rooted at the current directory");
 }
 
-/// `--goto` opens the picker instead of a directory.
+/// `--directory` opens the picker instead of a directory.
 #[tokio::test]
-async fn goto_flag_starts_on_the_picker() {
+async fn directory_flag_starts_on_the_picker() {
     // Serialize with other cwd-mutating tests (the cwd is process-global).
     let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
@@ -3175,7 +3175,7 @@ async fn goto_flag_starts_on_the_picker() {
 
     assert!(
         matches!(app.current_screen(), Screen::DirPicker(_)),
-        "--goto should open the picker"
+        "--directory should open the picker"
     );
     // Nothing was scanned on the way: the picker is the only screen, so `q`
     // quits rather than dropping into a tree the user never asked for.
@@ -3190,10 +3190,10 @@ async fn goto_flag_starts_on_the_picker() {
     );
 }
 
-/// The `--goto` picker lists the catalog, which is the whole point of the flag —
-/// an empty picker would be no better than the path field alone.
+/// The `--directory` picker lists the catalog, which is the whole point of the
+/// flag — an empty picker would be no better than the path field alone.
 #[tokio::test]
-async fn goto_flag_lists_the_saved_catalog() {
+async fn directory_flag_lists_the_saved_catalog() {
     let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
@@ -3212,13 +3212,14 @@ async fn goto_flag_lists_the_saved_catalog() {
     }
 }
 
-/// Connecting from a `--goto` picker must not empty the panel's screen stack.
+/// Connecting from a `--directory` picker must not empty the screen stack.
 ///
-/// The picker is the only screen under `--goto`, and the connect path popped it
-/// unconditionally — the next redraw then panicked in `current_screen` with
-/// "empty stack", taking the whole app down as soon as a host was chosen.
+/// The picker is the only screen under `--directory`, and the connect path
+/// popped it unconditionally — the next redraw then panicked in
+/// `current_screen` with "empty stack", taking the app down as soon as a host
+/// was chosen.
 #[tokio::test]
-async fn connecting_from_the_goto_picker_does_not_empty_the_panel() {
+async fn connecting_from_the_directory_picker_does_not_empty_the_panel() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
