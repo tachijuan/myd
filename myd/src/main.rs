@@ -3,8 +3,21 @@ use clap::Parser;
 use myd::app::FileBrowser;
 use myd::cli::{Cli, Startup};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // An explicit runtime rather than `#[tokio::main]`, so the process can stop
+    // without waiting on background tasks. An SFTP connection keeps a russh
+    // session task running for as long as the backend is registered, and nothing
+    // unregisters it — quitting after browsing a remote host therefore hung on a
+    // task that never finishes. `shutdown_background` drops the runtime without
+    // joining, which is safe here because the UI has already exited and any
+    // in-flight transfer is being abandoned deliberately.
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_background();
+    result
+}
+
+async fn run() -> Result<()> {
     // Diagnostics, when asked for via MYD_LOG / MYD_TRACE. Must happen here:
     // without it no subscriber is installed and every tracing call in the app is
     // a no-op, so `MYD_LOG=...` silently produced nothing. Output goes to a file

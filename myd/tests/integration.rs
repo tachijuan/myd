@@ -7461,6 +7461,56 @@ async fn a_remote_second_argument_builds_a_split_with_the_local_path_left() {
     );
 }
 
+/// Navigating a remote panel to a local directory must clear its remote tag.
+#[tokio::test]
+async fn a_remote_panel_navigated_to_a_local_path_stops_being_remote() {
+    // Reported sequence: left /tmp, right connected to sftp://gb10 (a copy at
+    // that point worked), then `gd` on the right pane to a local CIFS mount. The
+    // next copy failed with "destination directory remote:/Volumes/data/nog/hen
+    // does not exist" — the `remote:` prefix being the whole tell.
+    //
+    // `Panel::backend` was set when the panel was created or connected and never
+    // afterwards, so a panel that navigated away from the remote kept the tag
+    // while showing local content. Starting the app fresh on the same two local
+    // directories worked, which is what pointed at stale state rather than at
+    // the path itself.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let local_dest = tempfile::tempdir().unwrap();
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Make the panel remote, as a connection would.
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+    assert!(
+        !app.panel_backend_for_test(0).is_local(),
+        "the panel should start out remote"
+    );
+
+    // Now navigate it to a local directory through the picker, exactly as `gd`
+    // followed by a typed path does.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    for ch in local_dest.path().to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.panel_current_dir(0).and_then(|p| p.canonicalize().ok()),
+        local_dest.path().canonicalize().ok(),
+        "the panel should now be showing the local directory"
+    );
+    assert!(
+        app.panel_backend_for_test(0).is_local(),
+        "and must no longer be tagged remote, or copies address the server"
+    );
+}
+
 #[tokio::test]
 async fn a_local_destination_typed_from_a_remote_panel_stays_local() {
     // From a user's report: connected to an SFTP host, pressed `c`, and typed a
