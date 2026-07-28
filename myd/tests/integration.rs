@@ -7618,6 +7618,57 @@ async fn a_typed_transfer_destination_without_collisions_just_goes() {
     );
 }
 
+/// Tab in the overwrite prompt moves the focus; it must not confirm.
+#[tokio::test]
+async fn tab_in_the_overwrite_prompt_does_not_confirm() {
+    // Reported: hitting Tab at the copy-overwrite prompt was taken as "OK", so
+    // the file was replaced. Every key the app did not recognise was flattened
+    // to `' '` on the way into the dialog, and `' '` meant accept.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("big_file"), b"original").unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(dest.path().to_path_buf()),
+        Some(dest.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "confirm", "expected the prompt");
+
+    // Tab: focus moves, the dialog stays up, nothing is decided.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "Tab must not answer the prompt"
+    );
+    assert!(
+        app.transfer_queue().transfers().is_empty(),
+        "and must not queue the overwrite"
+    );
+
+    // Enter now takes the focused button, which Tab moved to "No".
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.transfer_queue().transfers().is_empty(),
+        "Enter on No must decline"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("big_file")).unwrap(),
+        b"original",
+        "the existing file must be untouched"
+    );
+}
+
 /// Accepting the overwrite still queues the transfer, and a non-colliding file
 /// is never asked about at all.
 #[tokio::test]

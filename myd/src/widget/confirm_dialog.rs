@@ -31,6 +31,9 @@ pub struct ConfirmDialog {
     /// directory") rather than asking anything, and offering Yes/No there
     /// invites the reader to wonder what "No" would decline.
     notice: bool,
+    /// Where each button was last drawn, for click hit-testing. Rebuilt every
+    /// render, so a resize can never leave a button answering from stale coords.
+    button_areas: Vec<Rect>,
 }
 
 impl ConfirmDialog {
@@ -41,6 +44,7 @@ impl ConfirmDialog {
             cursor: 0,
             choices: Vec::new(),
             notice: false,
+            button_areas: Vec::new(),
         }
     }
 
@@ -57,6 +61,7 @@ impl ConfirmDialog {
             cursor: 0,
             choices: Vec::new(),
             notice: true,
+            button_areas: Vec::new(),
         }
     }
 
@@ -66,9 +71,30 @@ impl ConfirmDialog {
     }
 
     /// Handle a key; `None` while the dialog is still waiting for a valid one.
+    ///
+    /// `\t` moves the focus between buttons and `\u{1}` moves it back; neither
+    /// ever answers. Tab used to arrive here as `' '`, along with every other
+    /// unhandled key, and `' '` meant accept — so reaching for the other button
+    /// pressed the one already focused. Only Enter, a mouse click, or a button's
+    /// own letter decides anything.
     pub fn handle_key_answer(&mut self, key: char) -> Option<Answer> {
+        // Focus movement first, so it can never be read as an answer.
+        if key == '\t' || key == '\u{1}' {
+            let count = self.button_count();
+            if count > 1 {
+                self.cursor = if key == '\t' {
+                    (self.cursor + 1) % count
+                } else {
+                    (self.cursor + count - 1) % count
+                };
+            }
+            return None;
+        }
+
         // A notice has nothing to decide: any of the usual dismissals closes it,
         // and the caller reads that as "acknowledged" rather than as consent.
+        // Space is safe here precisely because there is only one button — on a
+        // question it would be a blind answer, so it is not accepted there.
         if self.notice {
             return match key {
                 '\n' | ' ' | 'y' | 'o' => Some(Answer::Yes),
@@ -80,19 +106,68 @@ impl ConfirmDialog {
             if self.choices.contains(&lowered) {
                 return Some(Answer::Choice(lowered));
             }
-            // Enter picks the highlighted (first) choice; Esc is handled by the
+            // Enter picks whichever choice has the focus; Esc is handled by the
             // caller, which maps it to the safest option.
             if key == '\n' {
-                return self.choices.first().copied().map(Answer::Choice);
+                return self.choices.get(self.cursor).copied().map(Answer::Choice);
             }
             return None;
         }
         match key {
             'y' => Some(Answer::Yes),
             'n' => Some(Answer::No),
-            '\n' | ' ' => Some(if self.cursor == 0 { Answer::Yes } else { Answer::No }),
+            '\n' => Some(if self.cursor == 0 { Answer::Yes } else { Answer::No }),
             _ => None,
         }
+    }
+
+    /// How many focusable buttons this dialog draws.
+    fn button_count(&self) -> usize {
+        if self.notice {
+            1
+        } else if self.choices.is_empty() {
+            2
+        } else {
+            self.choices.len()
+        }
+    }
+
+    /// Which button currently has the focus, for the renderer and for tests.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The label each button draws, in order. One source for the rendered text
+    /// and the click rectangles, so the two can never describe different boxes.
+    fn button_labels(&self) -> Vec<String> {
+        if self.notice {
+            vec![" [ OK ] ".to_string()]
+        } else if self.choices.is_empty() {
+            vec![" [ Yes ] ".to_string(), " [  No  ] ".to_string()]
+        } else {
+            self.choices.iter().map(|c| format!("[{}]", c)).collect()
+        }
+    }
+
+    /// Answer a click at `(x, y)`, or `None` if it missed every button.
+    ///
+    /// A click on a button is that button's answer — the same decision Enter
+    /// makes on the focused one. Clicks elsewhere in the dialog do nothing
+    /// rather than dismissing: this is a question, and a stray click landing on
+    /// "yes" is exactly the accident the Tab fix is about.
+    pub fn click_at(&mut self, x: u16, y: u16) -> Option<Answer> {
+        let hit = self
+            .button_areas
+            .iter()
+            .position(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)?;
+        self.cursor = hit;
+        if self.notice {
+            return Some(Answer::Yes);
+        }
+        if !self.choices.is_empty() {
+            return self.choices.get(hit).copied().map(Answer::Choice);
+        }
+        Some(if hit == 0 { Answer::Yes } else { Answer::No })
     }
 
     /// Yes/no view of [`handle_key_answer`], for the many plain confirmations.
@@ -105,7 +180,7 @@ impl ConfirmDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Sized to its content: a fixed box clipped long messages (a full path
         // in a collision prompt is easily wider than 50 columns) and left the
         // user answering a question they could only half read.
@@ -120,41 +195,35 @@ impl ConfirmDialog {
         }
         frame.render_widget(Clear, center);
 
-        let buttons = if self.notice {
-            Line::from(Span::styled(
-                " [ OK ] ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-        } else if self.choices.is_empty() {
-            Line::from(vec![
-                if self.cursor == 0 {
-                    Span::styled(
-                        " [ Yes ] ",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Span::raw("  Yes  ")
-                },
-                Span::raw("  "),
-                if self.cursor == 1 {
-                    Span::styled(
-                        " [  No  ] ",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Span::raw("   No   ")
-                },
-            ])
-        } else {
-            Line::from(Span::styled(
-                self.choices
-                    .iter()
-                    .map(|c| format!("[{}]", c))
-                    .collect::<Vec<_>>()
-                    .join("  "),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ))
-        };
+        // Buttons and their click targets are laid out together. The focused one
+        // is reversed so Tab visibly moves something — without that the key
+        // looked inert, which is half of why it read as "accept".
+        let labels = self.button_labels();
+        let sep = "  ";
+        // Text starts inside the left border, and the buttons are the last line
+        // before the bottom one.
+        let mut x = center.x + 1;
+        let button_y = center.y + center.height.saturating_sub(2);
+        let mut spans: Vec<Span> = Vec::new();
+        self.button_areas.clear();
+        for (i, label) in labels.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(sep));
+                x += sep.chars().count() as u16;
+            }
+            let w = label.chars().count() as u16;
+            let style = if i == self.cursor {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+            spans.push(Span::styled(label.clone(), style));
+            self.button_areas.push(Rect::new(x, button_y, w, 1));
+            x += w;
+        }
+        let buttons = Line::from(spans);
 
         let mut lines = vec![
             Line::from(Span::styled(
@@ -247,6 +316,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tab_moves_the_focus_and_never_answers() {
+        // Reported: the overwrite prompt read Tab as "OK". Every key the app did
+        // not recognise arrived here as `' '`, and `' '` meant accept — so
+        // reaching for the other button pressed the one already focused.
+        let mut d = ConfirmDialog::new("'x' exists. Overwrite?");
+        assert_eq!(d.cursor(), 0, "Yes starts focused");
+
+        assert_eq!(d.handle_key_answer('\t'), None, "Tab must not answer");
+        assert_eq!(d.cursor(), 1, "it moves to No");
+        assert_eq!(d.handle_key_answer('\t'), None);
+        assert_eq!(d.cursor(), 0, "and wraps");
+
+        // Shift-Tab steps back.
+        assert_eq!(d.handle_key_answer('\u{1}'), None);
+        assert_eq!(d.cursor(), 1);
+
+        // Enter takes whatever has the focus.
+        assert_eq!(d.handle_key_answer('\n'), Some(Answer::No));
+    }
+
+    #[test]
+    fn unhandled_keys_do_not_answer_a_question() {
+        // `\0` is what the app maps every unrecognised key to. Space goes with
+        // them on a question: two buttons means it would be a blind answer.
+        let mut d = ConfirmDialog::new("Delete 3 items?");
+        for k in ['\0', ' ', 'q', '\u{7}'] {
+            assert_eq!(
+                d.handle_key_answer(k),
+                None,
+                "{:?} must not answer a question",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn tab_cycles_a_multi_choice_dialog_and_enter_takes_the_focused_one() {
+        // A move collision offers overwrite / skip / cancel. Enter used to take
+        // the first choice whatever the focus, so Tab could not reach the others.
+        let mut d = ConfirmDialog::new("'x' exists.").with_choices(&['o', 's', 'c']);
+        assert_eq!(d.handle_key_answer('\t'), None);
+        assert_eq!(d.cursor(), 1);
+        assert_eq!(d.handle_key_answer('\n'), Some(Answer::Choice('s')));
+
+        // A letter still answers directly, wherever the focus is.
+        let mut d = ConfirmDialog::new("'x' exists.").with_choices(&['o', 's', 'c']);
+        assert_eq!(d.handle_key_answer('c'), Some(Answer::Choice('c')));
+    }
+
+    #[test]
+    fn clicking_a_button_answers_it() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // The click targets come from the same labels the renderer draws, so
+        // they cannot describe boxes that are not on screen.
+        let mut d = ConfirmDialog::new("'x' exists. Overwrite?");
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| d.render(f, f.area())).unwrap();
+
+        let areas = d.button_areas.clone();
+        assert_eq!(areas.len(), 2, "a question draws Yes and No");
+
+        // A click on "No" answers No, not whatever had the focus.
+        let no = areas[1];
+        assert_eq!(
+            d.click_at(no.x + 1, no.y),
+            Some(Answer::No),
+            "clicking No must answer No"
+        );
+
+        // A click that misses every button decides nothing.
+        let mut d = ConfirmDialog::new("'x' exists. Overwrite?");
+        term.draw(|f| d.render(f, f.area())).unwrap();
+        let y = d.button_areas[0].y;
+        assert_eq!(
+            d.click_at(0, y.saturating_sub(2)),
+            None,
+            "a stray click must not answer"
+        );
+    }
+
+    #[test]
     fn a_notice_is_dismissed_but_asks_nothing() {
         // Errors and status messages are statements. Offering Yes/No invites the
         // reader to wonder what declining would mean.
@@ -278,7 +429,7 @@ mod tests {
     fn a_notice_renders_one_ok_button() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
-        let d = ConfirmDialog::notice("something went wrong");
+        let mut d = ConfirmDialog::notice("something went wrong");
         term.draw(|f| d.render(f, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = (0..12)
