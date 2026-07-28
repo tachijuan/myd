@@ -65,8 +65,8 @@ myd
 myd ~/Documents
 myd /var/log
 
-# Start on the "go to" picker instead, and choose from there
-myd --goto                    # or -g; takes no path, since it asks for one
+# Choose from your saved directories and hosts instead of opening a path
+myd --goto                    # or -g
 
 # Dual-panel mode — two independent views side by side
 myd --dual                    # split; left panel picks a directory
