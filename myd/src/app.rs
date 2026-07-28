@@ -1007,6 +1007,14 @@ impl FileBrowser {
         self.panels.get(index).map(|p| p.depth()).unwrap_or(0)
     }
 
+    /// Which backend a panel's paths are addressed on (for tests).
+    pub fn panel_backend_for_test(&self, index: usize) -> crate::vfs::BackendId {
+        self.panels
+            .get(index)
+            .map(|p| p.backend)
+            .unwrap_or(crate::vfs::BackendId::LOCAL)
+    }
+
     /// Resolve any pending Loading screen into a Main screen (normally driven
     /// by the event loop each tick). Returns false if the app should now quit
     /// (a cancelled first-screen scan).

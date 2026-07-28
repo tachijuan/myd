@@ -144,6 +144,15 @@ impl Panel {
                 if !tree.source.is_remote() {
                     *opened = Some(path.clone());
                 }
+                // The tree that just loaded is the authority on which machine
+                // this panel is showing, so adopt its backend. The field was only
+                // set when a panel was created or connected: navigating a remote
+                // panel to a local path (`gd` to a mounted volume, say) left it
+                // still tagged remote, and the next copy addressed the
+                // destination as `remote:/Volumes/…`, which the server does not
+                // have. The reverse — a local panel that opens a remote tree —
+                // has the same hazard.
+                self.backend = tree.source.backend();
                 let mut state = MainScreenState::from_tree(path, tree);
                 // Carry the panel's view preferences onto the new screen so
                 // entering a directory doesn't silently reset them.
