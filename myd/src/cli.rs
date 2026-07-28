@@ -18,11 +18,10 @@ pub struct Cli {
     #[arg(long, short = '2')]
     pub dual: bool,
 
-    /// Open the "go to" picker instead of a directory, as if `gd` were pressed.
-    ///
-    /// Conflicts with a starting path: the point of the flag is to be asked
-    /// where to go, so being told as well is a contradiction worth reporting
-    /// rather than silently resolving one way or the other.
+    /// Choose from your saved directories and hosts instead of opening a path.
+    // Conflicts with a path rather than overriding one: the flag asks to be
+    // prompted for a destination, so supplying one too is a contradiction, and
+    // reporting it beats silently honouring whichever happened to win.
     #[arg(long, short = 'g', conflicts_with_all = ["path", "right"])]
     pub goto: bool,
 }
