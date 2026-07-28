@@ -2453,21 +2453,36 @@ impl FileBrowser {
                                 // `/tmp` became `/private/tmp`, which was then sent
                                 // to a remote server that has no `/private`.
                                 let dir = PathBuf::from(&value).expand_user();
+                                let src_backend = self.active_panel().backend;
+                                // Which machine the typed path names. It used to
+                                // be assumed to be the panel's own, so a local
+                                // destination typed from a remote panel was sent
+                                // to the server — `/Volumes/…` on a Mac went to
+                                // the SFTP host, which reported it missing.
+                                //
+                                // An existing local directory is taken at its
+                                // word; anything else is a path on the server,
+                                // which is the only reading that keeps a
+                                // server-side copy to a not-yet-created directory
+                                // working.
+                                let dest_backend = if !src_backend.is_local() && dir.is_dir() {
+                                    crate::vfs::BackendId::LOCAL
+                                } else {
+                                    src_backend
+                                };
                                 // Only a local destination can be checked from
                                 // here; a remote one is validated by the transfer
                                 // itself, which now reports a missing destination
                                 // directory as exactly that.
-                                let backend = self.active_panel().backend;
-                                let is_local = backend.is_local();
+                                let is_local = src_backend.is_local();
                                 if !is_local || dir.is_dir() {
                                     let active = self.active;
-                                    if copy_needs_transfer_queue(backend, backend) {
-                                        // Both endpoints are the same remote
-                                        // panel, so this is a server-side copy and
-                                        // belongs on the queue. `begin_copy_batch`
-                                        // spawns `copy_path`, which is plain
-                                        // `std::fs` and would have operated on the
-                                        // local disk under remote paths.
+                                    if copy_needs_transfer_queue(src_backend, dest_backend) {
+                                        // Either endpoint is remote, so this goes
+                                        // on the queue. `begin_copy_batch` spawns
+                                        // `copy_path`, which is plain `std::fs`
+                                        // and would have operated on the local
+                                        // disk under remote paths.
                                         let kinds: Vec<bool> = if let Screen::Main(state) =
                                             self.panels[active].current_screen()
                                         {
@@ -2478,7 +2493,7 @@ impl FileBrowser {
                                             vec![false; srcs.len()]
                                         };
                                         self.enqueue_cross_backend_copy(
-                                            srcs, kinds, backend, dir, backend, active,
+                                            srcs, kinds, src_backend, dir, dest_backend, active,
                                         );
                                     } else {
                                         // Copy into the chosen directory, refreshing
@@ -2546,6 +2561,22 @@ impl FileBrowser {
     /// connect runs in the background once the event loop starts.
     pub fn connect_on_start(&mut self, target: &str) {
         self.start_connect(target);
+    }
+
+    /// As [`Self::connect_on_start`], but opening the remote in a named panel.
+    ///
+    /// `start_connect` dials into whichever panel is active, which is panel 0 at
+    /// start-up. `myd <local> sftp://host` needs the remote on the right, so the
+    /// destination is passed explicitly rather than by making the panel active
+    /// first — that would also move the initial focus.
+    pub fn connect_on_start_in_panel(&mut self, target: &str, panel: usize) {
+        match crate::vfs::sftp::SftpTarget::parse(target) {
+            Ok(t) => self.spawn_connect(t, crate::vfs::sftp::Credentials::default(), panel),
+            Err(e) => {
+                self.modal =
+                    Modal::Confirm(ConfirmDialog::new(format!("Invalid remote target: {}", e)));
+            }
+        }
     }
 
     /// Apply a submitted add/edit form.

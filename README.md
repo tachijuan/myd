@@ -76,6 +76,7 @@ myd ~/Documents ~/Downloads   # two paths implies dual: left and right roots
 # Remote browsing over SFTP — opens the remote in a panel beside your local files
 myd sftp://prod                       # host from ~/.ssh/config, auth via agent/keys
 myd sftp://user@host:2222/var/log     # explicit user, port, and starting path
+myd /tmp sftp://prod                  # split: local left, remote right (either order)
 # ...or connect from inside the app with `gd`.
 ```
 
