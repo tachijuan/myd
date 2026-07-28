@@ -34,7 +34,15 @@ tempfile = "3"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# Thin LTO across 16 codegen units rather than full LTO into one. Full LTO with
+# codegen-units = 1 serialises the whole final crate through one thread: it was
+# ~39s of a ~58s build on a 20-core machine, while the dependencies — which do
+# parallelise — took the rest. Thin/16 builds the same crate in ~8s.
+#
+# Measured, not assumed: a repeated directory-size walk (the hottest non-UI
+# path) runs at 0.46s under both, and the binary grows 6MB -> 7MB. Paying 5x the
+# build time for no measurable speed-up is not a trade worth keeping.
+lto = "thin"
+codegen-units = 16
 strip = true
 panic = "abort"
