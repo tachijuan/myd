@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.12.2" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.13.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -263,16 +263,23 @@ Rescan the file tree.
 .B Ctrl+p
 Toggle the info panel sidebar.
 .TP
-.B gr
-Open the dialing directory on your three most-used remote locations, and
-connect to the chosen one in the active panel, replacing whatever it was
-showing. With nothing saved yet it prompts directly for an
-\fBsftp://[user@]host[:port][/path]\fR target (or an ssh config alias).
-.TP
-.B gs
-Open the dialing directory on the full saved-host list. Inside it, \fBj\fR /
-\fBk\fR / \fBg\fR / \fBG\fR navigate, \fBEnter\fR connects, \fB/\fR searches,
-\fBa\fR adds, \fBe\fR edits, \fBd\fR deletes and \fBEsc\fR closes.
+.B gd
+Open the picker: your saved directories and remote hosts in one list, with a
+path field above it. \fBTab\fR switches between the two halves and the focused
+one is outlined in cyan. In the list, \fBj\fR / \fBk\fR / \fBg\fR / \fBG\fR
+navigate, \fBEnter\fR opens a directory or connects to a host depending on which
+kind the cursor is on, \fBa\fR saves a destination, \fBe\fR edits one, \fBd\fR
+forgets one, \fBp\fR / \fBu\fR pin and unpin, \fBm\fR reorders, \fBS\fR toggles
+measuring and \fBEsc\fR closes.
+.IP
+\fB/\fR searches everything on screen. If the search narrows the list to a
+single row, \fBEnter\fR opens it straight away; with more than one match
+\fBEnter\fR keeps the narrowed list so you can pick from it.
+.IP
+The path field takes a local path or a remote
+\fBsftp://[user@]host[:port][/path]\fR URL, so an address you have not saved
+needs no separate step \(em type it and press \fBEnter\fR. A connection replaces
+whatever the active panel was showing.
 .TP
 .B Ctrl+N
 Release the mouse so the terminal's own text selection works; press again to
@@ -292,8 +299,9 @@ returns to the tree. A double-click on a transfer also cancels it.
 .B gx
 Cancel all queued and in-flight transfers.
 .SH REMOTE BROWSING
-myd can browse and transfer files over SFTP. Connect with \fBgr\fR, or launch
-with a remote target:
+myd can browse and transfer files over SFTP. Connect from the \fBgd\fR picker
+\(em pick a saved host, or type an \fBsftp://\fR URL into its path field \(em or
+launch with a remote target:
 .PP
 .RS
 .nf
@@ -331,16 +339,15 @@ comparison it cannot make.
 .PP
 The info panel shows only what the directory listing carries (size and
 timestamps); owner, group and creation time are not part of it.
-.SH DIALING DIRECTORY
+.SH SAVED HOSTS
 Saved remote locations live in \fB~/.config/myd/hosts.toml\fR (honouring
 \fBXDG_CONFIG_HOME\fR) and are hand-editable. An entry records a label, host,
 optional user, port and starting path, plus a use count and the time of the last
 connection.
 .PP
-The quick list \fBgr\fR shows is ordered strictly by recency \(em most recently
-connected first \(em so it changes visibly as you work. The use count is
-displayed but does not affect the order. The full list (\fBgs\fR) stays
-alphabetical, since that list is for finding a host by name.
+Hosts are listed after the directories in the \fBgd\fR picker, ordered strictly
+by recency \(em most recently connected first \(em so the list changes visibly
+as you work. The use count is displayed but does not affect the order.
 .PP
 .B No passwords are stored.
 Authentication goes through the same ladder as always: ssh-agent, then

@@ -442,8 +442,8 @@ impl HostCatalog {
 
     /// The `n` most recently connected hosts, newest first.
     ///
-    /// This is what `gr` shows without asking for the full list — the whole
-    /// point of the catalog is that the usual destinations need no searching.
+    /// The picker lists these after the directories — the whole point of the
+    /// catalog is that the usual destinations need no searching.
     ///
     /// Strictly least-recently-used. Ranking by *frequency* first (as this once
     /// did) meant a host connected fifty times last month outranked one used an

@@ -41,8 +41,6 @@ pub struct DirPickerState {
     input_is_suggestion: bool,
     /// Which half of the screen the keyboard drives.
     focus: PickerFocus,
-    /// Which kinds of row this picker lists.
-    scope: PickerScope,
     /// Whether `/` has been pressed and typing is narrowing the list.
     searching: bool,
     /// Incremental search over the list, entered with `/`.
@@ -190,17 +188,6 @@ pub enum PickerSection {
     Hosts,
 }
 
-/// Which kinds of row the picker is showing.
-///
-/// `gd` opens on everything; `gs` opens filtered to hosts, so someone with many
-/// of both can still get straight to the remote list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PickerScope {
-    #[default]
-    All,
-    HostsOnly,
-}
-
 impl Default for DirPickerState {
     fn default() -> Self {
         Self::new()
@@ -220,20 +207,11 @@ impl DirPickerState {
     /// appearing twice.
     /// Build the picker over an entire catalog: directories and saved hosts.
     ///
-    /// `scope` decides which kinds are listed — `gd` shows everything, `gs`
-    /// shows only the hosts.
-    pub fn with_catalog(catalog: &crate::hosts::HostCatalog, scope: PickerScope) -> Self {
-        let mut picker = if scope == PickerScope::HostsOnly {
-            Self::with_favorites(&[])
-        } else {
-            Self::with_favorites(catalog.favorites())
-        };
-        if scope == PickerScope::HostsOnly {
-            // The synthesised working-directory row is a directory, so it has no
-            // place in a hosts-only view.
-            picker.options.clear();
-        }
-        picker.scope = scope;
+    /// One list of everywhere you might go. There was once a hosts-only variant
+    /// behind `gs`, but `/` narrows to the hosts just as well, so the scope
+    /// parameter went with the chord.
+    pub fn with_catalog(catalog: &crate::hosts::HostCatalog) -> Self {
+        let mut picker = Self::with_favorites(catalog.favorites());
 
         // Hosts follow the directories, most recently connected first — the same
         // ordering rule the directory tiers use.
@@ -350,7 +328,6 @@ impl DirPickerState {
             // The field starts focused: the picker exists to accept a path, and
             // the common directories are the shortcut, not the main event.
             focus: PickerFocus::Field,
-            scope: PickerScope::All,
             searching: false,
             query: String::new(),
             visible: Vec::new(),
@@ -371,10 +348,6 @@ impl DirPickerState {
             .options
             .iter()
             .enumerate()
-            .filter(|(_, o)| match self.scope {
-                PickerScope::All => true,
-                PickerScope::HostsOnly => o.is_host(),
-            })
             .filter(|(_, o)| {
                 query.is_empty() || o.search_text().to_lowercase().contains(&query)
             })
@@ -383,11 +356,6 @@ impl DirPickerState {
         if self.cursor >= self.visible.len() {
             self.cursor = self.visible.len().saturating_sub(1);
         }
-    }
-
-    /// Which kinds of row this picker is listing.
-    pub fn scope(&self) -> PickerScope {
-        self.scope
     }
 
     /// The active search query, for the title bar.
@@ -627,6 +595,12 @@ impl DirPickerState {
     pub fn confirm(&self) -> PickerChoice {
         let typed = self.input.trim();
         if !typed.is_empty() {
+            // A remote URL is a destination like any other, so the one field
+            // takes both. Without this the picker was local-only and connecting
+            // to an address you had not already saved needed a separate chord.
+            if is_remote_url(typed) {
+                return PickerChoice::Connect(typed.to_string());
+            }
             return match self.resolve_path(typed) {
                 Some(p) => PickerChoice::Open(p),
                 None => PickerChoice::NotADirectory(expand_tilde(typed)),
@@ -835,10 +809,28 @@ impl DirPickerState {
                     self.recompute_visible();
                     return Some(true);
                 }
-                // Enter accepts the filter and hands the keys back, leaving the
-                // narrowed list in place to choose from.
+                // Enter on a search that has narrowed to exactly one row opens
+                // it: having typed enough to leave a single candidate, being
+                // made to press Enter twice is pure ceremony. With any other
+                // count it accepts the filter and hands the keys back, leaving
+                // the narrowed list in place to choose from.
                 KeyCode::Enter => {
                     self.searching = false;
+                    // The keys go to the list either way: what the search
+                    // narrowed to is on screen, and j/k are how you pick from it.
+                    self.focus = PickerFocus::List;
+                    if self.visible.len() == 1 {
+                        self.cursor = 0;
+                        // `confirm` prefers the path field, which may still hold
+                        // a suggestion mirrored in before the search began — not
+                        // what the user narrowed to. Clearing it makes the sole
+                        // match the thing Enter acts on.
+                        self.input.clear();
+                        self.input_cursor = 0;
+                        self.input_is_suggestion = false;
+                        // Unconsumed, so the app's Enter runs `confirm` on it.
+                        return None;
+                    }
                     return Some(true);
                 }
                 // Arrows still move, so a match can be picked without leaving.
@@ -1273,6 +1265,17 @@ impl super::ScreenState for DirPickerState {
         );
         frame.render_widget(list, vertical[2]);
     }
+}
+
+/// Whether `s` names a remote target rather than a local path.
+///
+/// Only the two explicit schemes count. A bare `user@host:/path` is deliberately
+/// *not* remote here: it is also a perfectly legal local filename, and guessing
+/// wrong would turn a typo into a connection attempt to somewhere unintended.
+/// The parse itself is left to `SftpTarget::parse`, which reports a bad URL far
+/// better than a silent "not a directory" would.
+fn is_remote_url(s: &str) -> bool {
+    s.starts_with("sftp://") || s.starts_with("ssh://")
 }
 
 /// Expand a leading `~` to the user's home directory.

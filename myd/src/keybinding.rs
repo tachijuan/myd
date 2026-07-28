@@ -63,10 +63,6 @@ pub enum Action {
     ToggleTransferPanel,
     /// Cancel every queued and in-flight transfer.
     CancelTransfers,
-    /// Prompt for a remote host to connect to.
-    Connect,
-    /// Open the dialing directory on the full saved-host list.
-    HostDirectory,
     /// Release or re-grab the mouse, for terminal text selection.
     ToggleMouse,
     /// Hand the selected entry to the desktop's default application.
@@ -215,12 +211,12 @@ impl KeyBindingHandler {
         match combined {
             "gg" => Some(Action::ToTop),
             "gu" => Some(Action::GoParent),
+            // One picker for every destination. `gr` (connect) and `gs` (saved
+            // hosts) used to sit alongside this: `gd` now lists directories and
+            // hosts together, `/` searches the lot, and the path field takes an
+            // sftp:// URL directly, which left both chords doing nothing `gd`
+            // could not.
             "gd" => Some(Action::GoDirPicker),
-            // Single letters are effectively exhausted, so remote connect and
-            // transfer-cancel take g-chords.
-            "gr" => Some(Action::Connect),
-            // The full saved-host list, skipping the recent-three view.
-            "gs" => Some(Action::HostDirectory),
             "gx" => Some(Action::CancelTransfers),
             _ => None,
         }
