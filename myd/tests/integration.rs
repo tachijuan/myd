@@ -3212,6 +3212,43 @@ async fn goto_flag_lists_the_saved_catalog() {
     }
 }
 
+/// Connecting from a `--goto` picker must not empty the panel's screen stack.
+///
+/// The picker is the only screen under `--goto`, and the connect path popped it
+/// unconditionally — the next redraw then panicked in `current_screen` with
+/// "empty stack", taking the whole app down as soon as a host was chosen.
+#[tokio::test]
+async fn connecting_from_the_goto_picker_does_not_empty_the_panel() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    let mut app = FileBrowser::new_on_picker_with_hosts_for_test(test_catalog());
+    assert_eq!(app.panel_depth_for_test(0), 1, "the picker is the only screen");
+
+    // Reproduce the reported flow: `/` to search, narrow to one host, Enter.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for c in "/france".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // The connection is asynchronous and this host does not resolve, so what
+    // matters is that the panel still has a screen to draw. Touching it is what
+    // used to panic.
+    assert!(
+        app.panel_depth_for_test(0) >= 1,
+        "the panel must keep a screen while the connection is in flight"
+    );
+    let _ = app.current_screen();
+
+    // A tick drives the connect state machine; it must not panic either.
+    app.resolve_loading_for_test();
+    let _ = app.current_screen();
+}
+
 #[tokio::test]
 async fn gd_chord_opens_the_directory_picker() {
     let dir = tempfile::tempdir().unwrap();
