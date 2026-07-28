@@ -1,10 +1,10 @@
-.TH "MYD" "1" "July 2026" "myd 0.15.3" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.16.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
 \fBmyd\fR [\fB\-2\fR] [\fIPATH\fR [\fIRIGHT\fR]]
 .br
-\fBmyd\fR \fB\-g\fR
+\fBmyd\fR \fB\-d\fR
 .br
 \fBmyd\fR [\fIPATH\fR] \fBsftp://\fR[\fIuser\fR@]\fIhost\fR[:\fIport\fR][/\fIpath\fR]
 .SH DESCRIPTION
@@ -17,17 +17,18 @@ Built with \fBratatui\fR and \fBcrossterm\fR.
 .PP
 If \fIPATH\fR is provided, the browser starts at that directory; otherwise it
 starts in the current directory. The picker is reached with \fBg d\fR, or at
-start-up with \fB\-\-goto\fR.
+start-up with \fB\-\-directory\fR.
 .SH OPTIONS
 .TP
 .B \-2, \-\-dual
 Start in dual-panel mode, with two independent views side by side. Implied by
 passing a second path.
 .TP
-.B \-g, \-\-goto
+.B \-d, \-\-directory
 Start on the picker and choose from your saved directories and hosts, rather
-than opening a directory. Cannot be combined with \fIPATH\fR, which would be
-supplying the destination the flag exists to ask for.
+than opening a directory \(em the same list \fBg d\fR opens, which the letter
+matches. Cannot be combined with \fIPATH\fR, which would be supplying the
+destination the flag exists to ask for.
 .TP
 .B \-h, \-\-help
 Print a usage summary and exit.
@@ -527,7 +528,7 @@ Hide or show the panel with \fBCtrl+p\fR.
 .B myd
 Start browsing in the current directory.
 .TP
-.B myd \-g
+.B myd \-d
 Start on the picker and choose a destination from the saved list.
 .TP
 .B myd ~/Documents
