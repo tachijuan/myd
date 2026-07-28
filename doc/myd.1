@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.16.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.16.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -163,7 +163,9 @@ Create a new directory in the current location.
 Copy the tagged files, or the selected one, into the other panel's directory.
 Each name already taken at the destination is confirmed individually, whether
 the copy is local or runs through the transfer queue; declining skips that file
-and leaves the existing one alone.
+and leaves the existing one alone. In that prompt, and in every dialog,
+\fBTab\fR moves between the buttons and never answers \(em only \fBEnter\fR, a
+click on a button, or the button's own letter decides. \fBEsc\fR cancels.
 .TP
 .B m
 Move the tagged files, or the selected one, into the other panel's directory.

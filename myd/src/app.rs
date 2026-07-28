@@ -922,6 +922,91 @@ impl FileBrowser {
         id
     }
 
+
+    /// Act on a confirm dialog's answer, however it was given.
+    ///
+    /// Shared by the key handler and the mouse handler: a click on a button has
+    /// to mean exactly what pressing that button's key means, and two copies of
+    /// this match would drift.
+    fn apply_confirm_answer(&mut self, answer: crate::widget::confirm_dialog::Answer) {
+        use crate::widget::confirm_dialog::Answer;
+        let result = answer == Answer::Yes;
+        self.modal = Modal::None;
+        match self.modal_target.take() {
+            Some(ModalTarget::Delete { paths }) if result => {
+                self.spawn_delete_batch(paths);
+            }
+            Some(ModalTarget::QuitConfirm) => {
+                // Declining simply closes the dialog; the flag stays
+                // false so a later `q` asks again.
+                self.quit_requested = result;
+            }
+            Some(ModalTarget::CancelTransfer { id }) if result => {
+                self.transfers.cancel(id);
+            }
+            Some(ModalTarget::MeasureDirs) if result => {
+                self.set_shallow(false);
+            }
+            Some(ModalTarget::HostDelete { label }) => {
+                if result {
+                    self.hosts.remove(&label);
+                    if let Err(e) = self.hosts.save() {
+                        self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                            "Could not save the host list: {}",
+                            e
+                        )));
+                        // The error is now the visible dialog; do not
+                        // reopen the picker over it.
+                        return;
+                    }
+                }
+                // Back to the list either way, so a mis-keyed delete
+                // doesn't also close the picker.
+                self.reopen_picker();
+            }
+            Some(ModalTarget::CopyOverwrite { src, dest }) => {
+                // Confirmed collisions join the approved batch; a
+                // declined one is simply skipped. Either way we move
+                // on to the next pending collision (or spawn).
+                if result {
+                    self.approved_copies.push((src, dest));
+                }
+                self.prompt_next_copy();
+            }
+            Some(ModalTarget::TransferOverwrite { src, is_dir }) => {
+                // Same rule for a queued transfer: confirmed files
+                // join the batch, declined ones are dropped.
+                if result {
+                    if let Some(batch) = self.pending_transfer.as_mut() {
+                        batch.approved.push((src, is_dir));
+                    }
+                }
+                self.prompt_next_transfer();
+            }
+            Some(ModalTarget::MoveOverwrite { src, dest, is_dir }) => {
+                match answer {
+                    // Overwrite: the batch clears the destination
+                    // just before renaming into it.
+                    Answer::Choice('o') => {
+                        self.approved_moves.push((src, dest, is_dir));
+                        self.prompt_next_move();
+                    }
+                    // Skip this one, keep going.
+                    Answer::Choice('s') => self.prompt_next_move(),
+                    // Cancel: abandon everything still pending *and*
+                    // everything already approved — the user asked to
+                    // stop the move, not just this file.
+                    _ => {
+                        self.pending_moves.clear();
+                        self.approved_moves.clear();
+                        self.modal = Modal::None;
+                    }
+                }
+            }
+            _ => {}
+                }
+    }
+
     /// Advance the transfer queue one scheduling step, applying targeted
     /// destination refreshes just like the event loop (for tests).
     pub fn tick_transfers_for_test(&mut self) {
@@ -1195,6 +1280,20 @@ impl FileBrowser {
                 // a double-click to run one is not what a menu does.
                 let outcome = menu.click_at(x, y);
                 return self.apply_sort_menu_outcome(outcome);
+            }
+            return true;
+        }
+        // A click on a confirm dialog's button is that button's answer. Clicks
+        // anywhere else in (or outside) the dialog are swallowed: it is a
+        // question, and a stray click must not answer it.
+        if matches!(self.modal, Modal::Confirm(_)) {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Modal::Confirm(dialog) = &mut self.modal else {
+                    return true;
+                };
+                if let Some(answer) = dialog.click_at(x, y) {
+                    self.apply_confirm_answer(answer);
+                }
             }
             return true;
         }
@@ -2315,79 +2414,7 @@ impl FileBrowser {
                     dialog.handle_key_answer(key_code_char(&key))
                 };
                 if let Some(answer) = answer {
-                    let result = answer == Answer::Yes;
-                    self.modal = Modal::None;
-                    match self.modal_target.take() {
-                        Some(ModalTarget::Delete { paths }) if result => {
-                            self.spawn_delete_batch(paths);
-                        }
-                        Some(ModalTarget::QuitConfirm) => {
-                            // Declining simply closes the dialog; the flag stays
-                            // false so a later `q` asks again.
-                            self.quit_requested = result;
-                        }
-                        Some(ModalTarget::CancelTransfer { id }) if result => {
-                            self.transfers.cancel(id);
-                        }
-                        Some(ModalTarget::MeasureDirs) if result => {
-                            self.set_shallow(false);
-                        }
-                        Some(ModalTarget::HostDelete { label }) => {
-                            if result {
-                                self.hosts.remove(&label);
-                                if let Err(e) = self.hosts.save() {
-                                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
-                                        "Could not save the host list: {}",
-                                        e
-                                    )));
-                                    return true;
-                                }
-                            }
-                            // Back to the list either way, so a mis-keyed delete
-                            // doesn't also close the picker.
-                            self.reopen_picker();
-                        }
-                        Some(ModalTarget::CopyOverwrite { src, dest }) => {
-                            // Confirmed collisions join the approved batch; a
-                            // declined one is simply skipped. Either way we move
-                            // on to the next pending collision (or spawn).
-                            if result {
-                                self.approved_copies.push((src, dest));
-                            }
-                            self.prompt_next_copy();
-                        }
-                        Some(ModalTarget::TransferOverwrite { src, is_dir }) => {
-                            // Same rule for a queued transfer: confirmed files
-                            // join the batch, declined ones are dropped.
-                            if result {
-                                if let Some(batch) = self.pending_transfer.as_mut() {
-                                    batch.approved.push((src, is_dir));
-                                }
-                            }
-                            self.prompt_next_transfer();
-                        }
-                        Some(ModalTarget::MoveOverwrite { src, dest, is_dir }) => {
-                            match answer {
-                                // Overwrite: the batch clears the destination
-                                // just before renaming into it.
-                                Answer::Choice('o') => {
-                                    self.approved_moves.push((src, dest, is_dir));
-                                    self.prompt_next_move();
-                                }
-                                // Skip this one, keep going.
-                                Answer::Choice('s') => self.prompt_next_move(),
-                                // Cancel: abandon everything still pending *and*
-                                // everything already approved — the user asked to
-                                // stop the move, not just this file.
-                                _ => {
-                                    self.pending_moves.clear();
-                                    self.approved_moves.clear();
-                                    self.modal = Modal::None;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                    self.apply_confirm_answer(answer);
                 }
                 true
             }
@@ -3859,12 +3886,23 @@ fn copy_path(src: &Path, dest: &Path, progress: Option<&OpProgress>) -> std::io:
     }
 }
 
+/// Flatten a key event into the single char the dialogs answer to.
+///
+/// Everything unrecognised used to collapse onto `' '`, which the dialogs read
+/// as "accept" — so Tab, Backspace, a function key or a stray arrow all counted
+/// as pressing Yes. Only keys that genuinely mean something get a char now, and
+/// anything else becomes `\0`, which every dialog ignores.
+///
+/// `\t` and the arrows are passed through so a dialog can move its own focus.
 fn key_code_char(key: &KeyEvent) -> char {
     use crossterm::event::KeyCode;
     match key.code {
         KeyCode::Char(c) => c,
         KeyCode::Enter => '\n',
-        _ => ' ',
+        KeyCode::Tab | KeyCode::Right | KeyCode::Down => '\t',
+        // Shift-Tab and the reverse arrows step the other way.
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Up => '\u{1}',
+        _ => '\0',
     }
 }
 
