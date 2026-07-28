@@ -7514,6 +7514,109 @@ async fn a_transfer_onto_an_existing_file_asks_first() {
     );
 }
 
+/// A destination typed into the single-panel prompt is checked too.
+#[tokio::test]
+async fn a_typed_transfer_destination_is_checked_for_collisions() {
+    // The dual-pane case reads the destination panel's loaded listing, but a
+    // typed destination is on no panel, so there was nothing to check and the
+    // batch went out unasked — the same silent overwrite, by a different route.
+    // It is listed in the background instead, one read_dir for the whole batch.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("big_file"), b"original").unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // A remote single panel, so `c` prompts for a destination.
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "input", "expected the path prompt");
+    for ch in dest.path().to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // The listing resolves on a tick, like a connection attempt.
+    for _ in 0..200 {
+        app.tick_for_test();
+        if app.modal_kind_for_test() == "confirm" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a typed destination that already holds the name must be confirmed"
+    );
+    assert!(
+        app.transfer_queue().transfers().is_empty(),
+        "and nothing queued before the answer"
+    );
+
+    app.handle_key_for_test(char_key('n'));
+    assert!(
+        app.transfer_queue().transfers().is_empty(),
+        "a declined overwrite must not transfer"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("big_file")).unwrap(),
+        b"original",
+        "the existing file must be untouched"
+    );
+}
+
+/// A typed destination with no collision queues without ever prompting.
+#[tokio::test]
+async fn a_typed_transfer_destination_without_collisions_just_goes() {
+    // The probe must not strand a batch that has nothing to ask about: the
+    // listing arrives, nothing matches, and the transfer is enqueued.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dest = tempfile::tempdir().unwrap();
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    for ch in dest.path().to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    for _ in 0..200 {
+        app.tick_for_test();
+        if !app.transfer_queue().transfers().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "nothing collides, so nothing to ask"
+    );
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        1,
+        "and the transfer must still be queued"
+    );
+}
+
 /// Accepting the overwrite still queues the transfer, and a non-colliding file
 /// is never asked about at all.
 #[tokio::test]
@@ -7650,6 +7753,17 @@ async fn a_local_destination_typed_from_a_remote_panel_stays_local() {
         app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // A typed destination is listed first, to check for names it would
+    // overwrite, so the transfer is queued a tick later rather than immediately.
+    // Nothing collides here — the destination is empty.
+    for _ in 0..200 {
+        app.tick_for_test();
+        if !app.transfer_queue().transfers().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
 
     // The queued transfer must address the local disk. Sending it to the remote
     // backend is the bug: the server has no such directory.

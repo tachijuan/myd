@@ -131,6 +131,9 @@ pub struct FileBrowser {
     approved_copies: Vec<(PathBuf, PathBuf)>,
     /// Panel whose tags to clear when the current copy batch completes.
     copy_source_panel: usize,
+    /// A listing of a typed destination, in flight. Resolved on tick, like a
+    /// connection attempt: the check cannot block the key handler.
+    dest_probe: Option<DestProbeTask>,
     /// A queued transfer batch waiting on overwrite confirmations.
     ///
     /// The queued path needs the same per-file prompt the local one has: the
@@ -229,6 +232,23 @@ struct ConnectTask {
     target_panel: usize,
 }
 
+/// A listing of a typed copy destination, in flight.
+///
+/// A destination typed into the single-panel prompt is not on screen, so there
+/// is no loaded tree to check names against. One `read_dir` answers the whole
+/// batch — cheaper than a stat per file, and the only option for a remote
+/// destination, where the check cannot be synchronous at all.
+struct DestProbeTask {
+    rx: tokio::sync::oneshot::Receiver<Vec<String>>,
+    /// The batch waiting on the answer, minus the collision split.
+    srcs: Vec<PathBuf>,
+    kinds: Vec<bool>,
+    src_backend: crate::vfs::BackendId,
+    dest_dir: PathBuf,
+    dest_backend: crate::vfs::BackendId,
+    source_panel: usize,
+}
+
 /// What a connection attempt produced.
 enum ConnectResult {
     /// Connected: the backend and the directory to open it on.
@@ -309,6 +329,7 @@ impl FileBrowser {
             pending_copies: Vec::new(),
             approved_copies: Vec::new(),
             pending_transfer: None,
+            dest_probe: None,
             copy_source_panel: 0,
             backends: BackendRegistry::new(),
             transfers: TransferQueue::default(),
@@ -492,6 +513,8 @@ impl FileBrowser {
             self.advance_transfers();
             // Advance any in-flight connection attempt.
             self.resolve_connect();
+            // And any listing of a typed copy destination.
+            self.resolve_dest_probe();
 
             let after_resolve = trace_started_now(tick_started);
             terminal.draw(|f| self.draw(f))?;
@@ -916,6 +939,7 @@ impl FileBrowser {
     /// connect + browse flow headlessly.
     pub fn tick_for_test(&mut self) {
         self.resolve_connect();
+        self.resolve_dest_probe();
         self.resolve_loading();
         self.resolve_deleting();
         self.resolve_copying();
@@ -2543,12 +2567,10 @@ impl FileBrowser {
                                             vec![false; srcs.len()]
                                         };
                                         // No panel shows the typed destination,
-                                        // so there is no listing to check for
-                                        // collisions against — `None` skips the
-                                        // prompt rather than inventing an answer.
-                                        self.begin_transfer_batch(
+                                        // so it is listed in the background and
+                                        // the overwrite prompts follow from that.
+                                        self.begin_transfer_batch_probing(
                                             srcs, kinds, src_backend, dir, dest_backend, active,
-                                            None,
                                         );
                                     } else {
                                         // Copy into the chosen directory, refreshing
@@ -3058,8 +3080,9 @@ impl FileBrowser {
     ///
     /// `dest_panel` is the pane showing the destination, whose loaded listing
     /// answers the collision question without a round trip. `None` means nothing
-    /// on screen shows that directory (a destination typed into the single-panel
-    /// prompt), so there is nothing to check and the batch goes straight out.
+    /// on screen shows that directory — a destination typed into the
+    /// single-panel prompt — and the caller has already listed it instead; see
+    /// [`Self::begin_transfer_batch_probing`].
     #[allow(clippy::too_many_arguments)]
     fn begin_transfer_batch(
         &mut self,
@@ -3071,21 +3094,52 @@ impl FileBrowser {
         source_panel: usize,
         dest_panel: Option<usize>,
     ) {
+        // Names already at the destination, from whichever panel is showing it.
+        let existing: Option<Vec<String>> = dest_panel.and_then(|p| {
+            match self.panels[p].current_screen() {
+                Screen::Main(state) => Some(
+                    srcs.iter()
+                        .filter_map(|s| s.file_name())
+                        .filter(|name| state.has_entry(&dest_dir.join(name)))
+                        .map(|n| n.to_string_lossy().to_string())
+                        .collect(),
+                ),
+                _ => None,
+            }
+        });
+        self.split_and_prompt_transfer(
+            srcs,
+            kinds,
+            src_backend,
+            dest_dir,
+            dest_backend,
+            source_panel,
+            existing.unwrap_or_default(),
+        );
+    }
+
+    /// Split `srcs` into colliding and clear entries against `existing`, then
+    /// start the confirmation flow.
+    #[allow(clippy::too_many_arguments)]
+    fn split_and_prompt_transfer(
+        &mut self,
+        srcs: Vec<PathBuf>,
+        kinds: Vec<bool>,
+        src_backend: crate::vfs::BackendId,
+        dest_dir: PathBuf,
+        dest_backend: crate::vfs::BackendId,
+        source_panel: usize,
+        existing: Vec<String>,
+    ) {
         let mut pending: Vec<(PathBuf, bool)> = Vec::new();
         let mut approved: Vec<(PathBuf, bool)> = Vec::new();
 
         for (i, src) in srcs.into_iter().enumerate() {
             let is_dir = kinds.get(i).copied().unwrap_or(false);
-            let collides = match (dest_panel, src.file_name()) {
-                (Some(p), Some(name)) => {
-                    let dest = dest_dir.join(name);
-                    match self.panels[p].current_screen() {
-                        Screen::Main(state) => state.has_entry(&dest),
-                        _ => false,
-                    }
-                }
-                _ => false,
-            };
+            let collides = src
+                .file_name()
+                .map(|n| existing.iter().any(|e| e.as_str() == n))
+                .unwrap_or(false);
             if collides {
                 pending.push((src, is_dir));
             } else {
@@ -3102,6 +3156,78 @@ impl FileBrowser {
             source_panel,
         });
         self.prompt_next_transfer();
+    }
+
+    /// As [`Self::begin_transfer_batch`], for a destination no panel is showing.
+    ///
+    /// Lists the destination directory in the background and finishes the split
+    /// when the answer arrives (see [`Self::resolve_dest_probe`]). One listing
+    /// covers the whole batch: a stat per file would be a round trip per file on
+    /// a remote destination, and the check cannot block the key handler at all.
+    ///
+    /// A listing that fails — the directory does not exist yet, or cannot be
+    /// read — yields no names, so nothing collides and the batch proceeds. The
+    /// transfer itself reports a genuinely missing destination.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_transfer_batch_probing(
+        &mut self,
+        srcs: Vec<PathBuf>,
+        kinds: Vec<bool>,
+        src_backend: crate::vfs::BackendId,
+        dest_dir: PathBuf,
+        dest_backend: crate::vfs::BackendId,
+        source_panel: usize,
+    ) {
+        use crate::vfs::VPath;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let fs = self.backends.get(dest_backend);
+        let probe_path = VPath::new(dest_backend, dest_dir.clone());
+        tokio::spawn(async move {
+            let names = fs
+                .read_dir(&probe_path)
+                .await
+                .map(|entries| entries.into_iter().map(|e| e.name).collect())
+                .unwrap_or_default();
+            let _ = tx.send(names);
+        });
+
+        self.dest_probe = Some(DestProbeTask {
+            rx,
+            srcs,
+            kinds,
+            src_backend,
+            dest_dir,
+            dest_backend,
+            source_panel,
+        });
+    }
+
+    /// Finish a typed-destination copy once its listing arrives.
+    fn resolve_dest_probe(&mut self) {
+        let Some(probe) = self.dest_probe.as_mut() else {
+            return;
+        };
+        let existing = match probe.rx.try_recv() {
+            Ok(names) => names,
+            // Still listing.
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            // The task vanished; treat it as "nothing known to collide" rather
+            // than dropping the copy the user asked for.
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Vec::new(),
+        };
+        let Some(probe) = self.dest_probe.take() else {
+            return;
+        };
+        self.split_and_prompt_transfer(
+            probe.srcs,
+            probe.kinds,
+            probe.src_backend,
+            probe.dest_dir,
+            probe.dest_backend,
+            probe.source_panel,
+            existing,
+        );
     }
 
     /// Ask about the next colliding transfer, or enqueue once none are left.
