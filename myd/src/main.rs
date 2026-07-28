@@ -31,12 +31,18 @@ async fn run() -> Result<()> {
         // is chosen. Clap rejects a path alongside the flag, so there is no
         // argument being ignored here.
         Startup::Picker => FileBrowser::new_on_picker(),
-        Startup::Local { left, right, dual } => FileBrowser::new(left, right, dual),
+        Startup::Local {
+            left,
+            right,
+            dual,
+            shallow,
+        } => FileBrowser::new_shallow(left, right, dual, shallow),
         Startup::Remote {
             target,
             panel,
             local,
             dual,
+            shallow,
         } => {
             // The local side always occupies the *other* pane, so the remote has
             // somewhere to sit without displacing it.
@@ -45,7 +51,9 @@ async fn run() -> Result<()> {
             } else {
                 (local, None)
             };
-            let mut b = FileBrowser::new(left, right, dual);
+            // Only the local pane takes the flag; the remote one replaces its
+            // panel wholesale on connect and never measures anyway.
+            let mut b = FileBrowser::new_shallow(left, right, dual, shallow);
             b.connect_on_start_in_panel(&target, panel);
             b
         }

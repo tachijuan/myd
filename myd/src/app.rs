@@ -294,9 +294,24 @@ impl FileBrowser {
     /// Build the app. `left`/`right` are the two panels' starting directories;
     /// dual mode is enabled by the `--dual` flag *or* by supplying a right path.
     pub fn new(left: Option<PathBuf>, right: Option<PathBuf>, dual: bool) -> Self {
-        let mut panels = vec![Panel::new(left)];
+        Self::new_shallow(left, right, dual, false)
+    }
+
+    /// As [`Self::new`], opening every panel without measuring directory sizes
+    /// when `shallow` — the `-s` flag.
+    ///
+    /// Applies to both panes: the flag says how you want to browse, and a split
+    /// where one side measured and the other did not would be arbitrary. A
+    /// remote pane ignores it because remote trees are never measured anyway.
+    pub fn new_shallow(
+        left: Option<PathBuf>,
+        right: Option<PathBuf>,
+        dual: bool,
+        shallow: bool,
+    ) -> Self {
+        let mut panels = vec![Panel::new_maybe_shallow(left, shallow)];
         if dual || right.is_some() {
-            panels.push(Panel::new(right));
+            panels.push(Panel::new_maybe_shallow(right, shallow));
         }
         Self::with_panels(panels)
     }
@@ -1141,6 +1156,12 @@ impl FileBrowser {
     /// The directory a given panel is rooted at. For tests.
     pub fn panel_current_dir(&self, index: usize) -> Option<PathBuf> {
         self.panels.get(index).and_then(|p| p.current_dir())
+    }
+
+    /// A panel's current screen (for tests). `panel_current_dir` answers where a
+    /// panel is; this answers what it is showing.
+    pub fn panel_screen_for_test(&self, index: usize) -> Option<&Screen> {
+        self.panels.get(index).map(|p| p.current_screen())
     }
 
     /// How many screens deep a panel's stack is (for tests).

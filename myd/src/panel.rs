@@ -64,18 +64,39 @@ impl Panel {
     /// directory picker is reserved for the `gd` chord). Only a path that turns
     /// out not to be a directory falls back to the picker.
     pub fn new(start: Option<PathBuf>) -> Self {
+        Self::new_maybe_shallow(start, false)
+    }
+
+    /// As [`Self::new`], opening without measuring directory sizes when
+    /// `shallow`. The `-s` flag, which is the `S` toggle applied from the start.
+    pub fn new_maybe_shallow(start: Option<PathBuf>, shallow: bool) -> Self {
+        // The only difference is which source the tree is built through, so the
+        // two paths share everything else — a second copy of the is_dir /
+        // fall-back-to-picker logic would be one more place to get it wrong.
+        let load = |path: PathBuf| {
+            if shallow {
+                Screen::loading_with_source_sorted(
+                    crate::widget::source::Source::LocalShallow,
+                    path,
+                    None,
+                    crate::screen::SortMode::default(),
+                )
+            } else {
+                Screen::loading(path)
+            }
+        };
         let screen = match start {
             Some(path) => {
                 let resolved = expand_user(&path).canonicalize().unwrap_or(path);
                 if resolved.is_dir() {
-                    Screen::loading(resolved)
+                    load(resolved)
                 } else {
                     Screen::dir_picker()
                 }
             }
             // Default to the current directory rather than the picker.
             None => match std::env::current_dir() {
-                Ok(cwd) => Screen::loading(cwd),
+                Ok(cwd) => load(cwd),
                 Err(_) => Screen::dir_picker(),
             },
         };

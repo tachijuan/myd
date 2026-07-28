@@ -1,8 +1,8 @@
-.TH "MYD" "1" "July 2026" "myd 0.16.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.17.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
-\fBmyd\fR [\fB\-2\fR] [\fIPATH\fR [\fIRIGHT\fR]]
+\fBmyd\fR [\fB\-2\fR] [\fB\-s\fR] [\fIPATH\fR [\fIRIGHT\fR]]
 .br
 \fBmyd\fR \fB\-d\fR
 .br
@@ -29,6 +29,12 @@ Start on the picker and choose from your saved directories and hosts, rather
 than opening a directory \(em the same list \fBg d\fR opens, which the letter
 matches. Cannot be combined with \fIPATH\fR, which would be supplying the
 destination the flag exists to ask for.
+.TP
+.B \-s, \-\-shallow
+Browse without measuring directory sizes, as though \fBS\fR had been pressed on
+arrival. Applies to both panes of a split. Useful over a network mount or a
+large archive, where the recursive walk is the slowest part of opening a
+directory and is rarely worth waiting for just to look around.
 .TP
 .B \-h, \-\-help
 Print a usage summary and exit.

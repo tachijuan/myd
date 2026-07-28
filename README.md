@@ -25,7 +25,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
 - **Remote browsing over SFTP** — connect from the `gd` picker (pick a saved host, or type an `sftp://` URL into its path field) or launch with `myd sftp://[user@]host[:port][/path]`, and browse it in the active panel. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Remote trees are fully manageable: create directories (`N`), rename (`R`), delete (`D`) and move (`m`) all act on the server. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
 - **Saved hosts** — kept in the same `gd` picker as your directories, most recently connected first, with vi navigation (`j`/`k`/`g`/`G`), `/` to search, and `a`/`e`/`d` to add, edit and delete entries. Saved to `~/.config/myd/hosts.toml`, which you can edit by hand. **Passwords are never stored** — an entry holds only where to connect and as whom, and authentication still goes through `ssh-agent`, your `~/.ssh` keys, or a prompt.
-- **Shallow traversal** — press `S` to browse without measuring directory sizes. The recursive walk is the slowest thing myd does, and over a large archive or a network mount it is rarely worth waiting for just to look around; unmeasured directories show a dash and sort last, exactly as remote ones do. Turning measuring back on asks first, and the choice is remembered per directory — `S` in the `gd` picker sets it for a saved directory without opening it.
+- **Shallow traversal** — press `S` to browse without measuring directory sizes, or start that way with `--shallow` (`-s`), which applies to both panes of a split. The recursive walk is the slowest thing myd does, and over a large archive or a network mount it is rarely worth waiting for just to look around; unmeasured directories show a dash and sort last, exactly as remote ones do. Turning measuring back on asks first, and the choice is remembered per directory — `S` in the `gd` picker sets it for a saved directory without opening it.
 - **Open with the desktop** — press `o` to hand the selected file or directory to the system's default application (`open` on macOS, `xdg-open` on Linux and the BSDs). The launcher runs detached, so myd stays responsive and nothing it prints disturbs the display.
 - **Mouse support** — scroll with the wheel, click to focus a panel and select a row or treemap tile, right-click to open a directory. Press `Ctrl+N` to release the mouse when you want your terminal's own text selection back.
 - **Non-blocking transfers** — copy (`c`) tagged files between a remote panel and a local one and the transfer runs in the background: the interface stays fully interactive, so you can keep browsing and queue more. Up to 16 transfers run at once and the rest stack up, and the files within a directory are copied concurrently — which is what makes a folder of small files usable over a high-latency link.
@@ -67,6 +67,9 @@ myd /var/log
 
 # Choose from your saved directories and hosts instead of opening a path
 myd --directory               # or -d, matching the gd chord
+
+# Skip measuring directory sizes — handy on a network mount or a huge archive
+myd --shallow /mnt/archive    # or -s; applies to both panes of a split
 
 # Dual-panel mode — two independent views side by side
 myd --dual                    # split; left panel picks a directory
