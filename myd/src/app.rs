@@ -247,7 +247,17 @@ impl FileBrowser {
         if dual || right.is_some() {
             panels.push(Panel::new(right));
         }
+        Self::with_panels(panels)
+    }
 
+    /// Build the app around already-constructed panels.
+    ///
+    /// The constructors differ only in which panels they open, so they share
+    /// this rather than repeating three dozen fields — one that drifts out of
+    /// step is a bug nobody would spot in review. Taking the panels as an
+    /// argument (rather than filling them in afterwards) keeps the catalog read
+    /// to exactly one, and means no panel is ever built and discarded.
+    fn with_panels(panels: Vec<Panel>) -> Self {
         Self {
             panels,
             active: 0,
@@ -285,6 +295,37 @@ impl FileBrowser {
             transfer_area: None,
             quit_requested: false,
         }
+    }
+
+    /// As [`Self::new_on_picker`], but over a supplied catalog rather than the
+    /// one on disk — the picker is built during construction, so a test cannot
+    /// swap the catalog in afterwards.
+    pub fn new_on_picker_with_hosts_for_test(hosts: HostCatalog) -> Self {
+        let mut browser = Self::with_panels(Vec::new());
+        browser.hosts = hosts;
+        let picker = crate::screen::DirPickerState::with_catalog(&browser.hosts);
+        browser.panels = vec![Panel::new_on_screen(Screen::DirPicker(picker))];
+        browser
+    }
+
+    /// Start on the "go to" picker rather than a directory, for `myd --goto`.
+    ///
+    /// Built here rather than in `Panel::new` because the picker has to list the
+    /// saved directories and hosts, and the catalog is not loaded until this
+    /// constructor has run — a panel-built picker would come up empty, which is
+    /// the one thing the flag exists to avoid.
+    pub fn new_on_picker() -> Self {
+        // No panels yet: the picker has to list the saved directories and hosts,
+        // and the catalog is not read until the app is built. Starting a panel on
+        // the current directory first would spawn a full walk for a tree that is
+        // about to be replaced.
+        let mut browser = Self::with_panels(Vec::new());
+        let picker = crate::screen::DirPickerState::with_catalog(&browser.hosts);
+        // The picker is the panel's only screen rather than one stacked on a
+        // directory: there is nothing underneath to go back to, and `q` on it
+        // quits, which is what someone who asked to be shown the picker expects.
+        browser.panels = vec![Panel::new_on_screen(Screen::DirPicker(picker))];
+        browser
     }
 
     /// The panel currently receiving navigation keys.
@@ -959,6 +1000,11 @@ impl FileBrowser {
     /// The directory a given panel is rooted at. For tests.
     pub fn panel_current_dir(&self, index: usize) -> Option<PathBuf> {
         self.panels.get(index).and_then(|p| p.current_dir())
+    }
+
+    /// How many screens deep a panel's stack is (for tests).
+    pub fn panel_depth_for_test(&self, index: usize) -> usize {
+        self.panels.get(index).map(|p| p.depth()).unwrap_or(0)
     }
 
     /// Resolve any pending Loading screen into a Main screen (normally driven

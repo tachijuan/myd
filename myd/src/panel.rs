@@ -236,6 +236,22 @@ impl Panel {
         }
     }
 
+    /// Open a panel showing `screen`, with no directory scan started.
+    ///
+    /// [`new`] always begins loading something, so building a panel and then
+    /// replacing its screen would leave a full walk of the current directory
+    /// running for a tree nobody is going to see. Used for `--goto`, which opens
+    /// on the picker instead.
+    pub fn new_on_screen(screen: Screen) -> Self {
+        Self {
+            screen_stack: vec![screen],
+            view_prefs: ViewPrefs::default(),
+            delete_task: None,
+            deleting_paths: Vec::new(),
+            backend: crate::vfs::BackendId::LOCAL,
+        }
+    }
+
     /// Open a panel on a remote backend, rooted at `path`, building its tree
     /// through `source`. Used after a successful SFTP connection.
     pub fn new_remote(source: crate::widget::source::Source, path: PathBuf) -> Self {
