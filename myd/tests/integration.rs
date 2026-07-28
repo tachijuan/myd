@@ -7428,6 +7428,89 @@ async fn a_single_panel_copy_destination_is_not_canonicalized_locally() {
     );
 }
 
+/// `myd <local> sftp://host` opens a split with the local path on the left.
+#[tokio::test]
+async fn a_remote_second_argument_builds_a_split_with_the_local_path_left() {
+    // The routing itself is asserted in cli.rs; this checks the layout it asks
+    // for is what actually gets built — a split, with the local path in pane 0
+    // and pane 1 left for the remote to take over on connect. Before the fix
+    // this was a split whose right pane showed the picker.
+    use myd::cli::{Cli, Startup};
+    use clap::Parser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    let cli = Cli::try_parse_from(["myd", &dir.path().to_string_lossy(), "sftp://gb10"]).unwrap();
+    let Startup::Remote { panel, local, dual, .. } = cli.startup(None) else {
+        panic!("a remote second argument should ask for a remote startup");
+    };
+    assert_eq!(panel, 1, "the remote takes the right pane");
+    assert!(dual, "and the layout is split");
+
+    // Build the panels the way main does, without dialing anything.
+    let (left, right) = if panel == 0 { (None, local) } else { (local, None) };
+    let mut app = FileBrowser::new(left, right, dual);
+    settle(&mut app).await;
+
+    assert_eq!(app.panel_count(), 2, "two panes");
+    assert_eq!(
+        app.panel_current_dir(0).and_then(|p| p.canonicalize().ok()),
+        dir.path().canonicalize().ok(),
+        "the local path keeps the left pane"
+    );
+}
+
+#[tokio::test]
+async fn a_local_destination_typed_from_a_remote_panel_stays_local() {
+    // From a user's report: connected to an SFTP host, pressed `c`, and typed a
+    // local CIFS mount (`/Volumes/data/nog/hen`). The copy failed with
+    // "destination directory … does not exist".
+    //
+    // The prompt handed BOTH endpoints the active panel's backend, so a typed
+    // destination was always treated as a path on the server. The directory does
+    // exist — on this machine, not on the host — so the transfer looked for it in
+    // the wrong place. An existing local directory now names the local disk.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The destination exists locally, standing in for the mounted volume.
+    let dest = tempfile::tempdir().unwrap();
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // A remote panel rooted somewhere that also exists locally, so the routing
+    // decision is what is under test rather than a path that happens to be absent.
+    let twin = tempfile::tempdir().unwrap();
+    std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "input", "expected the destination prompt");
+
+    for ch in dest.path().to_string_lossy().chars() {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // The queued transfer must address the local disk. Sending it to the remote
+    // backend is the bug: the server has no such directory.
+    let queued = app.transfer_queue().transfers();
+    assert_eq!(queued.len(), 1, "the copy should have been queued");
+    assert!(
+        queued[0].dest.is_local(),
+        "an existing local directory must stay local, not be sent to the server: {}",
+        queued[0].dest
+    );
+    assert!(
+        !queued[0].src.is_local(),
+        "and the source is still the remote panel: {}",
+        queued[0].src
+    );
+}
+
 #[test]
 fn a_single_panel_copy_from_a_remote_panel_routes_through_the_transfer_queue() {
     // The single-panel copy prompt fed `begin_copy_batch` unconditionally, which

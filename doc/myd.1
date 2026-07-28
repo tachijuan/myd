@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.14.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.15.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -6,7 +6,7 @@ myd \- vi-like terminal file browser
 .br
 \fBmyd\fR \fB\-g\fR
 .br
-\fBmyd\fR \fBsftp://\fR[\fIuser\fR@]\fIhost\fR[:\fIport\fR][/\fIpath\fR]
+\fBmyd\fR [\fIPATH\fR] \fBsftp://\fR[\fIuser\fR@]\fIhost\fR[:\fIport\fR][/\fIpath\fR]
 .SH DESCRIPTION
 \fBmyd\fR is a terminal user interface (TUI) for browsing and managing the
 filesystem. It provides a directory tree with \fBvi\fR-style key bindings,
@@ -80,8 +80,7 @@ current view; \fBEsc\fR dismisses it and returns to where you were.
 The picker lists local directories and saved remote hosts together, in two
 labelled sections \(em both answer "where do you want to go", and keeping two
 near-identical screens meant two places to fix every bug. \fBEnter\fR opens a
-directory or connects to a host, whichever the highlighted row is. \fBg s\fR
-opens the same list narrowed to hosts.
+directory or connects to a host, whichever the highlighted row is.
 .IP
 It has two halves: a path field and the list.
 \fBTab\fR moves the keyboard between them, and the focused one is outlined in
@@ -328,8 +327,13 @@ launch with a remote target:
 .nf
 myd sftp://prod
 myd sftp://user@host:2222/var/log
+myd /tmp sftp://prod
 .fi
 .RE
+.PP
+Either positional argument may be the remote one. Giving a local path and a
+remote target together opens them side by side, ready to copy between; a remote
+target on its own puts the current directory in the other pane.
 .PP
 Authentication reuses your existing SSH setup: the ssh-agent, then keys under
 \fB~/.ssh\fR (prompting for a passphrase if a key is encrypted), then a password

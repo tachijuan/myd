@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use myd::app::FileBrowser;
-use myd::cli::Cli;
+use myd::cli::{Cli, Startup};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,27 +13,29 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // A leading `sftp://…` opens a remote panel; the left panel then falls back
-    // to the current directory so the two sit side by side for copying.
-    let remote = cli
-        .path
-        .as_deref()
-        .filter(|p| myd::cli::is_remote_arg(p))
-        .and_then(|p| p.to_str())
-        .map(str::to_string);
-
-    let mut browser = if cli.goto {
+    let mut browser = match cli.startup(std::env::current_dir().ok()) {
         // Asked to be shown the picker, so nothing is opened until a destination
         // is chosen. Clap rejects a path alongside the flag, so there is no
         // argument being ignored here.
-        FileBrowser::new_on_picker()
-    } else if let Some(target) = remote {
-        let local = std::env::current_dir().ok();
-        let mut b = FileBrowser::new(local, None, false);
-        b.connect_on_start(&target);
-        b
-    } else {
-        FileBrowser::new(cli.path, cli.right, cli.dual)
+        Startup::Picker => FileBrowser::new_on_picker(),
+        Startup::Local { left, right, dual } => FileBrowser::new(left, right, dual),
+        Startup::Remote {
+            target,
+            panel,
+            local,
+            dual,
+        } => {
+            // The local side always occupies the *other* pane, so the remote has
+            // somewhere to sit without displacing it.
+            let (left, right) = if panel == 0 {
+                (None, local)
+            } else {
+                (local, None)
+            };
+            let mut b = FileBrowser::new(left, right, dual);
+            b.connect_on_start_in_panel(&target, panel);
+            b
+        }
     };
     browser.run().await
 }
