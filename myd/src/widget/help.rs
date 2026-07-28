@@ -145,9 +145,11 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("n / p", "Next / previous search match"),
                 ("gd", "Go to — directories and saved hosts"),
                 ("  Tab", "  Switch the path field and the list"),
+                ("  Enter", "  Open a directory, or connect to a host"),
+                ("  ", "  Type an sftp:// URL to connect to an address"),
                 ("  a / d", "  Save a destination / forget the highlighted one"),
                 ("  e", "  Edit the highlighted entry (path or host)"),
-                ("  /", "  Search the list (Esc clears)"),
+                ("  /", "  Search; Enter opens a lone match, else picks"),
                 ("  S", "  Toggle measuring for the highlighted directory"),
                 ("  p / u", "  Pin to the top block / unpin"),
                 ("  m", "  Move an entry into place (Enter, Esc)"),
@@ -160,15 +162,6 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("Tab", "Rotate focus through the panes"),
                 ("c", "Copy tagged/selected to other panel"),
                 ("m", "Move tagged/selected to other panel"),
-            ],
-        },
-        HelpCategory {
-            title: "Remote hosts",
-            items: &[
-                ("gr", "Connect — recent hosts, or type an address"),
-                ("gs", "The same list, narrowed to saved hosts"),
-                ("  /", "  Search the list; j/k/g/G navigate"),
-                ("  a / e / d", "  Add / edit / delete a saved host"),
             ],
         },
         HelpCategory {

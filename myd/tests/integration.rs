@@ -4834,66 +4834,110 @@ fn test_catalog() -> myd::hosts::HostCatalog {
     myd::hosts::HostCatalog::in_memory(hosts)
 }
 
-/// `gr` must open the saved-host picker, not the old free-text prompt.
+/// `gd` lists every saved host, which is what made `gs` redundant.
 #[tokio::test]
-async fn gr_opens_the_dialing_directory() {
+async fn gd_lists_every_saved_host() {
     let dir = create_test_structure();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     app.set_hosts_for_test(test_catalog());
     app.resolve_loading_for_test();
 
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('r'));
+    app.handle_key_for_test(char_key('d'));
 
-    assert_eq!(app.modal_kind_for_test(), "host_picker");
-    // Ranked by use, so the most-used host is preselected.
-    assert_eq!(app.picker_selection_for_test().as_deref(), Some("prod"));
-    assert_eq!(
-        app.picker_visible_count_for_test(),
-        3,
-        "the quick view should offer the top three"
-    );
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => {
+            let hosts = p.visible_options().iter().filter(|o| o.is_host()).count();
+            assert_eq!(hosts, 4, "every saved host is listed alongside directories");
+        }
+        _ => panic!("gd should open the picker"),
+    }
 }
 
-/// With nothing saved there is nothing to pick, so `gr` should go straight to
-/// the typed-address prompt rather than showing an empty list.
+/// `/` narrows `gd` to a host, which is the replacement for `gs`.
 #[tokio::test]
-async fn gr_with_an_empty_catalog_prompts_for_an_address() {
+async fn searching_gd_reaches_a_saved_host() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for c in "/france".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+
+    match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => {
+            assert_eq!(p.visible_count(), 1, "the search should isolate one host");
+            assert!(p.visible_options()[0].is_host());
+        }
+        _ => panic!("expected the picker"),
+    }
+}
+
+/// The picker's path field takes a remote URL, which is what made `gr`'s
+/// separate connect prompt redundant. Without this the field was local-only and
+/// an unsaved address had nowhere to be typed.
+#[tokio::test]
+async fn the_picker_field_connects_to_a_typed_sftp_url() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     let dir = create_test_structure();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     app.set_hosts_for_test(myd::hosts::HostCatalog::in_memory(vec![]));
     app.resolve_loading_for_test();
 
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('r'));
+    app.handle_key_for_test(char_key('d'));
+    for c in "sftp://juan@nowhere.invalid/srv".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_eq!(app.modal_kind_for_test(), "input");
+    // The host does not resolve, so this cannot assert a connection — what
+    // matters is that it was treated as a target to dial at all. The old
+    // behaviour was a "not a directory" notice, which is the bug this prevents.
+    assert_ne!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "an sftp:// URL must not be rejected as 'not a directory'"
+    );
 }
 
-/// `gs` opens the full list directly.
-#[tokio::test]
-async fn gs_opens_the_full_host_list() {
-    let dir = create_test_structure();
-    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
-    app.set_hosts_for_test(test_catalog());
-    app.resolve_loading_for_test();
-
+/// Open `gd` with the list focused and the cursor on the first host row.
+///
+/// These tests used to reach the hosts through `gs`, which opened the picker
+/// already filtered to them. `gd` lists directories first, so getting to a host
+/// is now a matter of stepping past them — the rows are all in one list.
+fn open_picker_on_first_host(app: &mut FileBrowser) {
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
 
-    // `gs` opens the combined picker narrowed to hosts, rather than its own
-    // screen — the two lists were the same shape and answered the same question.
-    match app.current_screen() {
+    let on_host = |app: &FileBrowser| match app.current_screen() {
         myd::screen::Screen::DirPicker(p) => {
-            assert_eq!(p.scope(), myd::screen::PickerScope::HostsOnly);
-            assert_eq!(p.visible_count(), 4, "every saved host is listed");
-            assert!(
-                p.visible_options().iter().all(|o| o.is_host()),
-                "and only hosts"
-            );
+            p.selected().map(|o| o.is_host()).unwrap_or(false)
         }
-        _ => panic!("gs should open the picker"),
+        _ => false,
+    };
+    let rows = match app.current_screen() {
+        myd::screen::Screen::DirPicker(p) => p.visible_count(),
+        _ => panic!("gd should open the picker"),
+    };
+    // Bounded by the row count: `j` wraps, so a list with no hosts at all would
+    // otherwise spin here rather than failing with something readable.
+    for _ in 0..rows {
+        if on_host(app) {
+            return;
+        }
+        app.handle_key_for_test(char_key('j'));
     }
+    panic!("no host row in the picker");
 }
 
 /// The picker owns j/k and `/` — they must navigate and search rather than
@@ -4905,9 +4949,7 @@ async fn picker_vi_navigation_and_search_work_through_the_app() {
     app.set_hosts_for_test(test_catalog());
     app.resolve_loading_for_test();
 
-    app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s'));
-    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    open_picker_on_first_host(&mut app);
 
     let label = |app: &FileBrowser| match app.current_screen() {
         myd::screen::Screen::DirPicker(p) => {
@@ -4970,7 +5012,7 @@ async fn adding_a_host_stores_it_without_a_password() {
     app.resolve_loading_for_test();
 
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('d'));
     // `a` needs the list focused; the path field starts focused.
     app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
     app.handle_key_for_test(char_key('a'));
@@ -5003,14 +5045,12 @@ async fn deleting_a_host_requires_confirmation() {
     app.set_hosts_for_test(test_catalog());
     app.resolve_loading_for_test();
 
-    app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s'));
-    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    open_picker_on_first_host(&mut app);
     let doomed = match app.current_screen() {
         myd::screen::Screen::DirPicker(p) => {
             p.selected().and_then(|o| o.host.as_ref()).unwrap().label.clone()
         }
-        _ => panic!("gs should open the picker"),
+        _ => panic!("gd should open the picker"),
     };
 
     app.handle_key_for_test(char_key('d'));
@@ -5036,7 +5076,8 @@ async fn an_unparsable_host_form_reports_the_error() {
     app.resolve_loading_for_test();
 
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('d'));
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
     app.handle_key_for_test(char_key('a'));
     for c in "bad = http://nope".chars() {
         app.handle_key_for_test(char_key(c));
@@ -5055,7 +5096,7 @@ async fn picker_renders_at_realistic_sizes() {
     app.set_hosts_for_test(test_catalog());
     app.resolve_loading_for_test();
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('d'));
 
     for (w, h) in [(120u16, 40u16), (80, 24), (40, 12), (20, 6)] {
         let backend = ratatui::backend::TestBackend::new(w, h);
@@ -7059,6 +7100,78 @@ async fn slash_searches_the_list_rather_than_starting_a_path() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert_eq!(picker(&app).visible_count(), all, "Esc clears the filter");
+}
+
+#[tokio::test]
+async fn enter_on_a_search_with_one_match_opens_it() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Having typed enough to leave exactly one candidate, the user has already
+    // said which one they mean. Making them press Enter a second time to accept
+    // the filter and then again to open is ceremony, so the single match opens
+    // straight away.
+    let (start, mut app) = picker_app().await;
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    type_str(&mut app, "/alpha");
+    assert_eq!(
+        picker(&app).visible_count(),
+        1,
+        "the fixture should narrow to one row for this to test anything"
+    );
+
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.panel_current_dir(0),
+        Some(start.path().join("alpha")),
+        "one match means Enter opens it"
+    );
+}
+
+#[tokio::test]
+async fn enter_on_a_search_with_several_matches_hands_over_the_filtered_list() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::screen::PickerFocus;
+
+    // More than one candidate is still a choice, so Enter accepts the filter and
+    // leaves the narrowed list to navigate rather than guessing at the top row.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    // "a" matches alpha, beta and gamma.
+    type_str(&mut app, "/a");
+    assert!(
+        picker(&app).visible_count() > 1,
+        "need several matches: {} shown",
+        picker(&app).visible_count()
+    );
+    let shown = picker(&app).visible_count();
+
+    // No `settle` here on purpose: nothing should have started loading, and
+    // waiting for a load that never comes is how this test first "failed".
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "Enter with several matches must not open anything"
+    );
+    assert_eq!(
+        picker(&app).visible_count(),
+        shown,
+        "the narrowed list stays in place to choose from"
+    );
+    assert_eq!(
+        picker(&app).focus(),
+        PickerFocus::List,
+        "and the keyboard drives that list"
+    );
+
+    // j/k now walk the filtered rows, which is the point of handing them back.
+    let before = picker(&app).cursor_for_test();
+    app.handle_key_for_test(char_key('j'));
+    assert_ne!(picker(&app).cursor_for_test(), before);
 }
 
 #[tokio::test]
@@ -9330,8 +9443,6 @@ async fn s_toggles_a_saved_directorys_traversal_mode_from_the_picker() {
 
 #[tokio::test]
 async fn s_does_nothing_on_a_host_row() {
-    use crossterm::event::KeyCode;
-
     // Remote directories are never measured, so the toggle has no meaning there
     // and must not write a flag onto a host entry.
     let cfg = tempfile::tempdir().unwrap();
@@ -9344,9 +9455,7 @@ async fn s_does_nothing_on_a_host_row() {
     let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
     app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(&file));
     settle(&mut app).await;
-    app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('s')); // hosts only
-    app.handle_key_for_test(special_key(KeyCode::Tab));
+    open_picker_on_first_host(&mut app);
 
     let before = std::fs::read_to_string(&file).unwrap();
     app.handle_key_for_test(char_key('S'));

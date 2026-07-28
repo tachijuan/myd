@@ -15,7 +15,6 @@ use crate::utils::sizes::CancelToken;
 use crate::vfs::{BackendRegistry, VPath};
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::{render_help, HelpState};
-use crate::widget::host_picker::{HostPicker, PickerOutcome};
 use crate::widget::input_dialog::InputDialog;
 use crate::widget::sort_menu::{SortMenu, SortMenuOutcome};
 use crate::widget::progress::{OpProgress, ProgressOverlay};
@@ -58,9 +57,6 @@ pub enum Modal {
     /// titles the overlay; live counts come from `FileBrowser::op_progress`.
     Operation { verb: &'static str },
     Help(HelpState),
-    /// The dialing directory. Owns its own key handling (vi navigation and `/`
-    /// search), which is why it is a modal rather than a screen.
-    HostPicker(HostPicker),
     /// Numbered sort-order menu, opened by clicking the "Sort:" indicator.
     SortMenu(SortMenu),
 }
@@ -86,8 +82,6 @@ pub enum ModalTarget {
         dest: PathBuf,
         is_dir: bool,
     },
-    /// Remote host prompt, e.g. `sftp://user@host/path` or an ssh config alias.
-    Connect,
     /// Masked prompt for a key passphrase or account password, feeding a
     /// connection retry.
     Password,
@@ -216,7 +210,7 @@ pub struct FileBrowser {
 struct ConnectTask {
     rx: tokio::sync::oneshot::Receiver<ConnectResult>,
     /// The panel that was active when the connect was issued — the remote opens
-    /// here on success, so `gr` replaces the pane the user was looking at.
+    /// here on success, so connecting replaces the pane the user was looking at.
     target_panel: usize,
 }
 
@@ -548,7 +542,6 @@ impl FileBrowser {
         match &mut self.modal {
             Modal::Confirm(d) => d.render(f, full),
             Modal::Input(d) => d.render(f, full),
-            Modal::HostPicker(p) => p.render(f, full),
             Modal::SortMenu(m) => m.render(f, full, sort_anchor),
             Modal::Operation { verb } => {
                 let overlay = match &op_progress {
@@ -913,26 +906,10 @@ impl FileBrowser {
             Modal::Input(_) => "input",
             Modal::Operation { .. } => "operation",
             Modal::Help(_) => "help",
-            Modal::HostPicker(_) => "host_picker",
             Modal::SortMenu(_) => "sort_menu",
         }
     }
 
-    /// The label of the host the picker has highlighted (for tests).
-    pub fn picker_selection_for_test(&self) -> Option<String> {
-        match &self.modal {
-            Modal::HostPicker(p) => p.selected().map(|h| h.label.clone()),
-            _ => None,
-        }
-    }
-
-    /// How many hosts the picker is currently showing (for tests).
-    pub fn picker_visible_count_for_test(&self) -> usize {
-        match &self.modal {
-            Modal::HostPicker(p) => p.visible_count(),
-            _ => 0,
-        }
-    }
 
     /// Replace the host catalog, so tests don't touch the user's real one.
     pub fn set_hosts_for_test(&mut self, hosts: HostCatalog) {
@@ -1099,26 +1076,6 @@ impl FileBrowser {
 
         let (x, y) = (ev.column, ev.row);
 
-        // The picker is the only modal with clickable rows; for the others a
-        // click is swallowed so it can't act on the screen underneath.
-        if matches!(self.modal, Modal::HostPicker(_)) {
-            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let area = self.last_frame;
-                // Same rule as the file tree: one click selects, two connect.
-                let double = self.note_click(x, y);
-                let Modal::HostPicker(picker) = &mut self.modal else {
-                    return true;
-                };
-                if picker.click_row(area, y) && double {
-                    let outcome = picker.handle_key(crossterm::event::KeyEvent::new(
-                        KeyCode::Enter,
-                        crossterm::event::KeyModifiers::NONE,
-                    ));
-                    return self.apply_picker_outcome(outcome);
-                }
-            }
-            return true;
-        }
         if matches!(self.modal, Modal::SortMenu(_)) {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let Modal::SortMenu(menu) = &mut self.modal else {
@@ -1451,8 +1408,8 @@ impl FileBrowser {
     ///
     /// Pushed rather than replacing the current screen, so dismissing it returns
     /// to what was underneath instead of leaving the panel with nothing to show.
-    fn open_dir_picker(&mut self, scope: crate::screen::PickerScope) {
-        let picker = crate::screen::DirPickerState::with_catalog(&self.hosts, scope);
+    fn open_dir_picker(&mut self) {
+        let picker = crate::screen::DirPickerState::with_catalog(&self.hosts);
         self.active_panel_mut()
             .screen_stack
             .push(Screen::DirPicker(picker));
@@ -1465,13 +1422,9 @@ impl FileBrowser {
     /// list or dump the user back into the path field.
     fn rebuild_dir_picker(&mut self) {
         let catalog = self.hosts.clone();
-        let scope = match self.active_panel().current_screen() {
-            Screen::DirPicker(state) => state.scope(),
-            _ => crate::screen::PickerScope::All,
-        };
         if let Screen::DirPicker(state) = self.active_panel_mut().current_screen_mut() {
             let keep = state.selected().map(|o| o.path.clone());
-            let mut rebuilt = crate::screen::DirPickerState::with_catalog(&catalog, scope);
+            let mut rebuilt = crate::screen::DirPickerState::with_catalog(&catalog);
             rebuilt.adopt_focus_from(state);
             if let Some(path) = keep {
                 rebuilt.select_path(&path);
@@ -1849,7 +1802,7 @@ impl FileBrowser {
                         }
                         crate::screen::PickerChoice::Connect(url) => {
                             // A saved host: leave the picker and dial it, the
-                            // same path `gr` takes.
+                            // same path a typed URL takes.
                             self.pop_screen();
                             self.connecting_label = label_for_url(&self.hosts, &url);
                             self.start_connect(&url);
@@ -1915,24 +1868,6 @@ impl FileBrowser {
                         }
                     }
                 }
-                true
-            }
-            Action::Connect => {
-                // The dialing directory replaces what used to be a bare text
-                // prompt. With nothing saved yet it goes straight to that
-                // prompt, so a first run costs no extra keystroke.
-                if self.hosts.is_empty() {
-                    self.prompt_manual_connect();
-                } else {
-                    self.modal = Modal::HostPicker(HostPicker::quick(&self.hosts));
-                }
-                true
-            }
-            Action::HostDirectory => {
-                // The same picker `gd` opens, narrowed to the remote entries —
-                // useful with many of both kinds, and it keeps the chord people
-                // already have in their fingers working.
-                self.open_dir_picker(crate::screen::PickerScope::HostsOnly);
                 true
             }
             Action::ToggleMouse => {
@@ -2089,7 +2024,7 @@ impl FileBrowser {
                     // current view. Replacing discarded the tree underneath,
                     // which left `q` nothing to return to — declining `gd` then
                     // had to quit the app.
-                    self.open_dir_picker(crate::screen::PickerScope::All);
+                    self.open_dir_picker();
                 }
                 true
             }
@@ -2230,8 +2165,6 @@ impl FileBrowser {
                     | Action::SearchPrev
                     | Action::ToggleTransferPanel
                     | Action::CancelTransfers
-                    | Action::Connect
-                    | Action::HostDirectory
                     | Action::ToggleMouse
                     | Action::OpenWithDefaultApp
                     | Action::ToggleShallow => unreachable!(),
@@ -2242,14 +2175,9 @@ impl FileBrowser {
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
-        // The picker owns its keys outright — vi navigation and `/` search need
-        // j/k// to be local commands, and going through the chord detector would
-        // put its 500 ms timeout in front of every keystroke.
-        if let Modal::HostPicker(picker) = &mut self.modal {
-            let outcome = picker.handle_key(key);
-            return self.apply_picker_outcome(outcome);
-        }
-        // Same for the sort menu: it binds the digits and j/k itself.
+        // The sort menu owns its keys outright: it binds the digits and j/k
+        // itself, and going through the chord detector would put its 500 ms
+        // timeout in front of every keystroke.
         if let Modal::SortMenu(menu) = &mut self.modal {
             let outcome = menu.handle_key(key);
             return self.apply_sort_menu_outcome(outcome);
@@ -2507,14 +2435,6 @@ impl FileBrowser {
                                     )));
                                 }
                             }
-                            ModalTarget::Connect => {
-                                if !value.is_empty() {
-                                    // A typed target isn't a saved one, so
-                                    // nothing gets promoted in the ranking.
-                                    self.connecting_label = None;
-                                    self.start_connect(&value);
-                                }
-                            }
                             ModalTarget::HostForm { editing } => {
                                 self.submit_host_form(&value, editing);
                             }
@@ -2560,7 +2480,7 @@ impl FileBrowser {
             }
             // Handled by the early returns at the top of this function, which
             // need `&mut self` for the whole call and so can't sit in this match.
-            Modal::HostPicker(_) | Modal::SortMenu(_) => true,
+            Modal::SortMenu(_) => true,
             Modal::None => true,
         }
     }
@@ -2569,68 +2489,6 @@ impl FileBrowser {
     /// connect runs in the background once the event loop starts.
     pub fn connect_on_start(&mut self, target: &str) {
         self.start_connect(target);
-    }
-
-    /// The free-text connect prompt, for a target that isn't saved.
-    fn prompt_manual_connect(&mut self) {
-        self.modal_target = Some(ModalTarget::Connect);
-        self.modal = Modal::Input(InputDialog::new(
-            "Connect to (sftp://[user@]host[:port][/path]):",
-            "sftp://host/path",
-        ));
-    }
-
-    /// Act on what the dialing directory decided.
-    fn apply_picker_outcome(&mut self, outcome: PickerOutcome) -> bool {
-        match outcome {
-            PickerOutcome::Continue => {}
-            PickerOutcome::Cancelled => self.modal = Modal::None,
-            PickerOutcome::Connect(url) => {
-                // Remember which entry this was so the ranking is updated only
-                // if the connection actually succeeds.
-                self.connecting_label = self
-                    .hosts
-                    .hosts()
-                    .iter()
-                    .find(|h| h.to_url() == url)
-                    .map(|h| h.label.clone());
-                self.modal = Modal::None;
-                self.start_connect(&url);
-            }
-            PickerOutcome::PromptManual => self.prompt_manual_connect(),
-            PickerOutcome::AddHost => {
-                self.modal_target = Some(ModalTarget::HostForm { editing: None });
-                self.modal = Modal::Input(
-                    InputDialog::new(HOST_FORM_PROMPT, "prod = sftp://juan@host:22/srv")
-                        .with_title("Add a saved host"),
-                );
-            }
-            PickerOutcome::EditHost(label) => {
-                let existing = self.hosts.find(&label).cloned();
-                let prefill = existing
-                    .as_ref()
-                    .map(|h| format!("{} = {}", h.label, h.to_url()))
-                    .unwrap_or_default();
-                self.modal_target = Some(ModalTarget::HostForm {
-                    editing: Some(label),
-                });
-                self.modal = Modal::Input(
-                    InputDialog::new(HOST_FORM_PROMPT, "")
-                        .with_title("Edit saved host")
-                        .with_default(prefill),
-                );
-            }
-            PickerOutcome::DeleteHost(label) => {
-                self.modal_target = Some(ModalTarget::HostDelete {
-                    label: label.clone(),
-                });
-                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
-                    "Remove saved host '{}'? (the remote itself is untouched)",
-                    label
-                )));
-            }
-        }
-        true
     }
 
     /// Apply a submitted add/edit form.
@@ -2707,22 +2565,16 @@ impl FileBrowser {
         self.modal = Modal::SortMenu(SortMenu::new(current));
     }
 
-    /// Return to the dialing directory after a management action.
+    /// Return to the directory picker after a management action.
+    ///
+    /// Every add, edit and delete now comes from the combined picker, so this
+    /// refreshes it in place. There used to be a fallback that opened the old
+    /// quick-connect modal for edits reached from `gr`; with that chord gone,
+    /// nothing can arrive here without the picker underneath.
     fn reopen_picker(&mut self) {
         self.modal_target = None;
         self.modal = Modal::None;
-        // Return to whichever list the edit came from. When the combined picker
-        // is already open — the usual case now — refresh it in place rather than
-        // stacking the old modal on top of it.
-        if matches!(
-            self.active_panel().current_screen(),
-            Screen::DirPicker(_)
-        ) {
-            self.rebuild_dir_picker();
-            return;
-        }
-        // Reached from `gr`'s quick connect, which has no picker underneath.
-        self.modal = Modal::HostPicker(HostPicker::quick(&self.hosts));
+        self.rebuild_dir_picker();
     }
 
     /// Begin connecting to a remote host named by `target` (e.g.
@@ -2732,7 +2584,7 @@ impl FileBrowser {
     /// finishes the job when the attempt completes.
     fn start_connect(&mut self, target: &str) {
         // Remember which panel is active now — the remote opens here on success,
-        // so `gr` takes over the pane the user was looking at.
+        // so connecting takes over the pane the user was looking at.
         let target_panel = self.active;
         match crate::vfs::sftp::SftpTarget::parse(target) {
             Ok(t) => {
@@ -2874,7 +2726,7 @@ impl FileBrowser {
                         return;
                     }
                 };
-                // Open the remote in the panel that was active when `gr` was
+                // Open the remote in the panel that was active when the connect was
                 // issued, replacing whatever it was showing. Guard the index in
                 // case the panel layout changed while connecting.
                 let panel = target_panel.min(self.panels.len().saturating_sub(1));
