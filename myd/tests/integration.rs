@@ -9768,6 +9768,59 @@ fn tree_is_shallow(app: &FileBrowser) -> bool {
     }
 }
 
+/// Whether a given panel's tree was built without measuring.
+fn panel_is_shallow(app: &FileBrowser, index: usize) -> bool {
+    match app.panel_screen_for_test(index) {
+        Some(myd::screen::Screen::Main(s)) => s.tree.is_shallow(),
+        _ => false,
+    }
+}
+
+/// `-s` opens a single panel without measuring.
+#[tokio::test]
+async fn shallow_flag_opens_a_single_panel_unmeasured() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/f.txt"), b"x").unwrap();
+
+    let mut app =
+        FileBrowser::new_shallow(Some(dir.path().to_path_buf()), None, false, true);
+    settle(&mut app).await;
+
+    assert!(
+        tree_is_shallow(&app),
+        "-s must start in shallow mode, as though S had been pressed"
+    );
+
+    // And the flag is opt-in: the same app without it still measures.
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    assert!(!tree_is_shallow(&app), "without -s the tree is measured");
+}
+
+/// `-s` applies to both panes of a split, not just the active one.
+#[tokio::test]
+async fn shallow_flag_applies_to_both_panes() {
+    // The flag says how you want to browse; a split where one side measured and
+    // the other did not would be arbitrary.
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(left.path().join("a")).unwrap();
+    std::fs::create_dir_all(right.path().join("b")).unwrap();
+
+    let mut app = FileBrowser::new_shallow(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+        true,
+    );
+    settle_all(&mut app).await;
+
+    assert_eq!(app.panel_count(), 2, "two panes");
+    assert!(panel_is_shallow(&app, 0), "the left pane is unmeasured");
+    assert!(panel_is_shallow(&app, 1), "and so is the right");
+}
+
 #[tokio::test]
 async fn s_stops_measuring_directories() {
     // Shallow mode reports directory sizes as unknown — the same display the

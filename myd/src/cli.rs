@@ -27,6 +27,13 @@ pub struct Cli {
     // reporting it beats silently honouring whichever happened to win.
     #[arg(long, short = 'd', conflicts_with_all = ["path", "right"])]
     pub directory: bool,
+
+    /// Browse without measuring directory sizes (the `S` toggle, from the start).
+    // Applies to whichever panels open, single or dual. Remote panels are never
+    // measured anyway, so the flag is simply redundant there rather than wrong —
+    // no reason to say so.
+    #[arg(long, short = 's')]
+    pub shallow: bool,
 }
 
 /// Whether a path-like argument is actually a remote target (`sftp://…` or
@@ -51,6 +58,8 @@ pub enum Startup {
         left: Option<PathBuf>,
         right: Option<PathBuf>,
         dual: bool,
+        /// Open without measuring directory sizes.
+        shallow: bool,
     },
     /// Connect to `target`, opening it in panel `panel`. `local` is the other
     /// panel's directory when the layout is split.
@@ -59,6 +68,9 @@ pub enum Startup {
         panel: usize,
         local: Option<PathBuf>,
         dual: bool,
+        /// Open the *local* pane without measuring. The remote one never
+        /// measures regardless, so this says nothing about it.
+        shallow: bool,
     },
 }
 
@@ -87,6 +99,7 @@ impl Cli {
                 panel: 1,
                 local: self.path.clone(),
                 dual: true,
+                shallow: self.shallow,
             };
         }
         if let Some(target) = as_remote(&self.path) {
@@ -101,12 +114,14 @@ impl Cli {
                 panel: 0,
                 local,
                 dual,
+                shallow: self.shallow,
             };
         }
         Startup::Local {
             left: self.path.clone(),
             right: self.right.clone(),
             dual: self.dual,
+            shallow: self.shallow,
         }
     }
 }
@@ -144,6 +159,7 @@ mod tests {
                 panel: 1,
                 local: Some(PathBuf::from("/tmp")),
                 dual: true,
+                shallow: false,
             },
             "the remote belongs in the right pane, beside the local path"
         );
@@ -161,6 +177,7 @@ mod tests {
                 panel: 0,
                 local: Some(PathBuf::from("/cwd")),
                 dual: false,
+                shallow: false,
             }
         );
 
@@ -174,6 +191,7 @@ mod tests {
                 panel: 0,
                 local: Some(PathBuf::from("/tmp")),
                 dual: true,
+                shallow: false,
             }
         );
     }
@@ -183,7 +201,7 @@ mod tests {
         let cli = Cli::try_parse_from(["myd"]).unwrap();
         assert_eq!(
             cli.startup(Some(PathBuf::from("/cwd"))),
-            Startup::Local { left: None, right: None, dual: false }
+            Startup::Local { left: None, right: None, dual: false, shallow: false }
         );
 
         let cli = Cli::try_parse_from(["myd", "/tmp", "/var"]).unwrap();
@@ -193,6 +211,7 @@ mod tests {
                 left: Some(PathBuf::from("/tmp")),
                 right: Some(PathBuf::from("/var")),
                 dual: false,
+                shallow: false,
             },
             "two local paths are still the plain dual-panel form"
         );
@@ -200,6 +219,51 @@ mod tests {
         // The flag wins over everything else.
         let cli = Cli::try_parse_from(["myd", "--directory"]).unwrap();
         assert_eq!(cli.startup(None), Startup::Picker);
+    }
+
+    #[test]
+    fn shallow_carries_through_every_layout() {
+        // The flag is about how to browse, not about what to open, so it rides
+        // along with whichever layout the arguments asked for.
+        let cli = Cli::try_parse_from(["myd", "-s", "/tmp"]).unwrap();
+        assert!(cli.shallow);
+        assert_eq!(
+            cli.startup(None),
+            Startup::Local {
+                left: Some(PathBuf::from("/tmp")),
+                right: None,
+                dual: false,
+                shallow: true,
+            }
+        );
+
+        // Both panes of a split.
+        let cli = Cli::try_parse_from(["myd", "--shallow", "/tmp", "/var"]).unwrap();
+        assert_eq!(
+            cli.startup(None),
+            Startup::Local {
+                left: Some(PathBuf::from("/tmp")),
+                right: Some(PathBuf::from("/var")),
+                dual: false,
+                shallow: true,
+            }
+        );
+
+        // And alongside a remote, where it describes the local pane only.
+        let cli = Cli::try_parse_from(["myd", "-s", "/tmp", "sftp://gb10"]).unwrap();
+        assert_eq!(
+            cli.startup(None),
+            Startup::Remote {
+                target: "sftp://gb10".into(),
+                panel: 1,
+                local: Some(PathBuf::from("/tmp")),
+                dual: true,
+                shallow: true,
+            }
+        );
+
+        // Off unless asked for.
+        assert!(!Cli::try_parse_from(["myd", "/tmp"]).unwrap().shallow);
     }
 
     #[test]
