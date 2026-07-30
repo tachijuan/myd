@@ -5823,7 +5823,9 @@ async fn help_without_overflow_shows_no_scroll_hint() {
     settle(&mut app).await;
 
     app.handle_key_for_test(char_key('?'));
-    let text = help_text(&mut app, 80, 100);
+    // Tall enough for the whole list, which grows as categories are added — the
+    // preview pane's keys took it past 100 rows.
+    let text = help_text(&mut app, 80, 130);
     assert!(
         !text.contains("to scroll"),
         "a terminal tall enough for the whole list should not advertise scrolling"
@@ -10008,5 +10010,509 @@ async fn s_does_nothing_on_a_host_row() {
         std::fs::read_to_string(&file).unwrap(),
         before,
         "S on a host row must change nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The file preview pane: space to open, vi motions, search, and the two key
+// contracts it must not break (Esc must not quit, space must not answer a
+// dialog).
+// ---------------------------------------------------------------------------
+
+/// A directory holding one text file with `lines` numbered lines, and an app
+/// rooted there with the cursor on that file.
+async fn preview_app(
+    lines: usize,
+) -> (tempfile::TempDir, myd::app::FileBrowser) {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (0..lines).map(|i| format!("line {i} of text\n")).collect();
+    std::fs::write(dir.path().join("sample.txt"), body).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    // Move onto the file: the root row is the directory itself.
+    app.handle_key_for_test(char_key('j'));
+    (dir, app)
+}
+
+/// Drive ticks until the preview has loaded something.
+async fn settle_preview(app: &mut myd::app::FileBrowser) {
+    for _ in 0..400 {
+        app.tick_for_test();
+        if app.preview_has_content_for_test() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("preview never loaded");
+}
+
+/// Render and return the screen as text, so the pane's own output can be read.
+fn screen_text(app: &mut myd::app::FileBrowser, w: u16, h: u16) -> String {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn test_space_opens_and_closes_the_preview() {
+    let (_dir, mut app) = preview_app(5).await;
+    assert!(!app.preview_open_for_test(), "starts closed");
+
+    app.handle_key_for_test(char_key(' '));
+    assert!(app.preview_open_for_test(), "space should open it");
+    assert!(
+        app.preview_focused_for_test(),
+        "opening should focus it — it covers the tree"
+    );
+
+    settle_preview(&mut app).await;
+    let out = screen_text(&mut app, 80, 24);
+    assert!(out.contains("sample.txt"), "title missing:\n{out}");
+    assert!(out.contains("line 0 of text"), "content missing:\n{out}");
+
+    app.handle_key_for_test(char_key(' '));
+    assert!(!app.preview_open_for_test(), "space should close it");
+    assert!(!app.preview_focused_for_test(), "focus must not linger");
+}
+
+#[tokio::test]
+async fn test_preview_scrolls_with_vi_motions_and_clamps() {
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    // Render once so the pane knows its height.
+    screen_text(&mut app, 80, 24);
+
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.preview_scroll_for_test(), 1, "j should scroll down");
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(app.preview_scroll_for_test(), 0, "k should scroll up");
+
+    // Already at the top: k must not go negative.
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(app.preview_scroll_for_test(), 0, "clamped at the top");
+
+    app.handle_key_for_test(ctrl_key('f'));
+    let paged = app.preview_scroll_for_test();
+    assert!(paged > 1, "Ctrl-f should page down, got {paged}");
+    app.handle_key_for_test(ctrl_key('b'));
+    assert_eq!(app.preview_scroll_for_test(), 0, "Ctrl-b should page back");
+
+    app.handle_key_for_test(ctrl_key('d'));
+    let half = app.preview_scroll_for_test();
+    assert!(half > 0 && half < paged, "Ctrl-d is half a page: {half}");
+
+    app.handle_key_for_test(char_key('G'));
+    let bottom = app.preview_scroll_for_test();
+    assert!(bottom > 100, "G should jump to the end, got {bottom}");
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.preview_scroll_for_test(), bottom, "clamped at the end");
+
+    app.handle_key_for_test(char_key('g'));
+    assert_eq!(app.preview_scroll_for_test(), 0, "g should return to the top");
+}
+
+#[tokio::test]
+async fn test_preview_search_steps_through_matches_and_wraps() {
+    let (_dir, mut app) = preview_app(60).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    // `/` opens a prompt that is separate from the tree's own search.
+    app.handle_key_for_test(char_key('/'));
+    for c in "line 5".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    // line 5, and 50..59 => 11 matches.
+    assert_eq!(app.preview_match_count_for_test(), 11);
+    assert_eq!(app.preview_match_line_for_test(), Some(5));
+
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(app.preview_match_line_for_test(), Some(50));
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(app.preview_match_line_for_test(), Some(5), "p steps back");
+
+    // Wrap backward off the first match.
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(
+        app.preview_match_line_for_test(),
+        Some(59),
+        "p should wrap to the last match"
+    );
+    // And forward off the last.
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(
+        app.preview_match_line_for_test(),
+        Some(5),
+        "n should wrap to the first match"
+    );
+
+    // N and P are the reverses of n and p.
+    app.handle_key_for_test(char_key('N'));
+    assert_eq!(app.preview_match_line_for_test(), Some(59));
+    app.handle_key_for_test(char_key('P'));
+    assert_eq!(app.preview_match_line_for_test(), Some(5));
+}
+
+/// Globally `Esc` resolves to `Action::Quit`. With the preview focused it must
+/// hand focus back instead, or the obvious way to leave the pane kills the app.
+#[tokio::test]
+async fn test_esc_in_the_preview_does_not_quit() {
+    let (_dir, mut app) = preview_app(10).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    let keep_running = app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(keep_running, "Esc in the preview must not quit the app");
+    assert!(
+        !app.preview_focused_for_test(),
+        "Esc should release focus..."
+    );
+    assert!(
+        app.preview_open_for_test(),
+        "...but leave the pane open, so the tree can be moved beneath it"
+    );
+
+    // With focus back on the tree, Esc means what it always did.
+    let keep_running = app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(!keep_running, "Esc on the tree still quits");
+}
+
+/// `q` behaves like Esc inside the pane: release focus, do not quit.
+#[tokio::test]
+async fn test_q_in_the_preview_releases_focus_instead_of_quitting() {
+    let (_dir, mut app) = preview_app(10).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    assert!(app.handle_key_for_test(char_key('q')), "q must not quit");
+    assert!(!app.preview_focused_for_test());
+    assert!(app.preview_open_for_test());
+}
+
+/// Space is now a global binding, and a two-button dialog must still refuse it.
+/// This is the regression that overwrote a file once: keys that are not an
+/// explicit answer have to be inert at a question.
+#[tokio::test]
+async fn test_space_does_not_answer_a_confirm_dialog() {
+    let (_dir, mut app) = preview_app(4).await;
+
+    // `D` on the file raises a delete confirmation.
+    app.handle_key_for_test(char_key('D'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "expected a confirm dialog"
+    );
+
+    app.handle_key_for_test(char_key(' '));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "space must not answer a two-button question"
+    );
+    assert!(
+        !app.preview_open_for_test(),
+        "and it must not reach the preview binding either"
+    );
+
+    // Esc still cancels, leaving the file alone.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert_eq!(app.modal_kind_for_test(), "none");
+}
+
+/// Motions inside the pane must not also move the tree underneath: that is what
+/// focus is for.
+#[tokio::test]
+async fn test_preview_motions_do_not_move_the_tree() {
+    let (_dir, mut app) = preview_app(200).await;
+    let before = app.selected_line_index_for_test();
+
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    for _ in 0..5 {
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert!(app.preview_scroll_for_test() > 0, "the pane scrolled");
+    assert_eq!(
+        app.selected_line_index_for_test(),
+        before,
+        "the tree cursor must not have moved"
+    );
+}
+
+/// A binary file gets a note rather than a screenful of control characters.
+#[tokio::test]
+async fn test_a_binary_file_is_reported_not_dumped() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A NUL byte is the decisive marker.
+    std::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 3, 255, 254, 0, 7]).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    let out = screen_text(&mut app, 80, 24);
+    assert!(out.contains("Binary file"), "expected a note:\n{out}");
+}
+
+/// The help overlay owns space as page-down, so it must not leak through to the
+/// preview binding.
+#[tokio::test]
+async fn test_space_in_help_does_not_open_the_preview() {
+    let (_dir, mut app) = preview_app(4).await;
+    app.handle_key_for_test(char_key('?'));
+    assert_eq!(app.modal_kind_for_test(), "help");
+
+    app.handle_key_for_test(char_key(' '));
+    assert!(
+        !app.preview_open_for_test(),
+        "space belongs to the help overlay while it is up"
+    );
+    assert_eq!(app.modal_kind_for_test(), "help", "and it should still be up");
+}
+
+/// Tab must reach the preview, and must not leave two panes claiming focus.
+#[tokio::test]
+async fn test_tab_rotates_into_the_preview() {
+    let (_dir, mut app) = preview_app(10).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    assert!(app.preview_focused_for_test());
+
+    // One panel plus the preview: Tab alternates between them.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(!app.preview_focused_for_test(), "Tab leaves the pane");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(app.preview_focused_for_test(), "and comes back to it");
+    assert!(
+        !app.transfer_focused_for_test(),
+        "the sidebar must not be focused at the same time"
+    );
+}
+
+/// Closing the pane must drop its focus, or keys go to something invisible.
+#[tokio::test]
+async fn test_closing_the_preview_releases_focus() {
+    let (_dir, mut app) = preview_app(10).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    assert!(app.preview_focused_for_test());
+
+    app.handle_key_for_test(char_key(' '));
+    assert!(!app.preview_focused_for_test());
+
+    // And a motion now moves the tree again, not a hidden pane. `k` rather than
+    // `j`: the cursor is on the only file, which is the last row, so `j` has
+    // nowhere to go and would prove nothing.
+    let before = app.selected_line_index_for_test();
+    app.handle_key_for_test(char_key('k'));
+    assert_ne!(
+        app.selected_line_index_for_test(),
+        before,
+        "the tree should take motions once the pane is closed"
+    );
+}
+
+/// Both plain-key tables must agree, or space works only until a `g` times out.
+#[test]
+fn test_space_is_bound_in_both_key_tables() {
+    use myd::keybinding::{Action, KeyBindingHandler};
+
+    let h = KeyBindingHandler::new();
+    assert_eq!(
+        h.resolve_single_for_test(char_key(' ')),
+        Some(Action::TogglePreview)
+    );
+    assert_eq!(
+        h.resolve_single_char_for_test(' '),
+        Some(Action::TogglePreview)
+    );
+}
+
+/// The preview follows the cursor, so moving to another file replaces what is
+/// shown rather than leaving the first file up.
+#[tokio::test]
+async fn test_the_preview_follows_the_cursor() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a-first.txt"), "AAA distinctive\n").unwrap();
+    std::fs::write(dir.path().join("b-second.txt"), "BBB different\n").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    let first = screen_text(&mut app, 80, 24);
+
+    // Focus the tree so j moves the cursor rather than scrolling the pane.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    app.handle_key_for_test(char_key('j'));
+    for _ in 0..400 {
+        app.tick_for_test();
+        let out = screen_text(&mut app, 80, 24);
+        if out.contains("different") || out.contains("distinctive") && out != first {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let second = screen_text(&mut app, 80, 24);
+    assert_ne!(first, second, "the pane should have followed the cursor");
+}
+
+/// A preview on a remote panel must read through the VFS, never `std::fs`.
+///
+/// The dangerous case is a path that exists on both machines: `std::fs` would
+/// succeed and show the *local* file's contents under the remote file's name.
+/// So the mock serves content that could not have come from local disk, and the
+/// assertion is on that content plus the read actually reaching the backend.
+#[tokio::test]
+async fn test_a_remote_preview_reads_through_the_vfs() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A path that really exists locally, so a std::fs read would quietly work.
+    let shared = std::path::PathBuf::from("/etc/hostname");
+    if !shared.is_file() {
+        eprintln!("/etc/hostname missing; skipping");
+        return;
+    }
+    let local_bytes = std::fs::read_to_string(&shared).unwrap_or_default();
+
+    struct Counting {
+        opens: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl myd::vfs::Vfs for Counting {
+        fn scheme(&self) -> &'static str {
+            "sftp"
+        }
+        async fn read_dir(&self, _p: &myd::vfs::VPath) -> anyhow::Result<Vec<myd::vfs::VEntry>> {
+            Ok(Vec::new())
+        }
+        async fn stat(&self, _p: &myd::vfs::VPath) -> anyhow::Result<myd::vfs::VMetadata> {
+            Ok(myd::vfs::VMetadata {
+                len: REMOTE_BODY.len() as u64,
+                ..Default::default()
+            })
+        }
+        async fn open_read(
+            &self,
+            _p: &myd::vfs::VPath,
+        ) -> anyhow::Result<Box<dyn myd::vfs::VRead>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(REMOTE_BODY.as_bytes().to_vec())))
+        }
+        // A preview only ever reads. Anything else reaching this mock is a bug
+        // in the code under test, so it fails loudly rather than silently.
+        async fn create_dir_all(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> {
+            anyhow::bail!("a preview must not create directories")
+        }
+        async fn remove_file(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> {
+            anyhow::bail!("a preview must not remove files")
+        }
+        async fn remove_dir(&self, _p: &myd::vfs::VPath) -> anyhow::Result<()> {
+            anyhow::bail!("a preview must not remove directories")
+        }
+        async fn rename(
+            &self,
+            _f: &myd::vfs::VPath,
+            _t: &myd::vfs::VPath,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("a preview must not rename")
+        }
+        async fn open_write(
+            &self,
+            _p: &myd::vfs::VPath,
+            _len: Option<u64>,
+        ) -> anyhow::Result<Box<dyn myd::vfs::VWrite>> {
+            anyhow::bail!("a preview must not write")
+        }
+        async fn dir_size(
+            &self,
+            _p: &myd::vfs::VPath,
+            _cache: &myd::utils::sizes::SizeCache,
+            _cancel: &myd::utils::sizes::CancelToken,
+            _progress: Option<&myd::widget::progress::OpProgress>,
+        ) -> u64 {
+            panic!("a preview must not walk directories")
+        }
+    }
+    const REMOTE_BODY: &str = "this text exists only on the fake remote server\n";
+
+    let fs = Arc::new(Counting {
+        opens: AtomicUsize::new(0),
+    });
+    let content = myd::preview::load(
+        fs.clone(),
+        myd::preview::PreviewRequest {
+            path: myd::vfs::VPath::new(myd::vfs::BackendId(1), shared.clone()),
+            label: shared.clone(),
+            cols: 60,
+            rows: 20,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        fs.opens.load(Ordering::SeqCst),
+        1,
+        "the preview must read through the backend"
+    );
+
+    let text = content.search_text().join("\n");
+    assert!(
+        text.contains("only on the fake remote"),
+        "expected the remote body, got: {text}"
+    );
+    if !local_bytes.trim().is_empty() {
+        assert!(
+            !text.contains(local_bytes.trim()),
+            "the preview showed the LOCAL file's contents for a remote path"
+        );
+    }
+}
+
+/// The help list is the project's single source of truth for bindings, so a new
+/// key that is not in it is effectively undiscoverable.
+#[tokio::test]
+async fn help_documents_the_preview_keys() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('?'));
+    let text = help_text(&mut app, 80, 130);
+    assert!(text.contains("Preview"), "no Preview category:\n{text}");
+    assert!(
+        text.contains("Show / hide the file preview"),
+        "space is not documented:\n{text}"
+    );
+    assert!(
+        text.contains("Search within the file"),
+        "the pane's search is not documented:\n{text}"
     );
 }
