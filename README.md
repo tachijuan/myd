@@ -16,7 +16,9 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **File preview** — press `space` to open a pane over most of the screen showing what is actually *in* the selected file, and `space` again to close it. Text, markdown and around a hundred programming languages are syntax highlighted. The pane takes focus, so vi motions act on it rather than on the tree: `j`/`k` by a line, `Ctrl+F`/`Ctrl+B` by a page, `Ctrl+D`/`Ctrl+U` by half of one, `g`/`G` to the start and end. `/` searches within the file (regex, case-insensitive) and `n`/`p` step through the matches — `N`/`P` go the other way — with the current match highlighted and the count shown in the footer. `Esc` or `q` hands focus back to the tree without closing the pane, so you can move the cursor and watch the preview follow; `Tab` moves focus in and out. Binary files are reported rather than dumped, and a file too large to read in full is shown truncated and labelled as such. Works on remote panels: the file is read from the server, not from a same-named path on your own machine.
-- **Image and PDF preview** — if [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/) is on your `PATH`, the preview pane draws images (PNG, JPEG, GIF, WebP, SVG, TIFF, …) as colored terminal blocks; `timg` is preferred where both are installed. A `timg` built with poppler also renders the first page of a **PDF** — `chafa` has no PDF loader, so a PDF on a chafa-only machine says so rather than failing obscurely. Neither tool is a dependency: without them the pane shows the file's details instead. The renderer's output is captured and drawn as part of the interface rather than written to the terminal, so it works over `tmux` and cannot corrupt the display.
+- **Image and PDF preview** — if [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/) is on your `PATH`, the preview pane draws images (PNG, JPEG, GIF, WebP, SVG, TIFF, …); `timg` is preferred where both are installed. A `timg` built with poppler also renders **PDFs** — `chafa` has no PDF loader, so a PDF on a chafa-only machine says so rather than failing obscurely. Neither tool is a dependency: without them the pane shows the file's details instead.
+- **High-resolution images where the terminal allows** — in a terminal that implements the kitty graphics protocol (kitty, ghostty, Konsole 22.04+) or iTerm2's inline images (iTerm2, WezTerm, mintty), the image is handed over as a real PNG and drawn at pixel resolution instead of being approximated with block characters. Detection is deliberately conservative, because a terminal that does not understand the sequence *prints* it: a multiplexer is refused unless it will forward the escape (`tmux` needs `set -g allow-passthrough on`), and anything unrecognized falls back to blocks, which work everywhere. Override with `MYD_PREVIEW_GRAPHICS=kitty|iterm2|blocks`.
+- **Page through a PDF** — with a multi-page document open, `j`/`k` turn pages rather than scrolling (a rendered page is drawn to fit and has nothing to scroll); `g`/`G` jump to the first and last page, and the footer shows `page 5/19`. The page count comes from `pdfinfo` when poppler-utils is installed; without it you can still page forward, just without a known end.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
@@ -42,6 +44,11 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
   for image previews in the preview pane. Neither is required — without them the
   pane falls back to showing the file's details. PDF previews need `timg` built
   with poppler (`timg --version` lists it); `chafa` cannot render PDFs.
+- Optional: `pdfinfo` (poppler-utils) so the preview knows how many pages a PDF
+  has. Without it you can still page forward, just without a known last page.
+- Optional, for pixel-resolution images rather than block approximations: a
+  terminal implementing the kitty graphics protocol or iTerm2 inline images. Under
+  `tmux` this additionally needs `set -g allow-passthrough on`.
 
 ## Installation
 
@@ -167,10 +174,10 @@ focus; `Esc` or `q` hands focus back to the tree while leaving the pane open.
 | Key               | Action                                      |
 |-------------------|---------------------------------------------|
 | `space`           | Open / close the preview                    |
-| `j` / `k`         | Scroll a line                               |
-| `Ctrl+F` / `Ctrl+B` | Scroll a page                             |
+| `j` / `k`         | Scroll a line — or turn the page of a PDF   |
+| `Ctrl+F` / `Ctrl+B` | Scroll a page (or turn a PDF page)        |
 | `Ctrl+D` / `Ctrl+U` | Scroll half a page                        |
-| `g` / `G`         | Jump to the start / end                     |
+| `g` / `G`         | Jump to the start / end (first / last page) |
 | `/`               | Search within the file (regex)              |
 | `n` / `p`         | Next / previous match                       |
 | `N` / `P`         | Previous / next match                       |
@@ -326,22 +333,51 @@ again to close it. The pane shows the file under the cursor and follows it: with
 focus handed back to the tree (`Esc` or `q`), moving the cursor re-reads the
 preview, so you can walk a directory and watch its contents go by.
 
-**Text** is syntax highlighted — around a hundred languages, plus markdown —
-using the file's extension, or its `#!` line when it has no extension. Files
-larger than 256 KB are shown as plain text instead: highlighting them costs more
-than the colors are worth, and the content is what you opened the pane for. Only
+**Text** is syntax highlighted — around a hundred languages — using the file's
+extension, or its `#!` line when it has no extension. Source files larger than
+64 KB are shown as plain text instead: highlighting is linear in the text and a
+4300-line file costs about a quarter of a second, which is not worth the colors
+when the content is what you opened the pane for.
+
+**Markdown** has its own highlighter rather than going through the general one,
+which makes it about four thousand times faster (37µs against 170ms on a 30KB
+README) and so exempt from that size limit. The general grammar embeds every other
+language so that fenced code blocks can be highlighted in their own syntax; that
+is a real feature, and far too slow for something that should feel instant. The
+trade is that fenced code is colored as one block instead of per language. Only
 the first megabyte of a large file is read, and the footer says `truncated` when
 that happened. A **binary** file is reported with its size rather than dumped as
 control characters.
 
-**Images** are drawn as colored terminal blocks by [`timg`](https://timg.sh/) or
+**Images** are drawn by [`timg`](https://timg.sh/) or
 [`chafa`](https://hpjansson.org/chafa/), whichever is on your `PATH` — `timg`
-first, since it renders more formats. A `timg` linked against poppler also draws
-the first page of a **PDF**; `chafa` has no PDF loader, so on a chafa-only machine
-a PDF says so rather than failing with an obscure error. With neither installed
-the pane shows the file's details and explains what is missing. The renderer's
-output is *captured and drawn as part of the interface*, not written to the
-terminal, so previews work inside `tmux` and can never corrupt the display.
+first, since it renders more formats. With neither installed the pane shows the
+file's details and explains what is missing.
+
+How the image reaches the screen depends on the terminal. Where it implements the
+**kitty graphics protocol** (kitty, ghostty, Konsole 22.04+) or **iTerm2 inline
+images** (iTerm2, WezTerm, mintty), the picture is handed over as a real PNG and
+drawn at pixel resolution. Everywhere else it is approximated with Unicode block
+characters, which is universally safe but visibly blocky, since a block packs four
+pixels into one cell and picks two colors for them.
+
+Detection errs towards blocks on purpose: a terminal that does not understand a
+graphics escape *prints* it, so a wrong guess sprays kilobytes of base64 over the
+display. A multiplexer is refused unless it will forward the sequence — for `tmux`
+that means `set -g allow-passthrough on` — and anything unrecognized falls back.
+Force a choice with `MYD_PREVIEW_GRAPHICS=kitty`, `iterm2` or `blocks`.
+
+Block output is *captured and drawn as part of the interface* rather than written
+to the terminal, so it can never corrupt the display. A graphics image necessarily
+does reach the terminal directly: the pane leaves a hole for it and the escape is
+written after the frame.
+
+A **PDF** needs a `timg` linked against poppler; `chafa` has no PDF loader, so on
+a chafa-only machine a PDF says so rather than failing with an obscure error. With
+a multi-page document open, `j`/`k` turn pages instead of scrolling — a rendered
+page is drawn to fit, so there is nothing to scroll — `g`/`G` jump to the first and
+last page, and the footer reads `page 5/19`. The count comes from `pdfinfo`; if
+poppler-utils is not installed you can still page forward, without a known end.
 
 The pane is focusable, which is what lets vi motions mean the pane rather than the
 tree: `j`/`k`, `Ctrl+F`/`Ctrl+B`, `Ctrl+D`/`Ctrl+U`, `g`/`G`. **`/`** searches

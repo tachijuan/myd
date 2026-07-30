@@ -37,6 +37,9 @@ pub struct PreviewKey {
     pub backend: BackendId,
     pub cols: u16,
     pub rows: u16,
+    /// Zero-based page of a multi-page document. Part of the key because turning
+    /// a page means re-rendering.
+    pub page: usize,
 }
 
 /// The preview pane.
@@ -61,6 +64,19 @@ pub struct PreviewState {
     current_match: Option<usize>,
     /// Where the content was last drawn, for mouse hit-testing.
     pub content_area: Option<Rect>,
+    /// Where a graphics image should be drawn, in terminal coordinates.
+    ///
+    /// Recorded during render because only the layout knows it, and read after the
+    /// frame is flushed by the code that writes the escape.
+    pub graphics_area: Option<Rect>,
+    /// Page being shown of a multi-page document, zero-based.
+    ///
+    /// Kept here rather than derived from the content so it survives the reload
+    /// that turning a page causes — the content is dropped while the next page
+    /// renders, and the pane still has to know which page it asked for.
+    page: usize,
+    /// Total pages, once a loaded document reports it.
+    pages: Option<usize>,
 }
 
 impl Default for PreviewState {
@@ -83,6 +99,9 @@ impl PreviewState {
             matches: Vec::new(),
             current_match: None,
             content_area: None,
+            graphics_area: None,
+            page: 0,
+            pages: None,
         }
     }
 
@@ -113,6 +132,18 @@ impl PreviewState {
     /// A search already in place is re-applied, so stepping through a file's
     /// matches survives the re-read that a resize causes.
     pub fn set_content(&mut self, key: PreviewKey, content: PreviewContent) {
+        // Learn the page count, and which page actually came back, from the
+        // document itself. Taking the page from the content rather than trusting
+        // the field keeps the footer honest when a load resolves out of order or
+        // renders a different page than the one last requested.
+        match &content {
+            PreviewContent::Image { pages, page, .. }
+            | PreviewContent::Graphics { pages, page, .. } => {
+                self.pages = *pages;
+                self.page = *page;
+            }
+            _ => self.pages = None,
+        }
         self.search_text = content.search_text();
         self.content = Some(content);
         self.key = Some(key);
@@ -120,6 +151,104 @@ impl PreviewState {
         if let Some(p) = self.pattern.clone() {
             self.apply_search(&p);
         }
+    }
+
+    /// The escape payload of a high-resolution image, if that is what is loaded.
+    ///
+    /// Returned for the event loop to write to the terminal after the frame; the
+    /// pane itself cannot draw it.
+    pub fn graphics(&self) -> Option<&str> {
+        match &self.content {
+            Some(PreviewContent::Graphics { payload, .. }) => Some(payload),
+            _ => None,
+        }
+    }
+
+    /// The document page currently being shown, zero-based.
+    ///
+    /// Named apart from [`Self::page`], which scrolls by a screenful — one is a
+    /// position in a document, the other a movement through text.
+    pub fn current_page(&self) -> usize {
+        self.page
+    }
+
+    /// Whether the pane is showing (or loading) a different file than `path`.
+    ///
+    /// Used to decide when the page number stops meaning anything.
+    pub fn showing_other_path(&self, path: &std::path::Path) -> bool {
+        match &self.key {
+            Some(k) => k.path != path,
+            // Nothing loaded yet: the title is the only clue, and it is only a
+            // file name. Treat that as "not a different file" so opening the pane
+            // does not immediately reset a page the user just chose.
+            None => false,
+        }
+    }
+
+    pub fn reset_page(&mut self) {
+        self.page = 0;
+        self.pages = None;
+    }
+
+    /// Whether the pane is showing something with pages to turn.
+    ///
+    /// An ordinary image reports no page count at all and is not paged: `j`/`k`
+    /// must scroll it, as they do everywhere else. A single-page PDF is likewise
+    /// not paged, or the motions would appear to do nothing. `Some(0)` means a
+    /// paged document of unknown length, which is pageable.
+    pub fn is_paged(&self) -> bool {
+        match self.pages {
+            None => false,
+            Some(0) => true,
+            Some(n) => n > 1,
+        }
+    }
+
+    /// Turn to the next or previous page, clamped.
+    ///
+    /// Returns whether the page changed, so the caller only re-reads when it did.
+    /// Clamping matters: timg renders *something* for a page past the end rather
+    /// than failing, so an unclamped next-page would silently show a blank.
+    pub fn step_page(&mut self, forward: bool) -> bool {
+        if !self.is_paged() {
+            return false;
+        }
+        let next = if forward {
+            match self.pages {
+                // Some(0) is "length unknown", so there is nothing to clamp to.
+                Some(n) if n > 0 && self.page + 1 >= n => return false,
+                _ => self.page + 1,
+            }
+        } else if self.page == 0 {
+            return false;
+        } else {
+            self.page - 1
+        };
+        self.page = next;
+        true
+    }
+
+    /// Jump to the first or last page. Returns whether it moved.
+    pub fn to_page_edge(&mut self, last: bool) -> bool {
+        if !self.is_paged() {
+            return false;
+        }
+        let target = if last {
+            // Without a count there is no known last page, so this is a no-op
+            // rather than a guess.
+            match self.pages {
+                Some(n) if n > 0 => n - 1,
+                // No known last page, so this is a no-op rather than a guess.
+                _ => return false,
+            }
+        } else {
+            0
+        };
+        if target == self.page {
+            return false;
+        }
+        self.page = target;
+        true
     }
 
     /// Visible rows from the last render, falling back before the first frame.
@@ -318,6 +447,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut PreviewState, focused: 
         height: 1,
     };
     state.content_area = Some(content_area);
+    // Only set for graphics, and cleared otherwise, so a stale rect can never
+    // leave an image painted over text.
+    state.graphics_area = matches!(state.content, Some(PreviewContent::Graphics { .. }))
+        .then_some(content_area);
 
     match &state.content {
         None => {
@@ -340,6 +473,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut PreviewState, focused: 
                 Paragraph::new(drawn).scroll((state.scroll as u16, 0)),
                 content_area,
             );
+        }
+        Some(PreviewContent::Graphics { .. }) => {
+            // Deliberately nothing: the terminal draws the image itself, into the
+            // gap this leaves. Writing cells here would be overwritten by the
+            // image, or would overwrite it.
         }
         Some(PreviewContent::Image { lines, .. }) => {
             // Centre the block: the renderers preserve aspect ratio, so the
@@ -382,11 +520,24 @@ fn build_title(state: &PreviewState, total: usize, viewport: usize) -> String {
 fn build_footer(state: &PreviewState, focused: bool) -> Line<'static> {
     let mut spans = Vec::new();
 
-    if let Some(PreviewContent::Image { backend, .. }) = &state.content {
+    let backend = match &state.content {
+        Some(PreviewContent::Image { backend, .. })
+        | Some(PreviewContent::Graphics { backend, .. }) => Some(*backend),
+        _ => None,
+    };
+    if let Some(backend) = backend {
         spans.push(Span::styled(
             format!(" {backend} "),
             Style::default().fg(Color::Cyan),
         ));
+        if state.is_paged() {
+            let label = match state.pages {
+                Some(n) if n > 0 => format!(" page {}/{} ", state.page + 1, n),
+                // Length unknown, so only say where we are.
+                _ => format!(" page {} ", state.page + 1),
+            };
+            spans.push(Span::styled(label, Style::default().fg(CURRENT_MATCH)));
+        }
     }
     if let Some(PreviewContent::Text {
         truncated: true, ..
@@ -406,10 +557,12 @@ fn build_footer(state: &PreviewState, focused: bool) -> Line<'static> {
         spans.push(Span::styled(label, Style::default().fg(CURRENT_MATCH)));
     }
 
-    spans.push(Span::raw(if focused {
-        " j/k scroll  / search  n/p match  space close  Esc unfocus "
-    } else {
+    spans.push(Span::raw(if !focused {
         " Tab to focus  space to close "
+    } else if state.is_paged() {
+        " j/k page  space close  Esc unfocus "
+    } else {
+        " j/k scroll  / search  n/p match  space close  Esc unfocus "
     }));
     Line::from(spans)
 }
@@ -464,6 +617,7 @@ mod tests {
             backend: BackendId::LOCAL,
             cols: 80,
             rows: 24,
+            page: 0,
         }
     }
 
@@ -656,10 +810,118 @@ mod tests {
             PreviewContent::Image {
                 lines: vec![Line::from("▀▀▀")],
                 backend: "timg",
+                page: 0,
+                pages: None,
             },
         );
         let out = draw(&mut s, 60, 10);
         assert!(out.contains("timg"), "{out}");
+    }
+
+    fn pdf(page: usize, pages: Option<usize>) -> PreviewContent {
+        PreviewContent::Image {
+            lines: (0..6).map(|i| Line::from(format!("page row {i}"))).collect(),
+            backend: "timg",
+            page,
+            pages,
+        }
+    }
+
+    /// An ordinary image reports no page count and must scroll, not page —
+    /// otherwise j/k on a tall photo would silently do nothing.
+    #[test]
+    fn a_plain_image_is_not_paged() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), pdf(0, None));
+        assert!(!s.is_paged());
+        assert!(!s.step_page(true), "an image has no pages to turn");
+    }
+
+    /// A one-page PDF is not paged either, for the same reason.
+    #[test]
+    fn a_single_page_document_is_not_paged() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), pdf(0, Some(1)));
+        assert!(!s.is_paged());
+    }
+
+    #[test]
+    fn pages_step_and_clamp_at_both_ends() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), pdf(0, Some(3)));
+        assert!(s.is_paged());
+
+        assert!(!s.step_page(false), "already on the first page");
+        assert_eq!(s.current_page(), 0);
+
+        assert!(s.step_page(true));
+        assert_eq!(s.current_page(), 1);
+        assert!(s.step_page(true));
+        assert_eq!(s.current_page(), 2);
+        // timg renders *something* past the end rather than failing, so the
+        // clamp is what stops a blank page being shown.
+        assert!(!s.step_page(true), "must clamp at the last page");
+        assert_eq!(s.current_page(), 2);
+
+        assert!(s.step_page(false));
+        assert_eq!(s.current_page(), 1);
+    }
+
+    #[test]
+    fn g_and_shift_g_jump_between_first_and_last_page() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), pdf(0, Some(19)));
+        assert!(s.to_page_edge(true));
+        assert_eq!(s.current_page(), 18);
+        assert!(!s.to_page_edge(true), "already there");
+        assert!(s.to_page_edge(false));
+        assert_eq!(s.current_page(), 0);
+    }
+
+    /// Without pdfinfo the length is unknown: paging forward must still work, and
+    /// jumping to the end must not invent a page number.
+    #[test]
+    fn an_unknown_length_document_pages_forward_but_has_no_end() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), pdf(0, Some(0)));
+        assert!(s.is_paged());
+        assert!(s.step_page(true));
+        assert_eq!(s.current_page(), 1);
+        assert!(!s.to_page_edge(true), "no known last page to jump to");
+    }
+
+    /// The page number means nothing once a different file is shown.
+    #[test]
+    fn the_page_resets_for_another_file() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), pdf(0, Some(5)));
+        s.step_page(true);
+        assert_eq!(s.current_page(), 1);
+
+        assert!(s.showing_other_path(std::path::Path::new("/tmp/other.pdf")));
+        s.reset_page();
+        assert_eq!(s.current_page(), 0);
+        assert!(!s.showing_other_path(std::path::Path::new("/tmp/a.txt")));
+    }
+
+    #[test]
+    fn the_footer_shows_the_page_position() {
+        let mut s = PreviewState::new();
+        s.begin_load("spec.pdf".to_string());
+        s.set_content(key(), pdf(4, Some(19)));
+        let out = draw(&mut s, 70, 14);
+        assert!(out.contains("page 5/19"), "{out}");
+    }
+
+    /// With no count, show where we are without claiming a total.
+    #[test]
+    fn the_footer_omits_an_unknown_page_total() {
+        let mut s = PreviewState::new();
+        s.begin_load("spec.pdf".to_string());
+        s.set_content(key(), pdf(2, Some(0)));
+        let out = draw(&mut s, 70, 14);
+        assert!(out.contains("page 3"), "{out}");
+        assert!(!out.contains("page 3/"), "should not claim a total: {out}");
     }
 
     #[test]

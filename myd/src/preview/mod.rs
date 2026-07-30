@@ -10,7 +10,9 @@
 //! fails or, worse, silently describes an unrelated local file that happens to
 //! share the name.
 
+pub mod graphics;
 pub mod image;
+pub mod markdown;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,11 +34,15 @@ const SNIFF_BYTES: usize = 8192;
 
 /// Largest file that gets syntax highlighting.
 ///
-/// Highlighting is superlinear in practice and grammar-dependent: syntect's
-/// markdown grammar costs ~170ms on a 25KB file where Rust costs ~40ms, both in
-/// release. Past this size the pane shows plain text immediately instead of
-/// making the user wait — the content is what matters, the colours are a bonus.
-const MAX_HIGHLIGHT_BYTES: usize = 256 * 1024;
+/// syntect's cost is linear in the text it is given and not cheap: ~264ms for a
+/// 4300-line Rust file, against 6.5ms for the first 200 lines of it. Past this
+/// size the pane shows plain text immediately rather than making the user wait,
+/// since the content is the point and the colours are a bonus.
+///
+/// 64KB is roughly 1500 lines of source — comfortably more than anyone reads in
+/// a preview, and about 90ms in the worst grammar measured. Markdown does not go
+/// through syntect at all (see [`markdown`]), so this only bounds code.
+const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 
 /// Largest remote file that will be staged to disk for image rendering.
 ///
@@ -56,6 +62,29 @@ pub enum PreviewContent {
         lines: Vec<Line<'static>>,
         /// Which tool drew it, for the footer.
         backend: &'static str,
+        /// Zero-based page this is, for a multi-page document.
+        page: usize,
+        /// Total pages when this is a paged document at all.
+        ///
+        /// `None` means "not paged" — an ordinary image, where `j`/`k` must
+        /// scroll rather than try to turn a page. A paged document whose length
+        /// could not be determined reports `Some(0)`, which says "there are pages,
+        /// but I do not know how many".
+        pages: Option<usize>,
+    },
+    /// A real image, as escape data the terminal must receive verbatim.
+    ///
+    /// Kept out of the frame on purpose: kitty and iTerm2 graphics are base64
+    /// payloads, not cells, so the widget leaves a blank hole and the escape is
+    /// written to stdout after the frame. See [`graphics`].
+    Graphics {
+        /// The renderer's raw output, ready to be written to the terminal.
+        payload: String,
+        /// Rows the image occupies, so the pane can size the hole it leaves.
+        rows: u16,
+        backend: &'static str,
+        page: usize,
+        pages: Option<usize>,
     },
     /// Nothing to show, with the reason: a binary file, no renderer installed,
     /// a file too large to stage.
@@ -67,6 +96,8 @@ impl PreviewContent {
     pub fn len(&self) -> usize {
         match self {
             PreviewContent::Text { lines, .. } | PreviewContent::Image { lines, .. } => lines.len(),
+            // The image is drawn by the terminal, not scrolled by us.
+            PreviewContent::Graphics { rows, .. } => *rows as usize,
             PreviewContent::Note { .. } => 1,
         }
     }
@@ -100,6 +131,9 @@ pub struct PreviewRequest {
     pub label: PathBuf,
     pub cols: u16,
     pub rows: u16,
+    /// Which page of a multi-page document to render, zero-based. Ignored for
+    /// everything else.
+    pub page: usize,
 }
 
 /// Load a preview. Blocking on the calling task; run it on a worker.
@@ -243,15 +277,44 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
         .unwrap_or_else(|| req.path.as_path().to_path_buf());
 
     let (cols, rows) = (req.cols, req.rows);
+    let page = req.page;
     // The tools take 80-130ms on real files. That is several frames, so it goes
-    // to a blocking worker even though we are already off the event loop.
-    let rendered =
-        tokio::task::spawn_blocking(move || image::render(backend, &render_path, cols, rows))
-            .await?;
+    // to a blocking worker even though we are already off the event loop. The
+    // page count is asked for on the same worker, since it is another process.
+    let probe = render_path.clone();
+    // Only a paged format is asked for a page count; an ordinary image reports
+    // `None`, which is what tells the pane to scroll rather than page.
+    let paged = filetype::is_pdf(label);
+    let protocol = graphics::protocol();
+    let (rendered, pages) = tokio::task::spawn_blocking(move || {
+        (
+            image::render(backend, &render_path, cols, rows, page, protocol),
+            // `Some(0)` = paged but the length is unknown.
+            paged.then(|| image::page_count(&probe).unwrap_or(0)),
+        )
+    })
+    .await?;
     // Keep the staged file alive until the renderer has finished with it.
     drop(staged);
 
     Ok(match rendered {
+        // A graphics protocol's output is opaque escape data; it cannot be parsed
+        // into cells and must reach the terminal as-is.
+        image::Rendered::Ansi(text) if protocol.is_graphics() => {
+            if text.trim().is_empty() {
+                PreviewContent::Note {
+                    message: format!("{} produced no output.", backend.binary()),
+                }
+            } else {
+                PreviewContent::Graphics {
+                    payload: text,
+                    rows,
+                    backend: backend.binary(),
+                    page,
+                    pages,
+                }
+            }
+        }
         image::Rendered::Ansi(text) => {
             let lines = ansi::parse_ansi(&text);
             if lines.is_empty() {
@@ -262,6 +325,8 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
                 PreviewContent::Image {
                     lines,
                     backend: backend.binary(),
+                    page,
+                    pages,
                 }
             }
         }
@@ -294,11 +359,15 @@ fn highlight(path: &Path, text: &str) -> Vec<Line<'static>> {
         (syntaxes, theme)
     });
 
-    // Markdown has its own grammar; otherwise go by extension, then by the first
-    // line, which catches a `#!/bin/sh` with no extension at all.
-    let syntax = if filetype::is_markdown(path) {
-        syntaxes.find_syntax_by_extension("md")
-    } else {
+    // Markdown gets a purpose-built highlighter: syntect's markdown grammar
+    // embeds every other language so fenced blocks can be highlighted in their
+    // own syntax, which costs ~170ms on a 30KB README where the hand-rolled pass
+    // costs ~37us. A preview has to feel instant.
+    if filetype::is_markdown(path) {
+        return markdown::highlight(text);
+    }
+
+    let syntax = {
         path.extension()
             .and_then(|e| e.to_str())
             .and_then(|e| syntaxes.find_syntax_by_extension(e))
@@ -363,7 +432,7 @@ fn strip_eol(s: &str) -> &str {
 }
 
 /// Tabs would otherwise be drawn as a single cell, wrecking indentation.
-fn expand_tabs(line: &str) -> String {
+pub(crate) fn expand_tabs(line: &str) -> String {
     if !line.contains('\t') {
         return line.to_string();
     }
@@ -424,10 +493,32 @@ mod tests {
         }
     }
 
-    /// A large file must show up as plain text rather than making the user wait
-    /// on the highlighter. Uses markdown, the slowest grammar measured.
+    /// A large source file must show up as plain text rather than making the user
+    /// wait on syntect, whose cost is linear in the text it is handed.
     #[test]
     fn a_large_file_skips_highlighting() {
+        let big = "fn f() { let x = 1; }\n".repeat(20_000);
+        assert!(big.len() > MAX_HIGHLIGHT_BYTES);
+
+        let t = std::time::Instant::now();
+        let lines = highlight(Path::new("big.rs"), &big);
+        let elapsed = t.elapsed();
+
+        assert_eq!(lines.len(), 20_000, "every line must still be shown");
+        // Plain text: no colour anywhere.
+        assert!(lines[0].spans.iter().all(|s| s.style.fg.is_none()));
+        // Generous, since this also runs in debug — highlighting this much text
+        // takes seconds.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "skipping highlighting should be fast, took {elapsed:?}"
+        );
+    }
+
+    /// Markdown does not go through syntect, so the byte cap must not apply to
+    /// it — a big README should still be coloured, and still be fast.
+    #[test]
+    fn a_large_markdown_file_is_still_highlighted_and_fast() {
         let big = "# heading with `code` and *emphasis*\n".repeat(20_000);
         assert!(big.len() > MAX_HIGHLIGHT_BYTES);
 
@@ -435,14 +526,14 @@ mod tests {
         let lines = highlight(Path::new("big.md"), &big);
         let elapsed = t.elapsed();
 
-        assert_eq!(lines.len(), 20_000, "every line must still be shown");
-        // Plain text: one span per line and no colour.
-        assert!(lines[0].spans.iter().all(|s| s.style.fg.is_none()));
-        // Generous, since this also runs in debug — the highlighted path takes
-        // seconds on far less text than this.
+        assert_eq!(lines.len(), 20_000);
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "skipping highlighting should be fast, took {elapsed:?}"
+            lines[0].spans.iter().any(|s| s.style.fg.is_some()),
+            "markdown should still be highlighted past the syntect cap"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "markdown highlighting took {elapsed:?}"
         );
     }
 
@@ -499,6 +590,8 @@ mod tests {
         let c = PreviewContent::Image {
             lines: vec![Line::from("▀▄")],
             backend: "timg",
+            page: 0,
+            pages: None,
         };
         assert!(c.search_text().is_empty());
     }

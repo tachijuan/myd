@@ -1804,6 +1804,27 @@ async fn settle_all(app: &mut myd::app::FileBrowser) {
     panic!("dual-panel loading never resolved");
 }
 
+/// Drive ticks until a copy's destination listing has been resolved.
+///
+/// Pressing `c` onto a destination does not decide anything straight away: the
+/// destination is listed in a background task and the collision prompt — or the
+/// queueing, when there is no collision — happens on a later tick. Asserting
+/// immediately races that listing and fails whenever it loses, which under a
+/// loaded parallel test run happens often enough to matter.
+///
+/// Waits for the probe to clear rather than for a modal to appear, since the
+/// no-collision case is expected to produce no modal at all.
+async fn settle_copy(app: &mut myd::app::FileBrowser) {
+    for _ in 0..400 {
+        app.tick_for_test();
+        if !app.dest_probe_pending_for_test() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("destination listing never resolved");
+}
+
 fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     use crossterm::event::{KeyEvent, KeyModifiers};
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -7405,6 +7426,7 @@ async fn a_single_panel_copy_destination_is_not_canonicalized_locally() {
     // Single panel: `c` prompts for a destination directory.
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
     assert_eq!(app.modal_kind_for_test(), "input", "expected the destination prompt");
 
     for ch in link.to_string_lossy().chars() {
@@ -7493,6 +7515,7 @@ async fn a_transfer_onto_an_existing_file_asks_first() {
     // Copy the remote file into the local pane, which already has that name.
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
 
     assert_eq!(
         app.modal_kind_for_test(),
@@ -7540,6 +7563,7 @@ async fn a_typed_transfer_destination_is_checked_for_collisions() {
 
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
     assert_eq!(app.modal_kind_for_test(), "input", "expected the path prompt");
     for ch in dest.path().to_string_lossy().chars() {
         app.handle_key_for_test(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -7644,6 +7668,7 @@ async fn tab_in_the_overwrite_prompt_does_not_confirm() {
 
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
     assert_eq!(app.modal_kind_for_test(), "confirm", "expected the prompt");
 
     // Tab: focus moves, the dialog stays up, nothing is decided.
@@ -7691,6 +7716,7 @@ async fn a_confirmed_transfer_overwrite_proceeds_and_a_clear_name_is_not_asked()
 
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
     assert_eq!(app.modal_kind_for_test(), "confirm");
     app.handle_key_for_test(char_key('y'));
 
@@ -7716,6 +7742,7 @@ async fn a_confirmed_transfer_overwrite_proceeds_and_a_clear_name_is_not_asked()
 
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
     assert_eq!(
         app.modal_kind_for_test(),
         "none",
@@ -7801,6 +7828,7 @@ async fn a_local_destination_typed_from_a_remote_panel_stays_local() {
 
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
     assert_eq!(app.modal_kind_for_test(), "input", "expected the destination prompt");
 
     for ch in dest.path().to_string_lossy().chars() {
@@ -10473,6 +10501,7 @@ async fn test_a_remote_preview_reads_through_the_vfs() {
             label: shared.clone(),
             cols: 60,
             rows: 20,
+            page: 0,
         },
     )
     .await;
@@ -10515,4 +10544,180 @@ async fn help_documents_the_preview_keys() {
         text.contains("Search within the file"),
         "the pane's search is not documented:\n{text}"
     );
+}
+
+/// Markdown must be effectively instant. syntect's markdown grammar embeds every
+/// other language for fenced code blocks and took ~170ms on a 30KB README, which
+/// is what the hand-rolled highlighter exists to avoid.
+#[tokio::test]
+async fn a_markdown_preview_opens_immediately() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Big enough that a slow highlighter would show, and representative: headings,
+    // fenced code, inline markup, links and tables.
+    let body = "# Title\n\nSome *text* with `code` and [a link](https://x.y).\n\n\
+                | a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n"
+        .repeat(200);
+    std::fs::write(dir.path().join("big.md"), &body).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+
+    let started = std::time::Instant::now();
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    let elapsed = started.elapsed();
+
+    let out = screen_text(&mut app, 100, 30);
+    assert!(out.contains("Title"), "content missing:\n{out}");
+    // Generous for a debug build on a loaded machine; syntect took over a second
+    // on this much markdown, so the margin still catches a regression.
+    assert!(
+        elapsed < std::time::Duration::from_millis(900),
+        "markdown preview took {elapsed:?}, which is not instant"
+    );
+}
+
+/// On a multi-page PDF, `j`/`k` turn pages rather than scrolling — a rendered page
+/// is drawn to fit and has nothing to scroll.
+#[tokio::test]
+async fn pdf_previews_turn_pages_with_j_and_k() {
+    use myd::app::FileBrowser;
+
+    let src = std::path::Path::new("/usr/share/doc/shared-mime-info/shared-mime-info-spec.pdf");
+    if !src.exists() {
+        eprintln!("no multi-page PDF on this machine; skipping");
+        return;
+    }
+    // Needs a timg built with poppler; chafa cannot render PDFs at all.
+    let caps = myd::preview::image::capabilities();
+    if caps.backend_for(src).is_none() {
+        eprintln!("no PDF renderer available; skipping");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(src, dir.path().join("doc.pdf")).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    // Render before opening: the geometry an image is rendered at comes from the
+    // last frame, so without one the pane has no size to ask for.
+    screen_text(&mut app, 110, 34);
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    assert!(
+        app.preview_is_paged_for_test(),
+        "a 19-page PDF must be treated as paged"
+    );
+    assert_eq!(app.preview_page_for_test(), 0, "starts on the first page");
+
+    // Each turn is a re-render. Waiting for "has content" would return at once,
+    // since the previous page is still loaded — wait for the page the pane reports
+    // to actually be the one asked for.
+    async fn turn(app: &mut FileBrowser, k: char) {
+        let before = app.preview_page_for_test();
+        app.handle_key_for_test(char_key(k));
+        let want = app.preview_page_for_test();
+        if want == before {
+            return; // clamped: nothing will be re-rendered
+        }
+        for _ in 0..400 {
+            app.tick_for_test();
+            // Re-render each time: the geometry a page is rendered at comes from
+            // the last frame, and the tick is what starts the next load.
+            screen_text(app, 110, 34);
+            if app.preview_has_content_for_test() && app.preview_page_for_test() == want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("page {want} never rendered");
+    }
+
+    turn(&mut app, 'j').await;
+    assert_eq!(app.preview_page_for_test(), 1, "j should turn the page");
+    turn(&mut app, 'j').await;
+    assert_eq!(app.preview_page_for_test(), 2);
+    turn(&mut app, 'k').await;
+    assert_eq!(app.preview_page_for_test(), 1, "k should go back");
+
+    // Back at the first page, k must stop rather than wrap or go negative.
+    turn(&mut app, 'k').await;
+    assert_eq!(app.preview_page_for_test(), 0);
+    turn(&mut app, 'k').await;
+    assert_eq!(app.preview_page_for_test(), 0, "must clamp at the first page");
+
+    // The footer says where we are.
+    let out = screen_text(&mut app, 110, 34);
+    assert!(out.contains("page 1/"), "no page indicator:\n{out}");
+}
+
+/// An ordinary image has no pages, so the motions must still scroll it — paging a
+/// single image would look like the keys were dead.
+#[tokio::test]
+async fn image_previews_are_not_paged() {
+    use myd::app::FileBrowser;
+
+    let src = std::path::Path::new("/usr/share/pixmaps/ubuntu-logo-text.png");
+    if !src.exists() || myd::preview::image::capabilities().backend_for(src).is_none() {
+        eprintln!("no image renderer available; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(src, dir.path().join("logo.png")).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    screen_text(&mut app, 110, 34);
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    assert!(
+        !app.preview_is_paged_for_test(),
+        "a plain image must not be treated as a paged document"
+    );
+    // And j does not move the page.
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.preview_page_for_test(), 0);
+}
+
+/// Graphics detection must refuse a terminal that cannot be shown to support the
+/// protocol — a mis-detection sprays base64 across the display.
+#[test]
+fn graphics_detection_is_conservative() {
+    use myd::preview::graphics::{EnvVars, Protocol, detect};
+
+    // A plain terminal, and the case on a machine running tmux without
+    // passthrough: both must fall back to blocks.
+    let plain = EnvVars {
+        term: Some("xterm-256color".into()),
+        ..Default::default()
+    };
+    assert_eq!(detect(&plain), Protocol::Blocks);
+
+    let tmux_off = EnvVars {
+        term: Some("screen-256color".into()),
+        kitty_window_id: Some("1".into()),
+        tmux: Some("/tmp/tmux-1000/default,1,0".into()),
+        tmux_passthrough: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        detect(&tmux_off),
+        Protocol::Blocks,
+        "graphics must not be sent through a tmux that will not forward them"
+    );
+
+    // And a terminal that does support it gets the high-resolution path.
+    let kitty = EnvVars {
+        term: Some("xterm-kitty".into()),
+        ..Default::default()
+    };
+    assert_eq!(detect(&kitty), Protocol::Kitty);
 }

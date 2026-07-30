@@ -127,10 +127,10 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             title: "Preview",
             items: &[
                 ("space", "Show / hide the file preview"),
-                ("j / k", "Scroll a line (while focused)"),
-                ("Ctrl+F/B", "Scroll a page"),
+                ("j / k", "Scroll a line, or turn a PDF page"),
+                ("Ctrl+F/B", "Scroll a page (or turn one)"),
                 ("Ctrl+D/U", "Scroll half a page"),
-                ("g / G", "Jump to the start / end"),
+                ("g / G", "Start / end, or first / last page"),
                 ("/", "Search within the file (regex)"),
                 ("n / p", "Next / previous match"),
                 ("N / P", "Previous / next match"),

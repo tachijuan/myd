@@ -242,6 +242,13 @@ pub struct FileBrowser {
     /// Moving the cursor supersedes a load rather than queueing behind it, or a
     /// held-down `j` would replay every file it passed over.
     preview_task: Option<PreviewTask>,
+    /// What high-resolution image is currently on the terminal: where it was put,
+    /// how big its payload was, and which page it was.
+    ///
+    /// Graphics escapes are written outside the frame, so nothing tracks them for
+    /// us. Without this the idle 10Hz loop would re-send the whole payload every
+    /// tick, which flickers and floods the terminal.
+    preview_graphics_shown: Option<(ratatui::layout::Rect, usize, usize)>,
 }
 
 /// A preview load running in the background.
@@ -394,6 +401,7 @@ impl FileBrowser {
             preview_open: false,
             preview_focused: false,
             preview_task: None,
+            preview_graphics_shown: None,
         }
     }
 
@@ -574,6 +582,11 @@ impl FileBrowser {
 
             let after_resolve = trace_started_now(tick_started);
             terminal.draw(|f| self.draw(f))?;
+            // A high-resolution image is escape data the terminal draws itself, so
+            // it can only go out after the frame has been flushed — ratatui would
+            // otherwise overwrite the cells it lands on. The pane leaves a blank
+            // hole for it during draw.
+            self.flush_preview_graphics();
 
             // Only log slow ticks: an idle loop runs at 10Hz and would otherwise
             // bury the interesting entries.
@@ -1102,6 +1115,17 @@ impl FileBrowser {
         self.request_preview();
     }
 
+    /// Whether a copy destination is still being listed in the background.
+    ///
+    /// Pressing `c` does not decide anything immediately: the destination is
+    /// listed off the event loop and the collision prompt (or the queueing) only
+    /// happens once `resolve_dest_probe` sees the result. A test that asserts
+    /// straight after the keypress races that listing, so it needs to be able to
+    /// wait for it.
+    pub fn dest_probe_pending_for_test(&self) -> bool {
+        self.dest_probe.is_some()
+    }
+
     /// Whether the preview pane is open, and whether it has focus (for tests).
     pub fn preview_open_for_test(&self) -> bool {
         self.preview_open
@@ -1124,6 +1148,16 @@ impl FileBrowser {
     /// The line the current search match sits on.
     pub fn preview_match_line_for_test(&self) -> Option<usize> {
         self.preview.current_match_line()
+    }
+
+    /// The document page the preview is showing, zero-based (for tests).
+    pub fn preview_page_for_test(&self) -> usize {
+        self.preview.current_page()
+    }
+
+    /// Whether the preview is treating its content as a paged document.
+    pub fn preview_is_paged_for_test(&self) -> bool {
+        self.preview.is_paged()
     }
 
     /// Whether a preview has finished loading and has content to draw.
@@ -1556,11 +1590,17 @@ impl FileBrowser {
         };
         let backend = self.panels[self.active].backend;
         let (cols, rows) = self.preview_cells();
+        // Moving to a different file starts at its first page, rather than
+        // carrying over a page number that meant something in another document.
+        if self.preview.showing_other_path(&path) {
+            self.preview.reset_page();
+        }
         let key = crate::widget::preview::PreviewKey {
             path: path.clone(),
             backend,
             cols,
             rows,
+            page: self.preview.current_page(),
         };
 
         // Already showing it, or already fetching it.
@@ -1588,6 +1628,7 @@ impl FileBrowser {
             label: path,
             cols,
             rows,
+            page: key.page,
         };
         let flag = cancel.clone();
         tokio::spawn(async move {
@@ -1603,6 +1644,61 @@ impl FileBrowser {
         });
 
         self.preview_task = Some(PreviewTask { key, rx, cancel });
+    }
+
+    /// Write a high-resolution preview image to the terminal.
+    ///
+    /// Must run *after* `terminal.draw` has flushed: kitty and iTerm2 graphics are
+    /// escape payloads rather than cells, so ratatui knows nothing about them and
+    /// would paint over the area on the next frame. The pane leaves that area blank
+    /// on purpose (see [`crate::widget::preview`]).
+    ///
+    /// Only emitted when something changed. The event loop runs at 10Hz even when
+    /// idle, and re-sending a few hundred kilobytes of base64 every tick would
+    /// flood the terminal and make the image flicker.
+    fn flush_preview_graphics(&mut self) {
+        use std::io::Write;
+
+        let wanted = match (&self.preview.graphics_area, self.preview.graphics()) {
+            (Some(area), Some(payload)) if self.preview_open => Some((*area, payload)),
+            _ => None,
+        };
+
+        let Some((area, payload)) = wanted else {
+            // Nothing to show. If an image is still on screen, the frame that just
+            // drew has already painted over its cells, so there is nothing to
+            // erase — just forget it so the next one is emitted.
+            self.preview_graphics_shown = None;
+            return;
+        };
+
+        // Identify what is on screen by where it is and what it is, so a resize,
+        // a page turn or a different file all re-emit, and an idle tick does not.
+        let stamp = (area, payload.len(), self.preview.current_page());
+        if self.preview_graphics_shown == Some(stamp) {
+            return;
+        }
+
+        let mut out = std::io::stdout();
+        // Place the cursor at the top-left of the hole: both protocols draw from
+        // the cursor position.
+        let mut seq = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
+        seq.push_str(payload);
+
+        // tmux only forwards an unknown sequence when it is wrapped, and detection
+        // already refused graphics unless it will.
+        if std::env::var_os("TMUX").is_some() {
+            seq = format!(
+                "\x1b[{};{}H{}",
+                area.y + 1,
+                area.x + 1,
+                crate::preview::graphics::wrap_for_tmux(payload)
+            );
+        }
+
+        if out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok() {
+            self.preview_graphics_shown = Some(stamp);
+        }
     }
 
     /// Install a finished preview load. Called once per tick.
@@ -1637,15 +1733,25 @@ impl FileBrowser {
         }
 
         // The pane's own paging keys shadow the tree's, which is the point of
-        // focus: Ctrl+F pages whatever the user is looking at.
+        // focus: Ctrl+F pages whatever the user is looking at. On a multi-page
+        // document that means a document page, not a screenful.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let paged = self.preview.is_paged();
             match key.code {
                 KeyCode::Char('f') => {
-                    self.preview.page(true);
+                    if paged {
+                        self.preview.step_page(true);
+                    } else {
+                        self.preview.page(true);
+                    }
                     return Some(true);
                 }
                 KeyCode::Char('b') => {
-                    self.preview.page(false);
+                    if paged {
+                        self.preview.step_page(false);
+                    } else {
+                        self.preview.page(false);
+                    }
                     return Some(true);
                 }
                 KeyCode::Char('d') => {
@@ -1658,6 +1764,31 @@ impl FileBrowser {
                 }
                 // Anything else Ctrl- falls through to the global bindings.
                 _ => return None,
+            }
+        }
+
+        // A rendered page has nothing to scroll — it is drawn to fit — so on a
+        // multi-page document the motions turn pages instead. Requesting the new
+        // page is left to the tick, which already reloads when the key changes.
+        if self.preview.is_paged() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                    self.preview.step_page(true);
+                    return Some(true);
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                    self.preview.step_page(false);
+                    return Some(true);
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    self.preview.to_page_edge(false);
+                    return Some(true);
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    self.preview.to_page_edge(true);
+                    return Some(true);
+                }
+                _ => {}
             }
         }
 
