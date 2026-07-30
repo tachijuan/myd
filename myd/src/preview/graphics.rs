@@ -631,6 +631,85 @@ pub fn cell_size() -> Option<(u16, u16)> {
     decision().2
 }
 
+/// Whether iTerm2 can decode this file itself, so its own bytes can be sent.
+///
+/// iTerm2's inline-image escape carries a *file*, in whatever format the
+/// terminal can open — it does not require PNG. That matters for size: timg
+/// re-encodes everything as PNG, and a photograph is the worst case for PNG.
+/// A 537KB JPEG became a 1.7MB PNG, 2.3MB once base64'd, where sending the
+/// original costs 716KB and looks better for not being re-encoded twice.
+///
+/// Deliberately conservative: only formats iTerm2 is known to decode, and only
+/// still images. Anything else goes through the renderer as before.
+pub fn iterm_decodes_natively(path: &std::path::Path) -> bool {
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "heic"
+    )
+}
+
+/// Build an iTerm2 inline-image escape around a file's own bytes.
+///
+/// The size is stated the same way [`pin_to_cells`] states it, so the image
+/// occupies exactly the pane whichever route it took.
+pub fn iterm_escape_for_file(bytes: &[u8], cols: u16, rows: u16) -> String {
+    use std::fmt::Write as _;
+
+    let size = match cell_size() {
+        Some((cw, ch)) => format!(
+            "width={}px;height={}px",
+            u32::from(cols) * u32::from(cw),
+            u32::from(rows) * u32::from(ch)
+        ),
+        None => format!("width={cols};height={rows}"),
+    };
+    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 128);
+    let _ = write!(
+        out,
+        "\x1b]1337;File=size={};{};preserveAspectRatio=1;inline=1:",
+        bytes.len(),
+        size
+    );
+    out.push_str(&base64_encode(bytes));
+    out.push('\x07');
+    out
+}
+
+/// Standard base64, which is what the escape expects.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Pin a graphics payload to an exact size in terminal cells.
 ///
 /// This is what keeps an image inside its pane. timg describes the image in
@@ -1696,6 +1775,65 @@ mod tests {
         assert!(
             payload_fits(1_731_194, true),
             "a correctly-sized render must not be thrown away"
+        );
+    }
+
+    /// timg re-encodes everything as PNG, which is the worst case for a
+    /// photograph: a 537KB JPEG became a 1.7MB PNG and 2.3MB once base64'd.
+    /// iTerm2 decodes the file itself, so its own bytes go over instead.
+    #[test]
+    fn iterm_takes_the_file_in_its_own_format() {
+        for name in ["a.jpg", "a.JPEG", "b.png", "c.gif", "d.webp", "e.heic"] {
+            assert!(
+                iterm_decodes_natively(std::path::Path::new(name)),
+                "{name} should be sent as-is"
+            );
+        }
+        // Anything that needs rendering, or whose format iTerm2 may not open,
+        // still goes through the renderer.
+        for name in ["a.pdf", "b.svg", "c.psd", "d.xcf", "noext", "e.mp4"] {
+            assert!(
+                !iterm_decodes_natively(std::path::Path::new(name)),
+                "{name} must not be sent as-is"
+            );
+        }
+    }
+
+    /// The escape must be well-formed and state the size the same way the
+    /// rendered path does, or the image is placed differently by route.
+    #[test]
+    fn a_native_iterm_escape_is_well_formed() {
+        let esc = iterm_escape_for_file(b"foobar", 140, 37);
+        assert!(esc.starts_with("\x1b]1337;File=size=6;"));
+        assert!(esc.contains("preserveAspectRatio=1"));
+        assert!(esc.ends_with('\x07'));
+        assert!(is_complete(&esc), "must be a complete sequence");
+        // The body is the file's bytes, base64'd.
+        assert_eq!(esc.split_once(':').unwrap().1.trim_end_matches('\x07'), "Zm9vYmFy");
+    }
+
+    /// Standard base64, checked against RFC 4648's own vectors — a wrong
+    /// encoding is a blank image, not an error.
+    #[test]
+    fn the_base64_encoder_is_correct() {
+        for (input, want) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input), want, "encoding {input:?}");
+        }
+        // Every byte value round-trips through the alphabet cleanly.
+        let all: Vec<u8> = (0..=255u8).collect();
+        let out = base64_encode(&all);
+        assert_eq!(out.len(), all.len().div_ceil(3) * 4);
+        assert!(
+            out.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=')
         );
     }
 
