@@ -322,8 +322,11 @@ pub fn render(
         let (mut c, mut r) = (cols, rows);
         for _ in 0..MAX_SHRINK_STEPS {
             match attempt {
+                // Judged per escape sequence, not on the total: a chunked
+                // protocol carries a large image as many small escapes, and none
+                // of them is what a multiplexer refuses.
                 Ok((true, ref stdout, _))
-                    if !super::graphics::payload_fits(stdout.len(), true) => {}
+                    if !super::graphics::sequences_fit(stdout, true) => {}
                 _ => break,
             }
             // Never below a size worth looking at; a tiny thumbnail is no more

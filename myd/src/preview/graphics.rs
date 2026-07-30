@@ -207,10 +207,7 @@ pub fn decide(env: &EnvVars, probed: Option<Probed>) -> Decision {
 
     // Inside a multiplexer the sequence has to survive being forwarded.
     if env.tmux.is_some() {
-        // tmux parses and re-emits sixel itself, so it needs no passthrough —
-        // this is the only protocol that works in a default tmux. It is
-        // preferred here even though kitty and iTerm2 look better, because
-        // working beats looking good.
+        // tmux parses and re-emits sixel itself, so it needs no passthrough.
         if caps.sixel {
             return Decision(Protocol::Sixel, None, cell);
         }
@@ -222,7 +219,19 @@ pub fn decide(env: &EnvVars, probed: Option<Probed>) -> Decision {
                 cell,
             );
         }
-        return Decision(preferred(env, &caps), None, cell);
+        // kitty's protocol, even on a terminal whose own protocol is iTerm2's.
+        //
+        // This is about how the image is *carried*, not which terminal is at the
+        // far end. kitty splits an image into ~4KB chunks, each its own escape,
+        // where iTerm2 sends one sequence however large — and a large single
+        // sequence is what a multiplexer will not deliver. Confirmed directly:
+        // `timg` run inside this tmux draws nothing for a large photo or a PDF
+        // page unless forced to `-pk`, at which point both appear.
+        //
+        // iTerm2 understands kitty's protocol, so this costs nothing there and
+        // removes the size ceiling that forced previews to be shrunk until they
+        // were unreadable.
+        return Decision(Protocol::Kitty, None, cell);
     }
 
     // GNU screen has no passthrough worth relying on. (tmux also sets
@@ -930,6 +939,21 @@ pub fn payload_fits(bytes: usize, in_multiplexer: bool) -> bool {
     !in_multiplexer || bytes <= multiplexed_payload_limit()
 }
 
+/// Whether a rendered payload will survive a multiplexer.
+///
+/// The limit is per *escape sequence*, not per image, which is the whole reason
+/// the chunked protocol is used inside tmux: kitty splits an image into ~4KB
+/// pieces, so a multi-megabyte picture is hundreds of small escapes and none of
+/// them is near the ceiling. Measuring the total instead is what shrank images
+/// until they were unreadable — the total was never the thing being refused.
+pub fn sequences_fit(payload: &str, in_multiplexer: bool) -> bool {
+    if !in_multiplexer {
+        return true;
+    }
+    let limit = multiplexed_payload_limit();
+    split_sequences(payload).into_iter().all(|s| s.len() <= limit)
+}
+
 /// The limit in force, allowing for an override.
 ///
 /// [`MAX_MULTIPLEXED_PAYLOAD`] comes from bisecting one terminal, and another
@@ -1154,8 +1178,13 @@ mod tests {
         assert_eq!(*decide(&e, None), Protocol::Iterm2);
     }
 
-    /// tmux overwrites `TERM_PROGRAM` with its own name, so the same fallback is
-    /// what identifies iTerm2 inside a multiplexer.
+    /// tmux overwrites `TERM_PROGRAM` with its own name, so `LC_TERMINAL` is
+    /// what identifies the terminal inside a multiplexer — without it the
+    /// terminal looks incapable and previews fall back to blocks.
+    ///
+    /// The protocol chosen is kitty's rather than iTerm2's: through a
+    /// multiplexer what matters is that the image is carried in small chunks,
+    /// not which terminal is at the far end. See the tmux arm of `decide`.
     #[test]
     fn tmux_does_not_hide_the_terminal_behind_its_own_name() {
         let e = EnvVars {
@@ -1166,7 +1195,37 @@ mod tests {
             tmux_passthrough: true,
             ..env()
         };
-        assert_eq!(*decide(&e, None), Protocol::Iterm2);
+        // Recognised as capable at all — the bug this test was written for.
+        assert_ne!(*decide(&e, None), Protocol::Blocks);
+        // And carried in chunks, which is what survives the trip.
+        assert_eq!(*decide(&e, None), Protocol::Kitty);
+    }
+
+    /// A large image is delivered through tmux only when it is chunked. timg
+    /// run inside tmux draws nothing for a photo or a PDF page unless forced to
+    /// `-pk`; iTerm2's single-sequence form is what was being dropped.
+    #[test]
+    fn tmux_always_uses_the_chunked_protocol() {
+        for lc in ["iTerm2", "WezTerm", "kitty"] {
+            let e = EnvVars {
+                term: Some("screen-256color".into()),
+                term_program: Some("tmux".into()),
+                lc_terminal: Some(lc.into()),
+                tmux: Some("/tmp/tmux-1000/default,1,0".into()),
+                tmux_passthrough: true,
+                ..env()
+            };
+            assert_eq!(*decide(&e, None), Protocol::Kitty, "{lc} under tmux");
+        }
+
+        // Outside tmux the terminal's own protocol is used, since there is no
+        // multiplexer to carry the image through.
+        let native = EnvVars {
+            term: Some("xterm-256color".into()),
+            lc_terminal: Some("iTerm2".into()),
+            ..env()
+        };
+        assert_eq!(*decide(&native, None), Protocol::Iterm2);
     }
 
     #[test]
