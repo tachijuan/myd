@@ -50,6 +50,12 @@ const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 /// downloaded first. That is a real transfer, so it is capped.
 const MAX_REMOTE_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Largest file sent to iTerm2 in its own format rather than re-rendered.
+///
+/// Past this a re-render at the pane's size is smaller than the original, so
+/// sending the file whole stops being the cheaper option.
+const MAX_NATIVE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// What the pane should draw.
 pub enum PreviewContent {
     /// Text, already highlighted. `truncated` when only a head was read.
@@ -206,6 +212,36 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
     Ok(PreviewContent::Text { lines, truncated })
 }
 
+/// Send an image's own bytes to iTerm2, skipping the renderer.
+///
+/// Returns `None` when the file is not worth sending whole — too large to be
+/// cheaper than a re-render, or unreadable — so the caller falls back.
+async fn native_iterm_image(
+    fs: Arc<dyn Vfs>,
+    req: &PreviewRequest,
+) -> anyhow::Result<Option<PreviewContent>> {
+    let meta = fs.stat(&req.path).await?;
+    // Past this the file is no longer smaller than what timg would produce, and
+    // a re-render at the pane's size is the better trade.
+    if meta.len > MAX_NATIVE_IMAGE_BYTES {
+        return Ok(None);
+    }
+    let bytes = read_head(fs, &req.path, meta.len).await?;
+    if bytes.len() as u64 != meta.len {
+        // A short read would send a truncated image; let the renderer handle it.
+        return Ok(None);
+    }
+
+    Ok(Some(PreviewContent::Graphics {
+        payload: graphics::iterm_escape_for_file(&bytes, req.cols, req.rows),
+        rows: req.rows,
+        backend: "iterm2",
+        page: 0,
+        // Not a paged format: the ones that are do not come through here.
+        pages: None,
+    }))
+}
+
 /// Read up to `len` bytes from the start of a file.
 ///
 /// SFTP backends get a positioned read, which is a single round trip. Note the
@@ -238,6 +274,22 @@ async fn read_head(fs: Arc<dyn Vfs>, path: &VPath, len: u64) -> anyhow::Result<V
 async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<PreviewContent> {
     let caps = image::capabilities();
     let label = req.label.as_path();
+
+    // iTerm2 decodes the file itself, so for a format it understands the file's
+    // own bytes go straight over and the renderer is skipped entirely.
+    //
+    // This is a size fix, not a shortcut. timg re-encodes everything as PNG, and
+    // a photograph is the worst case for PNG: a 537KB JPEG became a 1.7MB PNG,
+    // 2.3MB once base64'd. Sending the original costs 716KB, and looks better for
+    // not being re-encoded on the way. kitty takes PNG only and sixel is a raster
+    // format, so both still go through the renderer.
+    if graphics::protocol() == graphics::Protocol::Iterm2
+        && graphics::iterm_decodes_natively(label)
+    {
+        if let Some(content) = native_iterm_image(fs.clone(), req).await? {
+            return Ok(content);
+        }
+    }
 
     let Some(backend) = caps.backend_for(label) else {
         return Ok(PreviewContent::Note {

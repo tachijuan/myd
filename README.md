@@ -425,8 +425,15 @@ different answer inside tmux than it does natively — the same image filled a
 native window and came out small in a tmux pane. When the terminal does not
 report a cell size, the cell form is used as a fallback.
 
-The raster is then asked for at the geometry whose pixel box matches the pane's
-real one, so it arrives with enough detail to fill the space and no more. Asking
+Where iTerm2 can decode the file itself — JPEG, PNG, GIF, WebP and the like —
+the file's own bytes are sent and the renderer is skipped. That is a size fix
+rather than a shortcut: `timg` re-encodes everything as PNG, which is the worst
+case for a photograph, and a 537KB JPEG became a 2.3MB payload where the
+original costs 716KB and looks better for not being re-encoded. Formats that
+need rendering, and the other protocols, still go through `timg`.
+
+Otherwise the raster is asked for at the geometry whose pixel box matches the
+pane's real one, so it arrives with enough detail to fill the space and no more. Asking
 for a blind multiple of the pane instead is what once drew a tall photo past the
 bottom of its pane, and the overflow landed on rows nothing repaints — a blank
 rectangle. That matters:
