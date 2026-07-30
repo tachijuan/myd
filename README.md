@@ -411,8 +411,16 @@ pixels and the terminal decides how many rows that is, which is how an image
 ends up spilling past its border. Sixel carries no such control, so it is asked
 for a smaller raster instead.
 
-Because the cell count is pinned separately, the *raster* can be asked for at
-twice the pane's size without the image occupying more of it. That matters:
+myd asks the terminal how large a character cell is (`ESC[16t`, answered in the
+same round trip as the protocol probe) and states the image's size in **pixels**.
+Both pixels and cells are valid in the escape, but only one is unambiguous:
+sizing in cells leaves the terminal to multiply out, and iTerm2 reaches a
+different answer inside tmux than it does natively — the same image filled a
+native window and came out small in a tmux pane. When the terminal does not
+report a cell size, the cell form is used as a fallback.
+
+Because the size is stated separately from the image data, the *raster* can be
+asked for at twice the pane's size without the image occupying more of it. That matters:
 timg cannot ask a piped stdout how large a cell is and assumes 18 pixels, so on
 a retina display — where a cell is nearer 30 — an image sized for the smaller
 assumption arrives with too few pixels and draws small and soft inside its box.

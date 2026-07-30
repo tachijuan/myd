@@ -112,8 +112,8 @@ fn decision() -> &'static Decision {
     })
 }
 
-/// A protocol and, when it is a fallback, the reason.
-pub struct Decision(pub Protocol, pub Option<&'static str>);
+/// A protocol, the reason when it is a fallback, and the measured cell size.
+pub struct Decision(pub Protocol, pub Option<&'static str>, pub Option<(u16, u16)>);
 
 impl std::ops::Deref for Decision {
     type Target = Protocol;
@@ -134,6 +134,15 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100)
 pub struct Probed {
     pub kitty: bool,
     pub sixel: bool,
+    /// The terminal's cell size in pixels, when it reported one.
+    ///
+    /// This is what makes an image the right size. Given it, the escape can
+    /// state the image's size in **pixels**, which every terminal resolves the
+    /// same way. Sizing in *cells* instead leaves the terminal to do that
+    /// arithmetic, and iTerm2 reaches a different answer inside tmux than it
+    /// does natively — which is why previews filled a native window but came out
+    /// small in a tmux pane.
+    pub cell: Option<(u16, u16)>,
 }
 
 impl Probed {
@@ -181,15 +190,19 @@ impl EnvVars {
 
 /// Decide which protocol to use, given the environment and any probe result.
 pub fn decide(env: &EnvVars, probed: Option<Probed>) -> Decision {
+    // Carried through every outcome: the cell size is useful even when the
+    // decision is to fall back to blocks, and is independent of the protocol.
+    let cell = probed.and_then(|p| p.cell);
+
     // An explicit choice always wins: detection cannot know about every terminal,
     // and someone who knows their setup should not have to argue with a guess.
     if let Some(p) = env.override_var.as_deref().and_then(Protocol::from_name) {
-        return Decision(p, None);
+        return Decision(p, None, cell);
     }
 
     let caps = capabilities(env, probed);
     if !caps.saw_anything() {
-        return Decision(Protocol::Blocks, None);
+        return Decision(Protocol::Blocks, None, cell);
     }
 
     // Inside a multiplexer the sequence has to survive being forwarded.
@@ -199,16 +212,17 @@ pub fn decide(env: &EnvVars, probed: Option<Probed>) -> Decision {
         // preferred here even though kitty and iTerm2 look better, because
         // working beats looking good.
         if caps.sixel {
-            return Decision(Protocol::Sixel, None);
+            return Decision(Protocol::Sixel, None, cell);
         }
         // The rest ride the passthrough escape, which is off by default.
         if !env.tmux_passthrough {
             return Decision(
                 Protocol::Blocks,
                 Some("tmux needs: set -g allow-passthrough on"),
+                cell,
             );
         }
-        return Decision(preferred(env, &caps), None);
+        return Decision(preferred(env, &caps), None, cell);
     }
 
     // GNU screen has no passthrough worth relying on. (tmux also sets
@@ -218,10 +232,14 @@ pub fn decide(env: &EnvVars, probed: Option<Probed>) -> Decision {
         .as_deref()
         .is_some_and(|t| t.starts_with("screen") && env.tmux.is_none())
     {
-        return Decision(Protocol::Blocks, Some("GNU screen cannot forward graphics"));
+        return Decision(
+            Protocol::Blocks,
+            Some("GNU screen cannot forward graphics"),
+            cell,
+        );
     }
 
-    Decision(preferred(env, &caps), None)
+    Decision(preferred(env, &caps), None, cell)
 }
 
 /// Best available protocol, in quality order.
@@ -290,6 +308,8 @@ fn env_capabilities(env: &EnvVars) -> Probed {
         // Nothing in the environment reports sixel. Only a probe can, so an
         // env-only decision never selects it.
         sixel: false,
+        // Nor the cell size.
+        cell: None,
     }
 }
 
@@ -370,6 +390,10 @@ mod unix_probe {
     /// something already suggests the terminal speaks the protocol, and the
     /// answer for everyone else comes from Device Attributes and the environment.
     const DA_QUERY: &[u8] = b"\x1b[c";
+    /// Ask for the character cell size in pixels. Answered `ESC[6;H;Wt`.
+    /// Old terminals ignore it silently rather than printing it, so unlike the
+    /// kitty query this is safe to send anywhere.
+    const CELL_QUERY: &[u8] = b"\x1b[16t";
     const KITTY_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAAAAAA\x1b\\";
 
     pub fn run(timeout: std::time::Duration, ask_kitty: bool) -> Option<Probed> {
@@ -390,6 +414,7 @@ mod unix_probe {
         if ask_kitty {
             tty.write_all(KITTY_QUERY).ok()?;
         }
+        tty.write_all(CELL_QUERY).ok()?;
         tty.write_all(DA_QUERY).ok()?;
         tty.flush().ok()?;
 
@@ -428,7 +453,17 @@ mod unix_probe {
             .filter_map(|part| part.strip_prefix("[?"))
             .filter_map(|part| part.split('c').next())
             .any(|attrs| attrs.split(';').any(|a| a == "4"));
-        Probed { kitty, sixel }
+        // The cell size arrives as `ESC[6;<height>;<width>t` — note the reply
+        // gives height before width, the reverse of how sizes are usually
+        // written.
+        let cell = s.split('\x1b').find_map(|part| {
+            let body = part.strip_prefix("[6;")?.split('t').next()?;
+            let (h, w) = body.split_once(';')?;
+            let (h, w) = (h.trim().parse().ok()?, w.trim().parse().ok()?);
+            // A terminal that reports zero is not telling us anything usable.
+            (w > 0 && h > 0).then_some((w, h))
+        });
+        Probed { kitty, sixel, cell }
     }
 
     /// Put the terminal into raw mode so the reply is not line-buffered or echoed.
@@ -523,6 +558,14 @@ fn is_graphics_sequence(seq: &str) -> bool {
         || seq.starts_with("\x1bP")      // sixel DCS
 }
 
+/// The terminal's cell size in pixels, if it told us.
+///
+/// Measured once, alongside the protocol probe. `None` when there was no
+/// terminal to ask or it did not answer.
+pub fn cell_size() -> Option<(u16, u16)> {
+    decision().2
+}
+
 /// Pin a graphics payload to an exact size in terminal cells.
 ///
 /// This is what keeps an image inside its pane. timg describes the image in
@@ -554,7 +597,7 @@ fn is_graphics_sequence(seq: &str) -> bool {
 /// requested to leave headroom.
 pub fn pin_to_cells(payload: &str, cols: u16, rows: u16) -> String {
     if payload.starts_with("\x1b]1337;") {
-        return pin_iterm(payload, cols, rows);
+        return pin_iterm(payload, cols, rows, cell_size());
     }
     if payload.starts_with("\x1b_G") {
         return pin_kitty(payload, cols, rows);
@@ -562,10 +605,17 @@ pub fn pin_to_cells(payload: &str, cols: u16, rows: u16) -> String {
     payload.to_string()
 }
 
-/// Replace iTerm2's pixel dimensions with cell dimensions.
-fn pin_iterm(payload: &str, cols: u16, rows: u16) -> String {
-    // `width=260px;height=91px` -> `width=60;height=24;preserveAspectRatio=1`.
-    // Without the aspect-ratio flag iTerm2 stretches the image to fill the box.
+/// Give iTerm2 the size of the image, in pixels where possible.
+///
+/// Pixels rather than cells, when the terminal has told us how big a cell is.
+/// Both forms are valid, but only one is unambiguous: sizing in cells leaves the
+/// terminal to multiply out, and iTerm2 reaches a different answer inside tmux
+/// than it does natively — the same payload filled a native window and came out
+/// small in a tmux pane. A pixel count means the same thing everywhere.
+///
+/// Falls back to cells when the cell size is unknown, which is better than
+/// nothing and is what worked natively all along.
+fn pin_iterm(payload: &str, cols: u16, rows: u16, cell: Option<(u16, u16)>) -> String {
     let Some(start) = payload.find("width=") else {
         return payload.to_string();
     };
@@ -573,13 +623,18 @@ fn pin_iterm(payload: &str, cols: u16, rows: u16) -> String {
         return payload.to_string();
     };
     let end = start + rest;
-    format!(
-        "{}width={};height={};preserveAspectRatio=1;{}",
-        &payload[..start],
-        cols,
-        rows,
-        &payload[end..]
-    )
+
+    // `preserveAspectRatio=1` keeps the image's shape inside whichever box it is
+    // given; without it iTerm2 stretches to fill exactly.
+    let size = match cell {
+        Some((cw, ch)) => format!(
+            "width={}px;height={}px;preserveAspectRatio=1;",
+            u32::from(cols) * u32::from(cw),
+            u32::from(rows) * u32::from(ch)
+        ),
+        None => format!("width={cols};height={rows};preserveAspectRatio=1;"),
+    };
+    format!("{}{}{}", &payload[..start], size, &payload[end..])
 }
 
 /// Add kitty's columns/rows control keys to the first chunk.
@@ -660,6 +715,13 @@ pub fn oversampled_geometry(cols: u16, rows: u16) -> (u16, u16) {
 /// filling most of the space on a taller one. Sixel is the fallback protocol;
 /// the ones that can be pinned exactly are preferred where available.
 pub fn sixel_row_budget(rows: u16) -> u16 {
+    // With the cell size measured there is nothing to hedge against: timg's
+    // 18-pixel assumption is what the budget exists to absorb, and knowing the
+    // real figure makes the reserved rows exactly right. Shrinking anyway is
+    // what made forced sixel look small in a native terminal.
+    if cell_size().is_some() {
+        return rows.max(1);
+    }
     (rows.saturating_mul(3) / 4).max(1)
 }
 
@@ -928,6 +990,7 @@ mod tests {
         let probed = Probed {
             kitty: true,
             sixel: true,
+            ..Default::default()
         };
         assert_eq!(*decide(&e, Some(probed)), Protocol::Sixel);
     }
@@ -944,7 +1007,8 @@ mod tests {
                 &e,
                 Some(Probed {
                     kitty: true,
-                    sixel: true
+                    sixel: true,
+                    ..Default::default()
                 })
             ),
             Protocol::Kitty
@@ -954,7 +1018,8 @@ mod tests {
                 &e,
                 Some(Probed {
                     kitty: false,
-                    sixel: true
+                    sixel: true,
+                    ..Default::default()
                 })
             ),
             Protocol::Sixel
@@ -1060,7 +1125,8 @@ mod tests {
                 &e,
                 Some(Probed {
                     kitty: false,
-                    sixel: true
+                    sixel: true,
+                    ..Default::default()
                 })
             ),
             Protocol::Sixel
@@ -1097,6 +1163,28 @@ mod tests {
         use super::unix_probe::parse_reply;
         assert!(parse_reply(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22c").kitty);
         assert!(!parse_reply(b"\x1b[?62;22c").kitty);
+    }
+
+    /// `ESC[16t` is answered `ESC[6;<height>;<width>t` — height first, which is
+    /// the reverse of how sizes are normally written and easy to transpose.
+    #[cfg(unix)]
+    #[test]
+    fn the_cell_size_reply_is_parsed_height_first() {
+        use super::unix_probe::parse_reply;
+        assert_eq!(parse_reply(b"\x1b[6;17;8t").cell, Some((8, 17)));
+        // Alongside the other replies.
+        assert_eq!(
+            parse_reply(b"\x1b[6;34;16t\x1b[?62;4;22c").cell,
+            Some((16, 34))
+        );
+        // A terminal that says nothing, or says zero, tells us nothing usable.
+        assert_eq!(parse_reply(b"\x1b[?62;22c").cell, None);
+        assert_eq!(parse_reply(b"\x1b[6;0;0t").cell, None);
+        assert_eq!(parse_reply(b"").cell, None);
+        // Malformed replies must not panic or produce nonsense.
+        for junk in [&b"\x1b[6;"[..], b"\x1b[6;abc;deft", b"\x1b[6;17t"] {
+            assert_eq!(parse_reply(junk).cell, None, "{junk:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -1279,6 +1367,47 @@ mod tests {
 
         assert!(is_complete(""));
         assert!(is_complete("plain text"));
+    }
+
+    /// The reported bug: the same payload filled a native iTerm2 window but came
+    /// out small in a tmux pane. Sizing in cells leaves the terminal to multiply
+    /// out, and iTerm2 reaches a different answer through tmux. A pixel count
+    /// means the same thing everywhere.
+    #[test]
+    fn iterm_is_sized_in_pixels_when_the_cell_size_is_known() {
+        let raw = "\x1b]1337;File=size=9;width=260px;height=91px;inline=1:AA\x07";
+
+        // 140x37 cells of an 8x17 cell = 1120x629 pixels.
+        let pinned = pin_iterm(raw, 140, 37, Some((8, 17)));
+        assert!(
+            pinned.contains("width=1120px;height=629px"),
+            "should state the size in pixels: {pinned}"
+        );
+        assert!(pinned.contains("preserveAspectRatio=1"));
+        // The image data must be untouched.
+        assert!(pinned.ends_with(":AA\x07"));
+    }
+
+    /// Without a measured cell size there is nothing to multiply by, so the cell
+    /// form is still used — it is what worked natively before.
+    #[test]
+    fn iterm_falls_back_to_cells_when_the_cell_size_is_unknown() {
+        let raw = "\x1b]1337;File=size=9;width=260px;height=91px;inline=1:AA\x07";
+        let pinned = pin_iterm(raw, 140, 37, None);
+        assert!(
+            pinned.contains("width=140;height=37"),
+            "should fall back to cells: {pinned}"
+        );
+        assert!(!pinned.contains("px;"), "no pixel units: {pinned}");
+    }
+
+    /// A large pane must not overflow the arithmetic — 65535 cells of a 20px
+    /// cell is well past what a u16 holds.
+    #[test]
+    fn pixel_sizing_does_not_overflow() {
+        let raw = "\x1b]1337;File=size=9;width=1px;height=1px;inline=1:AA\x07";
+        let pinned = pin_iterm(raw, u16::MAX, u16::MAX, Some((20, 40)));
+        assert!(pinned.contains("width=1310700px"), "{pinned}");
     }
 
     // ---- clearing -------------------------------------------------------

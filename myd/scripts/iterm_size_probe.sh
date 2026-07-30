@@ -27,9 +27,25 @@ if [ ! -f "$IMG" ]; then
     exit 1
 fi
 
-# Encoded once and reused: this is the bulk of the work and the payload is the
-# same for every option, only the size arguments differ.
-PAYLOAD="$(base64 -w0 "$IMG" 2>/dev/null || base64 "$IMG" | tr -d '\n')"
+# The image is prepared exactly as myd prepares it: rendered through timg at
+# twice the target geometry with upscaling on, so the raster has enough pixels
+# to fill a real cell. Testing the *original* file instead would ask a different
+# question -- a 260x91 logo in a 60x20 cell box is letterboxed whatever the
+# sizing form, which is not the case myd is in.
+#
+# Falls back to the file itself when timg is not installed; the sizing forms are
+# still comparable, just against a smaller raster.
+PAYLOAD=""
+if command -v timg >/dev/null 2>&1; then
+    # `-pi` writes iTerm2's own escape; the base64 body of that escape is the
+    # upscaled PNG, which is exactly what myd ends up sending.
+    PAYLOAD="$(timg -pi -g"$((COLS * 2))x$((ROWS * 2))" -U --frames=1 "$IMG" 2>/dev/null \
+        | sed -n 's/.*inline=1://p' | tr -d '\007\n')"
+fi
+if [ -z "$PAYLOAD" ]; then
+    echo "  (timg not available -- using the file as-is)" >&2
+    PAYLOAD="$(base64 -w0 "$IMG" 2>/dev/null || base64 "$IMG" | tr -d '\n')"
+fi
 
 # A literal escape byte, for use in patterns where a `\033` spelling would not
 # be interpreted.

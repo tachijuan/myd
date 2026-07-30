@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.20.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.20.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -635,8 +635,17 @@ and the terminal decides how many rows that is, which is how an image spills pas
 its border. Sixel carries no such control and is asked for a smaller raster
 instead.
 .PP
-Because the cell count is pinned separately, the raster itself is requested at
-twice the size of the pane without the image occupying more of it. timg cannot
+myd asks the terminal how large a character cell is (\fBESC[16t\fR, answered in
+the same round trip as the protocol probe) and states the image's size in
+pixels. Both pixels and cells are valid in the escape, but only one is
+unambiguous: sizing in cells leaves the terminal to multiply out, and iTerm2
+reaches a different answer inside
+.BR tmux (1)
+than it does natively. When no cell size is reported, the cell form is used
+instead.
+.PP
+Because the size is stated separately from the image data, the raster itself is
+requested at twice the size of the pane without the image occupying more of it. timg cannot
 ask a piped stdout how large a cell is and assumes 18 pixels; on a display whose
 cells are nearer 30 an image sized for that assumption arrives with too few
 pixels and draws small and soft inside its box. Images are additionally rendered

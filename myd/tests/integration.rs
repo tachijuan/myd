@@ -10762,7 +10762,8 @@ fn iterm2_is_recognised_over_ssh_and_under_tmux() {
             &sixel_tmux,
             Some(Probed {
                 kitty: false,
-                sixel: true
+                sixel: true,
+                ..Default::default()
             })
         ),
         Protocol::Sixel
