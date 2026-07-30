@@ -578,6 +578,55 @@ fn pin_kitty(payload: &str, cols: u16, rows: u16) -> String {
     format!("{},c={},r={}{}", head, cols, rows, &payload[semi..])
 }
 
+/// How many times over to sample a graphics render.
+///
+/// With stdout on a pipe timg cannot ask the terminal how big a cell is and
+/// assumes 9x18 pixels — measured: a request of `rows` rows produced a raster
+/// exactly `rows * 18` pixels tall. Real cells are often larger, and on a retina
+/// display roughly twice that, so a raster sized for an 18px cell is drawn into
+/// a box built from 30px cells and comes out visibly soft and small.
+///
+/// The escape pins the image to a cell count regardless (see [`pin_to_cells`]),
+/// so the raster can be asked for at a multiple of the pane's size without
+/// changing the space it occupies — it just arrives with enough pixels to fill
+/// that space properly. Two is the useful ceiling: past it a PDF stops gaining
+/// resolution (poppler reaches its own limit) while the payload keeps growing.
+pub const GRAPHICS_OVERSAMPLE: u16 = 2;
+
+/// Largest oversampled geometry worth asking for, in cells.
+///
+/// The payload grows with the square of the raster: a full-screen photo at 2x
+/// came to 4.7MB across 1157 kitty chunks, each of which has to be individually
+/// wrapped and pushed through tmux every time the selection moves. Past roughly
+/// this size the extra pixels are beyond what any cell can show, so the cost buys
+/// nothing.
+const MAX_OVERSAMPLED_CELLS: u16 = 300;
+
+/// The geometry to ask a renderer for, given the cells the image will occupy.
+///
+/// Returns a larger box than the pane so the raster has enough pixels for a cell
+/// bigger than the renderer assumes — 37 rows of a 30px retina cell need 1110
+/// pixels, where an 18px assumption yields 666. Bounded at both ends: saturating,
+/// so a very large pane cannot wrap the multiplication, and capped, so it cannot
+/// ask for a raster whose cost outweighs what the screen can show.
+pub fn oversampled_geometry(cols: u16, rows: u16) -> (u16, u16) {
+    // Scale both axes by the same factor, so the aspect ratio of the request is
+    // unchanged — scaling them independently would ask for a differently-shaped
+    // box than the pane and let the renderer letterbox inside it.
+    //
+    // The factor is reduced until neither axis exceeds the cap. A pane already
+    // larger than the cap is passed through unscaled rather than shrunk: asking
+    // for fewer cells than the pane would make the image worse than not
+    // oversampling at all.
+    let largest = cols.max(rows);
+    let factor = if largest == 0 || largest >= MAX_OVERSAMPLED_CELLS {
+        1
+    } else {
+        GRAPHICS_OVERSAMPLE.min(MAX_OVERSAMPLED_CELLS / largest).max(1)
+    };
+    (cols.saturating_mul(factor), rows.saturating_mul(factor))
+}
+
 /// Rows to ask timg for when rendering sixel into a pane of `rows` rows.
 ///
 /// Sixel cannot be pinned to a cell count after the fact the way kitty and
@@ -624,7 +673,24 @@ pub fn needs_region_erase(protocol: Protocol) -> bool {
     matches!(protocol, Protocol::Iterm2 | Protocol::Sixel)
 }
 
-/// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough.
+/// Whether a graphics payload ends on a complete escape sequence.
+///
+/// The renderer's output is read under a size cap, so a very large image can be
+/// cut mid-sequence. A block render truncated that way merely loses its bottom
+/// rows, but a graphics payload goes to the terminal verbatim: an unterminated
+/// APC, OSC or DCS leaves the terminal consuming everything after it as part of
+/// the string, swallowing the interface.
+pub fn is_complete(payload: &str) -> bool {
+    match split_sequences(payload).last() {
+        Some(last) if last.starts_with('\x1b') => {
+            last.ends_with("\x1b\\") || last.ends_with('\x07')
+        }
+        // No sequences at all, or trailing plain text: nothing half-written.
+        _ => true,
+    }
+}
+
+/// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough.
 ///
 /// tmux forwards a sequence wrapped in `ESC Ptmux; … ESC \`, with every `ESC`
 /// inside doubled so it can tell the payload from the wrapper's terminator.
@@ -1119,6 +1185,81 @@ mod tests {
         // A pane with almost no room must still ask for a drawable row.
         assert_eq!(sixel_row_budget(1), 1);
         assert_eq!(sixel_row_budget(0), 1);
+    }
+
+    /// The reported bug: in tmux, images and PDFs drew far smaller than the pane.
+    /// timg cannot ask a piped stdout how big a cell is and assumes 18px, so the
+    /// raster it produces is too small for a real cell — especially a retina one
+    /// at roughly twice that. The escape pins the cell count separately, so the
+    /// raster can be asked for larger without changing the space it occupies.
+    #[test]
+    fn graphics_are_oversampled_without_growing_the_image() {
+        let (cols, rows) = oversampled_geometry(140, 37);
+        assert_eq!((cols, rows), (280, 74));
+
+        // The point of the exercise: more pixels, same cells. Pinning is what
+        // holds the size, so it must still name the pane's own cell count.
+        let pinned = pin_to_cells("\x1b]1337;File=size=1;width=9px;height=9px;inline=1:AA", 140, 37);
+        assert!(
+            pinned.contains("width=140;height=37"),
+            "must still occupy the pane, not the oversampled box: {pinned}"
+        );
+    }
+
+    /// A pane close to the integer limit must not wrap into a tiny request, and a
+    /// very large one must not ask for a raster that costs megabytes to push
+    /// through a multiplexer for pixels no cell can show.
+    #[test]
+    fn oversampling_is_bounded_at_both_ends() {
+        // Ordinary panes get the full multiple.
+        assert_eq!(oversampled_geometry(140, 37), (280, 74));
+
+        // A large pane is not doubled: the payload grows with the square of the
+        // raster and the extra pixels are past what a cell can show.
+        let (c, r) = oversampled_geometry(200, 60);
+        assert!(c <= MAX_OVERSAMPLED_CELLS, "cols not capped: {c}");
+        assert!(r <= MAX_OVERSAMPLED_CELLS, "rows not capped: {r}");
+
+        // The aspect ratio of the request must survive, or the renderer
+        // letterboxes inside a differently-shaped box than the pane.
+        let (c, r) = oversampled_geometry(140, 70);
+        assert_eq!(c, r * 2, "aspect ratio changed: {c}x{r}");
+
+        // A pane already past the cap is left alone rather than shrunk.
+        assert_eq!(oversampled_geometry(400, 120), (400, 120));
+
+        // No wrapping at the limit, and never smaller than the pane itself —
+        // asking for less than the pane would make the image *worse* than before.
+        let (c, r) = oversampled_geometry(u16::MAX, u16::MAX);
+        assert_eq!((c, r), (u16::MAX, u16::MAX));
+        for n in [1u16, 50, 299, 301, 1000] {
+            let (c, _) = oversampled_geometry(n, n);
+            assert!(c >= n, "{n}: asked for less than the pane ({c})");
+        }
+
+        assert_eq!(oversampled_geometry(0, 0), (0, 0));
+    }
+
+    /// A payload cut off by the output cap must be rejected rather than sent.
+    /// An unterminated escape leaves the terminal consuming everything printed
+    /// after it as part of the string.
+    #[test]
+    fn a_truncated_payload_is_detected() {
+        // Real payloads are complete.
+        for name in ["timg_kitty.esc", "timg_iterm2.esc", "timg_sixel.esc"] {
+            let raw = strip_framing(&fixture(name)).to_string();
+            assert!(is_complete(&raw), "{name} should be complete");
+        }
+
+        // Cutting one mid-sequence must be caught.
+        for name in ["timg_kitty.esc", "timg_iterm2.esc", "timg_sixel.esc"] {
+            let raw = strip_framing(&fixture(name)).to_string();
+            let cut = &raw[..raw.len() * 3 / 4];
+            assert!(!is_complete(cut), "{name} truncated but reported complete");
+        }
+
+        assert!(is_complete(""));
+        assert!(is_complete("plain text"));
     }
 
     // ---- clearing -------------------------------------------------------

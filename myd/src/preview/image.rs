@@ -75,6 +75,16 @@ impl Backend {
                 // understand them.
                 args.push("-p".into());
                 args.push(protocol.timg_flag().into());
+                if protocol.is_graphics() {
+                    // Fill the space rather than sitting tiny in the middle of
+                    // it. Without this timg never enlarges an image beyond its
+                    // own pixel size, so a 260x91 logo stays 260x91 inside a
+                    // pane hundreds of pixels across — the escape says "use
+                    // these cells" and iTerm2 letterboxes the small bitmap
+                    // inside them. Only for graphics: a block render is already
+                    // one cell per glyph and upscaling would just blur it.
+                    args.push("-U".into());
+                }
                 // Note there is deliberately no `-W` / `--fit-width` here. It
                 // forces the image to the full width and lets the height follow
                 // the aspect ratio, which for a graphics protocol means a tall
@@ -269,6 +279,16 @@ pub fn render(
         super::graphics::sixel_row_budget(rows)
     } else {
         rows
+    };
+    // kitty and iTerm2 are told the cell count in the escape, so the raster can
+    // be asked for larger than the pane without occupying more of it — which is
+    // what stops the image arriving too few pixels to fill a real cell. Sixel has
+    // no such pinning: its raster *is* its size, so it is asked for exactly what
+    // it should occupy.
+    let (cols, rows) = if protocol.is_graphics() && protocol != Protocol::Sixel {
+        super::graphics::oversampled_geometry(cols, rows)
+    } else {
+        (cols, rows)
     };
     let args = backend.args(path, cols, rows, page, protocol);
     match run_with_timeout(backend.binary(), &args) {
