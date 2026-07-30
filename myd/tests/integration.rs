@@ -10768,3 +10768,53 @@ fn iterm2_is_recognised_over_ssh_and_under_tmux() {
         Protocol::Sixel
     );
 }
+
+/// The ghost-image bug: an iTerm2 image stayed on screen after the preview
+/// closed. It has no delete escape and redrawing does not remove it, because
+/// ratatui only emits cells whose content changed and the cells under an image
+/// are ones it believes are already blank. The region has to be erased.
+#[test]
+fn a_graphics_region_erase_covers_exactly_the_image() {
+    use myd::app::region_erase_sequence;
+    use ratatui::layout::Rect;
+
+    let area = Rect {
+        x: 4,
+        y: 2,
+        width: 60,
+        height: 5,
+    };
+    let seq = region_erase_sequence(area);
+
+    // One erase per covered row, and no more — erasing beyond the image would
+    // take out the pane border and whatever is below it.
+    assert_eq!(seq.matches("\x1b[K").count(), 5);
+
+    // Positions are 1-based in the escape and 0-based in the Rect, and each row
+    // starts at the image's left edge so the erase does not eat the border.
+    assert!(seq.starts_with("\x1b[3;5H\x1b[K"), "{seq:?}");
+    assert!(seq.contains("\x1b[7;5H\x1b[K"), "last row missing: {seq:?}");
+    assert!(
+        !seq.contains("\x1b[8;"),
+        "erased a row past the image: {seq:?}"
+    );
+
+    // A zero-height area must produce nothing rather than erasing a stray row.
+    assert!(region_erase_sequence(Rect::new(0, 0, 10, 0)).is_empty());
+}
+
+/// Each graphics protocol must have exactly one way to be removed, or an image
+/// either leaks or is erased twice (which flickers).
+#[test]
+fn every_graphics_protocol_has_one_removal_path() {
+    use myd::preview::graphics::{Protocol, clear_sequence, needs_region_erase};
+
+    for p in [Protocol::Kitty, Protocol::Iterm2, Protocol::Sixel] {
+        let deletes = clear_sequence(p).is_some();
+        let erases = needs_region_erase(p);
+        assert!(deletes ^ erases, "{p:?} must have exactly one removal path");
+    }
+    // iTerm2 specifically — the reported case.
+    assert!(needs_region_erase(Protocol::Iterm2));
+    assert!(clear_sequence(Protocol::Iterm2).is_none());
+}

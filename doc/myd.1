@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.19.2" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.19.3" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -625,9 +625,16 @@ and iTerm2 escapes are given the size in cells so the picture occupies exactly t
 rows the pane reserved; left to itself the renderer describes the image in pixels
 and the terminal decides how many rows that is, which is how an image spills past
 its border. Sixel carries no such control and is asked for a smaller raster
-instead. A kitty image is an object the terminal keeps re-compositing rather than
-cells, so it is deleted explicitly when the preview closes, when the selection
-moves to another file, and on exit.
+instead.
+.PP
+Removing an image is protocol-specific too, and redrawing the screen is not
+enough for any of them: ratatui writes only the cells whose content changed, and
+the cells beneath an image are ones it believes are already blank. A kitty image
+is an object the terminal re-composites and has a real delete operation; iTerm2
+and sixel images belong to the cells they were drawn into and have none, so those
+rows are erased explicitly and the following frame is a full repaint. This
+happens when the preview closes, when the selection moves to another file, and on
+exit.
 .PP
 A \fBPDF\fR needs a \fBtimg\fR linked against poppler; \fBchafa\fR has no PDF
 loader, so on a machine with only \fBchafa\fR a PDF is reported as needing

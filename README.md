@@ -408,9 +408,16 @@ kitty and iTerm2 escapes are told the size in **cells** (`c=`/`r=`, and
 rows the pane reserved — left to itself the renderer describes the image in
 pixels and the terminal decides how many rows that is, which is how an image
 ends up spilling past its border. Sixel carries no such control, so it is asked
-for a smaller raster instead. A kitty image is an object the terminal keeps
-re-compositing rather than cells, so it is explicitly deleted when the preview
-closes, when the selection moves to another file, and on exit.
+for a smaller raster instead.
+
+Removing an image is protocol-specific too, and redrawing the screen is not
+enough for any of them — ratatui writes only the cells whose content changed, and
+the cells under an image are ones it believes are already blank. A kitty image is
+an object the terminal re-composites and has a real delete operation. iTerm2 and
+sixel images belong to the cells they were drawn into and have no delete, so
+those rows are erased explicitly and the next frame is a full repaint. All of
+this happens when the preview closes, when the selection moves to another file,
+and on exit.
 
 A **PDF** needs a `timg` linked against poppler; `chafa` has no PDF loader, so on
 a chafa-only machine a PDF says so rather than failing with an obscure error. With
