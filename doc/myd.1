@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.19.6" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.20.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -201,6 +201,14 @@ so a tile says whether there is anything to open.
 .TP
 .B Ctrl+p
 Toggle the info panel sidebar. Hidden by default.
+.TP
+.B Ctrl+l
+Redraw the whole screen, as in a shell or
+.BR vi (1).
+Only the cells that change are normally rewritten, so a display corrupted by
+something outside \fBmyd\fR's control \(em a stray write from another process, a
+resize the terminal reported oddly \(em stays wrong until something happens to
+overwrite each damaged cell. This repaints everything.
 .TP
 .B space
 Open or close the file preview pane, which covers most of the screen and shows

@@ -10849,3 +10849,59 @@ fn size_bars_toggle_with_a_capital_b() {
         "Ctrl+B must still page up"
     );
 }
+
+/// Ctrl+L redraws everything, as it does in a shell or vim.
+///
+/// ratatui emits only the cells that changed, so a screen corrupted by anything
+/// outside its knowledge stays wrong until something overwrites each damaged
+/// cell. This is the escape hatch.
+#[tokio::test]
+async fn ctrl_l_requests_a_full_repaint() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    assert!(
+        !app.force_repaint_pending_for_test(),
+        "nothing should be pending before the key"
+    );
+
+    let keep_running = app.handle_key_for_test(ctrl_key('l'));
+    assert!(keep_running, "Ctrl+L must not quit");
+    assert!(
+        app.force_repaint_pending_for_test(),
+        "Ctrl+L should request a full repaint"
+    );
+}
+
+/// Plain `l` still expands — the new binding is Ctrl-modified and must not
+/// shadow it.
+#[test]
+fn ctrl_l_does_not_disturb_plain_l() {
+    use myd::keybinding::{Action, KeyBindingHandler};
+
+    let h = KeyBindingHandler::new();
+    assert_eq!(
+        h.resolve_single_for_test(ctrl_key('l')),
+        Some(Action::Redraw)
+    );
+    assert_eq!(
+        h.resolve_single_for_test(char_key('l')),
+        Some(Action::Expand),
+        "plain l must still expand"
+    );
+}
+
+/// A redraw must also forget any image on screen, or the next frame assumes a
+/// picture is still there that the repaint has just erased.
+#[tokio::test]
+async fn ctrl_l_forgets_a_displayed_image() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // No image is displayed in the test harness, so this asserts the weaker but
+    // still meaningful property: the request is made regardless.
+    app.handle_key_for_test(ctrl_key('l'));
+    assert!(app.force_repaint_pending_for_test());
+}

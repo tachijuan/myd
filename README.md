@@ -165,6 +165,7 @@ Search wraps around at the ends. Filtering hides non-matching entries at every l
 | `P`       | Toggle permissions column     |
 | `T`       | Toggle modification-time column |
 | `Ctrl+p`  | Toggle info panel             |
+| `Ctrl+l`  | Redraw the screen             |
 | `space`   | Toggle the file preview pane  |
 | `?` / `F1`| Help                          |
 
