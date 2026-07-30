@@ -124,6 +124,21 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             ],
         },
         HelpCategory {
+            title: "Preview",
+            items: &[
+                ("space", "Show / hide the file preview"),
+                ("j / k", "Scroll a line (while focused)"),
+                ("Ctrl+F/B", "Scroll a page"),
+                ("Ctrl+D/U", "Scroll half a page"),
+                ("g / G", "Jump to the start / end"),
+                ("/", "Search within the file (regex)"),
+                ("n / p", "Next / previous match"),
+                ("N / P", "Previous / next match"),
+                ("Esc / q", "Return focus to the tree, keep the pane"),
+                ("Tab", "Move focus in and out of the pane"),
+            ],
+        },
+        HelpCategory {
             title: "Tagging & selection",
             items: &[
                 ("t", "Tag / untag file under cursor"),

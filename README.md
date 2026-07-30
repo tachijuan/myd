@@ -15,6 +15,8 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
+- **File preview** — press `space` to open a pane over most of the screen showing what is actually *in* the selected file, and `space` again to close it. Text, markdown and around a hundred programming languages are syntax highlighted. The pane takes focus, so vi motions act on it rather than on the tree: `j`/`k` by a line, `Ctrl+F`/`Ctrl+B` by a page, `Ctrl+D`/`Ctrl+U` by half of one, `g`/`G` to the start and end. `/` searches within the file (regex, case-insensitive) and `n`/`p` step through the matches — `N`/`P` go the other way — with the current match highlighted and the count shown in the footer. `Esc` or `q` hands focus back to the tree without closing the pane, so you can move the cursor and watch the preview follow; `Tab` moves focus in and out. Binary files are reported rather than dumped, and a file too large to read in full is shown truncated and labelled as such. Works on remote panels: the file is read from the server, not from a same-named path on your own machine.
+- **Image and PDF preview** — if [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/) is on your `PATH`, the preview pane draws images (PNG, JPEG, GIF, WebP, SVG, TIFF, …) as colored terminal blocks; `timg` is preferred where both are installed. A `timg` built with poppler also renders the first page of a **PDF** — `chafa` has no PDF loader, so a PDF on a chafa-only machine says so rather than failing obscurely. Neither tool is a dependency: without them the pane shows the file's details instead. The renderer's output is captured and drawn as part of the interface rather than written to the terminal, so it works over `tmux` and cannot corrupt the display.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
@@ -36,6 +38,10 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 
 - Rust 1.75+ (stable)
 - A terminal with true color support
+- Optional: [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/)
+  for image previews in the preview pane. Neither is required — without them the
+  pane falls back to showing the file's details. PDF previews need `timg` built
+  with poppler (`timg --version` lists it); `chafa` cannot render PDFs.
 
 ## Installation
 
@@ -150,7 +156,26 @@ Search wraps around at the ends. Filtering hides non-matching entries at every l
 | `P`       | Toggle permissions column     |
 | `T`       | Toggle modification-time column |
 | `Ctrl+p`  | Toggle info panel             |
+| `space`   | Toggle the file preview pane  |
 | `?` / `F1`| Help                          |
+
+### Preview pane
+
+Keys that act on the pane while it has focus. `space` opens it and gives it
+focus; `Esc` or `q` hands focus back to the tree while leaving the pane open.
+
+| Key               | Action                                      |
+|-------------------|---------------------------------------------|
+| `space`           | Open / close the preview                    |
+| `j` / `k`         | Scroll a line                               |
+| `Ctrl+F` / `Ctrl+B` | Scroll a page                             |
+| `Ctrl+D` / `Ctrl+U` | Scroll half a page                        |
+| `g` / `G`         | Jump to the start / end                     |
+| `/`               | Search within the file (regex)              |
+| `n` / `p`         | Next / previous match                       |
+| `N` / `P`         | Previous / next match                       |
+| `Esc` / `q`       | Return focus to the tree, keep the pane open |
+| `Tab`             | Move focus in and out of the pane           |
 
 ### Panels
 
@@ -293,6 +318,42 @@ Large copies and deletes show a progress overlay with an item-by-item count and 
 Press **`/`** to search entry names with a regular expression (case-insensitive). The cursor jumps to the first match; **`n`** and **`p`** then step to the next and previous matches, wrapping around at the ends.
 
 Press **`f`** to *filter* the tree: enter a regex and only entries whose names match remain visible, at every level. A directory is kept when something beneath it matches, so matching files stay reachable. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing. An active filter is always visible: the title bar reads `FILTERED` and shows how many entries are shown rather than how many exist, and the footer carries the pattern.
+
+## File Preview
+
+Press **`space`** to open the preview pane over most of the screen, and `space`
+again to close it. The pane shows the file under the cursor and follows it: with
+focus handed back to the tree (`Esc` or `q`), moving the cursor re-reads the
+preview, so you can walk a directory and watch its contents go by.
+
+**Text** is syntax highlighted — around a hundred languages, plus markdown —
+using the file's extension, or its `#!` line when it has no extension. Files
+larger than 256 KB are shown as plain text instead: highlighting them costs more
+than the colors are worth, and the content is what you opened the pane for. Only
+the first megabyte of a large file is read, and the footer says `truncated` when
+that happened. A **binary** file is reported with its size rather than dumped as
+control characters.
+
+**Images** are drawn as colored terminal blocks by [`timg`](https://timg.sh/) or
+[`chafa`](https://hpjansson.org/chafa/), whichever is on your `PATH` — `timg`
+first, since it renders more formats. A `timg` linked against poppler also draws
+the first page of a **PDF**; `chafa` has no PDF loader, so on a chafa-only machine
+a PDF says so rather than failing with an obscure error. With neither installed
+the pane shows the file's details and explains what is missing. The renderer's
+output is *captured and drawn as part of the interface*, not written to the
+terminal, so previews work inside `tmux` and can never corrupt the display.
+
+The pane is focusable, which is what lets vi motions mean the pane rather than the
+tree: `j`/`k`, `Ctrl+F`/`Ctrl+B`, `Ctrl+D`/`Ctrl+U`, `g`/`G`. **`/`** searches
+within the file (regex, case-insensitive) and `n`/`p` step through matches with
+wraparound — `N`/`P` reverse them — highlighting the current one and showing
+`3/11` in the footer. `Tab` moves focus in and out of the pane, and the focused
+pane is the one outlined in cyan.
+
+Everything works the same on a remote panel: the file is read from the server over
+SFTP, never from a same-named path on your own machine. A remote image is fetched
+to a temporary file first (capped at 32 MB) because the renderers take a path
+rather than a stream.
 
 ## Dual-Panel Mode
 

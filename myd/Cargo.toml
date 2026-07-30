@@ -1,6 +1,6 @@
 [package]
 name = "myd"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 
 [dependencies]
@@ -28,6 +28,8 @@ russh = "0.62.4"
 openssh-sftp-client = "0.15.7"
 ssh2-config = "0.7.1"
 bytes = "1.12.1"
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy", "dump-load", "plist-load", "yaml-load"] }
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
