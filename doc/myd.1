@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.19.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.19.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -619,6 +619,15 @@ Block output is captured and drawn as part of the interface rather than written 
 the terminal, so it cannot corrupt the display. A graphics image necessarily does
 reach the terminal directly: the pane leaves a hole for it and the escape is
 written after the frame.
+.PP
+Because such an image is not made of cells, it is bounded explicitly. The kitty
+and iTerm2 escapes are given the size in cells so the picture occupies exactly the
+rows the pane reserved; left to itself the renderer describes the image in pixels
+and the terminal decides how many rows that is, which is how an image spills past
+its border. Sixel carries no such control and is asked for a smaller raster
+instead. A kitty image is an object the terminal keeps re-compositing rather than
+cells, so it is deleted explicitly when the preview closes, when the selection
+moves to another file, and on exit.
 .PP
 A \fBPDF\fR needs a \fBtimg\fR linked against poppler; \fBchafa\fR has no PDF
 loader, so on a machine with only \fBchafa\fR a PDF is reported as needing

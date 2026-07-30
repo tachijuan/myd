@@ -304,7 +304,11 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
             // The renderer brackets the image with cursor hiding, mode setting
             // and a trailing newline. Inside a TUI that framing scrolls the pane
             // and un-hides the cursor, so only the image data goes through.
-            let payload = graphics::strip_framing(&text).to_string();
+            // Pin the image to the cells the pane reserved. timg describes it in
+            // pixels and lets the terminal pick a row count, which is how an
+            // image ends up taller than its pane — and the overflow lands on rows
+            // nothing repaints, so it also outlives the preview.
+            let payload = graphics::pin_to_cells(graphics::strip_framing(&text), cols, rows);
             if payload.is_empty() {
                 PreviewContent::Note {
                     message: format!("{} produced no output.", backend.binary()),

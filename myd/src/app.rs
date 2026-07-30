@@ -28,6 +28,15 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = std::io::stdout();
+        // Remove any image still on screen before handing the terminal back.
+        // Leaving the alternate screen restores the cells underneath, but a kitty
+        // image is an object the terminal keeps re-compositing and is not part of
+        // that buffer — without this it stays visible over the user's shell.
+        if let Some(seq) =
+            crate::preview::graphics::clear_sequence(crate::preview::graphics::protocol())
+        {
+            let _ = stdout.write_all(seq.as_bytes());
+        }
         // Flush any pending output before cleanup.
         let _ = stdout.flush();
         // Disable raw mode (restores cooked mode for normal terminal I/O).
@@ -1663,18 +1672,25 @@ impl FileBrowser {
     /// idle, and re-sending a few hundred kilobytes of base64 every tick would
     /// flood the terminal and make the image flicker.
     fn flush_preview_graphics(&mut self) {
-        use std::io::Write;
-
         let wanted = match (&self.preview.graphics_area, self.preview.graphics()) {
             (Some(area), Some(payload)) if self.preview_open => Some((*area, payload)),
             _ => None,
         };
 
         let Some((area, payload)) = wanted else {
-            // Nothing to show. If an image is still on screen, the frame that just
-            // drew has already painted over its cells, so there is nothing to
-            // erase — just forget it so the next one is emitted.
-            self.preview_graphics_shown = None;
+            // Nothing to show any more. Whether the old image needs erasing
+            // depends on the protocol: iTerm2 and sixel rasterise into the cell
+            // grid, so the frame that just drew has already covered them, but a
+            // kitty image is an object the terminal keeps re-compositing and
+            // survives anything painted over it. Without this the picture stays
+            // on screen after the preview closes.
+            if self.preview_graphics_shown.take().is_some() {
+                if let Some(seq) = crate::preview::graphics::clear_sequence(
+                    crate::preview::graphics::protocol(),
+                ) {
+                    self.write_graphics(seq);
+                }
+            }
             return;
         };
 
@@ -1685,27 +1701,52 @@ impl FileBrowser {
             return;
         }
 
-        use crate::preview::graphics::{self, Protocol};
+        // Remove whatever was there first. A kitty placement is an object rather
+        // than cells, so drawing a smaller image over a larger one leaves the old
+        // one showing around the edges — moving between two pictures has to erase
+        // before it draws.
+        if self.preview_graphics_shown.is_some() {
+            if let Some(seq) =
+                crate::preview::graphics::clear_sequence(crate::preview::graphics::protocol())
+            {
+                self.write_graphics(seq);
+            }
+        }
 
-        // tmux swallows an escape it does not understand unless it is wrapped in
-        // a passthrough envelope — but it understands sixel natively and parses
-        // it itself, so wrapping *that* would hide the image from the very thing
-        // meant to draw it. Only the protocols tmux does not know get wrapped.
-        let body = match (std::env::var_os("TMUX").is_some(), graphics::protocol()) {
+        // Place the cursor at the top-left of the hole: every protocol draws from
+        // the cursor position.
+        let placed = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
+        if self.write_graphics(&placed) && self.write_graphics(payload) {
+            self.preview_graphics_shown = Some(stamp);
+        }
+    }
+
+    /// Write an escape sequence straight to the terminal, wrapping it for tmux
+    /// when that is what it takes to get through.
+    ///
+    /// tmux swallows an escape it does not understand unless it is wrapped in a
+    /// passthrough envelope — but it understands sixel natively and parses it
+    /// itself, so wrapping *that* would hide the image from the very thing meant
+    /// to draw it. Only the protocols tmux does not know get wrapped.
+    fn write_graphics(&self, payload: &str) -> bool {
+        use crate::preview::graphics::{self, Protocol};
+        use std::io::Write;
+
+        // Cursor positioning is ordinary CSI that tmux handles itself; only the
+        // image-carrying sequences need the envelope.
+        let needs_wrap = payload.contains("\x1b_") || payload.contains("\x1b]");
+        let body = match (
+            needs_wrap && std::env::var_os("TMUX").is_some(),
+            graphics::protocol(),
+        ) {
             (true, Protocol::Kitty) | (true, Protocol::Iterm2) => {
                 std::borrow::Cow::Owned(graphics::wrap_for_tmux(payload))
             }
             _ => std::borrow::Cow::Borrowed(payload),
         };
 
-        // Place the cursor at the top-left of the hole: every protocol draws from
-        // the cursor position.
-        let seq = format!("\x1b[{};{}H{}", area.y + 1, area.x + 1, body);
-
         let mut out = std::io::stdout();
-        if out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok() {
-            self.preview_graphics_shown = Some(stamp);
-        }
+        out.write_all(body.as_bytes()).is_ok() && out.flush().is_ok()
     }
 
     /// Install a finished preview load. Called once per tick.

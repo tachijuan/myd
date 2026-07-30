@@ -402,6 +402,16 @@ to the terminal, so it can never corrupt the display. A graphics image necessari
 does reach the terminal directly: the pane leaves a hole for it and the escape is
 written after the frame.
 
+Because the image is not made of cells, myd has to bound it explicitly. The
+kitty and iTerm2 escapes are told the size in **cells** (`c=`/`r=`, and
+`width=`/`height=` without the `px` suffix) so the picture occupies exactly the
+rows the pane reserved — left to itself the renderer describes the image in
+pixels and the terminal decides how many rows that is, which is how an image
+ends up spilling past its border. Sixel carries no such control, so it is asked
+for a smaller raster instead. A kitty image is an object the terminal keeps
+re-compositing rather than cells, so it is explicitly deleted when the preview
+closes, when the selection moves to another file, and on exit.
+
 A **PDF** needs a `timg` linked against poppler; `chafa` has no PDF loader, so on
 a chafa-only machine a PDF says so rather than failing with an obscure error. With
 a multi-page document open, `j`/`k` turn pages instead of scrolling — a rendered

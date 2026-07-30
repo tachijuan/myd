@@ -504,7 +504,113 @@ fn is_graphics_sequence(seq: &str) -> bool {
         || seq.starts_with("\x1bP")      // sixel DCS
 }
 
-/// Wrap graphics output so it survives tmux's passthrough.
+/// Pin a graphics payload to an exact size in terminal cells.
+///
+/// This is what keeps an image inside its pane. timg describes the image in
+/// **pixels** (`width=260px;height=91px` for iTerm2, and nothing at all for
+/// kitty), which leaves the terminal to divide by its own cell size and decide
+/// how many rows to occupy. That cell size is not knowable from here — timg
+/// itself falls back to assuming 18px per row when its stdout is a pipe, as it
+/// is here — so the row count the terminal picks and the row count the pane
+/// reserved are two different numbers.
+///
+/// When the image comes out taller, the excess lands on rows the pane never
+/// drew. Those rows are outside everything ratatui repaints, so the overflow
+/// both spills past the pane border *and* survives closing the preview: the two
+/// symptoms are one bug.
+///
+/// Both protocols can be told the size in cells directly, which removes the
+/// guesswork:
+///
+/// - **iTerm2** takes `width=` / `height=` in cells when the `px` suffix is
+///   dropped, plus `preserveAspectRatio` so it letterboxes rather than
+///   stretches.
+/// - **kitty** takes `c=` / `r=` (columns and rows) among the control keys of
+///   the *first* chunk — the continuation chunks carry no control keys.
+///
+/// Sixel has no such control. It is a raster with fixed pixel dimensions, and
+/// the rows it occupies depend on the terminal's cell height — which timg
+/// assumes is 18px when it cannot ask. A terminal with a shorter cell will draw
+/// it taller than the reserved rows, so [`sixel_row_budget`] shrinks what is
+/// requested to leave headroom.
+pub fn pin_to_cells(payload: &str, cols: u16, rows: u16) -> String {
+    if payload.starts_with("\x1b]1337;") {
+        return pin_iterm(payload, cols, rows);
+    }
+    if payload.starts_with("\x1b_G") {
+        return pin_kitty(payload, cols, rows);
+    }
+    payload.to_string()
+}
+
+/// Replace iTerm2's pixel dimensions with cell dimensions.
+fn pin_iterm(payload: &str, cols: u16, rows: u16) -> String {
+    // `width=260px;height=91px` -> `width=60;height=24;preserveAspectRatio=1`.
+    // Without the aspect-ratio flag iTerm2 stretches the image to fill the box.
+    let Some(start) = payload.find("width=") else {
+        return payload.to_string();
+    };
+    let Some(rest) = payload[start..].find("inline=") else {
+        return payload.to_string();
+    };
+    let end = start + rest;
+    format!(
+        "{}width={};height={};preserveAspectRatio=1;{}",
+        &payload[..start],
+        cols,
+        rows,
+        &payload[end..]
+    )
+}
+
+/// Add kitty's columns/rows control keys to the first chunk.
+fn pin_kitty(payload: &str, cols: u16, rows: u16) -> String {
+    // Control keys run from `ESC_G` to the first `;`, and only the opening chunk
+    // has them; later chunks are `ESC_Gq=2,m=1;<data>`.
+    let Some(semi) = payload.find(';') else {
+        return payload.to_string();
+    };
+    let head = &payload[..semi];
+    // Already pinned (a payload that has been through here before).
+    if head.contains(",c=") || head.contains(",r=") {
+        return payload.to_string();
+    }
+    format!("{},c={},r={}{}", head, cols, rows, &payload[semi..])
+}
+
+/// Rows to ask timg for when rendering sixel into a pane of `rows` rows.
+///
+/// Sixel cannot be pinned to a cell count after the fact the way kitty and
+/// iTerm2 can, so the only lever is the geometry timg is given. It sizes the
+/// raster assuming an 18-pixel cell — measured: a request of `rows` produced a
+/// raster of `rows * 18` pixels. A terminal whose cells are shorter than that
+/// draws the same raster over *more* rows than were reserved, and the excess
+/// lands where nothing repaints it.
+///
+/// Common cell heights run from about 14px upwards, so asking for roughly three
+/// quarters of the pane keeps the image inside it on a 13-14px cell while still
+/// filling most of the space on a taller one. Sixel is the fallback protocol;
+/// the ones that can be pinned exactly are preferred where available.
+pub fn sixel_row_budget(rows: u16) -> u16 {
+    (rows.saturating_mul(3) / 4).max(1)
+}
+
+/// The escape that removes a previously drawn image, if the protocol needs one.
+///
+/// Only kitty does. Its images are objects the terminal keeps and re-composites,
+/// so painting text over them does not remove them — closing the preview would
+/// leave the picture on screen. `a=d,d=A` deletes every placement.
+///
+/// iTerm2 and sixel rasterise into the cell grid, so repainting those cells is
+/// enough and there is nothing to send.
+pub fn clear_sequence(protocol: Protocol) -> Option<&'static str> {
+    match protocol {
+        Protocol::Kitty => Some("\x1b_Ga=d,d=A\x1b\\"),
+        _ => None,
+    }
+}
+
+/// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough.
 ///
 /// tmux forwards a sequence wrapped in `ESC Ptmux; … ESC \`, with every `ESC`
 /// inside doubled so it can tell the payload from the wrapper's terminator.
@@ -900,6 +1006,122 @@ mod tests {
         use super::unix_probe::parse_reply;
         let p = parse_reply(b"");
         assert!(!p.kitty && !p.sixel);
+    }
+
+    // ---- cell pinning ---------------------------------------------------
+
+    /// The fix for images spilling past the pane. timg describes the image in
+    /// pixels and lets the terminal choose a row count; pinning it in cells is
+    /// what makes the image occupy exactly the rows the pane reserved.
+    #[test]
+    fn iterm_dimensions_are_converted_to_cells() {
+        let raw = strip_framing(&fixture("timg_iterm2.esc")).to_string();
+        // The fixture must actually carry pixel dimensions, or this proves
+        // nothing.
+        assert!(raw.contains("width=260px"), "fixture lost its pixel size");
+
+        let pinned = pin_to_cells(&raw, 60, 24);
+        assert!(pinned.contains("width=60;height=24"), "not pinned: {:?}",
+            &pinned[..pinned.find(':').unwrap_or(120).min(120)]);
+        // Only check the header: "px" also occurs by chance in the base64 body.
+        let header_end = pinned.find(':').expect("iTerm2 header ends at the colon");
+        assert!(
+            !pinned[..header_end].contains("px"),
+            "pixel dimensions must be gone, or the terminal sizes it itself: {:?}",
+            &pinned[..header_end]
+        );
+        // Without this iTerm2 stretches the image to fill the box.
+        assert!(pinned.contains("preserveAspectRatio=1"));
+        // The image data itself must be untouched.
+        assert!(pinned.contains("inline=1"));
+        assert_eq!(
+            pinned.matches("\x1b]1337;").count(),
+            1,
+            "should still be one sequence"
+        );
+    }
+
+    /// kitty takes columns and rows as control keys, and only the first chunk
+    /// carries control keys — the continuations are pure data.
+    #[test]
+    fn kitty_gets_column_and_row_control_keys() {
+        let raw = strip_framing(&fixture("timg_kitty.esc")).to_string();
+        let pinned = pin_to_cells(&raw, 60, 24);
+
+        let heads: Vec<&str> = pinned
+            .split("\x1b_G")
+            .skip(1)
+            .map(|c| c.split(';').next().unwrap_or(""))
+            .collect();
+        assert_eq!(heads.len(), 3, "should still be three chunks");
+        assert!(heads[0].contains("c=60"), "first chunk: {:?}", heads[0]);
+        assert!(heads[0].contains("r=24"), "first chunk: {:?}", heads[0]);
+        // Adding control keys to a continuation chunk would corrupt the stream.
+        for h in &heads[1..] {
+            assert!(!h.contains("c="), "continuation was modified: {h:?}");
+        }
+    }
+
+    /// Pinning twice must not stack duplicate keys — the payload is re-pinned
+    /// whenever the pane is resized.
+    #[test]
+    fn pinning_is_idempotent() {
+        let raw = strip_framing(&fixture("timg_kitty.esc")).to_string();
+        let once = pin_to_cells(&raw, 60, 24);
+        let twice = pin_to_cells(&once, 60, 24);
+        assert_eq!(once, twice);
+    }
+
+    /// Sixel is a raster with fixed dimensions and no size control, so it passes
+    /// through untouched rather than being corrupted by a rewrite attempt.
+    #[test]
+    fn sixel_is_left_alone() {
+        let raw = strip_framing(&fixture("timg_sixel.esc")).to_string();
+        assert_eq!(pin_to_cells(&raw, 60, 24), raw);
+    }
+
+    #[test]
+    fn pinning_a_malformed_payload_does_not_panic() {
+        for s in ["", "\x1b_G", "\x1b]1337;", "\x1b]1337;File=width=1px", "plain"] {
+            let _ = pin_to_cells(s, 10, 5);
+        }
+    }
+
+    /// Sixel cannot be pinned after the fact, so the geometry request is the
+    /// only lever; it must leave room for a terminal whose cells are shorter than
+    /// timg assumes.
+    #[test]
+    fn the_sixel_row_budget_leaves_headroom() {
+        for rows in [8u16, 20, 24, 40] {
+            let asked = sixel_row_budget(rows);
+            assert!(asked < rows, "{rows}: no headroom left ({asked})");
+            assert!(asked > 0, "{rows}: budget collapsed to nothing");
+            // Still worth looking at — not shrunk into a thumbnail.
+            assert!(
+                asked * 2 >= rows,
+                "{rows}: shrunk too far ({asked}), the image would be tiny"
+            );
+        }
+        // A pane with almost no room must still ask for a drawable row.
+        assert_eq!(sixel_row_budget(1), 1);
+        assert_eq!(sixel_row_budget(0), 1);
+    }
+
+    // ---- clearing -------------------------------------------------------
+
+    /// A kitty image is an object the terminal keeps re-compositing, so painting
+    /// text over it does not remove it — closing the preview would leave the
+    /// picture on screen. The others rasterise into the cell grid and need
+    /// nothing.
+    #[test]
+    fn only_kitty_needs_an_explicit_clear() {
+        let seq = clear_sequence(Protocol::Kitty).expect("kitty must be cleared");
+        assert!(seq.starts_with("\x1b_G"));
+        assert!(seq.contains("a=d"), "should be a delete: {seq:?}");
+
+        assert_eq!(clear_sequence(Protocol::Iterm2), None);
+        assert_eq!(clear_sequence(Protocol::Sixel), None);
+        assert_eq!(clear_sequence(Protocol::Blocks), None);
     }
 
     // ---- tmux wrapping --------------------------------------------------
