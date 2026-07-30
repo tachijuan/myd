@@ -530,6 +530,17 @@ fn build_footer(state: &PreviewState, focused: bool) -> Line<'static> {
             format!(" {backend} "),
             Style::default().fg(Color::Cyan),
         ));
+        // When a capable-looking terminal still got blocks, say what would have
+        // to change. Silently falling back is what made this hard to diagnose in
+        // the first place.
+        if let (Some(PreviewContent::Image { .. }), Some(why)) =
+            (&state.content, crate::preview::graphics::explain())
+        {
+            spans.push(Span::styled(
+                format!(" {why} "),
+                Style::default().fg(OTHER_MATCH),
+            ));
+        }
         if state.is_paged() {
             let label = match state.pages {
                 Some(n) if n > 0 => format!(" page {}/{} ", state.page + 1, n),
