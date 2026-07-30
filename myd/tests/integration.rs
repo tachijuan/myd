@@ -10777,7 +10777,10 @@ fn iterm2_is_recognised_over_ssh_and_under_tmux() {
     };
     assert_eq!(*decide(&over_ssh, None), Protocol::Iterm2);
 
-    // Under tmux, TERM_PROGRAM says "tmux" and hides the real terminal.
+    // Under tmux, TERM_PROGRAM says "tmux" and hides the real terminal. The
+    // terminal must still be recognised as capable — but the protocol used is
+    // kitty's, because through a multiplexer what matters is that the image is
+    // carried in small chunks rather than one large escape.
     let under_tmux = EnvVars {
         term: Some("screen-256color".into()),
         term_program: Some("tmux".into()),
@@ -10786,7 +10789,8 @@ fn iterm2_is_recognised_over_ssh_and_under_tmux() {
         tmux_passthrough: true,
         ..Default::default()
     };
-    assert_eq!(*decide(&under_tmux, None), Protocol::Iterm2);
+    assert_ne!(*decide(&under_tmux, None), Protocol::Blocks);
+    assert_eq!(*decide(&under_tmux, None), Protocol::Kitty);
 
     // And with passthrough off, sixel is the one thing tmux forwards itself.
     let sixel_tmux = EnvVars {

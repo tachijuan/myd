@@ -425,13 +425,18 @@ different answer inside tmux than it does natively — the same image filled a
 native window and came out small in a tmux pane. When the terminal does not
 report a cell size, the cell form is used as a fallback.
 
-Inside a multiplexer there is a further limit, and it is not tmux's: tmux
-forwards a megabyte happily, but the terminal at the far end stops *drawing*
-past a certain size and gives no error — just a blank space. Measured by
-bisection, images drew up to a 256KB base64 payload. Previews are therefore
-capped at 200KB there, shrinking the render until it fits, which is why an image
-looks softer in tmux than in a native window. `MYD_PREVIEW_MAX_PAYLOAD` sets the
-ceiling in kilobytes if your terminal manages more (`0` removes it).
+**Inside tmux the kitty protocol is always used**, whatever the terminal's own
+protocol is. This is about how the image is *carried*, not what is at the far
+end: kitty splits a picture into roughly 4KB chunks, each its own escape, while
+iTerm2 sends one sequence however large — and a single large escape is what a
+multiplexer will not deliver. `timg` run inside tmux shows the same thing, drawing
+nothing for a large photo unless forced to `-pk`. iTerm2 understands kitty's
+protocol, so this costs nothing and removes the size ceiling entirely: images
+keep full resolution in tmux rather than being shrunk to fit.
+
+The per-escape limit still exists as a backstop, and `MYD_PREVIEW_MAX_PAYLOAD`
+sets it in kilobytes (`0` removes it). It is judged per sequence rather than per
+image, which is the point of chunking.
 
 Where iTerm2 can decode the file itself — JPEG, PNG, GIF, WebP and the like —
 the file's own bytes are sent and the renderer is skipped. That is a size fix
