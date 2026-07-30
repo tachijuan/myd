@@ -403,6 +403,20 @@ fn highlight(path: &Path, text: &str) -> Vec<Line<'static>> {
 
     let mut h = HighlightLines::new(syntax, theme);
     let mut out = Vec::new();
+    // Tabs are expanded before highlighting rather than after. A tab that reaches
+    // the buffer is one cell as far as ratatui is concerned but advances the real
+    // cursor to the next tab stop, so the two disagree about where every
+    // subsequent character sits — the pane's border ends up drawn over, and the
+    // damage persists as the frame is diffed against a buffer that never matched
+    // the screen. Expanding first also keeps the highlighter's byte offsets
+    // aligned with what is finally drawn.
+    let expanded;
+    let text = if text.contains('\t') {
+        expanded = expand_text_tabs(text);
+        expanded.as_str()
+    } else {
+        text
+    };
     for line in LinesWithEndings::from(text) {
         let Ok(ranges) = h.highlight_line(line, syntaxes) else {
             // Give up on highlighting from here rather than losing the file.
@@ -447,6 +461,22 @@ fn plain_lines(text: &str) -> Vec<Line<'static>> {
 
 fn strip_eol(s: &str) -> &str {
     s.trim_end_matches('\n').trim_end_matches('\r')
+}
+
+/// Expand tabs across a whole document, preserving line endings.
+///
+/// Per line, because a tab stop is measured from the start of its own line.
+fn expand_text_tabs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    for line in syntect::util::LinesWithEndings::from(text) {
+        let (body, eol) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        out.push_str(&expand_tabs(body));
+        out.push_str(eol);
+    }
+    out
 }
 
 /// Tabs would otherwise be drawn as a single cell, wrecking indentation.
@@ -563,6 +593,53 @@ mod tests {
         assert!(src.len() < MAX_HIGHLIGHT_BYTES);
         let lines = highlight(Path::new("a.rs"), &src);
         assert!(lines[0].spans.len() > 1, "should be tokenised");
+    }
+
+    /// A tab that survives into the buffer is one cell as far as ratatui is
+    /// concerned, but the real cursor jumps to the next tab stop — so every
+    /// character after it sits somewhere the buffer does not expect, the pane
+    /// border is drawn over, and the damage persists because later frames are
+    /// diffed against a buffer that never matched the screen.
+    ///
+    /// The highlighted path used to pass syntect's pieces through untouched,
+    /// which is how tab-indented source (851 of the 1450 lines of Markdown.pl)
+    /// broke the pane.
+    #[test]
+    fn highlighted_code_never_carries_a_raw_tab() {
+        // Tab-indented Perl, the shape that broke: a tab, then content, then
+        // tabs used to align a trailing comment.
+        let src = "sub f {\n\tmy $x = qr{\n\t (?>\t\t\t# comment\n\t)*\n\t}x;\n}\n";
+        assert!(src.contains('\t'));
+
+        for name in ["t.pl", "t.rs", "t.py", "t.c", "t.unknown"] {
+            for line in highlight(Path::new(name), src) {
+                for span in &line.spans {
+                    assert!(
+                        !span.content.contains('\t'),
+                        "{name}: raw tab reached the buffer in {:?}",
+                        span.content
+                    );
+                }
+            }
+        }
+    }
+
+    /// Expanding must not disturb the text itself, only the tabs.
+    #[test]
+    fn expanding_tabs_preserves_every_line() {
+        let src = "a\n\tb\n\t\tc\nd\n";
+        let out = expand_text_tabs(src);
+        assert_eq!(out.lines().count(), src.lines().count());
+        assert_eq!(
+            out.lines().map(|l| l.trim().to_string()).collect::<Vec<_>>(),
+            src.lines().map(|l| l.trim().to_string()).collect::<Vec<_>>(),
+        );
+        // Each tab stop is measured from the start of its own line.
+        assert_eq!(expand_text_tabs("\tx\n\tx\n"), "    x\n    x\n");
+        // A file with no tabs is returned unchanged.
+        assert_eq!(expand_text_tabs("plain\n"), "plain\n");
+        // A final line with no newline must not gain one.
+        assert_eq!(expand_text_tabs("\ta"), "    a");
     }
 
     #[test]
