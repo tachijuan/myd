@@ -595,19 +595,33 @@ pub fn sixel_row_budget(rows: u16) -> u16 {
     (rows.saturating_mul(3) / 4).max(1)
 }
 
-/// The escape that removes a previously drawn image, if the protocol needs one.
+/// The escape that deletes a previously drawn image, where the protocol has one.
 ///
 /// Only kitty does. Its images are objects the terminal keeps and re-composites,
-/// so painting text over them does not remove them — closing the preview would
-/// leave the picture on screen. `a=d,d=A` deletes every placement.
+/// so `a=d,d=A` is the way to remove every placement.
 ///
-/// iTerm2 and sixel rasterise into the cell grid, so repainting those cells is
-/// enough and there is nothing to send.
+/// iTerm2 and sixel have no delete operation — the image belongs to the cells it
+/// was drawn into — so removing one means erasing those cells instead. See
+/// [`needs_region_erase`].
 pub fn clear_sequence(protocol: Protocol) -> Option<&'static str> {
     match protocol {
         Protocol::Kitty => Some("\x1b_Ga=d,d=A\x1b\\"),
         _ => None,
     }
+}
+
+/// Whether removing an image of this protocol means erasing the cells it covered.
+///
+/// iTerm2 and sixel draw into the grid and offer no delete escape, so the only
+/// way to get rid of one is to erase the region. Redrawing the frame is *not*
+/// enough: ratatui only emits cells whose content changed, and the cells under an
+/// image are ones it believes are already blank — so it writes nothing there and
+/// the picture survives. That is the ghost left behind in a native iTerm2 pane.
+///
+/// kitty is excluded because it has a real delete, which is cheaper and does not
+/// disturb the rest of the frame.
+pub fn needs_region_erase(protocol: Protocol) -> bool {
+    matches!(protocol, Protocol::Iterm2 | Protocol::Sixel)
 }
 
 /// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough./// Wrap graphics output so it survives tmux's passthrough.
@@ -1109,12 +1123,9 @@ mod tests {
 
     // ---- clearing -------------------------------------------------------
 
-    /// A kitty image is an object the terminal keeps re-compositing, so painting
-    /// text over it does not remove it — closing the preview would leave the
-    /// picture on screen. The others rasterise into the cell grid and need
-    /// nothing.
+    /// kitty images are objects with a real delete operation.
     #[test]
-    fn only_kitty_needs_an_explicit_clear() {
+    fn only_kitty_has_a_delete_escape() {
         let seq = clear_sequence(Protocol::Kitty).expect("kitty must be cleared");
         assert!(seq.starts_with("\x1b_G"));
         assert!(seq.contains("a=d"), "should be a delete: {seq:?}");
@@ -1122,6 +1133,41 @@ mod tests {
         assert_eq!(clear_sequence(Protocol::Iterm2), None);
         assert_eq!(clear_sequence(Protocol::Sixel), None);
         assert_eq!(clear_sequence(Protocol::Blocks), None);
+    }
+
+    /// The ghost-image bug. iTerm2 and sixel have no delete operation, and
+    /// redrawing the frame does not remove them either: ratatui emits only the
+    /// cells whose content changed, and the cells under an image are ones it
+    /// believes are already blank. They have to be erased explicitly.
+    #[test]
+    fn iterm_and_sixel_need_their_region_erased() {
+        assert!(
+            needs_region_erase(Protocol::Iterm2),
+            "an iTerm2 image is not removed by repainting"
+        );
+        assert!(needs_region_erase(Protocol::Sixel));
+
+        // kitty has a cheaper, more precise option.
+        assert!(!needs_region_erase(Protocol::Kitty));
+        assert!(!needs_region_erase(Protocol::Blocks));
+    }
+
+    /// Exactly one removal mechanism per protocol, and every graphics protocol
+    /// has one — a protocol with neither would leak images.
+    #[test]
+    fn every_graphics_protocol_can_be_removed() {
+        for p in [Protocol::Kitty, Protocol::Iterm2, Protocol::Sixel] {
+            let deletes = clear_sequence(p).is_some();
+            let erases = needs_region_erase(p);
+            assert!(deletes || erases, "{p:?} has no way to be removed");
+            assert!(
+                !(deletes && erases),
+                "{p:?} would be removed twice, which flickers"
+            );
+        }
+        // Blocks are cells; ratatui already owns them.
+        assert!(clear_sequence(Protocol::Blocks).is_none());
+        assert!(!needs_region_erase(Protocol::Blocks));
     }
 
     // ---- tmux wrapping --------------------------------------------------

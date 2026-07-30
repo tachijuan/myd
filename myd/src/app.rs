@@ -29,13 +29,19 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = std::io::stdout();
         // Remove any image still on screen before handing the terminal back.
-        // Leaving the alternate screen restores the cells underneath, but a kitty
-        // image is an object the terminal keeps re-compositing and is not part of
-        // that buffer — without this it stays visible over the user's shell.
-        if let Some(seq) =
-            crate::preview::graphics::clear_sequence(crate::preview::graphics::protocol())
-        {
+        //
+        // A kitty image is an object the terminal re-composites and is not part of
+        // the alternate screen's cells, so leaving that screen does not take it
+        // with us — it needs its own delete. iTerm2 and sixel images belong to
+        // cells, which *should* go with the alternate screen, but erasing them
+        // first is cheap and does not depend on that being true of every build.
+        let protocol = crate::preview::graphics::protocol();
+        if let Some(seq) = crate::preview::graphics::clear_sequence(protocol) {
             let _ = stdout.write_all(seq.as_bytes());
+        } else if crate::preview::graphics::needs_region_erase(protocol) {
+            // Erase the whole alternate screen rather than tracking where the
+            // image was: this runs once, on the way out.
+            let _ = stdout.write_all(b"\x1b[2J");
         }
         // Flush any pending output before cleanup.
         let _ = stdout.flush();
@@ -258,6 +264,12 @@ pub struct FileBrowser {
     /// us. Without this the idle 10Hz loop would re-send the whole payload every
     /// tick, which flickers and floods the terminal.
     preview_graphics_shown: Option<(ratatui::layout::Rect, usize, usize)>,
+    /// Set when the screen has been written to behind ratatui's back and its
+    /// buffer no longer describes what is displayed.
+    ///
+    /// Erasing an image writes over cells ratatui still believes it drew, so the
+    /// next frame has to be a full repaint rather than a diff.
+    force_repaint: bool,
 }
 
 /// A preview load running in the background.
@@ -411,6 +423,7 @@ impl FileBrowser {
             preview_focused: false,
             preview_task: None,
             preview_graphics_shown: None,
+            force_repaint: false,
         }
     }
 
@@ -596,6 +609,13 @@ impl FileBrowser {
             self.request_preview();
 
             let after_resolve = trace_started_now(tick_started);
+            // Erasing an image writes over cells ratatui still believes it drew,
+            // so its buffer no longer describes the screen and a diff would leave
+            // the erased region blank. `clear` discards that belief and forces the
+            // next draw to emit everything.
+            if std::mem::take(&mut self.force_repaint) {
+                terminal.clear()?;
+            }
             terminal.draw(|f| self.draw(f))?;
             // A high-resolution image is escape data the terminal draws itself, so
             // it can only go out after the frame has been flushed — ratatui would
@@ -1672,24 +1692,19 @@ impl FileBrowser {
     /// idle, and re-sending a few hundred kilobytes of base64 every tick would
     /// flood the terminal and make the image flicker.
     fn flush_preview_graphics(&mut self) {
+        // Taken by value: erasing the old image needs `&mut self`, which cannot
+        // coexist with a payload borrowed out of `self.preview`.
         let wanted = match (&self.preview.graphics_area, self.preview.graphics()) {
-            (Some(area), Some(payload)) if self.preview_open => Some((*area, payload)),
+            (Some(area), Some(payload)) if self.preview_open => {
+                Some((*area, payload.to_string()))
+            }
             _ => None,
         };
 
         let Some((area, payload)) = wanted else {
-            // Nothing to show any more. Whether the old image needs erasing
-            // depends on the protocol: iTerm2 and sixel rasterise into the cell
-            // grid, so the frame that just drew has already covered them, but a
-            // kitty image is an object the terminal keeps re-compositing and
-            // survives anything painted over it. Without this the picture stays
-            // on screen after the preview closes.
-            if self.preview_graphics_shown.take().is_some() {
-                if let Some(seq) = crate::preview::graphics::clear_sequence(
-                    crate::preview::graphics::protocol(),
-                ) {
-                    self.write_graphics(seq);
-                }
+            // Nothing to show any more, so remove whatever is still on screen.
+            if let Some((old, _, _)) = self.preview_graphics_shown.take() {
+                self.erase_graphics(old);
             }
             return;
         };
@@ -1701,24 +1716,51 @@ impl FileBrowser {
             return;
         }
 
-        // Remove whatever was there first. A kitty placement is an object rather
-        // than cells, so drawing a smaller image over a larger one leaves the old
-        // one showing around the edges — moving between two pictures has to erase
-        // before it draws.
-        if self.preview_graphics_shown.is_some() {
-            if let Some(seq) =
-                crate::preview::graphics::clear_sequence(crate::preview::graphics::protocol())
-            {
-                self.write_graphics(seq);
-            }
+        // Remove whatever was there first, or a smaller image drawn over a larger
+        // one leaves the old edges showing.
+        if let Some((old, _, _)) = self.preview_graphics_shown {
+            self.erase_graphics(old);
         }
 
         // Place the cursor at the top-left of the hole: every protocol draws from
         // the cursor position.
         let placed = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
-        if self.write_graphics(&placed) && self.write_graphics(payload) {
+        if self.write_graphics(&placed) && self.write_graphics(&payload) {
             self.preview_graphics_shown = Some(stamp);
         }
+    }
+
+    /// Remove an image previously drawn at `area`.
+    ///
+    /// How depends on the protocol. kitty images are objects with a delete
+    /// operation, so one escape removes every placement. iTerm2 and sixel have no
+    /// such operation — the image belongs to the cells it was drawn into — so the
+    /// only way to get rid of one is to erase those cells.
+    ///
+    /// Redrawing the frame does not do it. ratatui writes only the cells whose
+    /// content changed, and the cells under an image are ones it believes are
+    /// already blank, so it emits nothing for them and the picture survives. That
+    /// is the ghost left behind in a native iTerm2 pane.
+    ///
+    /// After erasing, the region has to be repainted or the pane's own border and
+    /// text would be missing too, so this asks for a full redraw on the next tick.
+    fn erase_graphics(&mut self, area: ratatui::layout::Rect) {
+        use crate::preview::graphics;
+
+        let protocol = graphics::protocol();
+        if let Some(seq) = graphics::clear_sequence(protocol) {
+            self.write_graphics(seq);
+            return;
+        }
+        if !graphics::needs_region_erase(protocol) {
+            return;
+        }
+
+        self.write_graphics(&region_erase_sequence(area));
+        // The cells just erased include whatever the pane had drawn there, so the
+        // next frame must be a full repaint rather than a diff against a buffer
+        // that no longer matches the screen.
+        self.force_repaint = true;
     }
 
     /// Write an escape sequence straight to the terminal, wrapping it for tmux
@@ -4390,6 +4432,25 @@ pub fn preview_area(full: ratatui::layout::Rect) -> ratatui::layout::Rect {
         width: full.width - INSET_X * 2,
         height: full.height - INSET_Y * 2,
     }
+}
+
+/// The escape that erases the cells an image was drawn into.
+///
+/// Used for the protocols with no delete operation of their own. `ESC[K` clears
+/// from the cursor to the end of the line, so the cursor is placed at the image's
+/// left edge on each row it covered in turn — erasing exactly those rows and
+/// leaving the rest of the frame alone.
+///
+/// Rows and columns in the escape are 1-based, where a [`Rect`] is 0-based.
+///
+/// [`Rect`]: ratatui::layout::Rect
+pub fn region_erase_sequence(area: ratatui::layout::Rect) -> String {
+    let mut seq = String::with_capacity(area.height as usize * 12);
+    for row in area.y..area.y.saturating_add(area.height) {
+        use std::fmt::Write as _;
+        let _ = write!(seq, "\x1b[{};{}H\x1b[K", row + 1, area.x + 1);
+    }
+    seq
 }
 
 /// The subset of pending transfer destinations that belong in one panel's tree:
