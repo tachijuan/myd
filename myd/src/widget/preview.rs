@@ -541,6 +541,15 @@ fn build_footer(state: &PreviewState, focused: bool) -> Line<'static> {
                 Style::default().fg(OTHER_MATCH),
             ));
         }
+        // Whether a cell size was measured decides how an image is sized, and it
+        // is otherwise invisible — so a graphics preview says which it used.
+        if matches!(state.content, Some(PreviewContent::Graphics { .. })) {
+            let how = match crate::preview::graphics::cell_size() {
+                Some((w, h)) => format!(" {w}x{h}px cells "),
+                None => " cell size unknown ".to_string(),
+            };
+            spans.push(Span::styled(how, Style::default().fg(OTHER_MATCH)));
+        }
         if state.is_paged() {
             let label = match state.pages {
                 Some(n) if n > 0 => format!(" page {}/{} ", state.page + 1, n),

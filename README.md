@@ -411,8 +411,13 @@ pixels and the terminal decides how many rows that is, which is how an image
 ends up spilling past its border. Sixel carries no such control, so it is asked
 for a smaller raster instead.
 
-myd asks the terminal how large a character cell is (`ESC[16t`, answered in the
-same round trip as the protocol probe) and states the image's size in **pixels**.
+myd works out how large a character cell is — from `TIOCGWINSZ` where the
+kernel carries pixel dimensions, otherwise by asking the terminal (`ESC[16t`,
+answered in the same round trip as the protocol probe) — and states the image's
+size in **pixels**. The kernel is preferred because under tmux it describes the
+*pane*, where the escape is answered by the outer terminal about its whole
+window. The preview footer shows which cell size was used, or says the size is
+unknown.
 Both pixels and cells are valid in the escape, but only one is unambiguous:
 sizing in cells leaves the terminal to multiply out, and iTerm2 reaches a
 different answer inside tmux than it does natively — the same image filled a

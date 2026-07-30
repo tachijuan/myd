@@ -396,6 +396,31 @@ mod unix_probe {
     const CELL_QUERY: &[u8] = b"\x1b[16t";
     const KITTY_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAAAAAA\x1b\\";
 
+    /// The cell size according to the kernel's window size, if it carries one.
+    ///
+    /// `TIOCGWINSZ` optionally reports the terminal's size in pixels alongside
+    /// its size in rows and columns; dividing gives the cell. Preferred over the
+    /// `ESC[16t` query because it is a synchronous call with no reply to wait
+    /// for — and because under tmux it describes the *pane*, where the escape is
+    /// answered by the outer terminal about its own window.
+    ///
+    /// Many terminals leave the pixel fields zero, in which case this reports
+    /// nothing and the query is used instead.
+    fn cell_from_ioctl(fd: i32) -> Option<(u16, u16)> {
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) != 0 {
+                return None;
+            }
+            if ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+                return None;
+            }
+            let w = ws.ws_xpixel / ws.ws_col;
+            let h = ws.ws_ypixel / ws.ws_row;
+            (w > 0 && h > 0).then_some((w, h))
+        }
+    }
+
     pub fn run(timeout: std::time::Duration, ask_kitty: bool) -> Option<Probed> {
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
@@ -411,10 +436,19 @@ mod unix_probe {
 
         // Kitty's query first when it is safe to ask, so both replies arrive
         // before the Device Attributes answer that marks the end.
+        // Ask the kernel first; it answers immediately or not at all.
+        let ioctl_cell = cell_from_ioctl(fd);
+
         if ask_kitty {
             tty.write_all(KITTY_QUERY).ok()?;
         }
-        tty.write_all(CELL_QUERY).ok()?;
+        // Only ask the terminal when the kernel had nothing, so a terminal that
+        // ignores the query does not cost the full timeout for an answer we
+        // already have.
+        let ask_cell = ioctl_cell.is_none();
+        if ask_cell {
+            tty.write_all(CELL_QUERY).ok()?;
+        }
         tty.write_all(DA_QUERY).ok()?;
         tty.flush().ok()?;
 
@@ -430,16 +464,47 @@ mod unix_probe {
                 Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    // The DA reply ends with 'c' and is sent last, so it marks the
-                    // end of everything the terminal has to say.
-                    if buf.contains(&b'c') {
+                    // Stop once everything asked for has arrived. Waiting on the
+                    // Device Attributes reply alone is not enough: a terminal may
+                    // answer the queries in any order, and stopping at the first
+                    // `c` byte then discards a cell-size reply that had not been
+                    // read yet — which silently loses the measurement and falls
+                    // back to sizing in cells.
+                    if replies_complete(&buf, ask_kitty, ask_cell) {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        Some(parse_reply(&buf))
+        // The kernel's answer wins: under tmux it describes the pane, where the
+        // escape is answered by the outer terminal about its whole window.
+        let mut probed = parse_reply(&buf);
+        if let Some(c) = ioctl_cell {
+            probed.cell = Some(c);
+        }
+        Some(probed)
+    }
+
+    /// Whether every answer that was asked for has arrived.
+    ///
+    /// A terminal is free to answer in any order, so this waits for each reply
+    /// individually rather than treating one of them as a finish line.
+    pub fn replies_complete(buf: &[u8], asked_kitty: bool, asked_cell: bool) -> bool {
+        let s = String::from_utf8_lossy(buf);
+        // Device Attributes: `ESC[?...c`.
+        let da = s
+            .split('\x1b')
+            .any(|p| p.starts_with("[?") && p.contains('c'));
+        // Cell size: `ESC[6;h;wt`. A terminal that does not implement the query
+        // says nothing at all, so this can never complete on its own — the
+        // timeout is what ends the wait there.
+        let cell = !asked_cell
+            || s.split('\x1b')
+                .any(|p| p.starts_with("[6;") && p.contains('t'));
+        // kitty answers `_G...;OK` or an error; either is an answer.
+        let kitty = !asked_kitty || s.contains("_Gi=31;");
+        da && cell && kitty
     }
 
     /// Read the answers out of whatever the terminal sent.
@@ -723,6 +788,31 @@ pub fn sixel_row_budget(rows: u16) -> u16 {
         return rows.max(1);
     }
     (rows.saturating_mul(3) / 4).max(1)
+}
+
+/// Scale a row count so timg's assumed cell height lands on the real one.
+///
+/// timg rasterises to `rows * 18` pixels when it cannot ask the terminal how big
+/// a cell is — and it cannot, because its stdout is a pipe here. On a terminal
+/// whose cells are taller than 18 pixels that raster is too small for the space
+/// it will occupy, and the image looks shrunken. Asking for proportionally more
+/// rows makes the pixel size come out right.
+///
+/// Only useful for sixel: the other protocols state their size in the escape and
+/// are corrected there instead. Returns `rows` unchanged when the cell size is
+/// unknown, or when the real cell is no taller than the assumption.
+pub fn scale_rows_for_cell(rows: u16) -> u16 {
+    /// The cell height timg assumes for a graphics render on a pipe.
+    const ASSUMED_CELL_H: u32 = 18;
+
+    let Some((_, ch)) = cell_size() else {
+        return rows;
+    };
+    if u32::from(ch) <= ASSUMED_CELL_H {
+        return rows;
+    }
+    let scaled = u32::from(rows) * u32::from(ch) / ASSUMED_CELL_H;
+    scaled.min(u32::from(u16::MAX)) as u16
 }
 
 /// The escape that deletes a previously drawn image, where the protocol has one.
@@ -1187,6 +1277,42 @@ mod tests {
         }
     }
 
+    /// The probe used to stop at the first `c` byte, on the assumption that the
+    /// Device Attributes reply came last. A terminal may answer in any order, and
+    /// when DA arrived first the cell-size reply was still unread — so the
+    /// measurement was silently lost and sizing fell back to cells.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_waits_for_every_answer_it_asked_for() {
+        use super::unix_probe::replies_complete;
+
+        let da = b"\x1b[?62;4;22c";
+        let cell = b"\x1b[6;34;16t";
+
+        // DA alone is not enough when a cell size was asked for.
+        assert!(!replies_complete(da, false, true));
+        // Nor is the cell size alone.
+        assert!(!replies_complete(cell, false, true));
+
+        // Either order completes once both have arrived.
+        let mut both = da.to_vec();
+        both.extend_from_slice(cell);
+        assert!(replies_complete(&both, false, true), "DA first");
+
+        let mut other = cell.to_vec();
+        other.extend_from_slice(da);
+        assert!(replies_complete(&other, false, true), "cell first");
+
+        // Nothing was asked of kitty or the cell size: DA alone finishes.
+        assert!(replies_complete(da, false, false));
+
+        // A kitty answer is waited for when it was asked for.
+        assert!(!replies_complete(&both, true, true));
+        let mut all = b"\x1b_Gi=31;OK\x1b\\".to_vec();
+        all.extend_from_slice(&both);
+        assert!(replies_complete(&all, true, true));
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_empty_reply_reports_nothing() {
@@ -1408,6 +1534,40 @@ mod tests {
         let raw = "\x1b]1337;File=size=9;width=1px;height=1px;inline=1:AA\x07";
         let pinned = pin_iterm(raw, u16::MAX, u16::MAX, Some((20, 40)));
         assert!(pinned.contains("width=1310700px"), "{pinned}");
+    }
+
+    /// Sixel cannot be corrected in the escape the way the others can, so the
+    /// geometry has to compensate for timg's assumed 18-pixel cell. Without this
+    /// a forced sixel rasterises for a smaller screen than the one it is on and
+    /// comes out visibly small.
+    #[test]
+    fn sixel_rows_scale_to_the_real_cell_height() {
+        // No measurement: nothing to scale by, leave it alone.
+        assert_eq!(scale_rows_for_cell(37), 37);
+    }
+
+    /// The scaling arithmetic itself, independent of whether a cell was measured.
+    #[test]
+    fn the_cell_scaling_arithmetic_is_proportional() {
+        // Mirrors `scale_rows_for_cell`'s body so the maths can be checked
+        // without a terminal to measure.
+        fn scaled(rows: u16, cell_h: u32) -> u16 {
+            const ASSUMED: u32 = 18;
+            if cell_h <= ASSUMED {
+                return rows;
+            }
+            ((u32::from(rows) * cell_h / ASSUMED).min(u32::from(u16::MAX))) as u16
+        }
+
+        // A 36px retina cell is twice the assumption: ask for twice the rows so
+        // the raster comes out the right pixel height.
+        assert_eq!(scaled(37, 36), 74);
+        // A cell at or below the assumption needs no correction — asking for
+        // fewer rows would make the image smaller than it should be.
+        assert_eq!(scaled(37, 18), 37);
+        assert_eq!(scaled(37, 14), 37);
+        // And it cannot overflow.
+        assert_eq!(scaled(u16::MAX, 1000), u16::MAX);
     }
 
     // ---- clearing -------------------------------------------------------

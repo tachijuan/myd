@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.20.1" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.20.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -635,9 +635,13 @@ and the terminal decides how many rows that is, which is how an image spills pas
 its border. Sixel carries no such control and is asked for a smaller raster
 instead.
 .PP
-myd asks the terminal how large a character cell is (\fBESC[16t\fR, answered in
-the same round trip as the protocol probe) and states the image's size in
-pixels. Both pixels and cells are valid in the escape, but only one is
+myd works out how large a character cell is \(em from \fBTIOCGWINSZ\fR where the
+kernel carries pixel dimensions, otherwise by asking the terminal
+(\fBESC[16t\fR, answered in the same round trip as the protocol probe) \(em and
+states the image's size in pixels. The kernel is preferred because under
+.BR tmux (1)
+it describes the pane, where the escape is answered by the outer terminal about
+its whole window. The preview footer shows which cell size was used. Both pixels and cells are valid in the escape, but only one is
 unambiguous: sizing in cells leaves the terminal to multiply out, and iTerm2
 reaches a different answer inside
 .BR tmux (1)
