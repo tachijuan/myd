@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.20.2" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.21.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -679,8 +679,10 @@ last page to jump to.
 Keys below act on the pane while it has focus.
 .TP
 .B j, k
-Scroll down or up one line, or turn to the next or previous page of a multi-page
-document. The arrow keys do the same.
+Scroll down or up one line. On a multi-page document they turn the page; on a
+single image, which is drawn to fit and has nothing to scroll, they move the
+tree's cursor instead and the preview follows to the next file. The arrow keys
+do the same.
 .TP
 .B Ctrl+F, Ctrl+B
 Scroll forward or back a full page, keeping one line of overlap. On a multi-page
@@ -702,8 +704,13 @@ Step to the next or previous match, wrapping at the ends. \fBN\fR and \fBP\fR
 step the other way. The current match is highlighted and the footer shows the
 position, as in \fB3/11\fR.
 .TP
-.B Esc, q
-Return focus to the tree, leaving the pane open.
+.B q
+Close the preview. Note this closes the pane rather than quitting \fBmyd\fR,
+which is what \fBq\fR does elsewhere \(em reaching for it to dismiss a preview
+should not end the session. It works whether or not the pane has focus.
+.TP
+.B Esc
+Return focus to the tree, leaving the pane open so it follows the cursor.
 .TP
 .B Tab
 Move focus in and out of the pane, as it does for the transfer sidebar.

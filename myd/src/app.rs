@@ -1199,6 +1199,11 @@ impl FileBrowser {
         self.preview.current_page()
     }
 
+    /// Whether the preview is showing a single image (for tests).
+    pub fn preview_is_single_image_for_test(&self) -> bool {
+        self.preview.is_single_image()
+    }
+
     /// Whether the preview is treating its content as a paged document.
     pub fn preview_is_paged_for_test(&self) -> bool {
         self.preview.is_paged()
@@ -1845,7 +1850,20 @@ impl FileBrowser {
     /// `Esc` *must* be handled here: globally it resolves to [`Action::Quit`], so
     /// without this the obvious way to leave the pane would exit the app.
     fn handle_preview_key(&mut self, key: KeyEvent) -> Option<bool> {
-        if !self.preview_open || !self.preview_focused {
+        if !self.preview_open {
+            return None;
+        }
+
+        // `q` closes the pane whether or not it has focus. Unfocused it would
+        // otherwise fall through to the global binding and quit the app, which is
+        // a surprising amount to lose when a preview is on screen and `q` is the
+        // obvious way to dismiss it.
+        if matches!(key.code, KeyCode::Char('q')) && key.modifiers.is_empty() {
+            self.close_preview();
+            return Some(true);
+        }
+
+        if !self.preview_focused {
             return None;
         }
 
@@ -1854,9 +1872,14 @@ impl FileBrowser {
         // document that means a document page, not a screenful.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             let paged = self.preview.is_paged();
+            // A single image has neither pages nor anything to scroll, so the
+            // paging keys move the tree, as j/k do below.
+            let image = self.preview.is_single_image();
             match key.code {
                 KeyCode::Char('f') => {
-                    if paged {
+                    if image {
+                        self.dispatch_action(Action::PageDown);
+                    } else if paged {
                         self.preview.step_page(true);
                     } else {
                         self.preview.page(true);
@@ -1864,7 +1887,9 @@ impl FileBrowser {
                     return Some(true);
                 }
                 KeyCode::Char('b') => {
-                    if paged {
+                    if image {
+                        self.dispatch_action(Action::PageUp);
+                    } else if paged {
                         self.preview.step_page(false);
                     } else {
                         self.preview.page(false);
@@ -1887,6 +1912,24 @@ impl FileBrowser {
         // A rendered page has nothing to scroll — it is drawn to fit — so on a
         // multi-page document the motions turn pages instead. Requesting the new
         // page is left to the tick, which already reloads when the key changes.
+        // A single image is drawn to fit and has nothing to scroll, so the
+        // motions move the *tree's* cursor and the preview follows to whatever is
+        // selected next. That makes j/k a way to flick through a directory of
+        // pictures, which is what they are reaching for on an image.
+        if self.preview.is_single_image() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.dispatch_action(Action::CursorDown);
+                    return Some(true);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.dispatch_action(Action::CursorUp);
+                    return Some(true);
+                }
+                _ => {}
+            }
+        }
+
         if self.preview.is_paged() {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
@@ -1962,13 +2005,16 @@ impl FileBrowser {
                 self.preview.step_match(true);
                 Some(true)
             }
-            KeyCode::Char(' ') => {
+            // Both close the pane. `q` closing rather than quitting matters:
+            // globally it exits the app, and reaching for it to dismiss a preview
+            // should not end the session.
+            KeyCode::Char(' ') | KeyCode::Char('q') => {
                 self.close_preview();
                 Some(true)
             }
-            // Hand focus back without closing, so the tree can be moved while the
-            // pane stays up.
-            KeyCode::Esc | KeyCode::Char('q') => {
+            // Esc hands focus back without closing, so the tree can be moved
+            // while the pane stays up and follows the cursor.
+            KeyCode::Esc => {
                 self.preview_focused = false;
                 Some(true)
             }

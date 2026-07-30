@@ -293,13 +293,41 @@ pub fn render(
     // what stops the image arriving too few pixels to fill a real cell. Sixel has
     // no such pinning: its raster *is* its size, so it is asked for exactly what
     // it should occupy.
+    let (base_cols, base_rows) = (cols, rows);
     let (cols, rows) = if protocol.is_graphics() && protocol != Protocol::Sixel {
         super::graphics::oversampled_geometry(cols, rows)
     } else {
         (cols, rows)
     };
+
+    // A multiplexer buffers a passthrough escape whole and drops one that grows
+    // past its input limit, which is a blank rectangle rather than an error.
+    // Oversampling is what pushes a payload over: it is a quality improvement,
+    // so it is the part to give up when the result would not survive the trip.
+    let in_multiplexer = std::env::var_os("TMUX").is_some();
+    let oversampled = (cols, rows) != (base_cols, base_rows);
+
     let args = backend.args(path, cols, rows, page, protocol);
-    match run_with_timeout(backend.binary(), &args) {
+    let first = run_with_timeout(backend.binary(), &args);
+    if oversampled {
+        if let Ok((true, ref stdout, _)) = first {
+            if !super::graphics::payload_fits(stdout.len(), in_multiplexer) {
+                // Retry at the pane's own size. Smaller, but visible, which beats
+                // a correct image the multiplexer throws away.
+                let args = backend.args(path, base_cols, base_rows, page, protocol);
+                return finish(backend, run_with_timeout(backend.binary(), &args));
+            }
+        }
+    }
+    finish(backend, first)
+}
+
+/// Turn a finished child process into a render result.
+fn finish(
+    backend: Backend,
+    outcome: Result<(bool, String, String), String>,
+) -> Rendered {
+    match outcome {
         Ok((status, stdout, stderr)) => {
             if status {
                 Rendered::Ansi(stdout)
