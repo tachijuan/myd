@@ -75,6 +75,8 @@ pub enum Action {
     ToggleTimes,
     /// Show or hide the file preview pane.
     TogglePreview,
+    /// Redraw the whole screen from scratch.
+    Redraw,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -244,6 +246,9 @@ impl KeyBindingHandler {
                 KeyCode::Char('t') => Some(Action::ToggleTransferPanel),
                 // Releases the mouse so the terminal's own text selection works.
                 KeyCode::Char('n') => Some(Action::ToggleMouse),
+                // Redraw everything, as in a shell or vim. The escape hatch for
+                // a screen left corrupted by something outside our control.
+                KeyCode::Char('l') => Some(Action::Redraw),
                 _ => None,
             };
         }

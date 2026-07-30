@@ -1161,6 +1161,15 @@ impl FileBrowser {
         self.dest_probe.is_some()
     }
 
+    /// Whether a full repaint has been requested and not yet consumed.
+    ///
+    /// The event loop takes this flag and calls `Terminal::clear`, which the test
+    /// harness does not run — so a test observes the request rather than its
+    /// effect.
+    pub fn force_repaint_pending_for_test(&self) -> bool {
+        self.force_repaint
+    }
+
     /// Whether the preview pane is open, and whether it has focus (for tests).
     pub fn preview_open_for_test(&self) -> bool {
         self.preview_open
@@ -1586,6 +1595,24 @@ impl FileBrowser {
             self.focus_preview();
             self.request_preview();
         }
+    }
+
+    /// Repaint everything from scratch (Ctrl+L).
+    ///
+    /// The escape hatch for a screen that has been corrupted by something
+    /// outside our control — a stray write from another process, a resize the
+    /// terminal reported oddly, a graphics escape a terminal did not fully
+    /// understand. ratatui normally emits only the cells that changed, so a
+    /// screen that no longer matches its buffer stays wrong until something
+    /// happens to overwrite each damaged cell; this discards that assumption.
+    ///
+    /// Any image on screen is forgotten as well as cleared, so the next frame
+    /// draws it again rather than assuming it survived.
+    fn redraw(&mut self) {
+        if let Some((area, _, _)) = self.preview_graphics_shown.take() {
+            self.erase_graphics(area);
+        }
+        self.force_repaint = true;
     }
 
     fn close_preview(&mut self) {
@@ -2684,6 +2711,10 @@ impl FileBrowser {
                 self.toggle_preview();
                 true
             }
+            Action::Redraw => {
+                self.redraw();
+                true
+            }
             Action::ChangeRoot => {
                 self.modal_target = Some(ModalTarget::ChangeRoot);
                 self.modal =
@@ -2970,6 +3001,7 @@ impl FileBrowser {
                     | Action::ToggleMouse
                     | Action::OpenWithDefaultApp
                     | Action::TogglePreview
+                    | Action::Redraw
                     | Action::ToggleShallow => unreachable!(),
                     Action::None => true,
                 }
