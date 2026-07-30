@@ -263,6 +263,13 @@ pub fn render(
         Backend::Timg => protocol,
         Backend::Chafa => Protocol::Blocks,
     };
+    // Sixel is sized by the geometry alone — unlike kitty and iTerm2 it carries
+    // no cell-count control that could correct an overflow afterwards.
+    let rows = if protocol == Protocol::Sixel {
+        super::graphics::sixel_row_budget(rows)
+    } else {
+        rows
+    };
     let args = backend.args(path, cols, rows, page, protocol);
     match run_with_timeout(backend.binary(), &args) {
         Ok((status, stdout, stderr)) => {
