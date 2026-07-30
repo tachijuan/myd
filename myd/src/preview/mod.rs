@@ -301,13 +301,17 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
         // A graphics protocol's output is opaque escape data; it cannot be parsed
         // into cells and must reach the terminal as-is.
         image::Rendered::Ansi(text) if protocol.is_graphics() => {
-            if text.trim().is_empty() {
+            // The renderer brackets the image with cursor hiding, mode setting
+            // and a trailing newline. Inside a TUI that framing scrolls the pane
+            // and un-hides the cursor, so only the image data goes through.
+            let payload = graphics::strip_framing(&text).to_string();
+            if payload.is_empty() {
                 PreviewContent::Note {
                     message: format!("{} produced no output.", backend.binary()),
                 }
             } else {
                 PreviewContent::Graphics {
-                    payload: text,
+                    payload,
                     rows,
                     backend: backend.binary(),
                     page,

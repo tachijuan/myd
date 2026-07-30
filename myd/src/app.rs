@@ -455,6 +455,12 @@ impl FileBrowser {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Ask the terminal what image protocols it supports before taking over
+        // the screen. The query is answered on the same channel as keystrokes, so
+        // running it later would deliver the reply into the event loop as if the
+        // user had typed it. Cached, so this is the only time it costs anything.
+        let _ = crate::preview::graphics::protocol();
+
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
             std::io::stdout(),
@@ -1679,23 +1685,24 @@ impl FileBrowser {
             return;
         }
 
-        let mut out = std::io::stdout();
-        // Place the cursor at the top-left of the hole: both protocols draw from
+        use crate::preview::graphics::{self, Protocol};
+
+        // tmux swallows an escape it does not understand unless it is wrapped in
+        // a passthrough envelope — but it understands sixel natively and parses
+        // it itself, so wrapping *that* would hide the image from the very thing
+        // meant to draw it. Only the protocols tmux does not know get wrapped.
+        let body = match (std::env::var_os("TMUX").is_some(), graphics::protocol()) {
+            (true, Protocol::Kitty) | (true, Protocol::Iterm2) => {
+                std::borrow::Cow::Owned(graphics::wrap_for_tmux(payload))
+            }
+            _ => std::borrow::Cow::Borrowed(payload),
+        };
+
+        // Place the cursor at the top-left of the hole: every protocol draws from
         // the cursor position.
-        let mut seq = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
-        seq.push_str(payload);
+        let seq = format!("\x1b[{};{}H{}", area.y + 1, area.x + 1, body);
 
-        // tmux only forwards an unknown sequence when it is wrapped, and detection
-        // already refused graphics unless it will.
-        if std::env::var_os("TMUX").is_some() {
-            seq = format!(
-                "\x1b[{};{}H{}",
-                area.y + 1,
-                area.x + 1,
-                crate::preview::graphics::wrap_for_tmux(payload)
-            );
-        }
-
+        let mut out = std::io::stdout();
         if out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok() {
             self.preview_graphics_shown = Some(stamp);
         }
