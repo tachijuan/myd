@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.19.3" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.19.4" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -626,6 +626,15 @@ rows the pane reserved; left to itself the renderer describes the image in pixel
 and the terminal decides how many rows that is, which is how an image spills past
 its border. Sixel carries no such control and is asked for a smaller raster
 instead.
+.PP
+Because the cell count is pinned separately, the raster itself is requested at
+twice the size of the pane without the image occupying more of it. timg cannot
+ask a piped stdout how large a cell is and assumes 18 pixels; on a display whose
+cells are nearer 30 an image sized for that assumption arrives with too few
+pixels and draws small and soft inside its box. Images are additionally rendered
+with upscaling, or a small picture sits at its own pixel size in the middle of a
+large pane. The oversampling is capped, since the payload grows with the square
+of the raster.
 .PP
 Removing an image is protocol-specific too, and redrawing the screen is not
 enough for any of them: ratatui writes only the cells whose content changed, and

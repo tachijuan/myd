@@ -309,6 +309,16 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
             // image ends up taller than its pane — and the overflow lands on rows
             // nothing repaints, so it also outlives the preview.
             let payload = graphics::pin_to_cells(graphics::strip_framing(&text), cols, rows);
+            // A payload that hit the output cap is a half-written escape, and
+            // unlike a block render it goes straight to the terminal — sending a
+            // truncated graphics sequence leaves it waiting for a terminator that
+            // never comes, which swallows whatever is printed next.
+            if !payload.is_empty() && !graphics::is_complete(&payload) {
+                return Ok(PreviewContent::Note {
+                    message: "This image is too large to preview at this size."
+                        .to_string(),
+                });
+            }
             if payload.is_empty() {
                 PreviewContent::Note {
                     message: format!("{} produced no output.", backend.binary()),

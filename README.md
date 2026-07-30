@@ -410,6 +410,16 @@ pixels and the terminal decides how many rows that is, which is how an image
 ends up spilling past its border. Sixel carries no such control, so it is asked
 for a smaller raster instead.
 
+Because the cell count is pinned separately, the *raster* can be asked for at
+twice the pane's size without the image occupying more of it. That matters:
+timg cannot ask a piped stdout how large a cell is and assumes 18 pixels, so on
+a retina display — where a cell is nearer 30 — an image sized for the smaller
+assumption arrives with too few pixels and draws small and soft inside its box.
+Images are also rendered with upscaling, or a small picture would sit at its own
+pixel size in the middle of a large pane rather than filling it. The oversampling
+is capped, since the payload grows with the square of the raster and past a point
+the extra pixels are beyond what any cell can show.
+
 Removing an image is protocol-specific too, and redrawing the screen is not
 enough for any of them — ratatui writes only the cells whose content changed, and
 the cells under an image are ones it believes are already blank. A kitty image is
