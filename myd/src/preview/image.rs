@@ -274,9 +274,17 @@ pub fn render(
         Backend::Chafa => Protocol::Blocks,
     };
     // Sixel is sized by the geometry alone — unlike kitty and iTerm2 it carries
-    // no cell-count control that could correct an overflow afterwards.
+    // no cell-count control that could correct an overflow afterwards, so what
+    // timg rasterises is exactly what appears.
+    //
+    // timg divides the geometry by an assumed 9x18 cell to reach a pixel size.
+    // Where the real cell is known, the geometry is scaled so that assumption
+    // lands on the pane's true pixel box: a taller real cell means asking for
+    // proportionally more rows. Without that the image is drawn for a smaller
+    // screen than the one it is on, which is why a forced sixel came out small.
     let rows = if protocol == Protocol::Sixel {
-        super::graphics::sixel_row_budget(rows)
+        let budgeted = super::graphics::sixel_row_budget(rows);
+        super::graphics::scale_rows_for_cell(budgeted)
     } else {
         rows
     };
