@@ -10221,16 +10221,52 @@ async fn test_esc_in_the_preview_does_not_quit() {
     assert!(!keep_running, "Esc on the tree still quits");
 }
 
-/// `q` behaves like Esc inside the pane: release focus, do not quit.
+/// `q` closes the preview rather than quitting the app. Globally it exits, and
+/// reaching for it to dismiss a preview should not end the session.
 #[tokio::test]
-async fn test_q_in_the_preview_releases_focus_instead_of_quitting() {
+async fn test_q_in_the_preview_closes_it_instead_of_quitting() {
     let (_dir, mut app) = preview_app(10).await;
     app.handle_key_for_test(char_key(' '));
     settle_preview(&mut app).await;
 
     assert!(app.handle_key_for_test(char_key('q')), "q must not quit");
+    assert!(!app.preview_open_for_test(), "q should close the pane");
     assert!(!app.preview_focused_for_test());
-    assert!(app.preview_open_for_test());
+
+    // With the pane gone, q means what it always did.
+    assert!(!app.handle_key_for_test(char_key('q')), "q quits normally");
+}
+
+/// The pane can be open without having focus — Esc hands the keyboard back to
+/// the tree. `q` must still close it there rather than falling through to the
+/// global binding and quitting.
+#[tokio::test]
+async fn test_q_closes_an_unfocused_preview() {
+    let (_dir, mut app) = preview_app(10).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(app.preview_open_for_test() && !app.preview_focused_for_test());
+
+    assert!(
+        app.handle_key_for_test(char_key('q')),
+        "q must not quit while a preview is on screen"
+    );
+    assert!(!app.preview_open_for_test());
+}
+
+/// Esc still hands focus back without closing, so the tree can be moved while
+/// the pane stays up and follows the cursor.
+#[tokio::test]
+async fn test_esc_unfocuses_the_preview_without_closing_it() {
+    let (_dir, mut app) = preview_app(10).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(app.preview_open_for_test(), "Esc should leave the pane open");
+    assert!(!app.preview_focused_for_test());
 }
 
 /// Space is now a global binding, and a two-button dialog must still refuse it.
@@ -10905,4 +10941,76 @@ async fn ctrl_l_forgets_a_displayed_image() {
     // still meaningful property: the request is made regardless.
     app.handle_key_for_test(ctrl_key('l'));
     assert!(app.force_repaint_pending_for_test());
+}
+
+/// On an image preview the motions move the *tree's* cursor, and the preview
+/// follows. A rendered image is drawn to fit the pane, so there is nothing to
+/// scroll — j/k on one are reaching to see the next picture.
+#[tokio::test]
+async fn image_previews_move_the_tree_cursor() {
+    use myd::app::FileBrowser;
+
+    let src = std::path::Path::new("/usr/share/pixmaps/ubuntu-logo-text.png");
+    if !src.exists() || myd::preview::image::capabilities().backend_for(src).is_none() {
+        eprintln!("no image renderer available; skipping");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.png", "b.png", "c.png"] {
+        std::fs::copy(src, dir.path().join(name)).unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    screen_text(&mut app, 110, 34);
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+
+    assert!(
+        app.preview_is_single_image_for_test(),
+        "an image is neither scrollable nor paged"
+    );
+    let before = app.selected_line_index_for_test();
+
+    app.handle_key_for_test(char_key('j'));
+    assert_ne!(
+        app.selected_line_index_for_test(),
+        before,
+        "j should move the tree cursor on an image"
+    );
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        0,
+        "and must not scroll the pane, which has nothing to scroll"
+    );
+
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(
+        app.selected_line_index_for_test(),
+        before,
+        "k should move it back"
+    );
+}
+
+/// Text previews keep scrolling — the tree-moving behaviour is specific to
+/// content that is drawn to fit.
+#[tokio::test]
+async fn text_previews_still_scroll_with_j_and_k() {
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    assert!(!app.preview_is_single_image_for_test());
+    let cursor = app.selected_line_index_for_test();
+
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.preview_scroll_for_test(), 1, "text should scroll");
+    assert_eq!(
+        app.selected_line_index_for_test(),
+        cursor,
+        "and must not move the tree"
+    );
 }

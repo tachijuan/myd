@@ -177,14 +177,15 @@ focus; `Esc` or `q` hands focus back to the tree while leaving the pane open.
 | Key               | Action                                      |
 |-------------------|---------------------------------------------|
 | `space`           | Open / close the preview                    |
-| `j` / `k`         | Scroll a line — or turn the page of a PDF   |
-| `Ctrl+F` / `Ctrl+B` | Scroll a page (or turn a PDF page)        |
+| `j` / `k`         | Scroll a line; a PDF turns a page; an image moves to the next file |
+| `Ctrl+F` / `Ctrl+B` | Scroll a page (a PDF turns a page; an image moves the tree) |
 | `Ctrl+D` / `Ctrl+U` | Scroll half a page                        |
 | `g` / `G`         | Jump to the start / end (first / last page) |
 | `/`               | Search within the file (regex)              |
 | `n` / `p`         | Next / previous match                       |
 | `N` / `P`         | Previous / next match                       |
-| `Esc` / `q`       | Return focus to the tree, keep the pane open |
+| `q`               | Close the preview                           |
+| `Esc`             | Return focus to the tree, keep the pane open |
 | `Tab`             | Move focus in and out of the pane           |
 
 ### Panels

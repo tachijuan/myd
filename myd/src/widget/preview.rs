@@ -204,6 +204,18 @@ impl PreviewState {
         }
     }
 
+    /// Whether the pane is showing a single rendered picture with nothing to
+    /// scroll and no pages to turn.
+    ///
+    /// An image is drawn to fit the pane, so the motions have no work to do on it
+    /// — they move the tree's cursor instead, and the preview follows.
+    pub fn is_single_image(&self) -> bool {
+        matches!(
+            self.content,
+            Some(PreviewContent::Image { .. }) | Some(PreviewContent::Graphics { .. })
+        ) && !self.is_paged()
+    }
+
     /// Turn to the next or previous page, clamped.
     ///
     /// Returns whether the page changed, so the caller only re-reads when it did.
@@ -578,11 +590,13 @@ fn build_footer(state: &PreviewState, focused: bool) -> Line<'static> {
     }
 
     spans.push(Span::raw(if !focused {
-        " Tab to focus  space to close "
+        " Tab to focus  q to close "
     } else if state.is_paged() {
-        " j/k page  space close  Esc unfocus "
+        " j/k page  q close  Esc unfocus "
+    } else if state.is_single_image() {
+        " j/k next file  q close  Esc unfocus "
     } else {
-        " j/k scroll  / search  n/p match  space close  Esc unfocus "
+        " j/k scroll  / search  n/p match  q close  Esc unfocus "
     }));
     Line::from(spans)
 }

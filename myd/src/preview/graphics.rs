@@ -790,6 +790,27 @@ pub fn sixel_row_budget(rows: u16) -> u16 {
     (rows.saturating_mul(3) / 4).max(1)
 }
 
+/// Largest escape a multiplexer will carry in one piece, in bytes.
+///
+/// tmux buffers a passthrough sequence whole before forwarding it and discards
+/// one that grows past its input limit, which leaves a blank rectangle where the
+/// image should be. Measured against the real renders: a 2x-oversampled photo
+/// reaches 2.4MB at a full-screen pane, well past the limit, while a small image
+/// at 68KB comes through fine — which is why some previews appeared and others
+/// were black.
+///
+/// One megabyte is tmux's own buffer limit. The budget is set below it so the
+/// wrapper's overhead and a little slack still fit.
+pub const MAX_MULTIPLEXED_PAYLOAD: usize = 768 * 1024;
+
+/// Whether a payload of `bytes` can be sent as one escape in this session.
+///
+/// Only a multiplexer imposes this. Writing straight to a terminal, the escape
+/// goes out as fast as it can be written and nothing buffers it whole.
+pub fn payload_fits(bytes: usize, in_multiplexer: bool) -> bool {
+    !in_multiplexer || bytes <= MAX_MULTIPLEXED_PAYLOAD
+}
+
 /// Scale a row count so timg's assumed cell height lands on the real one.
 ///
 /// timg rasterises to `rows * 18` pixels when it cannot ask the terminal how big
@@ -1568,6 +1589,29 @@ mod tests {
         assert_eq!(scaled(37, 14), 37);
         // And it cannot overflow.
         assert_eq!(scaled(u16::MAX, 1000), u16::MAX);
+    }
+
+    /// tmux buffers a passthrough escape whole and silently drops one past its
+    /// input limit, leaving a blank rectangle. Large images and PDFs crossed that
+    /// line once oversampling was added, which is why some previews were black
+    /// and smaller ones were fine.
+    #[test]
+    fn oversized_payloads_are_only_rejected_inside_a_multiplexer() {
+        let small = 68 * 1024;
+        let large = 2_433_695; // a real 2x-oversampled photo
+
+        // Straight to a terminal there is nothing buffering it whole.
+        assert!(payload_fits(large, false));
+
+        // Through a multiplexer the large one has to be given up on.
+        assert!(payload_fits(small, true));
+        assert!(!payload_fits(large, true));
+
+        // The budget sits below tmux's own 1MB buffer so the wrapper's overhead
+        // still fits.
+        const { assert!(MAX_MULTIPLEXED_PAYLOAD < 1024 * 1024) };
+        assert!(payload_fits(MAX_MULTIPLEXED_PAYLOAD, true));
+        assert!(!payload_fits(MAX_MULTIPLEXED_PAYLOAD + 1, true));
     }
 
     // ---- clearing -------------------------------------------------------
