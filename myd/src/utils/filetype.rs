@@ -157,6 +157,83 @@ pub fn categorize(path: &Path) -> FileCategory {
     }
 }
 
+/// Whether a terminal image renderer should be asked to draw this file.
+///
+/// Deliberately not `categorize(path) == Image`: that set includes `psd`, `xcf`
+/// and `raw`, which neither renderer loads. Those still reach the renderer and
+/// come back as a failure, which the pane reports — this is about not bothering
+/// for files that were never going to work.
+pub fn is_image_like(path: &Path) -> bool {
+    matches!(categorize(path), FileCategory::Image)
+}
+
+/// Whether this is a PDF.
+///
+/// Kept apart from [`is_image_like`] because the two have different
+/// requirements: `timg` renders PDFs when it was built against poppler, and
+/// `chafa` cannot render them at all — its loaders stop at image formats. A PDF
+/// on a machine with only chafa has no renderer, which is a different answer from
+/// "no renderer installed".
+pub fn is_pdf(path: &Path) -> bool {
+    matches!(lower_ext(path).as_deref(), Some("pdf"))
+}
+
+/// Whether to render this as markdown rather than as source.
+pub fn is_markdown(path: &Path) -> bool {
+    matches!(
+        lower_ext(path).as_deref(),
+        Some("md" | "markdown" | "mdown" | "mkd")
+    )
+}
+
+/// A file's extension, lowercased.
+fn lower_ext(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+}
+
+/// Whether a byte sample looks like text that can be shown in the preview pane.
+///
+/// Extensions cannot answer this. [`categorize`] returns `Other` for a bare
+/// `README`, `Makefile` or `Dockerfile` — all of which should preview as text —
+/// and its `Document` and `Data` variants each mix text with binary (`md` beside
+/// `pdf`, `toml` beside `sqlite`). So the content decides.
+///
+/// The test is a NUL byte, which no text encoding we care about contains, plus a
+/// ceiling on undecodable bytes so a mostly-binary file with a plausible header
+/// is still rejected. Takes a sample rather than the whole file: the pane only
+/// reads a bounded head anyway.
+pub fn looks_like_text(sample: &[u8]) -> bool {
+    if sample.is_empty() {
+        // An empty file has nothing to disprove. Showing it as an empty pane
+        // beats calling it binary.
+        return true;
+    }
+    if sample.contains(&0) {
+        return false;
+    }
+
+    // A truncated multi-byte character at the end of the sample is an artefact of
+    // where the read stopped, not evidence of binary, so measure only the bytes
+    // before the final incomplete sequence.
+    let bad = match std::str::from_utf8(sample) {
+        Ok(_) => 0,
+        Err(e) => {
+            if e.error_len().is_none() {
+                // Incomplete sequence at the very end — everything before it
+                // decoded cleanly.
+                0
+            } else {
+                sample.len() - e.valid_up_to()
+            }
+        }
+    };
+    // Latin-1 text can trip UTF-8 validation on a handful of bytes; a real binary
+    // trips it on far more.
+    (bad * 100) / sample.len() < 10
+}
+
 /// The heaviest category among already-known `(path, size)` pairs.
 ///
 /// Prefer this over [`dominant_category`] wherever the caller already holds the

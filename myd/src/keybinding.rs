@@ -73,6 +73,8 @@ pub enum Action {
     TogglePerms,
     /// Show or hide the tree's modification-time column.
     ToggleTimes,
+    /// Show or hide the file preview pane.
+    TogglePreview,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
@@ -202,6 +204,7 @@ impl KeyBindingHandler {
             'N' => Some(Action::CreateDir),
             'n' => Some(Action::SearchNext),
             'p' => Some(Action::SearchPrev),
+            ' ' => Some(Action::TogglePreview),
             _ => None,
         }
     }
@@ -274,6 +277,10 @@ impl KeyBindingHandler {
             KeyCode::Char('N') => Some(Action::CreateDir),
             KeyCode::Char('n') => Some(Action::SearchNext),
             KeyCode::Char('p') => Some(Action::SearchPrev),
+            // Space opens and closes the preview pane. It was the one unbound
+            // key that reads as "show me this", and it is not an accept key in
+            // any dialog, so a modal can never mistake it for one.
+            KeyCode::Char(' ') => Some(Action::TogglePreview),
             KeyCode::Char('0') => Some(Action::CollapseAll),
             KeyCode::Char('*') => Some(Action::ExpandAll),
             KeyCode::Char('/') => Some(Action::Search),

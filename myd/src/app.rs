@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -67,6 +67,8 @@ pub enum ModalTarget {
     Rename { old_path: PathBuf },
     ChangeRoot,
     Search,
+    /// Regex search within the previewed file, rather than across the tree.
+    PreviewSearch,
     /// Regex filter prompt for the cursor's directory.
     Filter,
     /// New-directory-name prompt; created in the cursor's current directory.
@@ -222,6 +224,32 @@ pub struct FileBrowser {
     /// returns "keep running" and the dialog arm has no way to say otherwise.
     /// `route_key` reads this flag on the way out instead.
     quit_requested: bool,
+    /// The file preview pane, shown over everything else when open.
+    ///
+    /// App-level rather than per-panel, like the transfer sidebar: it fills the
+    /// screen and shows one file, so it has no meaningful per-panel identity. It
+    /// follows the active panel's cursor.
+    preview: crate::widget::preview::PreviewState,
+    preview_open: bool,
+    /// Whether the preview has keyboard focus instead of a panel or the sidebar.
+    ///
+    /// Kept exclusive with `transfer_focused` by [`Self::focus_preview`] and the
+    /// Tab rotation — two focused panes would draw two active borders.
+    preview_focused: bool,
+    /// The in-flight preview load, and a flag for the task to observe when its
+    /// result is no longer wanted.
+    ///
+    /// Moving the cursor supersedes a load rather than queueing behind it, or a
+    /// held-down `j` would replay every file it passed over.
+    preview_task: Option<PreviewTask>,
+}
+
+/// A preview load running in the background.
+struct PreviewTask {
+    key: crate::widget::preview::PreviewKey,
+    rx: tokio::sync::oneshot::Receiver<crate::preview::PreviewContent>,
+    /// Dropped when a newer load starts; the task checks it before doing work.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -362,6 +390,10 @@ impl FileBrowser {
             transfer_rows: Default::default(),
             transfer_area: None,
             quit_requested: false,
+            preview: crate::widget::preview::PreviewState::new(),
+            preview_open: false,
+            preview_focused: false,
+            preview_task: None,
         }
     }
 
@@ -502,6 +534,11 @@ impl FileBrowser {
                 // whatever pane is focused underneath.
                 if let Modal::Help(state) = &mut self.modal {
                     state.scroll_by(pending_scroll as isize);
+                } else if self.preview_open {
+                    // The preview covers the panels, so the wheel belongs to it
+                    // whenever it is up — scrolling a tree the user cannot see
+                    // would be the wrong answer.
+                    self.preview.scroll_by(pending_scroll as isize);
                 } else {
                     self.scroll_by(pending_scroll);
                 }
@@ -530,6 +567,10 @@ impl FileBrowser {
             self.resolve_connect();
             // And any listing of a typed copy destination.
             self.resolve_dest_probe();
+            // Install a finished preview, and start one if the cursor has moved
+            // onto a different file.
+            self.resolve_preview();
+            self.request_preview();
 
             let after_resolve = trace_started_now(tick_started);
             terminal.draw(|f| self.draw(f))?;
@@ -635,6 +676,19 @@ impl FileBrowser {
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
             }
             self.panels[0].current_screen_mut().render(f, area);
+        }
+
+        // The preview covers the panels, so it is drawn after them and before any
+        // modal. Drawn over the whole frame rather than the panel column: it is a
+        // view of one file, not of one panel.
+        if self.preview_open {
+            let focused = self.preview_focused;
+            crate::widget::preview::render(f, preview_area(full), &mut self.preview, focused);
+        } else {
+            // Focus must never rest on something that is not drawn — the same
+            // rule the transfer sidebar follows above.
+            self.preview_focused = false;
+            self.preview.content_area = None;
         }
 
         // Where the active panel drew its "Sort:" indicator, so the sort menu can
@@ -1044,6 +1098,37 @@ impl FileBrowser {
         self.resolve_deleting();
         self.resolve_copying();
         self.advance_transfers();
+        self.resolve_preview();
+        self.request_preview();
+    }
+
+    /// Whether the preview pane is open, and whether it has focus (for tests).
+    pub fn preview_open_for_test(&self) -> bool {
+        self.preview_open
+    }
+
+    pub fn preview_focused_for_test(&self) -> bool {
+        self.preview_focused
+    }
+
+    /// The preview's scroll offset, for asserting that motions move it.
+    pub fn preview_scroll_for_test(&self) -> usize {
+        self.preview.scroll()
+    }
+
+    /// How many lines the current search matched.
+    pub fn preview_match_count_for_test(&self) -> usize {
+        self.preview.match_count()
+    }
+
+    /// The line the current search match sits on.
+    pub fn preview_match_line_for_test(&self) -> Option<usize> {
+        self.preview.current_match_line()
+    }
+
+    /// Whether a preview has finished loading and has content to draw.
+    pub fn preview_has_content_for_test(&self) -> bool {
+        self.preview.has_content()
     }
 
     /// The active panel's cursor position in the flattened tree (for tests).
@@ -1402,8 +1487,244 @@ impl FileBrowser {
             return;
         }
         self.transfer_focused = true;
+        // Two focused panes would draw two active borders and both would answer
+        // to `j`.
+        self.preview_focused = false;
         if self.transfer_cursor.is_none() {
             self.transfer_cursor = self.transfer_rows.ids().first().copied();
+        }
+    }
+
+    /// Give the preview pane keyboard focus.
+    fn focus_preview(&mut self) {
+        if !self.preview_open {
+            return;
+        }
+        self.preview_focused = true;
+        self.transfer_focused = false;
+        self.transfer_cursor = None;
+    }
+
+    /// Open or close the preview pane (space).
+    ///
+    /// Opening focuses it: it covers the screen, so leaving focus on the tree
+    /// behind it would mean `j` scrolling something the user cannot see.
+    fn toggle_preview(&mut self) {
+        if self.preview_open {
+            self.close_preview();
+        } else {
+            self.preview_open = true;
+            self.focus_preview();
+            self.request_preview();
+        }
+    }
+
+    fn close_preview(&mut self) {
+        self.preview_open = false;
+        self.preview_focused = false;
+        // Abandon any load in flight — its result is for a pane that is gone.
+        self.cancel_preview_task();
+    }
+
+    fn cancel_preview_task(&mut self) {
+        if let Some(t) = self.preview_task.take() {
+            t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The geometry the preview will be drawn at, matching [`Self::preview_area`].
+    ///
+    /// Needed before rendering because an image is rendered by an external tool at
+    /// a fixed cell size, so the size has to be known when the load starts.
+    fn preview_cells(&self) -> (u16, u16) {
+        let area = preview_area(self.last_frame);
+        // Less the border on each side, and the footer row.
+        (
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(3).max(1),
+        )
+    }
+
+    /// Start loading a preview of the active panel's selection, if that is not
+    /// already what the pane is showing.
+    fn request_preview(&mut self) {
+        if !self.preview_open {
+            return;
+        }
+        let Some(path) = self.panels[self.active].selected_resolved_path() else {
+            return;
+        };
+        let backend = self.panels[self.active].backend;
+        let (cols, rows) = self.preview_cells();
+        let key = crate::widget::preview::PreviewKey {
+            path: path.clone(),
+            backend,
+            cols,
+            rows,
+        };
+
+        // Already showing it, or already fetching it.
+        if self.preview.key() == Some(&key) {
+            return;
+        }
+        if self.preview_task.as_ref().is_some_and(|t| t.key == key) {
+            return;
+        }
+
+        // A newer request supersedes the one in flight.
+        self.cancel_preview_task();
+
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.preview.begin_load(label);
+
+        let fs = self.backends.get(backend);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = crate::preview::PreviewRequest {
+            path: crate::vfs::VPath::new(backend, path.clone()),
+            label: path,
+            cols,
+            rows,
+        };
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            // Nothing here may run on the event loop: reading a remote file is
+            // round trips, and an image renderer is a process.
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let content = crate::preview::load(fs, req).await;
+            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = tx.send(content);
+            }
+        });
+
+        self.preview_task = Some(PreviewTask { key, rx, cancel });
+    }
+
+    /// Install a finished preview load. Called once per tick.
+    fn resolve_preview(&mut self) {
+        let Some(task) = self.preview_task.as_mut() else {
+            return;
+        };
+        match task.rx.try_recv() {
+            Ok(content) => {
+                let key = task.key.clone();
+                self.preview_task = None;
+                self.preview.set_content(key, content);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                // The task died or was superseded; stop waiting on it.
+                self.preview_task = None;
+            }
+        }
+    }
+
+    /// Keys the preview pane handles while focused.
+    ///
+    /// Returns `None` when the key is not one of them, so global keys like `?`
+    /// and Ctrl+C still work — the same contract as the transfer sidebar.
+    ///
+    /// `Esc` *must* be handled here: globally it resolves to [`Action::Quit`], so
+    /// without this the obvious way to leave the pane would exit the app.
+    fn handle_preview_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if !self.preview_open || !self.preview_focused {
+            return None;
+        }
+
+        // The pane's own paging keys shadow the tree's, which is the point of
+        // focus: Ctrl+F pages whatever the user is looking at.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('f') => {
+                    self.preview.page(true);
+                    return Some(true);
+                }
+                KeyCode::Char('b') => {
+                    self.preview.page(false);
+                    return Some(true);
+                }
+                KeyCode::Char('d') => {
+                    self.preview.half_page(true);
+                    return Some(true);
+                }
+                KeyCode::Char('u') => {
+                    self.preview.half_page(false);
+                    return Some(true);
+                }
+                // Anything else Ctrl- falls through to the global bindings.
+                _ => return None,
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.preview.scroll_by(1);
+                Some(true)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.preview.scroll_by(-1);
+                Some(true)
+            }
+            KeyCode::PageDown => {
+                self.preview.page(true);
+                Some(true)
+            }
+            KeyCode::PageUp => {
+                self.preview.page(false);
+                Some(true)
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.preview.to_bottom();
+                Some(true)
+            }
+            KeyCode::Home => {
+                self.preview.to_top();
+                Some(true)
+            }
+            // `gg` goes to the top. Handled here rather than through the chord
+            // machinery so the pane's motions do not depend on the tree's state.
+            KeyCode::Char('g') => {
+                self.preview.to_top();
+                Some(true)
+            }
+            KeyCode::Char('/') => {
+                self.modal_target = Some(ModalTarget::PreviewSearch);
+                self.modal = Modal::Input(InputDialog::new("Search in file (regex):", ""));
+                Some(true)
+            }
+            // n/p step forward/back; N/P reverse each, as in the tree.
+            KeyCode::Char('n') => {
+                self.preview.step_match(true);
+                Some(true)
+            }
+            KeyCode::Char('p') => {
+                self.preview.step_match(false);
+                Some(true)
+            }
+            KeyCode::Char('N') => {
+                self.preview.step_match(false);
+                Some(true)
+            }
+            KeyCode::Char('P') => {
+                self.preview.step_match(true);
+                Some(true)
+            }
+            KeyCode::Char(' ') => {
+                self.close_preview();
+                Some(true)
+            }
+            // Hand focus back without closing, so the tree can be moved while the
+            // pane stays up.
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.preview_focused = false;
+                Some(true)
+            }
+            _ => None,
         }
     }
 
@@ -1792,6 +2113,13 @@ impl FileBrowser {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // The preview pane takes its motions while focused, before the screen or
+        // the global table sees them — that is what focus means. It covers the
+        // screen, so it comes first.
+        if let Some(result) = self.handle_preview_key(key) {
+            return result;
+        }
+
         // The transfer sidebar takes its own keys while focused, but only the
         // ones it owns — anything else falls through so global keys still work.
         if let Some(result) = self.handle_transfer_key(key) {
@@ -1910,20 +2238,28 @@ impl FileBrowser {
                 // unreachable by Tab.
                 let panels = self.panels.len();
                 let sidebar = self.transfer_area.is_some();
-                // Position in the rotation: 0..panels are the browser panels, and
-                // `panels` is the sidebar when it is on screen.
-                let current = if self.transfer_focused {
-                    panels
+                // Position in the rotation: 0..panels are the browser panels,
+                // then the sidebar when it is on screen, then the preview when it
+                // is open.
+                let sidebar_stop = panels;
+                let preview_stop = panels + usize::from(sidebar);
+                let current = if self.preview_focused {
+                    preview_stop
+                } else if self.transfer_focused {
+                    sidebar_stop
                 } else {
                     self.active.min(panels.saturating_sub(1))
                 };
-                let stops = panels + usize::from(sidebar);
+                let stops = preview_stop + usize::from(self.preview_open);
                 if stops > 1 {
                     let next = (current + 1) % stops;
-                    if next == panels {
+                    if sidebar && next == sidebar_stop {
                         self.focus_transfers();
+                    } else if self.preview_open && next == preview_stop {
+                        self.focus_preview();
                     } else {
                         self.transfer_focused = false;
+                        self.preview_focused = false;
                         self.transfer_cursor = None;
                         self.active = next;
                     }
@@ -2121,6 +2457,10 @@ impl FileBrowser {
             }
             Action::ToggleShallow => {
                 self.toggle_shallow();
+                true
+            }
+            Action::TogglePreview => {
+                self.toggle_preview();
                 true
             }
             Action::ChangeRoot => {
@@ -2408,6 +2748,7 @@ impl FileBrowser {
                     | Action::CancelTransfers
                     | Action::ToggleMouse
                     | Action::OpenWithDefaultApp
+                    | Action::TogglePreview
                     | Action::ToggleShallow => unreachable!(),
                     Action::None => true,
                 }
@@ -2475,6 +2816,15 @@ impl FileBrowser {
                                         self.modal =
                                             Modal::Confirm(ConfirmDialog::new(msg));
                                     }
+                                }
+                            }
+                            // An empty value clears the search, as in the filter
+                            // prompt — the dialog cannot tell Esc from an empty
+                            // Enter, and clearing is the harmless reading.
+                            ModalTarget::PreviewSearch => {
+                                if let Some(msg) = self.preview.search(&value) {
+                                    self.modal =
+                                        Modal::Confirm(ConfirmDialog::notice(msg));
                                 }
                             }
                             ModalTarget::FavoriteEdit { original } => {
@@ -3836,6 +4186,31 @@ fn label_for_url(catalog: &HostCatalog, url: &str) -> Option<String> {
 
 pub fn credential_prompt_for_test(need: &crate::vfs::sftp::AuthNeed) -> String {
     credential_prompt(need)
+}
+
+/// Where the preview pane is drawn: most of the frame, inset a little.
+///
+/// Not the whole frame, so it reads as a pane over the browser rather than a
+/// different program, and the panel borders stay visible at the edges. Falls back
+/// to the full area on a terminal too small to inset.
+///
+/// A free function because the geometry is needed both when drawing and when
+/// starting a load — an image is rendered by an external tool at a fixed cell
+/// size, so the size has to be known in advance.
+pub fn preview_area(full: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    /// Frame cells left visible around the pane, when there is room.
+    const INSET_X: u16 = 4;
+    const INSET_Y: u16 = 2;
+
+    if full.width <= INSET_X * 2 + 10 || full.height <= INSET_Y * 2 + 4 {
+        return full;
+    }
+    ratatui::layout::Rect {
+        x: full.x + INSET_X,
+        y: full.y + INSET_Y,
+        width: full.width - INSET_X * 2,
+        height: full.height - INSET_Y * 2,
+    }
 }
 
 /// The subset of pending transfer destinations that belong in one panel's tree:
