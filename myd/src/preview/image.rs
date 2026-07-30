@@ -20,6 +20,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use super::graphics::Protocol;
+
 /// How long a renderer may run before it is killed.
 ///
 /// Both tools finish a large photo in about 130ms. This is far enough above that
@@ -49,17 +51,43 @@ impl Backend {
 
     /// The arguments that render `path` into a `cols` x `rows` block of text.
     ///
+    /// `page` selects a page of a multi-page document, and is ignored by chafa,
+    /// which has no notion of one.
+    ///
     /// Both invocations pin the output format instead of letting the tool
     /// auto-detect. Left to themselves they may emit sixel or kitty graphics,
     /// which cannot be turned into ratatui spans at all — and this often runs
     /// under tmux, which blocks those protocols anyway.
-    fn args(self, path: &Path, cols: u16, rows: u16) -> Vec<std::ffi::OsString> {
+    fn args(
+        self,
+        path: &Path,
+        cols: u16,
+        rows: u16,
+        page: usize,
+        protocol: Protocol,
+    ) -> Vec<std::ffi::OsString> {
         let mut args: Vec<std::ffi::OsString> = Vec::new();
         match self {
             Backend::Timg => {
-                // Quarter-block: four pixels per cell, plain SGR colour.
+                // `q` is quarter-block: four pixels per cell, plain SGR colour,
+                // parseable but visibly blocky. `k` and `i` hand the terminal a
+                // real PNG and are only chosen where it can be shown to
+                // understand them.
                 args.push("-p".into());
-                args.push("q".into());
+                args.push(protocol.timg_flag().into());
+                // Note there is deliberately no `-W` / `--fit-width` here. It
+                // forces the image to the full width and lets the height follow
+                // the aspect ratio, which for a graphics protocol means a tall
+                // picture runs off the bottom of the pane and paints over whatever
+                // is below — nothing clips it, because the terminal draws the image
+                // and ratatui knows nothing about it.
+                //
+                // Left alone, timg fits both dimensions and honours the row budget
+                // exactly: measured across a wide photo, a very tall image and
+                // several budgets, the result was always `rows * 18` pixels high,
+                // and an image smaller than the box is never upscaled. So the
+                // pane's own geometry can be handed over unchanged.
+                //
                 // Geometry is mandatory. With stdout piped, timg cannot query the
                 // terminal for a size and exits with "Failed to read size from
                 // terminal" — note this is `-g`, as `--grid` does not set it.
@@ -67,6 +95,11 @@ impl Backend {
                 // One frame only, so an animated GIF or a multi-page PDF becomes
                 // a still instead of a stream of frames.
                 args.push("--frames=1".into());
+                // timg counts PDF pages as frames, so the page to show is the
+                // frame to start at.
+                if page > 0 {
+                    args.push(format!("--frame-offset={page}").into());
+                }
                 // Do not blend transparency against a guessed terminal colour;
                 // querying for it is pointless when stdout is a pipe.
                 args.push("-b".into());
@@ -181,18 +214,56 @@ pub enum Rendered {
     Failed(String),
 }
 
-/// Render `path` at a given cell geometry.
+/// How many pages a document has, if that can be determined.
+///
+/// Uses `pdfinfo` from poppler-utils, which usually accompanies a `timg` built
+/// against poppler. `None` means "unknown", not "one": the caller must then let
+/// the user page freely rather than pretending a limit it does not know.
+pub fn page_count(path: &Path) -> Option<usize> {
+    if !crate::utils::filetype::is_pdf(path) {
+        return None;
+    }
+    let out = Command::new("pdfinfo")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("Pages:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Render `path` at a given cell geometry, optionally a specific page.
 ///
 /// Blocking: call from `spawn_blocking`, never the event loop. Both tools take
 /// roughly 80–130ms on real files, which is several frames.
-pub fn render(backend: Backend, path: &Path, cols: u16, rows: u16) -> Rendered {
+pub fn render(
+    backend: Backend,
+    path: &Path,
+    cols: u16,
+    rows: u16,
+    page: usize,
+    protocol: Protocol,
+) -> Rendered {
     // Zero geometry means the pane has not been laid out yet; the tools would
     // either fail or produce nothing useful.
     if cols == 0 || rows == 0 {
         return Rendered::Failed("no room to draw".to_string());
     }
 
-    let args = backend.args(path, cols, rows);
+    // Only timg speaks the graphics protocols; chafa always gets symbols.
+    let protocol = match backend {
+        Backend::Timg => protocol,
+        Backend::Chafa => Protocol::Blocks,
+    };
+    let args = backend.args(path, cols, rows, page, protocol);
     match run_with_timeout(backend.binary(), &args) {
         Ok((status, stdout, stderr)) => {
             if status {
@@ -361,7 +432,7 @@ mod tests {
     /// terminal, which fails when stdout is a pipe.
     #[test]
     fn timg_is_always_given_an_explicit_geometry() {
-        let args = Backend::Timg.args(Path::new("/tmp/x.png"), 60, 24);
+        let args = Backend::Timg.args(Path::new("/tmp/x.png"), 60, 24, 0, Protocol::Blocks);
         assert!(args.iter().any(|a| a == "-g60x24"));
         assert!(args.iter().any(|a| a == "-p"));
     }
@@ -370,10 +441,10 @@ mod tests {
     /// kitty graphics, which cannot be parsed into spans.
     #[test]
     fn both_backends_pin_a_text_output_format() {
-        let timg = Backend::Timg.args(Path::new("/tmp/x.png"), 10, 10);
+        let timg = Backend::Timg.args(Path::new("/tmp/x.png"), 10, 10, 0, Protocol::Blocks);
         assert!(timg.windows(2).any(|w| w[0] == "-p" && w[1] == "q"));
 
-        let chafa = Backend::Chafa.args(Path::new("/tmp/x.png"), 10, 10);
+        let chafa = Backend::Chafa.args(Path::new("/tmp/x.png"), 10, 10, 0, Protocol::Blocks);
         assert!(chafa.iter().any(|a| a == "--format=symbols"));
         assert!(chafa.iter().any(|a| a == "--colors=truecolor"));
         assert!(chafa.iter().any(|a| a == "--polite=on"));
@@ -381,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_zero_sized_pane_does_not_spawn_anything() {
-        let r = render(Backend::Timg, Path::new("/tmp/x.png"), 0, 0);
+        let r = render(Backend::Timg, Path::new("/tmp/x.png"), 0, 0, 0, Protocol::Blocks);
         assert!(matches!(r, Rendered::Failed(_)));
     }
 
@@ -397,7 +468,7 @@ mod tests {
         if !img.exists() {
             return;
         }
-        match render(backend, img, 40, 20) {
+        match render(backend, img, 40, 20, 0, Protocol::Blocks) {
             Rendered::Ansi(text) => {
                 let lines = crate::widget::ansi::parse_ansi(&text);
                 assert!(!lines.is_empty(), "no lines from {}", backend.binary());
@@ -420,7 +491,7 @@ mod tests {
         let txt = dir.path().join("notanimage.txt");
         std::fs::write(&txt, "hello").unwrap();
         assert!(matches!(
-            render(backend, &txt, 20, 10),
+            render(backend, &txt, 20, 10, 0, Protocol::Blocks),
             Rendered::Failed(_)
         ));
     }

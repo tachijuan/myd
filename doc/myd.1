@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.18.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.19.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -205,7 +205,8 @@ Toggle the info panel sidebar. Hidden by default.
 .B space
 Open or close the file preview pane, which covers most of the screen and shows
 the contents of the selected file. Opening it also gives it focus, so the vi
-motions act on the pane rather than on the tree behind it. See
+motions act on the pane rather than on the tree behind it. On a multi-page PDF the
+motions turn pages. See
 .B FILE PREVIEW
 below.
 .TP
@@ -545,40 +546,73 @@ hand focus back to the tree with \fBEsc\fR or \fBq\fR and moving the cursor
 re-reads the preview, so a directory can be walked and its contents watched.
 .PP
 Text is syntax highlighted, using the file's extension or its \fB#!\fR line when
-it has none. Files over 256 KB are shown as plain text instead, since
-highlighting them costs more than the colors are worth. Only the first megabyte
-of a large file is read; the footer reads \fBtruncated\fR when that happened. A
-binary file is reported with its size rather than written out as control
-characters.
+it has none. Source files over 64 KB are shown as plain text instead:
+highlighting is linear in the text and a 4300-line file costs about a quarter of
+a second, which is not worth the colours. Only the first megabyte of a large file
+is read; the footer reads \fBtruncated\fR when that happened. A binary file is
+reported with its size rather than written out as control characters.
 .PP
-Images are drawn as colored terminal blocks by
+Markdown has its own highlighter rather than going through the general grammar,
+which makes it roughly four thousand times faster (37 microseconds against 170
+milliseconds on a 30 KB file) and so exempt from that size limit. The general
+grammar embeds every other language so fenced code can be highlighted in its own
+syntax; that is far too slow for something which should feel instant. The trade is
+that fenced code is coloured as one block rather than per language.
+.PP
+Images are drawn by
 .BR timg (1)
 or
 .BR chafa (1),
 whichever is on the \fBPATH\fR. \fBtimg\fR is preferred, as it renders more
-formats. A \fBtimg\fR linked against poppler also renders the first page of a
-\fBPDF\fR; \fBchafa\fR has no PDF loader, so on a machine with only \fBchafa\fR a
-PDF is reported as needing \fBtimg\fR rather than failing obscurely. With neither
-installed the pane shows the file's details and says what is missing.
+formats. With neither installed the pane shows the file's details and says what is
+missing.
 .PP
-The renderer's output is captured and drawn as part of the interface rather than
-written to the terminal, so previews work inside
+How the image reaches the screen depends on the terminal. Where it implements the
+kitty graphics protocol (kitty, ghostty, Konsole 22.04 and later) or iTerm2 inline
+images (iTerm2, WezTerm, mintty), the picture is handed over as a real PNG and
+drawn at pixel resolution. Everywhere else it is approximated with Unicode block
+characters, which is universally safe but visibly blocky, since a block packs four
+pixels into one cell and picks two colours for them.
+.PP
+Detection errs towards blocks deliberately: a terminal that does not understand a
+graphics escape prints it, so a wrong guess sprays kilobytes of base64 over the
+display. A multiplexer is refused unless it will forward the sequence \(em for
 .BR tmux (1)
-and cannot corrupt the display.
+that means \fBset \-g allow\-passthrough on\fR \(em and anything unrecognised
+falls back. Set \fBMYD_PREVIEW_GRAPHICS\fR to \fBkitty\fR, \fBiterm2\fR or
+\fBblocks\fR to force a choice.
+.PP
+Block output is captured and drawn as part of the interface rather than written to
+the terminal, so it cannot corrupt the display. A graphics image necessarily does
+reach the terminal directly: the pane leaves a hole for it and the escape is
+written after the frame.
+.PP
+A \fBPDF\fR needs a \fBtimg\fR linked against poppler; \fBchafa\fR has no PDF
+loader, so on a machine with only \fBchafa\fR a PDF is reported as needing
+\fBtimg\fR rather than failing obscurely. With a multi-page document open the
+motions turn pages rather than scrolling, since a rendered page is drawn to fit and
+has nothing to scroll, and the footer reads \fBpage 5/19\fR. The page count comes
+from
+.BR pdfinfo (1);
+without poppler-utils installed you can still page forward, but there is no known
+last page to jump to.
 .PP
 Keys below act on the pane while it has focus.
 .TP
 .B j, k
-Scroll down or up one line. The arrow keys do the same.
+Scroll down or up one line, or turn to the next or previous page of a multi-page
+document. The arrow keys do the same.
 .TP
 .B Ctrl+F, Ctrl+B
-Scroll forward or back a full page, keeping one line of overlap.
+Scroll forward or back a full page, keeping one line of overlap. On a multi-page
+document these turn a page.
 .TP
 .B Ctrl+D, Ctrl+U
 Scroll half a page.
 .TP
 .B g, G
-Jump to the start or the end. \fBHome\fR and \fBEnd\fR do the same.
+Jump to the start or the end \(em the first or last page of a multi-page document.
+\fBHome\fR and \fBEnd\fR do the same.
 .TP
 .B /
 Search within the file with a regular expression (case-insensitive). An empty
@@ -625,6 +659,15 @@ Optional, for image previews in the preview pane. Neither is required; without
 them the pane shows the file's details instead. PDF previews need a
 .BR timg (1)
 built with poppler, which \fBtimg \-\-version\fR reports.
+.TP
+.B pdfinfo
+Optional, from poppler-utils, so the preview pane knows how many pages a PDF has.
+.TP
+.B A graphics-capable terminal
+Optional, for pixel-resolution images rather than block approximations: one
+implementing the kitty graphics protocol or iTerm2 inline images. Under
+.BR tmux (1)
+this additionally needs \fBallow\-passthrough\fR.
 .SH INSTALLATION
 .PP
 .RS
@@ -646,4 +689,5 @@ cargo run \-\- ~/Documents
 .BR tree (1),
 .BR lf (1),
 .BR timg (1),
-.BR chafa (1)
+.BR chafa (1),
+.BR pdfinfo (1)
