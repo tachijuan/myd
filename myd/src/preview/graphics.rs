@@ -99,8 +99,15 @@ fn decision() -> &'static Decision {
     static CACHE: OnceLock<Decision> = OnceLock::new();
     CACHE.get_or_init(|| {
         let env = EnvVars::from_process();
-        // Ask the terminal first; fall back to what the environment claims.
-        let probed = query_tty(PROBE_TIMEOUT);
+        // Only ask kitty's question where the environment already hints the
+        // protocol is understood — see `KITTY_QUERY` for why asking blindly puts
+        // the query text on the user's screen.
+        // `env_capabilities` folds the iTerm2 family in with kitty, because both
+        // are "some graphics protocol". Only a terminal that plausibly speaks
+        // *kitty's* protocol should be asked kitty's question — iTerm2 does not,
+        // and would print it.
+        let ask_kitty = env_capabilities(&env).kitty && !iterm_family(&env);
+        let probed = query_tty(PROBE_TIMEOUT, ask_kitty);
         decide(&env, probed)
     })
 }
@@ -333,14 +340,14 @@ fn tmux_allows_passthrough() -> bool {
 ///
 /// Must run **before** the alternate screen is entered: a reply that arrives
 /// late would otherwise be delivered as if it were a keypress.
-pub fn query_tty(timeout: std::time::Duration) -> Option<Probed> {
+pub fn query_tty(timeout: std::time::Duration, ask_kitty: bool) -> Option<Probed> {
     #[cfg(unix)]
     {
-        unix_probe::run(timeout)
+        unix_probe::run(timeout, ask_kitty)
     }
     #[cfg(not(unix))]
     {
-        let _ = timeout;
+        let _ = (timeout, ask_kitty);
         None
     }
 }
@@ -351,14 +358,21 @@ mod unix_probe {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
 
-    /// Query both capabilities in one round trip.
+    /// Ask the terminal what it supports.
     ///
-    /// `ESC_Gi=…a=q…ESC\` asks kitty whether it understands the graphics
-    /// protocol; `ESC[c` asks any terminal for its attributes, where a `4` in the
-    /// list means sixel.
-    const QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAAAAAA\x1b\\\x1b[c";
+    /// `ESC[c` (Device Attributes) is safe to send anywhere: it is ancient, every
+    /// terminal answers it, and none prints it. A `4` in the reply means sixel.
+    ///
+    /// The kitty graphics query is **not** sent unconditionally. It is an APC
+    /// string, and a terminal that does not understand APC prints the payload
+    /// instead of swallowing it — which puts `_Gi=31,s=1,...;AAAAAAAA` on the
+    /// user's screen. Observed doing exactly that. It is therefore only sent when
+    /// something already suggests the terminal speaks the protocol, and the
+    /// answer for everyone else comes from Device Attributes and the environment.
+    const DA_QUERY: &[u8] = b"\x1b[c";
+    const KITTY_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAAAAAA\x1b\\";
 
-    pub fn run(timeout: std::time::Duration) -> Option<Probed> {
+    pub fn run(timeout: std::time::Duration, ask_kitty: bool) -> Option<Probed> {
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -371,7 +385,12 @@ mod unix_probe {
         // panic in between.
         let _restore = Restore { fd, saved };
 
-        tty.write_all(QUERY).ok()?;
+        // Kitty's query first when it is safe to ask, so both replies arrive
+        // before the Device Attributes answer that marks the end.
+        if ask_kitty {
+            tty.write_all(KITTY_QUERY).ok()?;
+        }
+        tty.write_all(DA_QUERY).ok()?;
         tty.flush().ok()?;
 
         let deadline = std::time::Instant::now() + timeout;
@@ -1309,6 +1328,54 @@ mod tests {
         // Blocks are cells; ratatui already owns them.
         assert!(clear_sequence(Protocol::Blocks).is_none());
         assert!(!needs_region_erase(Protocol::Blocks));
+    }
+
+    /// The kitty query is an APC string, and a terminal that does not understand
+    /// APC *prints* it rather than swallowing it — observed putting
+    /// `_Gi=31,s=1,...;AAAAAAAA` on the screen at startup. It must only be sent
+    /// where the environment already suggests kitty's protocol is spoken.
+    #[test]
+    fn the_kitty_query_is_only_sent_to_plausible_terminals() {
+        let ask = |e: &EnvVars| env_capabilities(e).kitty && !iterm_family(e);
+
+        // Nothing known about the terminal: do not risk it.
+        assert!(!ask(&EnvVars {
+            term: Some("xterm-256color".into()),
+            ..env()
+        }));
+
+        // iTerm2 and WezTerm speak their own protocol, not kitty's — asking them
+        // kitty's question is what put the text on screen.
+        for e in [
+            EnvVars {
+                lc_terminal: Some("iTerm2".into()),
+                ..env()
+            },
+            EnvVars {
+                term_program: Some("WezTerm".into()),
+                ..env()
+            },
+        ] {
+            assert!(!ask(&e), "must not ask kitty's question: {e:?}");
+        }
+
+        // A terminal that plausibly speaks it may be asked.
+        for e in [
+            EnvVars {
+                kitty_window_id: Some("1".into()),
+                ..env()
+            },
+            EnvVars {
+                term: Some("xterm-kitty".into()),
+                ..env()
+            },
+            EnvVars {
+                term_program: Some("ghostty".into()),
+                ..env()
+            },
+        ] {
+            assert!(ask(&e), "should ask: {e:?}");
+        }
     }
 
     // ---- tmux wrapping --------------------------------------------------

@@ -161,7 +161,7 @@ Search wraps around at the ends. Filtering hides non-matching entries at every l
 | `v`       | Toggle tree / treemap view    |
 | `s`       | Cycle sort mode               |
 | `H`       | Toggle hidden files           |
-| `b`       | Toggle size bars              |
+| `B`       | Toggle size bars              |
 | `P`       | Toggle permissions column     |
 | `T`       | Toggle modification-time column |
 | `Ctrl+p`  | Toggle info panel             |
@@ -289,7 +289,7 @@ Colors indicate the item's share of its parent directory's total size:
 - **Amber** — 50–80% of parent
 - **Red** — more than 80% of parent
 
-Toggle bars on/off with `b`.
+Toggle bars on/off with `B`.
 
 ## Treemap View
 

@@ -1771,10 +1771,10 @@ async fn test_other_key_in_help_dismisses_and_acts() {
     app.handle_key_for_test(char_key('?'));
     assert!(app.is_help_open());
 
-    // `b` (toggle size bars) rather than `j`: the help list is taller than the
+    // `B` (toggle size bars) rather than `j`: the help list is taller than the
     // terminal, so j/k now scroll *within* it instead of dismissing it. A key
     // the overlay has no use for still dismisses and acts.
-    let keep_running = app.handle_key_for_test(char_key('b'));
+    let keep_running = app.handle_key_for_test(char_key('B'));
     assert!(keep_running);
     assert!(!app.is_help_open(), "an unrelated key should dismiss help");
     let bars_after = match app.current_screen() {
@@ -10817,4 +10817,35 @@ fn every_graphics_protocol_has_one_removal_path() {
     // iTerm2 specifically — the reported case.
     assert!(needs_region_erase(Protocol::Iterm2));
     assert!(clear_sequence(Protocol::Iterm2).is_none());
+}
+
+/// Size bars toggle with `B`, matching the other column toggles (`P` for
+/// permissions, `T` for times) rather than being the odd lowercase one out.
+#[test]
+fn size_bars_toggle_with_a_capital_b() {
+    use myd::keybinding::{Action, KeyBindingHandler};
+
+    let h = KeyBindingHandler::new();
+    assert_eq!(
+        h.resolve_single_for_test(char_key('B')),
+        Some(Action::ToggleBar)
+    );
+    // Both plain-key tables must agree, or the binding works only until a `g`
+    // times out.
+    assert_eq!(
+        h.resolve_single_char_for_test('B'),
+        Some(Action::ToggleBar)
+    );
+
+    // Lowercase `b` no longer toggles bars. It stays free as a plain key —
+    // Ctrl+B is page-up and is unaffected.
+    assert_ne!(
+        h.resolve_single_for_test(char_key('b')),
+        Some(Action::ToggleBar)
+    );
+    assert_eq!(
+        h.resolve_single_for_test(ctrl_key('b')),
+        Some(Action::PageUp),
+        "Ctrl+B must still page up"
+    );
 }
