@@ -300,10 +300,9 @@ pub fn render(
         (cols, rows)
     };
 
-    // A multiplexer buffers a passthrough escape whole and drops one that grows
-    // past its input limit, which is a blank rectangle rather than an error.
-    // Oversampling is what pushes a payload over: it is a quality improvement,
-    // so it is the part to give up when the result would not survive the trip.
+    // A payload that would not survive a multiplexer is retried smaller. This is
+    // a backstop, not the main defence: the geometry above already sizes the
+    // raster to the pane, so it only bites on a very large pane.
     let in_multiplexer = std::env::var_os("TMUX").is_some();
     let oversampled = (cols, rows) != (base_cols, base_rows);
 
@@ -312,8 +311,6 @@ pub fn render(
     if oversampled {
         if let Ok((true, ref stdout, _)) = first {
             if !super::graphics::payload_fits(stdout.len(), in_multiplexer) {
-                // Retry at the pane's own size. Smaller, but visible, which beats
-                // a correct image the multiplexer throws away.
                 let args = backend.args(path, base_cols, base_rows, page, protocol);
                 return finish(backend, run_with_timeout(backend.binary(), &args));
             }

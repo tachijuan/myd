@@ -753,10 +753,27 @@ pub fn oversampled_geometry(cols: u16, rows: u16) -> (u16, u16) {
     // unchanged — scaling them independently would ask for a differently-shaped
     // box than the pane and let the renderer letterbox inside it.
     //
-    // The factor is reduced until neither axis exceeds the cap. A pane already
-    // larger than the cap is passed through unscaled rather than shrunk: asking
-    // for fewer cells than the pane would make the image worse than not
-    // oversampling at all.
+    // With the real cell size known there is nothing to guess at: ask for the
+    // geometry whose assumed-cell pixel box matches the pane's true one, and the
+    // raster comes out exactly the right size.
+    //
+    // Multiplying the geometry blindly is what broke tall images. timg fits the
+    // image into the *pixel* box the geometry implies, so doubling the geometry
+    // doubles the pixels — and since the escape then pins the image to the
+    // pane's cells, a portrait photo was drawn 40 rows tall in a 37-row pane.
+    // The overflow lands on rows nothing repaints, which is the blank rectangle
+    // that was reported.
+    if let Some((cw, ch)) = cell_size() {
+        return (
+            scale_axis(cols, u32::from(cw), ASSUMED_CELL_W),
+            scale_axis(rows, u32::from(ch), ASSUMED_CELL_H),
+        );
+    }
+
+    // Without a measurement, fall back to a bounded multiple. The factor is
+    // reduced until neither axis exceeds the cap; a pane already larger than the
+    // cap is passed through unscaled rather than shrunk, since asking for fewer
+    // cells than the pane would be worse than not oversampling at all.
     let largest = cols.max(rows);
     let factor = if largest == 0 || largest >= MAX_OVERSAMPLED_CELLS {
         1
@@ -764,6 +781,26 @@ pub fn oversampled_geometry(cols: u16, rows: u16) -> (u16, u16) {
         GRAPHICS_OVERSAMPLE.min(MAX_OVERSAMPLED_CELLS / largest).max(1)
     };
     (cols.saturating_mul(factor), rows.saturating_mul(factor))
+}
+
+/// The cell size timg assumes for a graphics render when its stdout is a pipe.
+///
+/// Measured from its own arithmetic: a 100-column request produced a 900px-wide
+/// image, and heights come out in multiples of 18.
+const ASSUMED_CELL_W: u32 = 9;
+const ASSUMED_CELL_H: u32 = 18;
+
+/// Scale one axis so timg's assumed cell lands on the real pixel size.
+///
+/// `cells * real / assumed` is the geometry whose implied pixel box equals the
+/// pane's actual one. Never smaller than the pane: a cell smaller than the
+/// assumption would otherwise shrink the request and waste resolution.
+fn scale_axis(cells: u16, real: u32, assumed: u32) -> u16 {
+    if real <= assumed {
+        return cells;
+    }
+    let scaled = u32::from(cells) * real / assumed;
+    scaled.min(u32::from(u16::MAX)) as u16
 }
 
 /// Rows to ask timg for when rendering sixel into a pane of `rows` rows.
@@ -792,15 +829,11 @@ pub fn sixel_row_budget(rows: u16) -> u16 {
 
 /// Largest escape a multiplexer will carry in one piece, in bytes.
 ///
-/// tmux buffers a passthrough sequence whole before forwarding it and discards
-/// one that grows past its input limit, which leaves a blank rectangle where the
-/// image should be. Measured against the real renders: a 2x-oversampled photo
-/// reaches 2.4MB at a full-screen pane, well past the limit, while a small image
-/// at 68KB comes through fine — which is why some previews appeared and others
-/// were black.
-///
-/// One megabyte is tmux's own buffer limit. The budget is set below it so the
-/// wrapper's overhead and a little slack still fit.
+/// A backstop against a payload too large for a multiplexer to carry in one
+/// piece. Note this was *not* the cause of the blank images that prompted it:
+/// a live tmux forwarded payloads up to a megabyte without trouble, and the real
+/// fault was the render overflowing the pane. The budget stays as cheap
+/// insurance for a very large pane, not as the defence it was first taken for.
 pub const MAX_MULTIPLEXED_PAYLOAD: usize = 768 * 1024;
 
 /// Whether a payload of `bytes` can be sent as one escape in this session.
@@ -1458,6 +1491,46 @@ mod tests {
             pinned.contains("width=140;height=37"),
             "must still occupy the pane, not the oversampled box: {pinned}"
         );
+    }
+
+    /// The blank-image bug. Oversampling multiplied the geometry, and timg fits
+    /// the image into the *pixel* box the geometry implies — so doubling it
+    /// doubled the pixels while the escape still pinned the image to the pane's
+    /// cells. A 1280x1920 portrait came out 40 rows tall in a 37-row pane, and
+    /// the overflow landed on rows nothing repaints: a blank rectangle.
+    ///
+    /// Scaling by the real cell instead makes the implied pixel box match the
+    /// pane, whatever the image's shape.
+    #[test]
+    fn the_scaled_geometry_matches_the_panes_pixel_box() {
+        // The arithmetic, checkable without a terminal to measure.
+        fn ask(cells: u16, real: u32, assumed: u32) -> u16 {
+            if real <= assumed {
+                return cells;
+            }
+            ((u32::from(cells) * real / assumed).min(u32::from(u16::MAX))) as u16
+        }
+
+        // A 14x34 cell, as measured on the machine that reported this.
+        for (cols, rows) in [(140u16, 37u16), (140, 20), (60, 16), (200, 52)] {
+            let (ac, ar) = (ask(cols, 14, 9), ask(rows, 34, 18));
+            // What timg will produce, and what the pane actually is.
+            let (px_w, px_h) = (u32::from(ac) * 9, u32::from(ar) * 18);
+            let (pane_w, pane_h) = (u32::from(cols) * 14, u32::from(rows) * 34);
+            assert!(
+                px_w <= pane_w && px_h <= pane_h,
+                "{cols}x{rows}: asked for {px_w}x{px_h} into a {pane_w}x{pane_h} pane"
+            );
+            // And close enough to it that resolution is not thrown away.
+            assert!(px_h * 100 / pane_h >= 95, "{cols}x{rows}: too small");
+        }
+
+        // A cell no larger than the assumption needs no scaling — asking for
+        // less than the pane would waste resolution.
+        assert_eq!(ask(37, 18, 18), 37);
+        assert_eq!(ask(37, 10, 18), 37);
+        // And it cannot overflow.
+        assert_eq!(ask(u16::MAX, 1000, 18), u16::MAX);
     }
 
     /// A pane close to the integer limit must not wrap into a tiny request, and a
