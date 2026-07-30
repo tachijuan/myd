@@ -425,8 +425,11 @@ different answer inside tmux than it does natively — the same image filled a
 native window and came out small in a tmux pane. When the terminal does not
 report a cell size, the cell form is used as a fallback.
 
-Because the size is stated separately from the image data, the *raster* can be
-asked for at twice the pane's size without the image occupying more of it. That matters:
+The raster is then asked for at the geometry whose pixel box matches the pane's
+real one, so it arrives with enough detail to fill the space and no more. Asking
+for a blind multiple of the pane instead is what once drew a tall photo past the
+bottom of its pane, and the overflow landed on rows nothing repaints — a blank
+rectangle. That matters:
 timg cannot ask a piped stdout how large a cell is and assumes 18 pixels, so on
 a retina display — where a cell is nearer 30 — an image sized for the smaller
 assumption arrives with too few pixels and draws small and soft inside its box.
