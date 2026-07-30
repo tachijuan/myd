@@ -908,24 +908,46 @@ pub fn sixel_row_budget(rows: u16) -> u16 {
 
 /// Largest escape a multiplexer will carry in one piece, in bytes.
 ///
-/// A backstop against a payload too large for a multiplexer to carry in one
-/// piece.
+/// Largest inline image that reliably draws inside a multiplexer.
 ///
-/// Deliberately generous. This was *not* the cause of the blank images that
-/// prompted it — the real fault was the render overflowing the pane — and a
-/// budget set too low does active harm: at 768KB it rejected a correctly-sized
-/// 1.7MB render of a 21-page PDF and retried it smaller, throwing away the
-/// resolution the sizing fix had just gained. Measured against a live tmux with
-/// passthrough on, payloads of 1, 1.5, 2, 3 and 4MB were all forwarded intact,
-/// so this only catches something genuinely pathological.
-pub const MAX_MULTIPLEXED_PAYLOAD: usize = 8 * 1024 * 1024;
+/// Set from what a real terminal does, not from what tmux claims to forward.
+/// Bisecting on the affected machine, images drew up to a 256KB base64 payload
+/// and stopped after that; 200KB leaves room for the wrapper and the header.
+///
+/// The distinction matters because it misled me twice. tmux *forwards* far more
+/// than this — a megabyte of incompressible data arrives intact, and a marker
+/// printed after the image proves the sequence was consumed — so a test that
+/// only checks the bytes survived reports success while the picture never
+/// appears. The limit is in what the terminal will decode and display at the far
+/// end, which only shows up by looking at the screen.
+pub const MAX_MULTIPLEXED_PAYLOAD: usize = 200 * 1024;
 
 /// Whether a payload of `bytes` can be sent as one escape in this session.
 ///
 /// Only a multiplexer imposes this. Writing straight to a terminal, the escape
 /// goes out as fast as it can be written and nothing buffers it whole.
 pub fn payload_fits(bytes: usize, in_multiplexer: bool) -> bool {
-    !in_multiplexer || bytes <= MAX_MULTIPLEXED_PAYLOAD
+    !in_multiplexer || bytes <= multiplexed_payload_limit()
+}
+
+/// The limit in force, allowing for an override.
+///
+/// [`MAX_MULTIPLEXED_PAYLOAD`] comes from bisecting one terminal, and another
+/// build or version may draw more or less. `MYD_PREVIEW_MAX_PAYLOAD` takes a
+/// size in kilobytes so a different ceiling can be dialled in without a rebuild;
+/// `0` disables the limit entirely.
+pub fn multiplexed_payload_limit() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match std::env::var("MYD_PREVIEW_MAX_PAYLOAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(kb) => kb * 1024,
+            None => MAX_MULTIPLEXED_PAYLOAD,
+        }
+    })
 }
 
 /// Scale a row count so timg's assumed cell height lands on the real one.
@@ -1754,28 +1776,28 @@ mod tests {
     /// and smaller ones were fine.
     #[test]
     fn oversized_payloads_are_only_rejected_inside_a_multiplexer() {
-        // Real renders, all of which must be allowed through: a small image, a
-        // 2x-oversampled photo, and a 21-page PDF scaled to a full pane.
-        for bytes in [68 * 1024, 2_433_695, 1_731_194] {
-            assert!(payload_fits(bytes, true), "{bytes} should be allowed");
-            assert!(payload_fits(bytes, false));
+        // Straight to a terminal, size is not a constraint: a 2.4MB photo and a
+        // 1.9MB PDF page both draw, and shrinking them would only lose detail.
+        for bytes in [7_114, 716_588, 1_961_137, 2_433_695] {
+            assert!(payload_fits(bytes, false), "{bytes} should draw natively");
         }
 
-        // Only something pathological is refused, and only in a multiplexer.
-        let absurd = 32 * 1024 * 1024;
-        assert!(payload_fits(absurd, false));
-        assert!(!payload_fits(absurd, true));
+        // Inside a multiplexer the terminal stopped drawing past a 256KB base64
+        // payload, measured by bisection on the affected machine.
+        assert!(payload_fits(7_114, true), "a small image must still draw");
+        assert!(!payload_fits(716_588, true), "a photo this size did not draw");
+        assert!(!payload_fits(1_961_137, true), "nor did a PDF page");
+
+        // The budget leaves room under the observed ceiling for the wrapper.
+        const { assert!(MAX_MULTIPLEXED_PAYLOAD < 256 * 1024) };
 
         assert!(payload_fits(MAX_MULTIPLEXED_PAYLOAD, true));
         assert!(!payload_fits(MAX_MULTIPLEXED_PAYLOAD + 1, true));
 
-        // A correctly-sized render must not be rejected. A 21-page PDF scaled to
-        // a 140x37 pane comes to 1.7MB, and a budget below that silently retried
-        // it smaller — undoing the sizing it had just been given.
-        assert!(
-            payload_fits(1_731_194, true),
-            "a correctly-sized render must not be thrown away"
-        );
+        // Note the earlier reasoning here was backwards: it asserted a 1.7MB
+        // render must be allowed through, on the theory that shrinking it would
+        // waste resolution. It would — but an image that large is not drawn at
+        // all inside a multiplexer, and a smaller picture beats a blank one.
     }
 
     /// timg re-encodes everything as PNG, which is the worst case for a

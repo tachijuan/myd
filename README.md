@@ -425,6 +425,14 @@ different answer inside tmux than it does natively — the same image filled a
 native window and came out small in a tmux pane. When the terminal does not
 report a cell size, the cell form is used as a fallback.
 
+Inside a multiplexer there is a further limit, and it is not tmux's: tmux
+forwards a megabyte happily, but the terminal at the far end stops *drawing*
+past a certain size and gives no error — just a blank space. Measured by
+bisection, images drew up to a 256KB base64 payload. Previews are therefore
+capped at 200KB there, shrinking the render until it fits, which is why an image
+looks softer in tmux than in a native window. `MYD_PREVIEW_MAX_PAYLOAD` sets the
+ceiling in kilobytes if your terminal manages more (`0` removes it).
+
 Where iTerm2 can decode the file itself — JPEG, PNG, GIF, WebP and the like —
 the file's own bytes are sent and the renderer is skipped. That is a size fix
 rather than a shortcut: `timg` re-encodes everything as PNG, which is the worst
