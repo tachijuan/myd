@@ -33,6 +33,17 @@ const RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// generous headroom while bounding what a misbehaving tool can hand back.
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 
+/// How many times a render is halved trying to fit a multiplexer's limit.
+///
+/// Each step roughly quarters the payload, so four covers a 16x reduction —
+/// more than enough to bring any pane-sized render under the limit.
+const MAX_SHRINK_STEPS: usize = 4;
+
+/// Floor for a shrunken render. Below this the image is too small to read and
+/// showing nothing would be more honest.
+const MIN_GRAPHICS_COLS: u16 = 20;
+const MIN_GRAPHICS_ROWS: u16 = 6;
+
 /// A terminal image renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -293,30 +304,40 @@ pub fn render(
     // what stops the image arriving too few pixels to fill a real cell. Sixel has
     // no such pinning: its raster *is* its size, so it is asked for exactly what
     // it should occupy.
-    let (base_cols, base_rows) = (cols, rows);
     let (cols, rows) = if protocol.is_graphics() && protocol != Protocol::Sixel {
         super::graphics::oversampled_geometry(cols, rows)
     } else {
         (cols, rows)
     };
 
-    // A payload that would not survive a multiplexer is retried smaller. This is
-    // a backstop, not the main defence: the geometry above already sizes the
-    // raster to the pane, so it only bites on a very large pane.
+    // Inside a multiplexer a payload past the terminal's limit is simply not
+    // drawn — no error, just a blank rectangle — so it has to be brought under
+    // that limit before it is sent. Halving the geometry roughly quarters the
+    // payload, so a few steps cover a very large image, and each step is a real
+    // render rather than a guess at what the size would be.
     let in_multiplexer = std::env::var_os("TMUX").is_some();
-    let oversampled = (cols, rows) != (base_cols, base_rows);
+    let mut attempt = run_with_timeout(backend.binary(), &backend.args(path, cols, rows, page, protocol));
 
-    let args = backend.args(path, cols, rows, page, protocol);
-    let first = run_with_timeout(backend.binary(), &args);
-    if oversampled {
-        if let Ok((true, ref stdout, _)) = first {
-            if !super::graphics::payload_fits(stdout.len(), in_multiplexer) {
-                let args = backend.args(path, base_cols, base_rows, page, protocol);
-                return finish(backend, run_with_timeout(backend.binary(), &args));
+    if in_multiplexer {
+        let (mut c, mut r) = (cols, rows);
+        for _ in 0..MAX_SHRINK_STEPS {
+            match attempt {
+                Ok((true, ref stdout, _))
+                    if !super::graphics::payload_fits(stdout.len(), true) => {}
+                _ => break,
             }
+            // Never below a size worth looking at; a tiny thumbnail is no more
+            // use than a blank space.
+            let (nc, nr) = ((c / 2).max(MIN_GRAPHICS_COLS), (r / 2).max(MIN_GRAPHICS_ROWS));
+            if (nc, nr) == (c, r) {
+                break;
+            }
+            c = nc;
+            r = nr;
+            attempt = run_with_timeout(backend.binary(), &backend.args(path, c, r, page, protocol));
         }
     }
-    finish(backend, first)
+    finish(backend, attempt)
 }
 
 /// Turn a finished child process into a render result.

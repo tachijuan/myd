@@ -226,6 +226,16 @@ async fn native_iterm_image(
     if meta.len > MAX_NATIVE_IMAGE_BYTES {
         return Ok(None);
     }
+    // base64 costs a third on top, and a multiplexer will not carry an
+    // arbitrarily large inline image. Over the limit, hand back to the renderer,
+    // which can shrink the picture until it fits — sending the original whole
+    // would just produce a blank space.
+    let encoded = meta.len.saturating_mul(4) / 3;
+    if std::env::var_os("TMUX").is_some()
+        && !graphics::payload_fits(encoded as usize, true)
+    {
+        return Ok(None);
+    }
     let bytes = read_head(fs, &req.path, meta.len).await?;
     if bytes.len() as u64 != meta.len {
         // A short read would send a truncated image; let the renderer handle it.
@@ -283,6 +293,10 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
     // 2.3MB once base64'd. Sending the original costs 716KB, and looks better for
     // not being re-encoded on the way. kitty takes PNG only and sixel is a raster
     // format, so both still go through the renderer.
+    //
+    // Only when the file is small enough to survive the trip: inside a
+    // multiplexer an oversized inline image is silently not drawn, and the
+    // renderer can shrink where sending the original cannot.
     if graphics::protocol() == graphics::Protocol::Iterm2
         && graphics::iterm_decodes_natively(label)
     {
