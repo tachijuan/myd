@@ -1,8 +1,10 @@
+pub mod ansi;
 pub mod confirm_dialog;
 pub mod file_info;
 pub mod file_tree;
 pub mod help;
 pub mod input_dialog;
+pub mod preview;
 pub mod progress;
 pub mod size_bar;
 pub mod sort_menu;

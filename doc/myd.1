@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.17.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.18.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -201,6 +201,13 @@ so a tile says whether there is anything to open.
 .TP
 .B Ctrl+p
 Toggle the info panel sidebar. Hidden by default.
+.TP
+.B space
+Open or close the file preview pane, which covers most of the screen and shows
+the contents of the selected file. Opening it also gives it focus, so the vi
+motions act on the pane rather than on the tree behind it. See
+.B FILE PREVIEW
+below.
 .TP
 .B s
 Cycle through sort modes: largest, smallest, dirs-first, files-first, newest
@@ -531,6 +538,67 @@ Creation, modification, and last access times.
 The absolute path to the item.
 .PP
 Hide or show the panel with \fBCtrl+p\fR.
+.SH FILE PREVIEW
+Press \fBspace\fR to open a pane over most of the screen showing what is in the
+selected file, and \fBspace\fR again to close it. The pane follows the cursor:
+hand focus back to the tree with \fBEsc\fR or \fBq\fR and moving the cursor
+re-reads the preview, so a directory can be walked and its contents watched.
+.PP
+Text is syntax highlighted, using the file's extension or its \fB#!\fR line when
+it has none. Files over 256 KB are shown as plain text instead, since
+highlighting them costs more than the colors are worth. Only the first megabyte
+of a large file is read; the footer reads \fBtruncated\fR when that happened. A
+binary file is reported with its size rather than written out as control
+characters.
+.PP
+Images are drawn as colored terminal blocks by
+.BR timg (1)
+or
+.BR chafa (1),
+whichever is on the \fBPATH\fR. \fBtimg\fR is preferred, as it renders more
+formats. A \fBtimg\fR linked against poppler also renders the first page of a
+\fBPDF\fR; \fBchafa\fR has no PDF loader, so on a machine with only \fBchafa\fR a
+PDF is reported as needing \fBtimg\fR rather than failing obscurely. With neither
+installed the pane shows the file's details and says what is missing.
+.PP
+The renderer's output is captured and drawn as part of the interface rather than
+written to the terminal, so previews work inside
+.BR tmux (1)
+and cannot corrupt the display.
+.PP
+Keys below act on the pane while it has focus.
+.TP
+.B j, k
+Scroll down or up one line. The arrow keys do the same.
+.TP
+.B Ctrl+F, Ctrl+B
+Scroll forward or back a full page, keeping one line of overlap.
+.TP
+.B Ctrl+D, Ctrl+U
+Scroll half a page.
+.TP
+.B g, G
+Jump to the start or the end. \fBHome\fR and \fBEnd\fR do the same.
+.TP
+.B /
+Search within the file with a regular expression (case-insensitive). An empty
+pattern clears the search; a malformed one is reported.
+.TP
+.B n, p
+Step to the next or previous match, wrapping at the ends. \fBN\fR and \fBP\fR
+step the other way. The current match is highlighted and the footer shows the
+position, as in \fB3/11\fR.
+.TP
+.B Esc, q
+Return focus to the tree, leaving the pane open.
+.TP
+.B Tab
+Move focus in and out of the pane, as it does for the transfer sidebar.
+.PP
+On a remote panel the file is read from the server over SFTP, never from a
+same-named path on the local machine. A remote image is fetched to a temporary
+file first, capped at 32 MB, because both renderers take a path rather than a
+stream.
 .SH EXAMPLES
 .TP
 .B myd
@@ -551,6 +619,12 @@ Start browsing at \fB/var/log\fR.
 .TP
 .B Terminal
 A terminal with true color (256-color or 24-bit) support.
+.TP
+.B timg or chafa
+Optional, for image previews in the preview pane. Neither is required; without
+them the pane shows the file's details instead. PDF previews need a
+.BR timg (1)
+built with poppler, which \fBtimg \-\-version\fR reports.
 .SH INSTALLATION
 .PP
 .RS
@@ -570,4 +644,6 @@ cargo run \-\- ~/Documents
 .SH SEE ALSO
 .BR vi (1),
 .BR tree (1),
-.BR lf (1)
+.BR lf (1),
+.BR timg (1),
+.BR chafa (1)
