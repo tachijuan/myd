@@ -17,7 +17,8 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
 - **File preview** — press `space` to open a pane over most of the screen showing what is actually *in* the selected file, and `space` again to close it. Text, markdown and around a hundred programming languages are syntax highlighted. The pane takes focus, so vi motions act on it rather than on the tree: `j`/`k` by a line, `Ctrl+F`/`Ctrl+B` by a page, `Ctrl+D`/`Ctrl+U` by half of one, `g`/`G` to the start and end. `/` searches within the file (regex, case-insensitive) and `n`/`p` step through the matches — `N`/`P` go the other way — with the current match highlighted and the count shown in the footer. `Esc` or `q` hands focus back to the tree without closing the pane, so you can move the cursor and watch the preview follow; `Tab` moves focus in and out. Binary files are reported rather than dumped, and a file too large to read in full is shown truncated and labelled as such. Works on remote panels: the file is read from the server, not from a same-named path on your own machine.
 - **Image and PDF preview** — if [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/) is on your `PATH`, the preview pane draws images (PNG, JPEG, GIF, WebP, SVG, TIFF, …); `timg` is preferred where both are installed. A `timg` built with poppler also renders **PDFs** — `chafa` has no PDF loader, so a PDF on a chafa-only machine says so rather than failing obscurely. Neither tool is a dependency: without them the pane shows the file's details instead.
-- **High-resolution images where the terminal allows** — in a terminal that implements the kitty graphics protocol (kitty, ghostty, Konsole 22.04+) or iTerm2's inline images (iTerm2, WezTerm, mintty), the image is handed over as a real PNG and drawn at pixel resolution instead of being approximated with block characters. Detection is deliberately conservative, because a terminal that does not understand the sequence *prints* it: a multiplexer is refused unless it will forward the escape (`tmux` needs `set -g allow-passthrough on`), and anything unrecognized falls back to blocks, which work everywhere. Override with `MYD_PREVIEW_GRAPHICS=kitty|iterm2|blocks`.
+- **High-resolution images where the terminal allows** — in a terminal that implements the kitty graphics protocol (kitty, ghostty, Konsole 22.04+), iTerm2's inline images (iTerm2, WezTerm, mintty) or **sixel**, the image is handed over as real pixel data instead of being approximated with block characters. myd asks the terminal directly at startup what it supports, falling back to environment variables when there is nothing to ask. Detection is deliberately conservative, because a terminal that does not understand the sequence *prints* it — anything unrecognized falls back to blocks, which work everywhere. Override with `MYD_PREVIEW_GRAPHICS=kitty|iterm2|sixel|blocks`.
+- **Works inside tmux** — tmux parses sixel itself, so sixel is preferred there and needs no configuration beyond telling tmux your terminal supports it. The kitty and iTerm2 protocols instead ride tmux's passthrough escape, which is off by default; see *Terminal graphics* below for the two settings involved. When myd has to fall back, the preview footer says which setting would change that rather than leaving you guessing.
 - **Page through a PDF** — with a multi-page document open, `j`/`k` turn pages rather than scrolling (a rendered page is drawn to fit and has nothing to scroll); `g`/`G` jump to the first and last page, and the footer shows `page 5/19`. The page count comes from `pdfinfo` when poppler-utils is installed; without it you can still page forward, just without a known end.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
@@ -47,8 +48,9 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - Optional: `pdfinfo` (poppler-utils) so the preview knows how many pages a PDF
   has. Without it you can still page forward, just without a known last page.
 - Optional, for pixel-resolution images rather than block approximations: a
-  terminal implementing the kitty graphics protocol or iTerm2 inline images. Under
-  `tmux` this additionally needs `set -g allow-passthrough on`.
+  terminal implementing the kitty graphics protocol, iTerm2 inline images, or
+  sixel. Inside `tmux` see *Terminal graphics* below — sixel needs one setting,
+  and the other two protocols need a different one.
 
 ## Installation
 
@@ -354,18 +356,46 @@ control characters.
 first, since it renders more formats. With neither installed the pane shows the
 file's details and explains what is missing.
 
-How the image reaches the screen depends on the terminal. Where it implements the
-**kitty graphics protocol** (kitty, ghostty, Konsole 22.04+) or **iTerm2 inline
-images** (iTerm2, WezTerm, mintty), the picture is handed over as a real PNG and
-drawn at pixel resolution. Everywhere else it is approximated with Unicode block
-characters, which is universally safe but visibly blocky, since a block packs four
-pixels into one cell and picks two colors for them.
+### Terminal graphics
+
+How the image reaches the screen depends on the terminal. Three protocols carry
+real pixel data:
+
+| Protocol | Terminals | Quality |
+|---|---|---|
+| kitty | kitty, ghostty, Konsole 22.04+ | best |
+| iTerm2 inline images | iTerm2, WezTerm, mintty | best |
+| sixel | xterm (`-ti vt340`), foot, contour, mlterm, Windows Terminal, iTerm2 | good — a palette rather than truecolor |
+
+Everywhere else the image is approximated with Unicode block characters, which is
+universally safe but visibly blocky, since a block packs four pixels into one cell
+and picks two colors for them.
+
+myd **asks the terminal** at startup — a kitty graphics query and a Device
+Attributes request, with a 100ms budget — and falls back to environment variables
+when there is nothing to ask or nothing answers. Sixel can only be discovered this
+way; no environment variable reports it.
 
 Detection errs towards blocks on purpose: a terminal that does not understand a
 graphics escape *prints* it, so a wrong guess sprays kilobytes of base64 over the
-display. A multiplexer is refused unless it will forward the sequence — for `tmux`
-that means `set -g allow-passthrough on` — and anything unrecognized falls back.
-Force a choice with `MYD_PREVIEW_GRAPHICS=kitty`, `iterm2` or `blocks`.
+display. Force a choice with `MYD_PREVIEW_GRAPHICS=kitty`, `iterm2`, `sixel` or
+`blocks`.
+
+**Inside tmux** the two mechanisms are different, which is worth knowing because
+the obvious setting only fixes one of them:
+
+```sh
+# sixel: tmux parses and re-draws it itself. Tell tmux your terminal has it.
+set -as terminal-features ',*:sixel'
+
+# kitty / iTerm2: these ride tmux's passthrough escape, which is off by default.
+set -g allow-passthrough on
+```
+
+Sixel is preferred inside tmux even though the other two look better, because it
+is the one that survives a multiplexer cleanly — it is a single escape sequence,
+where a kitty image is a chain of dozens that each have to be wrapped. If myd ends
+up on blocks anyway, the preview footer names the setting that would change that.
 
 Block output is *captured and drawn as part of the interface* rather than written
 to the terminal, so it can never corrupt the display. A graphics image necessarily

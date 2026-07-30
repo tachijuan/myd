@@ -6848,7 +6848,7 @@ async fn copy_targets_the_destination_panes_cursor_directory() {
         Some(dst.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
     for _ in 0..200 {
         app.resolve_loading_for_test();
         if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
@@ -7505,7 +7505,7 @@ async fn a_transfer_onto_an_existing_file_asks_first() {
         Some(dest.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
 
     // Panel 0 becomes the remote source, holding a file of the same name.
     let twin = tempfile::tempdir().unwrap();
@@ -7660,7 +7660,7 @@ async fn tab_in_the_overwrite_prompt_does_not_confirm() {
         Some(dest.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
 
     let twin = tempfile::tempdir().unwrap();
     std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
@@ -7708,7 +7708,7 @@ async fn a_confirmed_transfer_overwrite_proceeds_and_a_clear_name_is_not_asked()
         Some(dest.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
 
     let twin = tempfile::tempdir().unwrap();
     std::fs::write(twin.path().join("big_file"), b"payload").unwrap();
@@ -7735,7 +7735,7 @@ async fn a_confirmed_transfer_overwrite_proceeds_and_a_clear_name_is_not_asked()
         Some(fresh.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
     let twin2 = tempfile::tempdir().unwrap();
     std::fs::write(twin2.path().join("only_there"), b"payload").unwrap();
     app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin2.path()));
@@ -7911,7 +7911,7 @@ async fn tab_cycles_through_both_panels_and_the_transfer_sidebar() {
         Some(right.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
     for _ in 0..200 {
         app.resolve_loading_for_test();
         if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
@@ -8017,7 +8017,7 @@ async fn tab_still_alternates_panels_when_the_sidebar_is_hidden() {
         Some(right.path().to_path_buf()),
         true,
     );
-    settle(&mut app).await;
+    settle_all(&mut app).await;
     for _ in 0..200 {
         app.resolve_loading_for_test();
         if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
@@ -10691,16 +10691,24 @@ async fn image_previews_are_not_paged() {
 /// protocol — a mis-detection sprays base64 across the display.
 #[test]
 fn graphics_detection_is_conservative() {
-    use myd::preview::graphics::{EnvVars, Protocol, detect};
+    use myd::preview::graphics::{EnvVars, Protocol, decide};
 
-    // A plain terminal, and the case on a machine running tmux without
-    // passthrough: both must fall back to blocks.
+    // A plain terminal has nothing to offer.
     let plain = EnvVars {
         term: Some("xterm-256color".into()),
         ..Default::default()
     };
-    assert_eq!(detect(&plain), Protocol::Blocks);
+    assert_eq!(*decide(&plain, None), Protocol::Blocks);
 
+    // A terminal that supports it gets the high-resolution path.
+    let kitty = EnvVars {
+        term: Some("xterm-kitty".into()),
+        ..Default::default()
+    };
+    assert_eq!(*decide(&kitty, None), Protocol::Kitty);
+
+    // A kitty-capable terminal inside a tmux that will not forward the escape
+    // has to fall back, and must say which setting to change.
     let tmux_off = EnvVars {
         term: Some("screen-256color".into()),
         kitty_window_id: Some("1".into()),
@@ -10708,16 +10716,55 @@ fn graphics_detection_is_conservative() {
         tmux_passthrough: false,
         ..Default::default()
     };
+    let d = decide(&tmux_off, None);
     assert_eq!(
-        detect(&tmux_off),
+        *d,
         Protocol::Blocks,
         "graphics must not be sent through a tmux that will not forward them"
     );
+    assert!(d.1.is_some_and(|m| m.contains("allow-passthrough")));
+}
 
-    // And a terminal that does support it gets the high-resolution path.
-    let kitty = EnvVars {
-        term: Some("xterm-kitty".into()),
+/// The reported bug: images stayed blocky in a native iTerm2 pane and inside
+/// tmux. Both cases hinged on `LC_TERMINAL`, the only iTerm2 identification that
+/// survives ssh (which drops `TERM_PROGRAM`) and tmux (which overwrites it).
+#[test]
+fn iterm2_is_recognised_over_ssh_and_under_tmux() {
+    use myd::preview::graphics::{EnvVars, Probed, Protocol, decide};
+
+    // Native pane over ssh: TERM_PROGRAM never arrives.
+    let over_ssh = EnvVars {
+        term: Some("xterm-256color".into()),
+        term_program: None,
+        lc_terminal: Some("iTerm2".into()),
         ..Default::default()
     };
-    assert_eq!(detect(&kitty), Protocol::Kitty);
+    assert_eq!(*decide(&over_ssh, None), Protocol::Iterm2);
+
+    // Under tmux, TERM_PROGRAM says "tmux" and hides the real terminal.
+    let under_tmux = EnvVars {
+        term: Some("screen-256color".into()),
+        term_program: Some("tmux".into()),
+        lc_terminal: Some("iTerm2".into()),
+        tmux: Some("/tmp/tmux-1000/default,1,0".into()),
+        tmux_passthrough: true,
+        ..Default::default()
+    };
+    assert_eq!(*decide(&under_tmux, None), Protocol::Iterm2);
+
+    // And with passthrough off, sixel is the one thing tmux forwards itself.
+    let sixel_tmux = EnvVars {
+        tmux_passthrough: false,
+        ..under_tmux
+    };
+    assert_eq!(
+        *decide(
+            &sixel_tmux,
+            Some(Probed {
+                kitty: false,
+                sixel: true
+            })
+        ),
+        Protocol::Sixel
+    );
 }

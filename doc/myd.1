@@ -1,4 +1,4 @@
-.TH "MYD" "1" "July 2026" "myd 0.19.0" "User Commands"
+.TH "MYD" "1" "July 2026" "myd 0.19.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -567,20 +567,53 @@ whichever is on the \fBPATH\fR. \fBtimg\fR is preferred, as it renders more
 formats. With neither installed the pane shows the file's details and says what is
 missing.
 .PP
-How the image reaches the screen depends on the terminal. Where it implements the
-kitty graphics protocol (kitty, ghostty, Konsole 22.04 and later) or iTerm2 inline
-images (iTerm2, WezTerm, mintty), the picture is handed over as a real PNG and
-drawn at pixel resolution. Everywhere else it is approximated with Unicode block
-characters, which is universally safe but visibly blocky, since a block packs four
-pixels into one cell and picks two colours for them.
+How the image reaches the screen depends on the terminal. Three protocols carry
+real pixel data: the kitty graphics protocol (kitty, ghostty, Konsole 22.04 and
+later), iTerm2 inline images (iTerm2, WezTerm, mintty) and sixel (xterm built with
+sixel, foot, contour, mlterm, Windows Terminal, iTerm2). Everywhere else the image
+is approximated with Unicode block characters, which is universally safe but
+visibly blocky, since a block packs four pixels into one cell and picks two
+colours for them.
+.PP
+myd asks the terminal at start-up \(em a kitty graphics query and a Device
+Attributes request, with a 100 millisecond budget \(em and falls back to
+environment variables when there is nothing to ask or nothing answers. Sixel can
+only be discovered this way; no environment variable reports it. For iTerm2 the
+\fBLC_TERMINAL\fR variable is what identifies it, since \fBTERM_PROGRAM\fR is
+not forwarded by \fBssh\fR and is overwritten by
+.BR tmux (1).
 .PP
 Detection errs towards blocks deliberately: a terminal that does not understand a
 graphics escape prints it, so a wrong guess sprays kilobytes of base64 over the
-display. A multiplexer is refused unless it will forward the sequence \(em for
+display. Set \fBMYD_PREVIEW_GRAPHICS\fR to \fBkitty\fR, \fBiterm2\fR,
+\fBsixel\fR or \fBblocks\fR to force a choice.
+.PP
+Inside
 .BR tmux (1)
-that means \fBset \-g allow\-passthrough on\fR \(em and anything unrecognised
-falls back. Set \fBMYD_PREVIEW_GRAPHICS\fR to \fBkitty\fR, \fBiterm2\fR or
-\fBblocks\fR to force a choice.
+the two mechanisms differ, which matters because the obvious setting only fixes
+one of them. tmux parses and re-draws sixel itself, so it needs only to be told
+the terminal supports it:
+.PP
+.RS
+.nf
+set \-as terminal\-features ',*:sixel'
+.fi
+.RE
+.PP
+The kitty and iTerm2 protocols instead ride tmux's passthrough escape, which is
+off by default:
+.PP
+.RS
+.nf
+set \-g allow\-passthrough on
+.fi
+.RE
+.PP
+Sixel is preferred inside tmux even though the others look better, because it
+survives a multiplexer cleanly: it is a single escape sequence, where a kitty
+image is a chain of dozens that each have to be wrapped individually. When myd
+falls back to blocks anyway, the preview footer names the setting that would
+change that.
 .PP
 Block output is captured and drawn as part of the interface rather than written to
 the terminal, so it cannot corrupt the display. A graphics image necessarily does
@@ -665,9 +698,11 @@ Optional, from poppler-utils, so the preview pane knows how many pages a PDF has
 .TP
 .B A graphics-capable terminal
 Optional, for pixel-resolution images rather than block approximations: one
-implementing the kitty graphics protocol or iTerm2 inline images. Under
+implementing the kitty graphics protocol, iTerm2 inline images, or sixel. Under
 .BR tmux (1)
-this additionally needs \fBallow\-passthrough\fR.
+see the tmux settings described under
+.BR "FILE PREVIEW" ;
+sixel and the other two protocols need different ones.
 .SH INSTALLATION
 .PP
 .RS
