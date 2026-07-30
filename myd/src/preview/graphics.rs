@@ -830,11 +830,16 @@ pub fn sixel_row_budget(rows: u16) -> u16 {
 /// Largest escape a multiplexer will carry in one piece, in bytes.
 ///
 /// A backstop against a payload too large for a multiplexer to carry in one
-/// piece. Note this was *not* the cause of the blank images that prompted it:
-/// a live tmux forwarded payloads up to a megabyte without trouble, and the real
-/// fault was the render overflowing the pane. The budget stays as cheap
-/// insurance for a very large pane, not as the defence it was first taken for.
-pub const MAX_MULTIPLEXED_PAYLOAD: usize = 768 * 1024;
+/// piece.
+///
+/// Deliberately generous. This was *not* the cause of the blank images that
+/// prompted it — the real fault was the render overflowing the pane — and a
+/// budget set too low does active harm: at 768KB it rejected a correctly-sized
+/// 1.7MB render of a 21-page PDF and retried it smaller, throwing away the
+/// resolution the sizing fix had just gained. Measured against a live tmux with
+/// passthrough on, payloads of 1, 1.5, 2, 3 and 4MB were all forwarded intact,
+/// so this only catches something genuinely pathological.
+pub const MAX_MULTIPLEXED_PAYLOAD: usize = 8 * 1024 * 1024;
 
 /// Whether a payload of `bytes` can be sent as one escape in this session.
 ///
@@ -1670,21 +1675,28 @@ mod tests {
     /// and smaller ones were fine.
     #[test]
     fn oversized_payloads_are_only_rejected_inside_a_multiplexer() {
-        let small = 68 * 1024;
-        let large = 2_433_695; // a real 2x-oversampled photo
+        // Real renders, all of which must be allowed through: a small image, a
+        // 2x-oversampled photo, and a 21-page PDF scaled to a full pane.
+        for bytes in [68 * 1024, 2_433_695, 1_731_194] {
+            assert!(payload_fits(bytes, true), "{bytes} should be allowed");
+            assert!(payload_fits(bytes, false));
+        }
 
-        // Straight to a terminal there is nothing buffering it whole.
-        assert!(payload_fits(large, false));
+        // Only something pathological is refused, and only in a multiplexer.
+        let absurd = 32 * 1024 * 1024;
+        assert!(payload_fits(absurd, false));
+        assert!(!payload_fits(absurd, true));
 
-        // Through a multiplexer the large one has to be given up on.
-        assert!(payload_fits(small, true));
-        assert!(!payload_fits(large, true));
-
-        // The budget sits below tmux's own 1MB buffer so the wrapper's overhead
-        // still fits.
-        const { assert!(MAX_MULTIPLEXED_PAYLOAD < 1024 * 1024) };
         assert!(payload_fits(MAX_MULTIPLEXED_PAYLOAD, true));
         assert!(!payload_fits(MAX_MULTIPLEXED_PAYLOAD + 1, true));
+
+        // A correctly-sized render must not be rejected. A 21-page PDF scaled to
+        // a 140x37 pane comes to 1.7MB, and a budget below that silently retried
+        // it smaller — undoing the sizing it had just been given.
+        assert!(
+            payload_fits(1_731_194, true),
+            "a correctly-sized render must not be thrown away"
+        );
     }
 
     // ---- clearing -------------------------------------------------------
