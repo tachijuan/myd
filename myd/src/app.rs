@@ -1356,6 +1356,12 @@ impl FileBrowser {
         self.panels.get(index).map(|p| p.depth()).unwrap_or(0)
     }
 
+    /// The active panel's remembered sort order (for tests) — the one carried
+    /// onto screens opened later, as distinct from the current tree's.
+    pub fn view_prefs_sort_mode_for_test(&self) -> crate::screen::SortMode {
+        self.active_panel().view_prefs.sort_mode
+    }
+
     /// Which backend a panel's paths are addressed on (for tests).
     pub fn panel_backend_for_test(&self, index: usize) -> crate::vfs::BackendId {
         self.panels
@@ -2790,6 +2796,10 @@ impl FileBrowser {
                 self.toggle_shallow();
                 true
             }
+            Action::OpenSortMenu => {
+                self.open_sort_menu();
+                true
+            }
             Action::TogglePreview => {
                 self.toggle_preview();
                 true
@@ -3085,7 +3095,8 @@ impl FileBrowser {
                     | Action::OpenWithDefaultApp
                     | Action::TogglePreview
                     | Action::Redraw
-                    | Action::ToggleShallow => unreachable!(),
+                    | Action::ToggleShallow
+                    | Action::OpenSortMenu => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -3448,8 +3459,16 @@ impl FileBrowser {
             SortMenuOutcome::Cancelled => self.modal = Modal::None,
             SortMenuOutcome::Chosen(mode) => {
                 self.modal = Modal::None;
-                if let Screen::Main(st) = self.active_panel_mut().current_screen_mut() {
+                let panel = self.active_panel_mut();
+                if let Screen::Main(st) = panel.current_screen_mut() {
                     st.set_sort_mode(mode);
+                }
+                // Remembered for screens opened later, exactly as the `s` key
+                // does it. Without this the menu's choice lasted only until the
+                // next directory, which `s` would not have done — a difference
+                // between two ways of setting the same thing.
+                if let Screen::Main(st) = panel.current_screen() {
+                    panel.view_prefs.sort_mode = st.tree.sort_mode;
                 }
             }
         }

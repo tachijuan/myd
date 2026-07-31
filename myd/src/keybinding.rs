@@ -26,6 +26,9 @@ pub enum Action {
     Refresh,
     Rename,
     ToggleSort,
+    /// Open the sort picker, to choose an order directly rather than cycling to
+    /// it. Bound to the `gs` chord and to clicking the "Sort:" indicator.
+    OpenSortMenu,
     ToggleHidden,
     ToggleBar,
     CollapseAll,
@@ -220,8 +223,13 @@ impl KeyBindingHandler {
             // hosts) used to sit alongside this: `gd` now lists directories and
             // hosts together, `/` searches the lot, and the path field takes an
             // sftp:// URL directly, which left both chords doing nothing `gd`
-            // could not.
+            // could not. `gs` has since been reused for the sort picker.
             "gd" => Some(Action::GoDirPicker),
+            // Opens the numbered picker, so `gs5` is "sort by newest" as one
+            // gesture. `s` still cycles, which is quicker once the order is
+            // known; this is for going straight there, and for discovering what
+            // the orders are.
+            "gs" => Some(Action::OpenSortMenu),
             "gx" => Some(Action::CancelTransfers),
             _ => None,
         }

@@ -113,7 +113,9 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             title: "View",
             items: &[
                 ("s", "Cycle sort order"),
-                ("click Sort:", "Pick a sort order from a numbered menu"),
+                ("gs", "Pick a sort order from a numbered menu"),
+                ("  1-7", "  Choose that order outright (gs5 = newest)"),
+                ("click Sort:", "Opens the same menu"),
                 ("H", "Toggle hidden files"),
                 ("B", "Toggle size bars"),
                 ("S", "Browse without measuring directories"),

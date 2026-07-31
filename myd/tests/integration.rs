@@ -3288,6 +3288,107 @@ async fn gd_chord_opens_the_directory_picker() {
     );
 }
 
+#[tokio::test]
+async fn gs_chord_opens_the_sort_picker() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    assert_eq!(app.modal_kind_for_test(), "none", "no modal to start");
+
+    app.handle_key_for_test(char_key('g'));
+    // Mid-chord: `g` alone must not have done anything yet.
+    assert_eq!(app.modal_kind_for_test(), "none", "g alone is not a command");
+    app.handle_key_for_test(char_key('s'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "sort_menu",
+        "gs should open the sort picker"
+    );
+
+    // Esc backs out without changing the order, as it does everywhere else.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.modal_kind_for_test(), "none", "Esc dismisses the picker");
+}
+
+/// A `g` left to expire must not turn the next `s` into the sort picker.
+#[tokio::test]
+async fn a_timed_out_g_lets_s_cycle_as_normal() {
+    // `gs` now claims a chord whose second key is a real binding on its own, so
+    // the fallback after the 500ms timeout is the case that can break: `s` has
+    // to still cycle the order rather than open the menu.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let before = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => unreachable!("settled onto a main screen"),
+    };
+
+    app.handle_key_for_test(char_key('g'));
+    // Outlast the chord window.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    app.handle_key_for_test(char_key('s'));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "an expired g must not leave s opening the picker"
+    );
+    let after = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => unreachable!("still a main screen"),
+    };
+    assert_ne!(before, after, "s cycled the order, as it does alone");
+}
+
+/// The whole gesture from the request: `gs5` sorts by newest.
+#[tokio::test]
+async fn gs_then_a_number_picks_that_sort_order() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Entry 5 is Newest. Asserted against SortMode::ALL rather than hardcoded,
+    // so inserting a mode ahead of it corrects this test instead of leaving it
+    // quietly checking the wrong entry.
+    assert_eq!(
+        myd::screen::SortMode::ALL[4],
+        myd::screen::SortMode::Newest,
+        "gs5 is only 'newest' while Newest is the fifth entry"
+    );
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
+    app.handle_key_for_test(char_key('5'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "picking a number closes the menu"
+    );
+
+    match app.current_screen() {
+        Screen::Main(s) => assert_eq!(
+            s.tree.sort_mode,
+            myd::screen::SortMode::Newest,
+            "gs5 should sort by newest"
+        ),
+        _ => panic!("still a main screen"),
+    }
+
+    // And the order survives entering a directory, like the `s` key's does.
+    assert_eq!(
+        app.view_prefs_sort_mode_for_test(),
+        myd::screen::SortMode::Newest,
+        "the chosen order is remembered for screens opened later"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The user can always stop and exit, even during remote work.
 // ---------------------------------------------------------------------------
