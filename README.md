@@ -425,6 +425,13 @@ different answer inside tmux than it does natively — the same image filled a
 native window and came out small in a tmux pane. When the terminal does not
 report a cell size, the cell form is used as a fallback.
 
+The kitty protocol has no working way to say "draw this in N cells" here — its
+`c=`/`r=` keys are ignored by at least one terminal that otherwise implements
+the protocol, measured directly. The image is drawn at whatever pixel size the
+raster happens to be, so the raster is built to the pane's real pixel box
+instead. That is why the cell size matters: get it wrong and the picture either
+under-fills the pane or is upscaled until it looks pixelated.
+
 **Inside tmux the kitty protocol is always used**, whatever the terminal's own
 protocol is. This is about how the image is *carried*, not what is at the far
 end: kitty splits a picture into roughly 4KB chunks, each its own escape, while
