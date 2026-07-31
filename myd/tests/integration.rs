@@ -11465,3 +11465,274 @@ async fn text_previews_still_scroll_with_j_and_k() {
         "and must not move the tree"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Patterned rename (gR): one regex over every tagged file.
+// ---------------------------------------------------------------------------
+
+/// Three numbered files, cursor on the first, all of them tagged.
+async fn rename_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg"] {
+        std::fs::write(dir.path().join(n), "x").unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    // Step onto the first file and tag all three. `t` toggles in place without
+    // advancing, so the cursor has to be moved between tags.
+    app.handle_key_for_test(char_key('j'));
+    for _ in 0..3 {
+        app.handle_key_for_test(char_key('t'));
+        app.handle_key_for_test(char_key('j'));
+    }
+    (dir, app)
+}
+
+/// Press the `gR` chord, opening the patterned-rename dialog.
+///
+/// The chord has a 500ms window between the two keys. A loaded parallel test run
+/// can stall between them, which expires the chord and drops both keys — so this
+/// checks the dialog actually opened and presses again if it did not. Retrying
+/// is safe because a `g` that timed out leaves no state behind, and the assert
+/// still fails loudly if the binding is genuinely broken.
+fn press_gr(app: &mut myd::app::FileBrowser) {
+    for _ in 0..10 {
+        app.handle_key_for_test(char_key('g'));
+        app.handle_key_for_test(char_key('R'));
+        if app.modal_kind_for_test() == "rename" {
+            return;
+        }
+    }
+    panic!("gR never opened the rename dialog");
+}
+
+/// Type a string into whichever dialog field has the focus.
+fn type_into(app: &mut myd::app::FileBrowser, s: &str) {
+    for c in s.chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+}
+
+/// Drive ticks until `dir` contains a file named `name`.
+async fn settle_named(app: &mut myd::app::FileBrowser, dir: &std::path::Path, name: &str) {
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if dir.join(name).exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{} never appeared in {}", name, dir.display());
+}
+
+#[tokio::test]
+async fn gr_renames_every_tagged_file_through_the_pattern() {
+    let (dir, mut app) = rename_app().await;
+
+    press_gr(&mut app);
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "rename",
+        "gR should open the patterned rename dialog"
+    );
+
+    // Capture group carried into the replacement — the case the feature exists
+    // for, not just a literal swap.
+    type_into(&mut app, r"IMG_(\d+)\.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "holiday-$1.jpeg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    settle_named(&mut app, dir.path(), "holiday-1.jpeg").await;
+    for n in ["holiday-1.jpeg", "holiday-2.jpeg", "holiday-3.jpeg"] {
+        assert!(dir.path().join(n).exists(), "{} should exist", n);
+    }
+    for n in ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg"] {
+        assert!(!dir.path().join(n).exists(), "{} should be gone", n);
+    }
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "a clean rename just closes the dialog"
+    );
+}
+
+#[tokio::test]
+async fn the_rename_dialog_previews_the_first_tagged_file() {
+    // The preview is the point of the dialog: it has to show the real
+    // transformation before anything is renamed.
+    let (dir, mut app) = rename_app().await;
+    press_gr(&mut app);
+
+    type_into(&mut app, "IMG");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "PIC");
+
+    let text = app_screen_text(&mut app, 100, 30);
+    assert!(
+        text.contains("PIC_1.jpg"),
+        "the preview should show the first file's new name: {}",
+        text
+    );
+    // Nothing has happened yet — a preview is not a rename.
+    assert!(dir.path().join("IMG_1.jpg").exists(), "still on disk");
+}
+
+#[tokio::test]
+async fn a_pattern_that_cannot_be_used_keeps_the_dialog_open() {
+    // Both failure modes the request names: a regex that does not compile, and
+    // one that compiles but matches nothing. Enter must not close the dialog,
+    // so the patterns can be corrected rather than retyped.
+    let (dir, mut app) = rename_app().await;
+    press_gr(&mut app);
+
+    type_into(&mut app, "(unclosed");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "rename",
+        "a pattern that does not compile must not close the dialog"
+    );
+    let text = app_screen_text(&mut app, 100, 30);
+    assert!(text.contains('✗'), "the error should be visible: {}", text);
+
+    // Correct it to something valid but non-matching: still refused, still open.
+    for _ in 0.."(unclosed".len() {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into(&mut app, "zzz");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "rename",
+        "a pattern that matches nothing must not close it either"
+    );
+
+    // Esc is the way out, and it renames nothing.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert_eq!(app.modal_kind_for_test(), "none", "Esc cancels");
+    assert!(dir.path().join("IMG_1.jpg").exists(), "nothing was renamed");
+}
+
+#[tokio::test]
+async fn the_preview_samples_the_first_file_on_screen_not_an_arbitrary_one() {
+    // Tags are held in a HashSet, so the tagged set comes back in an arbitrary
+    // order that differs between runs. The dialog previews "the first tagged
+    // file", which has to mean the first one visible in the tree — otherwise the
+    // preview shows a different file each time it is opened.
+    for _ in 0..5 {
+        let (_dir, mut app) = rename_app().await;
+        let first_on_screen = match app.current_screen() {
+            Screen::Main(s) => s
+                .tree
+                .lines
+                .iter()
+                .find(|l| !l.is_dir)
+                .map(|l| l.name.clone())
+                .expect("a file in the tree"),
+            _ => panic!("expected a main screen"),
+        };
+
+        press_gr(&mut app);
+        // An identity pattern makes the preview echo the sampled name.
+        type_into(&mut app, "^");
+        let text = app_screen_text(&mut app, 100, 30);
+        assert!(
+            text.contains(&format!("→ {}", first_on_screen)),
+            "preview should sample {}, screen was:\n{}",
+            first_on_screen,
+            text
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_partly_matching_pattern_renames_only_what_matches() {
+    // Tagging a mixed set and renaming the subset that matches is ordinary use,
+    // not an error: the others are left alone.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("IMG_1.jpg"), "x").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+
+    press_gr(&mut app);
+    type_into(&mut app, "IMG_1");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "photo");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    settle_named(&mut app, dir.path(), "photo.jpg").await;
+    assert!(
+        dir.path().join("notes.txt").exists(),
+        "the file the pattern did not match is untouched"
+    );
+}
+
+#[tokio::test]
+async fn gr_with_nothing_tagged_uses_the_cursor_file() {
+    // Falls back to the selection the way D does, so the chord is not inert when
+    // you have not tagged anything.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("one.txt"), "x").unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+
+    press_gr(&mut app);
+    assert_eq!(app.modal_kind_for_test(), "rename", "opens on the selection");
+
+    type_into(&mut app, "one");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "two");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_named(&mut app, dir.path(), "two.txt").await;
+}
+
+#[tokio::test]
+async fn a_rename_that_would_collide_is_reported_and_nothing_is_lost() {
+    // rename_path refuses to clobber an existing entry. Over a batch that has to
+    // surface as a message rather than a silent skip, and the file that was
+    // already there must survive with its own contents.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a1.txt"), "first").unwrap();
+    std::fs::write(dir.path().join("b1.txt"), "second").unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag whichever file the cursor lands on and rename it onto the other, so
+    // the collision is deterministic however the tree happens to be sorted.
+    app.handle_key_for_test(char_key('j'));
+    let selected = match app.current_screen() {
+        Screen::Main(s) => s.selected_path().cloned().expect("a file"),
+        _ => panic!("expected a main screen"),
+    };
+    let from = selected.file_name().unwrap().to_string_lossy().to_string();
+    let onto = if from == "a1.txt" { "b1.txt" } else { "a1.txt" };
+    let survivor = std::fs::read_to_string(dir.path().join(onto)).unwrap();
+    app.handle_key_for_test(char_key('t'));
+
+    press_gr(&mut app);
+    type_into(&mut app, &from);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, onto);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a collision must be reported, not swallowed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(onto)).unwrap(),
+        survivor,
+        "the existing file must not be overwritten"
+    );
+    assert!(dir.path().join(&from).exists(), "and the source survives");
+}
