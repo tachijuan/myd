@@ -278,6 +278,13 @@ pub struct FileBrowser {
     /// which is exactly the recursive walk the flag was asking to avoid. A
     /// directory with a recorded preference still wins over this.
     shallow_default: bool,
+    /// Whether the user has asked not to be prompted before deleting.
+    ///
+    /// Deliberately in memory only, and never written to the catalog: it lasts
+    /// for this run of the app and is gone on the next one. Turning off the
+    /// guard on an irreversible operation should be a thing you opt into while
+    /// you are doing it, not a setting you can leave on and forget about.
+    skip_delete_confirm: bool,
 }
 
 /// A preview load running in the background.
@@ -437,6 +444,7 @@ impl FileBrowser {
             preview_graphics_shown: None,
             force_repaint: false,
             shallow_default: false,
+            skip_delete_confirm: false,
         }
     }
 
@@ -1069,9 +1077,19 @@ impl FileBrowser {
         let result = answer == Answer::Yes;
         self.modal = Modal::None;
         match self.modal_target.take() {
-            Some(ModalTarget::Delete { paths }) if result => {
-                self.spawn_delete_batch(paths);
-            }
+            // The delete prompt answers with letters rather than yes/no, so that
+            // "always" can sit alongside them as a third button. 'a' both
+            // consents to this delete and stops the asking; anything else
+            // (including Esc, which the caller maps to a cancelling choice)
+            // leaves the files alone.
+            Some(ModalTarget::Delete { paths }) => match answer {
+                Answer::Choice('a') => {
+                    self.skip_delete_confirm = true;
+                    self.spawn_delete_batch(paths);
+                }
+                Answer::Choice('y') | Answer::Yes => self.spawn_delete_batch(paths),
+                _ => {}
+            },
             Some(ModalTarget::QuitConfirm) => {
                 // Declining simply closes the dialog; the flag stays
                 // false so a later `q` asks again.
@@ -2832,6 +2850,11 @@ impl FileBrowser {
                     }
                 }
                 if !targets.is_empty() {
+                    // Asked once not to be asked again, so go straight to it.
+                    if self.skip_delete_confirm {
+                        self.spawn_delete_batch(targets);
+                        return true;
+                    }
                     let prompt = if targets.len() == 1 {
                         let name = targets[0]
                             .file_name()
@@ -2842,7 +2865,17 @@ impl FileBrowser {
                         format!("Delete {} tagged items?", targets.len())
                     };
                     self.modal_target = Some(ModalTarget::Delete { paths: targets });
-                    self.modal = Modal::Confirm(ConfirmDialog::new(prompt));
+                    // The letters are spelled out in the message, as the move
+                    // collision prompt does, since a bare `[a]` button says
+                    // nothing about what it means. 'a' rather than 'd' for
+                    // "always": 'd' next to a delete prompt reads as "delete".
+                    self.modal = Modal::Confirm(
+                        ConfirmDialog::new(format!(
+                            "{} [y]es, [n]o, or [a]lways (no more prompts this session)?",
+                            prompt
+                        ))
+                        .with_choices(&['y', 'n', 'a']),
+                    );
                 }
                 true
             }

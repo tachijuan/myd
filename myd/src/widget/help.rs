@@ -156,6 +156,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             title: "Actions",
             items: &[
                 ("D", "Delete tagged / selected"),
+                ("  y / n", "  Confirm or decline"),
+                ("  a", "  Delete, and stop asking until you restart"),
                 ("R", "Rename selected"),
                 ("N", "New directory here"),
                 ("o", "Open with the system default app"),
