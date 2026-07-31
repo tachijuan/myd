@@ -74,6 +74,8 @@ pub enum Modal {
     Help(HelpState),
     /// Numbered sort-order menu, opened by clicking the "Sort:" indicator.
     SortMenu(SortMenu),
+    /// Regex rename over the tagged files, opened by `gR`.
+    Rename(crate::widget::rename_dialog::RenameDialog),
 }
 
 /// Context for modal operations.
@@ -777,6 +779,7 @@ impl FileBrowser {
             Modal::Confirm(d) => d.render(f, full),
             Modal::Input(d) => d.render(f, full),
             Modal::SortMenu(m) => m.render(f, full, sort_anchor),
+            Modal::Rename(d) => d.render(f, full),
             Modal::Operation { verb } => {
                 let overlay = match &op_progress {
                     Some(p) => ProgressOverlay::for_operation(verb, p),
@@ -1309,6 +1312,7 @@ impl FileBrowser {
             Modal::Operation { .. } => "operation",
             Modal::Help(_) => "help",
             Modal::SortMenu(_) => "sort_menu",
+            Modal::Rename(_) => "rename",
         }
     }
 
@@ -1502,6 +1506,20 @@ impl FileBrowser {
         use crossterm::event::{MouseButton, MouseEventKind};
 
         let (x, y) = (ev.column, ev.row);
+
+        // A click inside the rename form focuses the field it landed on; one
+        // outside is swallowed rather than dismissing, since a stray click must
+        // not discard half-typed patterns.
+        if matches!(self.modal, Modal::Rename(_)) {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Modal::Rename(dialog) = &mut self.modal else {
+                    return true;
+                };
+                let outcome = dialog.click_at(x, y);
+                return self.apply_rename_dialog_outcome(outcome);
+            }
+            return true;
+        }
 
         if matches!(self.modal, Modal::SortMenu(_)) {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -2818,6 +2836,10 @@ impl FileBrowser {
                 self.open_sort_menu();
                 true
             }
+            Action::PatternRename => {
+                self.open_pattern_rename();
+                true
+            }
             Action::TogglePreview => {
                 self.toggle_preview();
                 true
@@ -3129,7 +3151,8 @@ impl FileBrowser {
                     | Action::TogglePreview
                     | Action::Redraw
                     | Action::ToggleShallow
-                    | Action::OpenSortMenu => unreachable!(),
+                    | Action::OpenSortMenu
+                    | Action::PatternRename => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -3140,6 +3163,14 @@ impl FileBrowser {
         // The sort menu owns its keys outright: it binds the digits and j/k
         // itself, and going through the chord detector would put its 500 ms
         // timeout in front of every keystroke.
+        // The rename dialog owns its keys too: it is a form, and its fields have
+        // to take every printable character rather than have `q` quit or `j`
+        // move a cursor underneath.
+        if let Modal::Rename(dialog) = &mut self.modal {
+            let outcome = dialog.handle_key(key);
+            return self.apply_rename_dialog_outcome(outcome);
+        }
+
         if let Modal::SortMenu(menu) = &mut self.modal {
             let outcome = menu.handle_key(key);
             return self.apply_sort_menu_outcome(outcome);
@@ -3408,7 +3439,7 @@ impl FileBrowser {
             }
             // Handled by the early returns at the top of this function, which
             // need `&mut self` for the whole call and so can't sit in this match.
-            Modal::SortMenu(_) => true,
+            Modal::SortMenu(_) | Modal::Rename(_) => true,
             Modal::None => true,
         }
     }
@@ -3485,6 +3516,34 @@ impl FileBrowser {
         }
     }
 
+    /// Act on the rename dialog's decision.
+    ///
+    /// Applying replaces the dialog with a notice only when something went
+    /// wrong; a clean rename just closes it. A pattern that does not match is
+    /// refused by the dialog itself and never reaches here, so the failure
+    /// reported here is the one the preview could not have predicted — a name
+    /// collision, or a backend that said no.
+    fn apply_rename_dialog_outcome(
+        &mut self,
+        outcome: crate::widget::rename_dialog::RenameDialogOutcome,
+    ) -> bool {
+        use crate::widget::rename_dialog::RenameDialogOutcome as Outcome;
+        match outcome {
+            Outcome::Continue => {}
+            Outcome::Cancelled => self.modal = Modal::None,
+            Outcome::Apply {
+                pattern,
+                replacement,
+            } => {
+                self.modal = Modal::None;
+                if let Some(msg) = self.apply_pattern_rename(&pattern, &replacement) {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(msg));
+                }
+            }
+        }
+        true
+    }
+
     /// Act on the sort menu's decision.
     fn apply_sort_menu_outcome(&mut self, outcome: SortMenuOutcome) -> bool {
         match outcome {
@@ -3515,6 +3574,136 @@ impl FileBrowser {
             _ => return,
         };
         self.modal = Modal::SortMenu(SortMenu::new(current));
+    }
+
+    /// The files a patterned rename would act on: the tagged set, or the
+    /// cursor's file when nothing is tagged.
+    ///
+    /// Mirrors how `D` chooses its targets, so "what does this act on" has one
+    /// answer across the app rather than one per operation.
+    fn rename_targets(&self) -> Vec<PathBuf> {
+        let mut targets = self.active_panel().current_screen().tagged_paths();
+        if targets.is_empty() {
+            if let Screen::Main(state) = self.active_panel().current_screen() {
+                if let Some(p) = state.selected_resolved_path() {
+                    targets.push(p.clone());
+                }
+            }
+            return targets;
+        }
+        // Tags live in a HashSet, so `tagged_paths` hands them back in an
+        // arbitrary order that changes between runs. Put them back into the
+        // order they appear on screen: "the first tagged file" is what the
+        // dialog previews, and it has to mean the first one the user can see
+        // rather than whichever the hash happened to yield.
+        if let Screen::Main(state) = self.active_panel().current_screen() {
+            let mut ordered: Vec<PathBuf> = Vec::with_capacity(targets.len());
+            for line in state.tree.lines.iter() {
+                let tagged = targets
+                    .iter()
+                    .any(|t| *t == line.resolved_path || *t == line.path);
+                if tagged && !ordered.contains(&line.resolved_path) {
+                    ordered.push(line.resolved_path.clone());
+                }
+            }
+            // Anything tagged but not currently visible (a collapsed branch)
+            // keeps its place at the end rather than being dropped.
+            for t in targets.iter() {
+                if !ordered.contains(t) {
+                    ordered.push(t.clone());
+                }
+            }
+            if !ordered.is_empty() {
+                targets = ordered;
+            }
+        }
+        targets
+    }
+
+    /// Open the patterned-rename dialog over the tagged files.
+    fn open_pattern_rename(&mut self) {
+        let targets = self.rename_targets();
+        if targets.is_empty() {
+            return;
+        }
+        // Preview against the first target, which is what the dialog shows being
+        // transformed. Named files only: the pattern applies to the name, not
+        // the directory it sits in.
+        let sample = targets[0]
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.modal = Modal::Rename(crate::widget::rename_dialog::RenameDialog::new(
+            sample,
+            targets.len(),
+        ));
+    }
+
+    /// Apply `pattern` -> `replacement` to every target, renaming as it goes.
+    ///
+    /// Returns a message to show, or `None` when everything was renamed. Files
+    /// the pattern does not match are skipped rather than treated as failures:
+    /// tagging a mixed set and renaming only the ones that match is the ordinary
+    /// case, not a mistake.
+    fn apply_pattern_rename(&mut self, pattern: &str, replacement: &str) -> Option<String> {
+        use crate::widget::rename_dialog::apply_pattern;
+
+        let targets = self.rename_targets();
+        let mut renamed = 0usize;
+        let mut skipped = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        for path in targets {
+            let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) else {
+                continue;
+            };
+            match apply_pattern(pattern, replacement, &name) {
+                // A pattern that stopped compiling between the preview and here
+                // is not something to report per file.
+                Err(e) => return Some(format!("Invalid pattern: {}", e)),
+                Ok(None) => skipped += 1,
+                Ok(Some(new_name)) if new_name == name => skipped += 1,
+                Ok(Some(new_name)) => {
+                    // An empty result would ask the backend to rename a file to
+                    // nothing; refuse before it reaches the wire.
+                    if new_name.is_empty() {
+                        failures.push(format!("{}: would leave an empty name", name));
+                        continue;
+                    }
+                    if let Some(msg) = self.rename_path(&path, &new_name) {
+                        failures.push(format!("{}: {}", name, msg));
+                    } else {
+                        renamed += 1;
+                    }
+                }
+            }
+        }
+
+        // Tags name paths that no longer exist once renamed, so clear them
+        // rather than leave the panel tagging files that are gone.
+        if renamed > 0 {
+            self.active_panel_mut().current_screen_mut().clear_tags();
+        }
+
+        if !failures.is_empty() {
+            // Report at most a few: a long list in a modal is unreadable, and
+            // the count carries the rest.
+            let shown: Vec<String> = failures.iter().take(3).cloned().collect();
+            let more = failures.len().saturating_sub(shown.len());
+            let mut msg = format!("Renamed {}, {} failed:\n{}", renamed, failures.len(), shown.join("\n"));
+            if more > 0 {
+                msg.push_str(&format!("\n(and {} more)", more));
+            }
+            return Some(msg);
+        }
+        if renamed == 0 {
+            return Some(format!(
+                "Nothing renamed: the pattern matched none of the {} file{}.",
+                skipped,
+                if skipped == 1 { "" } else { "s" }
+            ));
+        }
+        None
     }
 
     /// Return to the directory picker after a management action.

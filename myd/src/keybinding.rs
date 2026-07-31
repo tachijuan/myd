@@ -29,6 +29,8 @@ pub enum Action {
     /// Open the sort picker, to choose an order directly rather than cycling to
     /// it. Bound to the `gs` chord and to clicking the "Sort:" indicator.
     OpenSortMenu,
+    /// Rename every tagged file through a regex and a replacement (`gR`).
+    PatternRename,
     ToggleHidden,
     ToggleBar,
     CollapseAll,
@@ -230,6 +232,9 @@ impl KeyBindingHandler {
             // known; this is for going straight there, and for discovering what
             // the orders are.
             "gs" => Some(Action::OpenSortMenu),
+            // Capital R, matching plain `R` for renaming one file: this is the
+            // same operation over the tagged set.
+            "gR" => Some(Action::PatternRename),
             "gx" => Some(Action::CancelTransfers),
             _ => None,
         }

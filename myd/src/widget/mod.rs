@@ -6,6 +6,7 @@ pub mod help;
 pub mod input_dialog;
 pub mod preview;
 pub mod progress;
+pub mod rename_dialog;
 pub mod size_bar;
 pub mod sort_menu;
 pub mod source;
