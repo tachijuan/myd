@@ -1561,6 +1561,32 @@ impl FileBrowser {
             return true;
         }
 
+        // The preview covers the panels, so a click belongs to it whenever it is
+        // up — the same rule the scroll wheel already follows. Without this the
+        // click fell through to the tree hidden underneath, moving a cursor the
+        // user could not see and loading a different file into the pane they
+        // were reading.
+        //
+        // A left click advances like `j`, which is what the pane's own binding
+        // does: turn the page on a paged document, scroll a line on a long one,
+        // and step to the next file on a single image. Routing it through the
+        // key handler rather than reimplementing it means the click cannot drift
+        // from what `j` does.
+        if self.preview_open {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                // Clicking is also a way of saying "I am reading this", so it
+                // takes focus first — otherwise the first click would only move
+                // focus and the second would advance, which is not what a click
+                // on a page looks like.
+                self.focus_preview();
+                self.handle_preview_key(KeyEvent::new(
+                    KeyCode::Char('j'),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+            return true;
+        }
+
         // A click in the sidebar focuses it and selects a transfer; a
         // double-click on one asks to cancel it.
         if let Some(ta) = self.transfer_area {
