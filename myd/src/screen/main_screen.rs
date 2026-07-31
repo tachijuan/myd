@@ -62,6 +62,13 @@ pub struct MainScreenState {
     /// Where the "Sort: …" indicator was drawn in the title bar, so a click on
     /// it can open the sort menu. Recorded during render like `tree_area`.
     pub sort_area: Option<Rect>,
+    /// A chord prefix waiting for its second key, set by the app each frame like
+    /// `active`.
+    ///
+    /// Chords no longer time out, so a pending `g` would otherwise be invisible
+    /// state — the app would look like it had ignored the key and then behave
+    /// oddly on the next one. Showing it makes the wait explainable.
+    pub pending_chord: Option<char>,
 }
 
 /// A user-facing explanation of why a regex would not compile.
@@ -105,6 +112,7 @@ impl MainScreenState {
             tree_scroll: 0,
             tree_viewport: 0,
             sort_area: None,
+            pending_chord: None,
         }
     }
 
@@ -126,6 +134,7 @@ impl MainScreenState {
             tree_scroll: 0,
             tree_viewport: 0,
             sort_area: None,
+            pending_chord: None,
         }
     }
 
@@ -1156,6 +1165,18 @@ impl MainScreenState {
                         Style::default()
                             .fg(Color::Black)
                             .bg(crate::widget::file_tree::FILTER_COLOR)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                // A chord waiting for its second key, shown the way vim shows a
+                // pending operator. Without a timeout this is the only sign the
+                // app is mid-sequence rather than ignoring keys.
+                if let Some(c) = self.pending_chord {
+                    spans.push(Span::styled(
+                        format!(" {}… ", c),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Rgb(120, 220, 255))
                             .add_modifier(Modifier::BOLD),
                     ));
                 }

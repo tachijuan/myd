@@ -3313,12 +3313,13 @@ async fn gs_chord_opens_the_sort_picker() {
     assert_eq!(app.modal_kind_for_test(), "none", "Esc dismisses the picker");
 }
 
-/// A `g` left to expire must not turn the next `s` into the sort picker.
+/// A `g` is held until the next key arrives, however long that takes.
 #[tokio::test]
-async fn a_timed_out_g_lets_s_cycle_as_normal() {
-    // `gs` now claims a chord whose second key is a real binding on its own, so
-    // the fallback after the 500ms timeout is the case that can break: `s` has
-    // to still cycle the order rather than open the menu.
+async fn a_pending_g_waits_rather_than_expiring() {
+    // Chords used to expire after 500ms, which made the same two keystrokes mean
+    // different things depending on how fast they were typed — and on a loaded
+    // machine `g` then `s` would run `s` (cycle sort) instead of opening the
+    // picker. The wait is now unbounded.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x").unwrap();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
@@ -3330,60 +3331,137 @@ async fn a_timed_out_g_lets_s_cycle_as_normal() {
     };
 
     app.handle_key_for_test(char_key('g'));
-    // Outlast the chord window.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(
+        app.pending_chord_for_test(),
+        Some('g'),
+        "the prefix is held, and visible to the status bar"
+    );
+
+    // Far longer than the old window.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     app.handle_key_for_test(char_key('s'));
 
     assert_eq!(
         app.modal_kind_for_test(),
-        "none",
-        "an expired g must not leave s opening the picker"
+        "sort_menu",
+        "the chord completes no matter how long the gap was"
     );
+    assert_eq!(app.pending_chord_for_test(), None, "and the prefix is cleared");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+
     let after = match app.current_screen() {
         Screen::Main(s) => s.tree.sort_mode,
         _ => unreachable!("still a main screen"),
     };
-    assert_ne!(before, after, "s cycled the order, as it does alone");
+    assert_eq!(before, after, "s must not also have cycled the order");
 }
 
-/// A `g` left to expire must not turn the next `r` into the rename dialog.
+/// An unknown second key beeps instead of running that key on its own.
 #[tokio::test]
-async fn a_timed_out_g_lets_r_refresh_as_normal() {
-    // `gr` claims a chord whose second key is Refresh on its own, so the
-    // fallback after the 500ms timeout is what can break: `r` has to still
-    // refresh rather than open the rename form.
+async fn an_unknown_chord_beeps_and_does_nothing_else() {
+    // The old design fell through to the second key alone, so a slow `g`+`r`
+    // refreshed. Now `g` followed by something that completes no chord is
+    // reported and discarded — it does not half-run.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x").unwrap();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    app.handle_key_for_test(char_key('g'));
-    // Outlast the chord window.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    app.handle_key_for_test(char_key('r'));
-    settle(&mut app).await;
+    let bells = app.bells_rung_for_test();
+    let before = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => unreachable!("settled onto a main screen"),
+    };
 
+    // `gz` is not a chord. `z` alone is not a binding either, but the point is
+    // that the *chord* failing is what beeps.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
     assert_eq!(
-        app.modal_kind_for_test(),
-        "none",
-        "an expired g must not leave r opening the rename dialog"
+        app.bells_rung_for_test(),
+        bells + 1,
+        "an unknown chord rings the bell"
     );
-    // A refresh re-lists the directory, so a file created meanwhile shows up.
-    std::fs::write(dir.path().join("b.txt"), "y").unwrap();
-    app.handle_key_for_test(char_key('r'));
-    settle(&mut app).await;
+    assert_eq!(app.pending_chord_for_test(), None, "and the prefix is cleared");
+
+    // `gt` is not a chord either, and `t` alone tags — which must not happen.
+    let bells = app.bells_rung_for_test();
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(app.bells_rung_for_test(), bells + 1, "beeps again");
     match app.current_screen() {
-        Screen::Main(s) => {
-            let names: Vec<String> =
-                s.tree.lines.iter().map(|l| l.name.clone()).collect();
-            assert!(
-                names.iter().any(|n| n == "b.txt"),
-                "r on its own still refreshes: {:?}",
-                names
-            );
-        }
+        Screen::Main(s) => assert!(
+            s.tagged_paths().is_empty(),
+            "the second key must not run on its own"
+        ),
         _ => panic!("expected a main screen"),
     }
+
+    // And `s` after a failed chord is an ordinary keystroke again.
+    app.handle_key_for_test(char_key('s'));
+    settle(&mut app).await;
+    let after = match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => unreachable!("still a main screen"),
+    };
+    assert_ne!(before, after, "the handler is back to normal after a beep");
+}
+
+/// A pending chord is visible, since nothing else signals the wait.
+#[tokio::test]
+async fn a_pending_chord_shows_in_the_status_bar() {
+    // Without a timeout the app can sit mid-chord indefinitely, so the state has
+    // to be on screen — otherwise a stray `g` looks like a key that did nothing
+    // and the next keystroke behaves surprisingly.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let text = app_screen_text(&mut app, 100, 12);
+    assert!(!text.contains("g…"), "nothing pending to start with");
+
+    app.handle_key_for_test(char_key('g'));
+    let text = app_screen_text(&mut app, 100, 12);
+    assert!(
+        text.contains("g…"),
+        "a held prefix must be visible: {}",
+        text
+    );
+
+    app.handle_key_for_test(char_key('g'));
+    let text = app_screen_text(&mut app, 100, 12);
+    assert!(!text.contains("g…"), "and gone once the chord completes");
+}
+
+/// Esc abandons a pending chord quietly; other non-character keys beep.
+#[tokio::test]
+async fn esc_cancels_a_pending_chord_without_a_beep() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let bells = app.bells_rung_for_test();
+    app.handle_key_for_test(char_key('g'));
+    assert_eq!(app.pending_chord_for_test(), Some('g'));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert_eq!(app.pending_chord_for_test(), None, "Esc drops the prefix");
+    assert_eq!(
+        app.bells_rung_for_test(),
+        bells,
+        "backing out deliberately is not an error"
+    );
+
+    // An arrow key mid-chord is not the second half of anything, so it does beep.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Down));
+    assert_eq!(app.pending_chord_for_test(), None);
+    assert_eq!(
+        app.bells_rung_for_test(),
+        bells + 1,
+        "a key that cannot complete a chord reports it"
+    );
 }
 
 /// The whole gesture from the request: `gs5` sorts by newest.
@@ -6827,36 +6905,6 @@ async fn remote_listings_carry_their_mode_bits() {
         Some(0o750),
         "the listing's mode must reach the tree line"
     );
-}
-
-#[test]
-fn the_two_plain_key_tables_agree() {
-    // `resolve_single` and `resolve_single_char` are near-duplicate tables; the
-    // second only runs after a timed-out `g` chord, so a binding added to one and
-    // not the other fails in a way nobody trips over until much later.
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use myd::keybinding::KeyBindingHandler;
-
-    let h = KeyBindingHandler::new();
-    let candidates: Vec<char> = ('a'..='z')
-        .chain('A'..='Z')
-        .chain("0*/?|".chars())
-        .collect();
-
-    for c in candidates {
-        let via_event = h.resolve_single_for_test(KeyEvent::new(
-            KeyCode::Char(c),
-            KeyModifiers::NONE,
-        ));
-        let via_char = h.resolve_single_char_for_test(c);
-        if let (Some(a), Some(b)) = (via_event, via_char) {
-            assert_eq!(
-                a, b,
-                "the two tables disagree on {:?}: {:?} vs {:?}",
-                c, a, b
-            );
-        }
-    }
 }
 
 #[tokio::test]
@@ -10896,10 +10944,6 @@ fn test_space_is_bound_in_both_key_tables() {
         h.resolve_single_for_test(char_key(' ')),
         Some(Action::TogglePreview)
     );
-    assert_eq!(
-        h.resolve_single_char_for_test(' '),
-        Some(Action::TogglePreview)
-    );
 }
 
 /// The preview follows the cursor, so moving to another file replaces what is
@@ -11358,12 +11402,6 @@ fn size_bars_toggle_with_a_capital_b() {
         h.resolve_single_for_test(char_key('B')),
         Some(Action::ToggleBar)
     );
-    // Both plain-key tables must agree, or the binding works only until a `g`
-    // times out.
-    assert_eq!(
-        h.resolve_single_char_for_test('B'),
-        Some(Action::ToggleBar)
-    );
 
     // Lowercase `b` no longer toggles bars. It stays free as a plain key —
     // Ctrl+B is page-up and is unaffected.
@@ -11532,20 +11570,17 @@ async fn rename_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
 
 /// Press the `gr` chord, opening the patterned-rename dialog.
 ///
-/// The chord has a 500ms window between the two keys. A loaded parallel test run
-/// can stall between them, which expires the chord and drops both keys — so this
-/// checks the dialog actually opened and presses again if it did not. Retrying
-/// is safe because a `g` that timed out leaves no state behind, and the assert
-/// still fails loudly if the binding is genuinely broken.
+/// A plain two-key press: chords have no timeout, so the prefix waits for the
+/// second key however long the test takes to send it. This used to retry in a
+/// loop to survive the 500ms window expiring under parallel load.
 fn press_gr(app: &mut myd::app::FileBrowser) {
-    for _ in 0..10 {
-        app.handle_key_for_test(char_key('g'));
-        app.handle_key_for_test(char_key('r'));
-        if app.modal_kind_for_test() == "rename" {
-            return;
-        }
-    }
-    panic!("gr never opened the rename dialog");
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('r'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "rename",
+        "gr should open the rename dialog"
+    );
 }
 
 /// Type a string into whichever dialog field has the focus.
@@ -11796,13 +11831,8 @@ async fn the_natural_sort_order_can_be_picked_from_the_menu() {
     let digit = char::from_digit(n as u32 + 1, 10).expect("a single digit");
 
     // gs then its number, retried like the other chord tests.
-    for _ in 0..10 {
-        app.handle_key_for_test(char_key('g'));
-        app.handle_key_for_test(char_key('s'));
-        if app.modal_kind_for_test() == "sort_menu" {
-            break;
-        }
-    }
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
     assert_eq!(app.modal_kind_for_test(), "sort_menu", "gs opens the menu");
     app.handle_key_for_test(char_key(digit));
     settle(&mut app).await;
@@ -11850,13 +11880,8 @@ fn choose_natural(app: &mut myd::app::FileBrowser) {
         .position(|m| *m == myd::screen::SortMode::Natural)
         .expect("natural is offered");
     let digit = char::from_digit(n as u32 + 1, 10).expect("a single digit");
-    for _ in 0..10 {
-        app.handle_key_for_test(char_key('g'));
-        app.handle_key_for_test(char_key('s'));
-        if app.modal_kind_for_test() == "sort_menu" {
-            break;
-        }
-    }
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('s'));
     assert_eq!(app.modal_kind_for_test(), "sort_menu", "gs opens the menu");
     app.handle_key_for_test(char_key(digit));
 }
@@ -11883,13 +11908,8 @@ async fn the_sort_order_survives_opening_a_directory_from_the_picker() {
     assert_eq!(current_sort(&app), myd::screen::SortMode::Natural);
 
     // Open the subdirectory by typing its path into the picker.
-    for _ in 0..10 {
-        app.handle_key_for_test(char_key('g'));
-        app.handle_key_for_test(char_key('d'));
-        if matches!(app.current_screen(), Screen::DirPicker(_)) {
-            break;
-        }
-    }
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
     assert!(
         matches!(app.current_screen(), Screen::DirPicker(_)),
         "gd opens the picker"

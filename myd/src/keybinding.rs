@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::time::{Duration, Instant};
 
 /// Actions that keybindings resolve to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,19 +81,31 @@ pub enum Action {
     TogglePreview,
     /// Redraw the whole screen from scratch.
     Redraw,
+    /// Ring the terminal bell: the keys typed were not a binding.
+    ///
+    /// Only a chord that went nowhere produces this. A single unbound key stays
+    /// silent, as it always has — you have not started anything, so there is
+    /// nothing to report failing.
+    Bell,
 }
 
 /// Tracks whether a chord prefix has been pressed and is awaiting the second key.
+///
+/// There is no deadline. `g` waits for the next key however long that takes, and
+/// the sequence is resolved by what is typed rather than by how fast it was
+/// typed. A timeout made the same two keystrokes mean different things depending
+/// on the machine's load — the chord tests here had to retry because a busy test
+/// run could expire the window between two programmatic presses, which is the
+/// same race a user hits on a loaded machine or over a slow link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChordState {
     Idle,
-    Waiting { key: char, deadline: Instant },
+    Waiting { key: char },
 }
 
 /// Handles key events and resolves them to actions via vi-like bindings + chord detection.
 pub struct KeyBindingHandler {
     chord: ChordState,
-    chord_timeout: Duration,
 }
 
 impl Default for KeyBindingHandler {
@@ -107,7 +118,15 @@ impl KeyBindingHandler {
     pub fn new() -> Self {
         Self {
             chord: ChordState::Idle,
-            chord_timeout: Duration::from_millis(500),
+        }
+    }
+
+    /// Whether a chord prefix is pending — the UI shows it in the status bar, so
+    /// a waiting `g` is visible rather than the app seeming to ignore a key.
+    pub fn pending_chord(&self) -> Option<char> {
+        match self.chord {
+            ChordState::Waiting { key } => Some(key),
+            ChordState::Idle => None,
         }
     }
 
@@ -118,102 +137,47 @@ impl KeyBindingHandler {
             KeyCode::Char(c) => c,
             KeyCode::Enter => '\n',
             _ => {
-                // Non-character keys don't participate in chords.
-                self.chord = ChordState::Idle;
+                // Non-character keys don't participate in chords. Pressing one
+                // mid-chord abandons it: Esc is the obvious way out, and an
+                // arrow key is not the second half of anything.
+                if self.chord != ChordState::Idle {
+                    self.chord = ChordState::Idle;
+                    // Esc means "never mind", so it is not an error worth a
+                    // beep; anything else here is a sequence that went nowhere.
+                    if key.code == KeyCode::Esc {
+                        return None;
+                    }
+                    return Some(Action::Bell);
+                }
                 return self.resolve_single(key);
             }
         };
 
-        // Check if the chord is still alive (only g-prefix chords).
-        if let ChordState::Waiting {
-            key: first,
-            deadline,
-        } = self.chord
-        {
-            if Instant::now() > deadline {
-                // Timeout — fall back to single-key handling for the new key.
-                self.chord = ChordState::Idle;
-                return self.resolve_single(key);
-            } else {
-                // Chord completed (gX).
-                let combined = format!("{}{}", first, ch);
-                self.chord = ChordState::Idle;
-                if let Some(a) = self.resolve_chord(&combined) {
-                    return Some(a);
-                }
-                // Chord didn't match — fall back to second key.
-                if ch == 'g' {
-                    self.chord = ChordState::Waiting {
-                        key: ch,
-                        deadline: Instant::now() + self.chord_timeout,
-                    };
-                    return None;
-                }
-                return self.resolve_single_char(ch);
+        if let ChordState::Waiting { key: first } = self.chord {
+            let combined = format!("{}{}", first, ch);
+            self.chord = ChordState::Idle;
+            if let Some(a) = self.resolve_chord(&combined) {
+                return Some(a);
             }
+            // `gg` is a chord in its own right, so a second `g` cannot be a new
+            // prefix — it is handled above. Anything else that does not complete
+            // a chord is a mistake, and says so rather than silently running
+            // whatever the second key means on its own. That fallback was the
+            // real hazard of the old design: `gr` timing out ran `r` (refresh),
+            // so a slow `g`+`r` did something other than what was typed.
+            Some(Action::Bell)
+        } else if ch == 'g' {
+            // Only `g` starts a chord.
+            self.chord = ChordState::Waiting { key: ch };
+            None // Wait for the second key, however long it takes.
+        } else {
+            self.resolve_single(key)
         }
-
-        // Only g starts a chord (no d-chord to avoid delay).
-        if ch == 'g' {
-            self.chord = ChordState::Waiting {
-                key: ch,
-                deadline: Instant::now() + self.chord_timeout,
-            };
-            return None; // Wait for second key.
-        }
-
-        self.chord = ChordState::Idle;
-        self.resolve_single(key)
     }
 
-    /// Test hooks for the two plain-key tables, so a test can assert they agree.
-    /// The chord-fallback table is only reachable through a timed-out `g`, which
-    /// makes a disagreement between them very easy to miss in practice.
+    /// Test hook for the plain-key table.
     pub fn resolve_single_for_test(&self, key: KeyEvent) -> Option<Action> {
         self.resolve_single(key)
-    }
-
-    pub fn resolve_single_char_for_test(&self, c: char) -> Option<Action> {
-        self.resolve_single_char(c)
-    }
-
-    /// Resolve a single character to an action (used by chord fallback).
-    fn resolve_single_char(&self, c: char) -> Option<Action> {
-        match c {
-            'q' => Some(Action::Quit),
-            'j' => Some(Action::CursorDown),
-            'k' => Some(Action::CursorUp),
-            'h' => Some(Action::Collapse),
-            'l' => Some(Action::Expand),
-            'G' => Some(Action::ToBottom),
-            'r' => Some(Action::Refresh),
-            'R' => Some(Action::Rename),
-            's' => Some(Action::ToggleSort),
-            'H' => Some(Action::ToggleHidden),
-            'B' => Some(Action::ToggleBar),
-            'o' => Some(Action::OpenWithDefaultApp),
-            'S' => Some(Action::ToggleShallow),
-            'P' => Some(Action::TogglePerms),
-            'T' => Some(Action::ToggleTimes),
-            '0' => Some(Action::CollapseAll),
-            '*' => Some(Action::ExpandAll),
-            '/' => Some(Action::Search),
-            '?' => Some(Action::Help),
-            'u' => Some(Action::GoParent),
-            'v' => Some(Action::ToggleView),
-            'c' => Some(Action::Copy),
-            'm' => Some(Action::Move),
-            '|' => Some(Action::ToggleSplit),
-            't' => Some(Action::ToggleTag),
-            'V' => Some(Action::VisualMode),
-            'U' => Some(Action::UntagAll),
-            'f' => Some(Action::Filter),
-            'N' => Some(Action::CreateDir),
-            'n' => Some(Action::SearchNext),
-            'p' => Some(Action::SearchPrev),
-            ' ' => Some(Action::TogglePreview),
-            _ => None,
-        }
     }
 
     /// Resolve a chord (two-character sequence, only g-prefix).
