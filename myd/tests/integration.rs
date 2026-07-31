@@ -7644,6 +7644,60 @@ async fn a_single_panel_copy_destination_is_not_canonicalized_locally() {
 
 /// `myd <local> sftp://host` opens a split with the local path on the left.
 #[tokio::test]
+async fn a_lone_remote_argument_builds_a_single_pane() {
+    // Reported: `myd sftp://host` started split. The cwd was handed to the other
+    // pane, and `new_shallow` splits whenever a right path is present, so the
+    // layout ignored the absent --dual. One argument should mean one pane.
+    use clap::Parser;
+    use myd::cli::{Cli, Startup};
+
+    let cli = Cli::try_parse_from(["myd", "sftp://gb10"]).unwrap();
+    let Startup::Remote { panel, local, dual, .. } = cli.startup(Some(PathBuf::from("/cwd")))
+    else {
+        panic!("a remote argument should ask for a remote startup");
+    };
+    assert_eq!(panel, 0, "the remote takes the only pane");
+    assert!(!dual, "and does not ask for a split");
+    assert_eq!(local, None, "with no local pane alongside it");
+
+    // Built the way main does, without dialing anything.
+    let (left, right) = if panel == 0 { (None, local) } else { (local, None) };
+    let mut app = FileBrowser::new(left, right, dual);
+    settle(&mut app).await;
+    assert_eq!(app.panel_count(), 1, "a single pane");
+}
+
+#[tokio::test]
+async fn a_lone_remote_still_splits_when_dual_is_asked_for() {
+    // `--dual` is how to get the old pairing back: the cwd fills the pane the
+    // remote is not taking.
+    use clap::Parser;
+    use myd::cli::{Cli, Startup};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    let cli = Cli::try_parse_from(["myd", "--dual", "sftp://gb10"]).unwrap();
+    let Startup::Remote { panel, local, dual, .. } =
+        cli.startup(Some(dir.path().to_path_buf()))
+    else {
+        panic!("a remote argument should ask for a remote startup");
+    };
+    assert!(dual, "--dual still splits");
+    assert_eq!(local, Some(dir.path().to_path_buf()), "the cwd fills the other pane");
+
+    let (left, right) = if panel == 0 { (None, local) } else { (local, None) };
+    let mut app = FileBrowser::new(left, right, dual);
+    settle_all(&mut app).await;
+    assert_eq!(app.panel_count(), 2, "two panes");
+    assert_eq!(
+        app.panel_current_dir(1).and_then(|p| p.canonicalize().ok()),
+        dir.path().canonicalize().ok(),
+        "the cwd sits beside the pane the remote will take"
+    );
+}
+
+#[tokio::test]
 async fn a_remote_second_argument_builds_a_split_with_the_local_path_left() {
     // The routing itself is asserted in cli.rs; this checks the layout it asks
     // for is what actually gets built — a split, with the local path in pane 0
