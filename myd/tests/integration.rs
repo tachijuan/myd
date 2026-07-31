@@ -3346,6 +3346,46 @@ async fn a_timed_out_g_lets_s_cycle_as_normal() {
     assert_ne!(before, after, "s cycled the order, as it does alone");
 }
 
+/// A `g` left to expire must not turn the next `r` into the rename dialog.
+#[tokio::test]
+async fn a_timed_out_g_lets_r_refresh_as_normal() {
+    // `gr` claims a chord whose second key is Refresh on its own, so the
+    // fallback after the 500ms timeout is what can break: `r` has to still
+    // refresh rather than open the rename form.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('g'));
+    // Outlast the chord window.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    app.handle_key_for_test(char_key('r'));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "an expired g must not leave r opening the rename dialog"
+    );
+    // A refresh re-lists the directory, so a file created meanwhile shows up.
+    std::fs::write(dir.path().join("b.txt"), "y").unwrap();
+    app.handle_key_for_test(char_key('r'));
+    settle(&mut app).await;
+    match app.current_screen() {
+        Screen::Main(s) => {
+            let names: Vec<String> =
+                s.tree.lines.iter().map(|l| l.name.clone()).collect();
+            assert!(
+                names.iter().any(|n| n == "b.txt"),
+                "r on its own still refreshes: {:?}",
+                names
+            );
+        }
+        _ => panic!("expected a main screen"),
+    }
+}
+
 /// The whole gesture from the request: `gs5` sorts by newest.
 #[tokio::test]
 async fn gs_then_a_number_picks_that_sort_order() {
@@ -11467,7 +11507,7 @@ async fn text_previews_still_scroll_with_j_and_k() {
 }
 
 // ---------------------------------------------------------------------------
-// Patterned rename (gR): one regex over every tagged file.
+// Patterned rename (gr): one regex over every tagged file.
 // ---------------------------------------------------------------------------
 
 /// Three numbered files, cursor on the first, all of them tagged.
@@ -11490,7 +11530,7 @@ async fn rename_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
     (dir, app)
 }
 
-/// Press the `gR` chord, opening the patterned-rename dialog.
+/// Press the `gr` chord, opening the patterned-rename dialog.
 ///
 /// The chord has a 500ms window between the two keys. A loaded parallel test run
 /// can stall between them, which expires the chord and drops both keys — so this
@@ -11500,12 +11540,12 @@ async fn rename_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
 fn press_gr(app: &mut myd::app::FileBrowser) {
     for _ in 0..10 {
         app.handle_key_for_test(char_key('g'));
-        app.handle_key_for_test(char_key('R'));
+        app.handle_key_for_test(char_key('r'));
         if app.modal_kind_for_test() == "rename" {
             return;
         }
     }
-    panic!("gR never opened the rename dialog");
+    panic!("gr never opened the rename dialog");
 }
 
 /// Type a string into whichever dialog field has the focus.
@@ -11535,7 +11575,7 @@ async fn gr_renames_every_tagged_file_through_the_pattern() {
     assert_eq!(
         app.modal_kind_for_test(),
         "rename",
-        "gR should open the patterned rename dialog"
+        "gr should open the patterned rename dialog"
     );
 
     // Capture group carried into the replacement — the case the feature exists

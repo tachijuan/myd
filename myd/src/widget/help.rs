@@ -159,7 +159,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("  y / n", "  Confirm or decline"),
                 ("  a", "  Delete, and stop asking until you restart"),
                 ("R", "Rename selected"),
-                ("gR", "Rename every tagged file by regex"),
+                ("gr", "Rename every tagged file by regex"),
                 ("  Tab", "  Switch the pattern and replacement fields"),
                 ("  ", "  $1 in the replacement is the first capture group"),
                 ("N", "New directory here"),
