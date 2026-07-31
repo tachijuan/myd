@@ -114,7 +114,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             items: &[
                 ("s", "Cycle sort order"),
                 ("gs", "Pick a sort order from a numbered menu"),
-                ("  1-7", "  Choose that order outright (gs5 = newest)"),
+                ("  1-9", "  Choose that order outright (gs5 = newest)"),
                 ("click Sort:", "Opens the same menu"),
                 ("H", "Toggle hidden files"),
                 ("B", "Toggle size bars"),

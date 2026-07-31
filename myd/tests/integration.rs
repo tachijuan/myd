@@ -11736,3 +11736,53 @@ async fn a_rename_that_would_collide_is_reported_and_nothing_is_lost() {
     );
     assert!(dir.path().join(&from).exists(), "and the source survives");
 }
+
+#[tokio::test]
+async fn the_natural_sort_order_can_be_picked_from_the_menu() {
+    // End to end: the mode has to be reachable from the UI, not just correct in
+    // the tree. Natural is the last entry, so this also covers the menu growing
+    // past the seven it used to have.
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["10", "1", "20", "3", "4", "2"] {
+        std::fs::write(dir.path().join(n), "x").unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let n = myd::screen::SortMode::ALL
+        .iter()
+        .position(|m| *m == myd::screen::SortMode::Natural)
+        .expect("natural is offered");
+    let digit = char::from_digit(n as u32 + 1, 10).expect("a single digit");
+
+    // gs then its number, retried like the other chord tests.
+    for _ in 0..10 {
+        app.handle_key_for_test(char_key('g'));
+        app.handle_key_for_test(char_key('s'));
+        if app.modal_kind_for_test() == "sort_menu" {
+            break;
+        }
+    }
+    assert_eq!(app.modal_kind_for_test(), "sort_menu", "gs opens the menu");
+    app.handle_key_for_test(char_key(digit));
+    settle(&mut app).await;
+
+    match app.current_screen() {
+        Screen::Main(s) => {
+            assert_eq!(s.tree.sort_mode, myd::screen::SortMode::Natural);
+            let names: Vec<String> = s
+                .tree
+                .lines
+                .iter()
+                .filter(|l| l.depth == 1)
+                .map(|l| l.name.clone())
+                .collect();
+            assert_eq!(
+                names,
+                ["1", "2", "3", "4", "10", "20"],
+                "natural order reads numerically"
+            );
+        }
+        _ => panic!("expected a main screen"),
+    }
+}

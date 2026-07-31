@@ -1125,7 +1125,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("big.bin");
         // Several chunks, so cancellation lands between two of them.
-        std::fs::write(&src, vec![3u8; 8 * 1024 * 1024]).unwrap();
+        //
+        // Large enough that the copy cannot finish before the cancel arrives.
+        // At 8 MB this raced: the test waits for the first bytes to move and
+        // then cancels, but a warm page cache could copy the whole file inside
+        // that window, leaving a completed transfer and no part file to find.
+        // It failed roughly one run in ten, and more often under parallel load.
+        std::fs::write(&src, vec![3u8; 64 * 1024 * 1024]).unwrap();
         let dest = dir.path().join("out.bin");
 
         let fs: Arc<dyn Vfs> = Arc::new(LocalFs::new());
