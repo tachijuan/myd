@@ -1332,6 +1332,23 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_url_connects_whatever_it_ends_with() {
+        // The trailing slash is the address people actually type. It must still
+        // be recognised as a remote URL — not fall through to the local-path
+        // branch and be reported as "not a directory" — and it must reach the
+        // connect path verbatim, since SftpTarget::parse is the one place that
+        // decides what a trailing slash means.
+        for typed in ["sftp://gb10", "sftp://gb10/", "sftp://gb10//"] {
+            let mut p = DirPickerState::new();
+            p.input = typed.to_string();
+            match p.confirm() {
+                PickerChoice::Connect(url) => assert_eq!(url, typed, "passed through as typed"),
+                other => panic!("{} should connect, got {:?}", typed, other),
+            }
+        }
+    }
+
+    #[test]
     fn tilde_expands_to_the_home_directory() {
         // `PathBuf::push` *replaces* the buffer when given an absolute path, and
         // stripping `~` from `~/code` leaves `/code` — so the home prefix was
