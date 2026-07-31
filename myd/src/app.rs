@@ -270,6 +270,14 @@ pub struct FileBrowser {
     /// Erasing an image writes over cells ratatui still believes it drew, so the
     /// next frame has to be a full repaint rather than a diff.
     force_repaint: bool,
+    /// How to browse a directory that has no remembered traversal mode of its
+    /// own. Seeded from `-s` and moved by the `S` toggle.
+    ///
+    /// `-s` is a statement about this session, not about the one directory it
+    /// opened on: drilling into a subdirectory used to fall back to a full scan,
+    /// which is exactly the recursive walk the flag was asking to avoid. A
+    /// directory with a recorded preference still wins over this.
+    shallow_default: bool,
 }
 
 /// A preview load running in the background.
@@ -369,7 +377,11 @@ impl FileBrowser {
         if dual || right.is_some() {
             panels.push(Panel::new_maybe_shallow(right, shallow));
         }
-        Self::with_panels(panels)
+        let mut app = Self::with_panels(panels);
+        // The flag describes the session, so every directory opened later
+        // without a preference of its own starts out this way too.
+        app.shallow_default = shallow;
+        app
     }
 
     /// Build the app around already-constructed panels.
@@ -424,6 +436,7 @@ impl FileBrowser {
             preview_task: None,
             preview_graphics_shown: None,
             force_repaint: false,
+            shallow_default: false,
         }
     }
 
@@ -824,6 +837,12 @@ impl FileBrowser {
             // ordinary way — at startup, before the catalog was reachable.
             // Re-open it in shallow mode rather than leaving a measured tree the
             // preference says they did not want.
+            //
+            // Only an explicitly recorded preference forces a re-open;
+            // `shallow_default` is deliberately not consulted. Arrivals already
+            // apply it when they build the loading screen, so a measured tree
+            // reaching this point in a shallow session is one the user just
+            // switched to with `S` — re-opening it would undo the toggle.
             let needs_shallow: Vec<PathBuf> = opened
                 .iter()
                 .filter(|p| self.hosts.dir_is_shallow(&p.to_string_lossy()))
@@ -2335,6 +2354,12 @@ impl FileBrowser {
                 sort_mode,
             ));
 
+        // The `S` toggle is the explicit change of mode the startup flag defers
+        // to, so it redirects the session as well as this one directory —
+        // otherwise turning measuring off here and walking on would start
+        // measuring again at the next subdirectory.
+        self.shallow_default = shallow;
+
         // Remembered per directory, so somewhere you have decided not to measure
         // stays that way the next time you open it. Keyed on the root captured
         // above: reading it back now would ask the *loading* screen, which has no
@@ -2634,9 +2659,12 @@ impl FileBrowser {
                                 );
                             }
                             // A directory opened from the picker honours the
-                            // remembered traversal mode too.
-                            let shallow =
-                                self.hosts.dir_is_shallow(&path.to_string_lossy());
+                            // remembered traversal mode too, falling back to the
+                            // session's when it has none.
+                            let shallow = self
+                                .hosts
+                                .dir_shallow_pref(&path.to_string_lossy())
+                                .unwrap_or(self.shallow_default);
                             let panel = self.active_panel_mut();
                             if shallow {
                                 panel.screen_stack.push(Screen::loading_with_source_sorted(
@@ -2719,9 +2747,14 @@ impl FileBrowser {
                     } else {
                         // Honour whatever was decided for this directory last
                         // time: somewhere not worth walking stays that way
-                        // instead of measuring again on every arrival.
-                        let shallow =
-                            self.hosts.dir_is_shallow(&path.to_string_lossy());
+                        // instead of measuring again on every arrival. With
+                        // nothing recorded, the session's mode carries in — a
+                        // subdirectory entered under `-s` is not a reason to
+                        // start measuring.
+                        let shallow = self
+                            .hosts
+                            .dir_shallow_pref(&path.to_string_lossy())
+                            .unwrap_or(self.shallow_default);
                         let panel = self.active_panel_mut();
                         if shallow {
                             panel.screen_stack.push(Screen::loading_with_source_sorted(
