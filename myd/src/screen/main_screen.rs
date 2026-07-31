@@ -139,14 +139,34 @@ impl MainScreenState {
     /// navigating into a directory preserves how the user has set the view up.
     ///
     /// Takes the whole struct rather than a list of bools, which would be easy to
-    /// transpose silently. `sort_mode` is deliberately not applied here: the order
-    /// has to be known before the tree is built, so it is threaded through the
-    /// loading screen instead of being set after the fact.
+    /// transpose silently.
+    ///
+    /// `sort_mode` is applied here too. It used to be left out on the reasoning
+    /// that the order has to be known before the tree is built and so should be
+    /// threaded through the loading screen — which is true of *how the tree is
+    /// built*, but left the preference unenforced wherever a caller forgot to
+    /// pass it, and the picker did. Applying it here as well costs an in-memory
+    /// resort on the rare arrival that disagrees, and makes the preference hold
+    /// by construction rather than by every call site remembering.
     pub fn apply_view_prefs(&mut self, prefs: crate::panel::ViewPrefs) {
         self.info_panel_hidden = prefs.info_panel_hidden;
         self.focus = prefs.focus;
         self.tree.show_perms = prefs.show_perms;
         self.tree.show_times = prefs.show_times;
+        // The sort order is a view preference like the rest, and was the one
+        // this forgot to apply. `ViewPrefs` carried it and every toggle wrote
+        // it, but nothing read it back — so the order held only where a caller
+        // happened to thread it through by hand (entering a directory did), and
+        // reset to the default everywhere else: the picker, a changed root, a
+        // shallow re-open.
+        //
+        // Resorting is pure reordering of nodes already in memory — no I/O — so
+        // it is safe on every arrival. Skipped when it already matches to avoid
+        // a needless reflatten on the common path.
+        if self.tree.sort_mode != prefs.sort_mode {
+            self.tree.set_sort_mode(prefs.sort_mode);
+            self.rebuild_treemap();
+        }
     }
 
     /// Visible content rows in the tree, from the last render.

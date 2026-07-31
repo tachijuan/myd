@@ -11786,3 +11786,158 @@ async fn the_natural_sort_order_can_be_picked_from_the_menu() {
         _ => panic!("expected a main screen"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The sort order is a view preference: it holds until the user changes it.
+// ---------------------------------------------------------------------------
+
+/// A directory whose numbered names sort differently by size and by nature,
+/// plus a subdirectory holding the same names.
+fn sort_persistence_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    for n in ["10", "1", "2"] {
+        std::fs::write(dir.path().join(n), "x").unwrap();
+        std::fs::write(dir.path().join("sub").join(n), "x").unwrap();
+    }
+    dir
+}
+
+/// Switch the active panel to natural order through the sort menu.
+fn choose_natural(app: &mut myd::app::FileBrowser) {
+    let n = myd::screen::SortMode::ALL
+        .iter()
+        .position(|m| *m == myd::screen::SortMode::Natural)
+        .expect("natural is offered");
+    let digit = char::from_digit(n as u32 + 1, 10).expect("a single digit");
+    for _ in 0..10 {
+        app.handle_key_for_test(char_key('g'));
+        app.handle_key_for_test(char_key('s'));
+        if app.modal_kind_for_test() == "sort_menu" {
+            break;
+        }
+    }
+    assert_eq!(app.modal_kind_for_test(), "sort_menu", "gs opens the menu");
+    app.handle_key_for_test(char_key(digit));
+}
+
+fn current_sort(app: &myd::app::FileBrowser) -> myd::screen::SortMode {
+    match app.current_screen() {
+        Screen::Main(s) => s.tree.sort_mode,
+        _ => panic!("expected a main screen"),
+    }
+}
+
+#[tokio::test]
+async fn the_sort_order_survives_opening_a_directory_from_the_picker() {
+    // The reported bug. `ViewPrefs` carried the sort order and every toggle
+    // wrote it, but `apply_view_prefs` never read it back — so the order held
+    // only where a caller threaded it through by hand. Entering a directory did;
+    // the picker did not, and reset to the default.
+    let dir = sort_persistence_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    choose_natural(&mut app);
+    settle(&mut app).await;
+    assert_eq!(current_sort(&app), myd::screen::SortMode::Natural);
+
+    // Open the subdirectory by typing its path into the picker.
+    for _ in 0..10 {
+        app.handle_key_for_test(char_key('g'));
+        app.handle_key_for_test(char_key('d'));
+        if matches!(app.current_screen(), Screen::DirPicker(_)) {
+            break;
+        }
+    }
+    assert!(
+        matches!(app.current_screen(), Screen::DirPicker(_)),
+        "gd opens the picker"
+    );
+    let sub = dir.path().join("sub");
+    for c in sub.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    assert_eq!(
+        current_sort(&app),
+        myd::screen::SortMode::Natural,
+        "the picker must not reset the sort order"
+    );
+    // And the rows really are in that order, not merely labelled with it.
+    match app.current_screen() {
+        Screen::Main(s) => {
+            let names: Vec<String> = s
+                .tree
+                .lines
+                .iter()
+                .filter(|l| l.depth == 1)
+                .map(|l| l.name.clone())
+                .collect();
+            assert_eq!(names, ["1", "2", "10"]);
+        }
+        _ => panic!("expected a main screen"),
+    }
+}
+
+#[tokio::test]
+async fn the_sort_order_survives_entering_and_leaving_a_directory() {
+    // Entering already threaded the order through by hand; this pins that, and
+    // covers coming back out, which goes through apply_view_prefs on the pop.
+    let dir = sort_persistence_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    choose_natural(&mut app);
+    settle(&mut app).await;
+
+    // Step onto the subdirectory and enter it.
+    let mut target = None;
+    for _ in 0..8 {
+        app.handle_key_for_test(char_key('j'));
+        if let Screen::Main(s) = app.current_screen() {
+            if s.selected_is_dir() && s.selected_path() != Some(&dir.path().to_path_buf()) {
+                target = s.selected_path().cloned();
+                break;
+            }
+        }
+    }
+    let target = target.expect("a subdirectory under the cursor");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_into(&mut app, &target).await;
+    assert_eq!(
+        current_sort(&app),
+        myd::screen::SortMode::Natural,
+        "entering keeps the order"
+    );
+
+    app.handle_key_for_test(ctrl_key('o'));
+    settle(&mut app).await;
+    assert_eq!(
+        current_sort(&app),
+        myd::screen::SortMode::Natural,
+        "and so does coming back out"
+    );
+}
+
+#[tokio::test]
+async fn the_sort_order_survives_a_shallow_toggle() {
+    // `S` rebuilds the tree from scratch, and the rebuild used to be handed the
+    // default order rather than the one on screen.
+    let dir = sort_persistence_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    choose_natural(&mut app);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+    assert_eq!(
+        current_sort(&app),
+        myd::screen::SortMode::Natural,
+        "going shallow must not reset the order"
+    );
+}
