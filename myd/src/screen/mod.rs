@@ -38,6 +38,9 @@ pub enum SortMode {
     Oldest,
     /// Most recently accessed first.
     RecentlyAccessed,
+    /// By name, with runs of digits compared as numbers rather than as text —
+    /// so `2` sorts before `10` instead of after it.
+    Natural,
 }
 
 impl SortMode {
@@ -50,6 +53,7 @@ impl SortMode {
             SortMode::Newest => "newest",
             SortMode::Oldest => "oldest",
             SortMode::RecentlyAccessed => "recently-accessed",
+            SortMode::Natural => "natural",
         }
     }
 
@@ -57,7 +61,7 @@ impl SortMode {
     ///
     /// Single source of truth for the cycle, the sort menu and the help text, so
     /// adding a mode cannot leave one of them behind.
-    pub const ALL: [SortMode; 7] = [
+    pub const ALL: [SortMode; 8] = [
         SortMode::Largest,
         SortMode::Smallest,
         SortMode::DirsFirst,
@@ -65,6 +69,7 @@ impl SortMode {
         SortMode::Newest,
         SortMode::Oldest,
         SortMode::RecentlyAccessed,
+        SortMode::Natural,
     ];
 
     /// A one-line explanation, for the sort menu.
@@ -77,6 +82,7 @@ impl SortMode {
             SortMode::Newest => "Most recently modified first",
             SortMode::Oldest => "Least recently modified first",
             SortMode::RecentlyAccessed => "Most recently opened first",
+            SortMode::Natural => "By name, numbers in order (2 before 10)",
         }
     }
 }

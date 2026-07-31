@@ -175,7 +175,15 @@ impl SortMenu {
         }
 
         lines.push(Line::from(Span::styled(
-            pad_to(" 1-7 / click to pick   Esc: cancel", inner),
+            // Derived from ALL rather than written out: this said "1-7" and was
+            // silently wrong the moment an eighth mode was added.
+            pad_to(
+                &format!(
+                    " 1-{} / click to pick   Esc: cancel",
+                    SortMode::ALL.len()
+                ),
+                inner,
+            ),
             Style::default().fg(Color::Rgb(150, 150, 170)).bg(bg),
         )));
 
@@ -314,10 +322,34 @@ mod tests {
     fn every_mode_is_offered() {
         // The menu is built from SortMode::ALL, so a newly added mode appears
         // here automatically rather than being silently unreachable.
-        assert_eq!(SortMode::ALL.len(), 7);
+        assert_eq!(SortMode::ALL.len(), 8);
         for m in SortMode::ALL {
             assert!(!m.label().is_empty());
             assert!(!m.description().is_empty());
+        }
+    }
+
+    #[test]
+    fn every_mode_can_be_typed_as_a_single_digit() {
+        // Entries are picked by typing their number, and the handler reads one
+        // digit. A tenth mode would be listed but unreachable from the keyboard,
+        // and the help text's "1-9" would be a lie — so this is the point to
+        // stop and rethink the shortcut, not to quietly add another row.
+        assert!(
+            SortMode::ALL.len() <= 9,
+            "a tenth sort mode needs a different shortcut scheme"
+        );
+        // And each digit really does select the mode at that position.
+        for (i, mode) in SortMode::ALL.iter().enumerate() {
+            let mut m = SortMenu::new(SortMode::ALL[0]);
+            let digit = char::from_digit(i as u32 + 1, 10).expect("1-9");
+            assert_eq!(
+                m.handle_key(key(digit)),
+                SortMenuOutcome::Chosen(*mode),
+                "typing {} should choose {}",
+                digit,
+                mode.label()
+            );
         }
     }
 }

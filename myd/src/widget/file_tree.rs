@@ -418,7 +418,48 @@ fn sort_key_fast(
         SortMode::Newest => (0, -epoch_secs(node.mtime), name),
         SortMode::Oldest => (0, epoch_secs_oldest_last(node.mtime), name),
         SortMode::RecentlyAccessed => (0, -epoch_secs(node.atime), name),
+        // Purely by name, but with digit runs rewritten so the ordinary string
+        // comparison that follows puts 2 before 10.
+        SortMode::Natural => (0, 0, natural_key(&name)),
     }
+}
+
+/// Rewrite `name` so plain lexicographic comparison orders it naturally.
+///
+/// `file10` sorts after `file9` to a human and before it to a byte comparison,
+/// because '1' < '9'. Each run of digits is emitted with its length in front, so
+/// a longer number always compares greater than a shorter one and equal-length
+/// numbers fall back to their digits — 10 becomes `\u{2}10`, 9 becomes `\u{1}9`,
+/// and `\u{1}` < `\u{2}` puts them the right way round.
+///
+/// A length prefix rather than zero-padding to a fixed width: padding has to
+/// pick a maximum, and a number longer than it silently sorts wrong. This has no
+/// ceiling. The prefix is capped at `char::MAX` only so a pathological run of
+/// digits cannot overflow the conversion; nothing near that length is a real
+/// file name.
+///
+/// Leading zeros are kept in the digits, so `01` and `1` are both length 2 and 1
+/// respectively and order `1` before `01` — stable and predictable rather than
+/// declaring them equal, which would make the sort depend on input order.
+fn natural_key(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 8);
+    let mut rest = name;
+    while !rest.is_empty() {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            // A run of non-digits, copied through as-is.
+            let text: String = rest.chars().take_while(|c| !c.is_ascii_digit()).collect();
+            out.push_str(&text);
+            rest = &rest[text.len()..];
+        } else {
+            let len = char::from_u32(digits.len().min(char::MAX as usize) as u32)
+                .unwrap_or(char::MAX);
+            out.push(len);
+            out.push_str(&digits);
+            rest = &rest[digits.len()..];
+        }
+    }
+    out
 }
 
 /// Seconds since the Unix epoch for a timestamp, or 0 when unknown. Used for the
@@ -1705,6 +1746,34 @@ mod tests {
 
 
     #[test]
+    fn natural_sort_orders_a_real_directory_numerically() {
+        // Through the tree itself, not just the key: the mode has to be wired
+        // into sort_key_fast and survive flattening.
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["10", "1", "20", "3", "4", "2"] {
+            std::fs::write(dir.path().join(n), "x").unwrap();
+        }
+        let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Natural, true, false);
+        let names: Vec<String> = tree
+            .lines
+            .iter()
+            .filter(|l| l.depth == 1)
+            .map(|l| l.name.clone())
+            .collect();
+        assert_eq!(names, ["1", "2", "3", "4", "10", "20"]);
+
+        // The contrast that motivates the mode: by name as text, 10 lands second.
+        let tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, false);
+        let names: Vec<String> = tree
+            .lines
+            .iter()
+            .filter(|l| l.depth == 1)
+            .map(|l| l.name.clone())
+            .collect();
+        assert_eq!(names, ["1", "10", "2", "20", "3", "4"]);
+    }
+
+    #[test]
     fn test_flatten_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tree = FileTree::new(dir.path().to_path_buf(), SortMode::DirsFirst, true, true);
@@ -1999,5 +2068,81 @@ mod tests {
             tree.cursor
         );
         assert!(tree.scroll < tree.lines.len());
+    }
+}
+
+#[cfg(test)]
+mod natural_sort_tests {
+    use super::*;
+
+    /// Sort `names` the way the Natural mode would, by its key alone.
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        v.sort_by_cached_key(|n| natural_key(&n.to_lowercase()));
+        v
+    }
+
+    #[test]
+    fn the_reported_sequence_sorts_numerically() {
+        // The example from the request: 10 1 20 3 4 2 must read 1 2 3 4 10 20,
+        // where a plain string sort gives 1 10 2 20 3 4.
+        assert_eq!(
+            sorted(&["10", "1", "20", "3", "4", "2"]),
+            ["1", "2", "3", "4", "10", "20"]
+        );
+    }
+
+    #[test]
+    fn numbers_inside_names_sort_numerically_too() {
+        assert_eq!(
+            sorted(&["file10.txt", "file9.txt", "file1.txt"]),
+            ["file1.txt", "file9.txt", "file10.txt"]
+        );
+        // Several numbers in one name, each compared in turn.
+        assert_eq!(
+            sorted(&["s1e10", "s1e2", "s10e1", "s2e1"]),
+            ["s1e2", "s1e10", "s2e1", "s10e1"]
+        );
+    }
+
+    #[test]
+    fn text_still_sorts_as_text() {
+        // Names with no digits are unaffected: this is the ordinary A-Z order.
+        assert_eq!(
+            sorted(&["banana", "apple", "cherry"]),
+            ["apple", "banana", "cherry"]
+        );
+        // A shared prefix falls through to what follows it.
+        assert_eq!(
+            sorted(&["img_b", "img_a"]),
+            ["img_a", "img_b"]
+        );
+    }
+
+    #[test]
+    fn long_numbers_beat_short_ones_with_no_ceiling() {
+        // The reason for a length prefix rather than zero-padding to a fixed
+        // width: padding has to choose a maximum, and anything longer sorts
+        // wrong. These are far past any sane pad width.
+        assert_eq!(
+            sorted(&["v100000000000000000000", "v9", "v1000"]),
+            ["v9", "v1000", "v100000000000000000000"]
+        );
+    }
+
+    #[test]
+    fn leading_zeros_are_ordered_not_merged() {
+        // 1 and 01 are different names, so they must have a stable order rather
+        // than comparing equal and letting the input order decide.
+        let out = sorted(&["01", "1", "001"]);
+        assert_eq!(out, ["1", "01", "001"]);
+    }
+
+    #[test]
+    fn a_name_that_is_all_digits_or_empty_does_not_panic() {
+        assert_eq!(natural_key(""), "");
+        assert!(!natural_key("12345").is_empty());
+        // Multibyte text around the digits must not be split mid-codepoint.
+        assert_eq!(sorted(&["café10", "café2"]), ["café2", "café10"]);
     }
 }
