@@ -10574,6 +10574,126 @@ async fn test_space_opens_and_closes_the_preview() {
 }
 
 #[tokio::test]
+async fn a_click_in_the_preview_scrolls_it_instead_of_the_tree_underneath() {
+    // Reported: clicks went to the hidden tree. The preview covers the panels,
+    // so the click moved a cursor the user could not see and swapped the file
+    // they were reading — the scroll wheel already knew to stay in the preview,
+    // but clicks fell straight through.
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    let before = app.preview_scroll_for_test();
+    let selected = match app.current_screen() {
+        Screen::Main(s) => s.selected_path().cloned(),
+        _ => panic!("expected a main screen"),
+    };
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before + 1,
+        "a click should advance the preview like j"
+    );
+
+    let after = match app.current_screen() {
+        Screen::Main(s) => s.selected_path().cloned(),
+        _ => panic!("expected a main screen"),
+    };
+    assert_eq!(
+        selected, after,
+        "and must not move the tree cursor hidden behind it"
+    );
+}
+
+#[tokio::test]
+async fn a_click_focuses_the_preview_before_advancing_it() {
+    // Clicking is a way of saying "I am reading this". If the click only moved
+    // focus, the first one would appear to do nothing and the second would
+    // scroll — not how clicking on a page behaves.
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    // Hand focus back to the tree, the way Tab does.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    let before = app.preview_scroll_for_test();
+
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    assert!(
+        app.preview_focused_for_test(),
+        "the click takes focus for the preview"
+    );
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before + 1,
+        "and advances it in the same click"
+    );
+}
+
+#[tokio::test]
+async fn a_click_outside_the_preview_still_belongs_to_it() {
+    // The pane is drawn over the whole frame, so there is no "outside" while it
+    // is open. A click on the status row must not reach the tree either.
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    let selected = match app.current_screen() {
+        Screen::Main(s) => s.selected_path().cloned(),
+        _ => panic!("expected a main screen"),
+    };
+    let before = app.preview_scroll_for_test();
+
+    // Bottom-left, well away from the text body.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 1, 23));
+    assert_eq!(app.preview_scroll_for_test(), before + 1);
+    let after = match app.current_screen() {
+        Screen::Main(s) => s.selected_path().cloned(),
+        _ => panic!("expected a main screen"),
+    };
+    assert_eq!(selected, after, "the tree is untouched wherever the click lands");
+}
+
+#[tokio::test]
+async fn a_right_click_in_the_preview_does_not_reach_the_tree() {
+    // Right-click opens the entry under it in the tree. Through a pane that
+    // covers the whole frame that would be a directory change the user never
+    // asked for, so it is swallowed rather than passed down.
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    let depth = app.screen_stack_depth();
+    let before = app.preview_scroll_for_test();
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Right), 20, 10));
+
+    assert_eq!(
+        app.screen_stack_depth(),
+        depth,
+        "a right click must not navigate the hidden tree"
+    );
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before,
+        "and only the left button advances the page"
+    );
+    assert!(app.preview_open_for_test(), "the preview is still up");
+}
+
+#[tokio::test]
 async fn test_preview_scrolls_with_vi_motions_and_clamps() {
     let (_dir, mut app) = preview_app(200).await;
     app.handle_key_for_test(char_key(' '));
