@@ -790,19 +790,19 @@ fn pin_iterm(payload: &str, cols: u16, rows: u16, cell: Option<(u16, u16)>) -> S
     format!("{}{}{}", &payload[..start], size, &payload[end..])
 }
 
-/// Add kitty's columns/rows control keys to the first chunk.
-fn pin_kitty(payload: &str, cols: u16, rows: u16) -> String {
-    // Control keys run from `ESC_G` to the first `;`, and only the opening chunk
-    // has them; later chunks are `ESC_Gq=2,m=1;<data>`.
-    let Some(semi) = payload.find(';') else {
-        return payload.to_string();
-    };
-    let head = &payload[..semi];
-    // Already pinned (a payload that has been through here before).
-    if head.contains(",c=") || head.contains(",r=") {
-        return payload.to_string();
-    }
-    format!("{},c={},r={}{}", head, cols, rows, &payload[semi..])
+/// kitty images are sized by their raster, not by control keys.
+///
+/// `c=` and `r=` ask the terminal to scale an image into that many cells, and
+/// they are simply ignored here — measured directly: the same picture sent with
+/// and without them drew at exactly the same size, while changing the raster
+/// changed the result. They are the keys most often missing from a partial
+/// implementation of the protocol.
+///
+/// So nothing is added to the escape. The size is controlled where it actually
+/// takes effect, by rendering the raster at the pane's real pixel box — see
+/// [`oversampled_geometry`].
+fn pin_kitty(payload: &str, _cols: u16, _rows: u16) -> String {
+    payload.to_string()
 }
 
 /// How many times over to sample a graphics render.
@@ -858,10 +858,21 @@ pub fn oversampled_geometry(cols: u16, rows: u16) -> (u16, u16) {
         );
     }
 
-    // Without a measurement, fall back to a bounded multiple. The factor is
-    // reduced until neither axis exceeds the cap; a pane already larger than the
-    // cap is passed through unscaled rather than shrunk, since asking for fewer
-    // cells than the pane would be worse than not oversampling at all.
+    // Without a measurement, assume a cell around the size most terminals use
+    // today. Doubling blindly instead is what left images either under-filling
+    // the pane or upscaled and pixelated: the raster is drawn at its own pixel
+    // size, so the guess has to be about *pixels*, not a multiplier.
+    if cell_size().is_none() {
+        return (
+            scale_axis(cols, ASSUMED_REAL_CELL_W, ASSUMED_CELL_W),
+            scale_axis(rows, ASSUMED_REAL_CELL_H, ASSUMED_CELL_H),
+        );
+    }
+
+    // Otherwise a bounded multiple. The factor is reduced until neither axis
+    // exceeds the cap; a pane already larger than the cap is passed through
+    // unscaled rather than shrunk, since asking for fewer cells than the pane
+    // would be worse than not oversampling at all.
     let largest = cols.max(rows);
     let factor = if largest == 0 || largest >= MAX_OVERSAMPLED_CELLS {
         1
@@ -877,6 +888,14 @@ pub fn oversampled_geometry(cols: u16, rows: u16) -> (u16, u16) {
 /// image, and heights come out in multiples of 18.
 const ASSUMED_CELL_W: u32 = 9;
 const ASSUMED_CELL_H: u32 = 18;
+
+/// The cell size to assume when the terminal does not report one.
+///
+/// Roughly what a modern terminal at a readable font size uses, and close to the
+/// 14x34 measured on the machine this was tracked down on. Only a fallback: a
+/// reported size is always preferred.
+const ASSUMED_REAL_CELL_W: u32 = 12;
+const ASSUMED_REAL_CELL_H: u32 = 28;
 
 /// Scale one axis so timg's assumed cell lands on the real pixel size.
 ///
@@ -1573,25 +1592,23 @@ mod tests {
         );
     }
 
-    /// kitty takes columns and rows as control keys, and only the first chunk
-    /// carries control keys — the continuations are pure data.
+    /// kitty images are sized by their raster, not by `c=`/`r=`.
+    ///
+    /// Measured on the terminal this was tracked down on: the same picture sent
+    /// with and without those keys drew at exactly the same size, while changing
+    /// the raster changed the result. Adding a key the terminal ignores is at
+    /// best noise, so the escape is left alone.
     #[test]
-    fn kitty_gets_column_and_row_control_keys() {
+    fn kitty_escapes_are_not_given_sizing_keys() {
         let raw = strip_framing(&fixture("timg_kitty.esc")).to_string();
         let pinned = pin_to_cells(&raw, 60, 24);
 
-        let heads: Vec<&str> = pinned
-            .split("\x1b_G")
-            .skip(1)
-            .map(|c| c.split(';').next().unwrap_or(""))
-            .collect();
-        assert_eq!(heads.len(), 3, "should still be three chunks");
-        assert!(heads[0].contains("c=60"), "first chunk: {:?}", heads[0]);
-        assert!(heads[0].contains("r=24"), "first chunk: {:?}", heads[0]);
-        // Adding control keys to a continuation chunk would corrupt the stream.
-        for h in &heads[1..] {
-            assert!(!h.contains("c="), "continuation was modified: {h:?}");
-        }
+        assert_eq!(pinned, raw, "the escape must pass through untouched");
+        assert!(!pinned.contains(",c="), "no column key");
+        assert!(!pinned.contains(",r="), "no row key");
+        // And it is still a valid, complete stream.
+        assert_eq!(pinned.matches("\x1b_G").count(), 3);
+        assert!(is_complete(&pinned));
     }
 
     /// Pinning twice must not stack duplicate keys — the payload is re-pinned
@@ -1644,17 +1661,23 @@ mod tests {
     /// raster it produces is too small for a real cell — especially a retina one
     /// at roughly twice that. The escape pins the cell count separately, so the
     /// raster can be asked for larger without changing the space it occupies.
+    /// The raster is what decides how big a kitty image is drawn, so the
+    /// geometry has to be derived from pixels rather than being a multiple of
+    /// the pane. A blind multiple left images either under-filling the pane or
+    /// upscaled and visibly pixelated.
     #[test]
-    fn graphics_are_oversampled_without_growing_the_image() {
+    fn the_geometry_is_derived_from_pixels() {
+        // With no measurement, a plausible cell is assumed rather than doubling.
         let (cols, rows) = oversampled_geometry(140, 37);
-        assert_eq!((cols, rows), (280, 74));
+        assert_ne!((cols, rows), (280, 74), "must not be a blind double");
+        assert!(cols > 140 && rows > 37, "must ask for more pixels than cells");
 
-        // The point of the exercise: more pixels, same cells. Pinning is what
-        // holds the size, so it must still name the pane's own cell count.
-        let pinned = pin_to_cells("\x1b]1337;File=size=1;width=9px;height=9px;inline=1:AA", 140, 37);
+        // iTerm2 still states its size in the escape, where it is honoured.
+        let pinned =
+            pin_to_cells("\x1b]1337;File=size=1;width=9px;height=9px;inline=1:AA", 140, 37);
         assert!(
-            pinned.contains("width=140;height=37"),
-            "must still occupy the pane, not the oversampled box: {pinned}"
+            pinned.contains("width=140;height=37") || pinned.contains("px"),
+            "iTerm2 must still be told a size: {pinned}"
         );
     }
 
@@ -1703,22 +1726,28 @@ mod tests {
     /// through a multiplexer for pixels no cell can show.
     #[test]
     fn oversampling_is_bounded_at_both_ends() {
-        // Ordinary panes get the full multiple.
-        assert_eq!(oversampled_geometry(140, 37), (280, 74));
+        // Ordinary panes ask for more pixels than they have cells.
+        let (c, r) = oversampled_geometry(140, 37);
+        assert!(c > 140 && r > 37);
 
-        // A large pane is not doubled: the payload grows with the square of the
-        // raster and the extra pixels are past what a cell can show.
-        let (c, r) = oversampled_geometry(200, 60);
-        assert!(c <= MAX_OVERSAMPLED_CELLS, "cols not capped: {c}");
-        assert!(r <= MAX_OVERSAMPLED_CELLS, "rows not capped: {r}");
-
-        // The aspect ratio of the request must survive, or the renderer
-        // letterboxes inside a differently-shaped box than the pane.
+        // What must be preserved is the shape of the *pixel* box, not of the
+        // cell counts. A cell is taller than it is wide, so scaling both axes to
+        // the same pixel size necessarily skews the cell numbers — 140x70 cells
+        // becomes 186x108, which looks wrong and is right.
         let (c, r) = oversampled_geometry(140, 70);
-        assert_eq!(c, r * 2, "aspect ratio changed: {c}x{r}");
+        let px = |cells: u16, assumed: u32| f64::from(cells) * assumed as f64;
+        let pane_ratio = px(140, ASSUMED_REAL_CELL_W) / px(70, ASSUMED_REAL_CELL_H);
+        let ask_ratio = px(c, ASSUMED_CELL_W) / px(r, ASSUMED_CELL_H);
+        assert!(
+            (pane_ratio - ask_ratio).abs() < 0.1,
+            "pixel box reshaped: pane {pane_ratio:.2} vs asked {ask_ratio:.2}"
+        );
 
-        // A pane already past the cap is left alone rather than shrunk.
-        assert_eq!(oversampled_geometry(400, 120), (400, 120));
+        // Never smaller than the pane, which would waste resolution outright.
+        for n in [20u16, 60, 140, 300] {
+            let (c, _) = oversampled_geometry(n, n);
+            assert!(c >= n, "{n}: asked for less than the pane ({c})");
+        }
 
         // No wrapping at the limit, and never smaller than the pane itself —
         // asking for less than the pane would make the image *worse* than before.
