@@ -29,7 +29,7 @@ pub enum Action {
     /// Open the sort picker, to choose an order directly rather than cycling to
     /// it. Bound to the `gs` chord and to clicking the "Sort:" indicator.
     OpenSortMenu,
-    /// Rename every tagged file through a regex and a replacement (`gR`).
+    /// Rename every tagged file through a regex and a replacement (`gr`).
     PatternRename,
     ToggleHidden,
     ToggleBar,
@@ -225,16 +225,17 @@ impl KeyBindingHandler {
             // hosts) used to sit alongside this: `gd` now lists directories and
             // hosts together, `/` searches the lot, and the path field takes an
             // sftp:// URL directly, which left both chords doing nothing `gd`
-            // could not. `gs` has since been reused for the sort picker.
+            // could not. Both have since been reused — `gs` for the sort picker,
+            // `gr` for the patterned rename.
             "gd" => Some(Action::GoDirPicker),
             // Opens the numbered picker, so `gs5` is "sort by newest" as one
             // gesture. `s` still cycles, which is quicker once the order is
             // known; this is for going straight there, and for discovering what
             // the orders are.
             "gs" => Some(Action::OpenSortMenu),
-            // Capital R, matching plain `R` for renaming one file: this is the
-            // same operation over the tagged set.
-            "gR" => Some(Action::PatternRename),
+            // Lower case, matching the other chords. Plain `R` renames one file;
+            // this is the same operation over the tagged set.
+            "gr" => Some(Action::PatternRename),
             "gx" => Some(Action::CancelTransfers),
             _ => None,
         }

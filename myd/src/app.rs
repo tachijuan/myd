@@ -74,7 +74,7 @@ pub enum Modal {
     Help(HelpState),
     /// Numbered sort-order menu, opened by clicking the "Sort:" indicator.
     SortMenu(SortMenu),
-    /// Regex rename over the tagged files, opened by `gR`.
+    /// Regex rename over the tagged files, opened by `gr`.
     Rename(crate::widget::rename_dialog::RenameDialog),
 }
 
