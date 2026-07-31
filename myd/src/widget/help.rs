@@ -80,6 +80,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("j / Down", "Cursor down"),
                 ("k / Up", "Cursor up"),
                 ("gg", "Go to top"),
+                ("  g…", "  g waits for the next key; Esc cancels"),
                 ("G", "Go to bottom"),
                 ("Ctrl+F/PgDn", "Page down (full screen)"),
                 ("Ctrl+B/PgUp", "Page up (full screen)"),

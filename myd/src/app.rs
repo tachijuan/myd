@@ -287,6 +287,9 @@ pub struct FileBrowser {
     /// guard on an irreversible operation should be a thing you opt into while
     /// you are doing it, not a setting you can leave on and forget about.
     skip_delete_confirm: bool,
+    /// How many times the terminal bell has been rung. Tests cannot hear it, so
+    /// they count it instead.
+    bells_rung: usize,
 }
 
 /// A preview load running in the background.
@@ -447,6 +450,7 @@ impl FileBrowser {
             force_repaint: false,
             shallow_default: false,
             skip_delete_confirm: false,
+            bells_rung: 0,
         }
     }
 
@@ -716,6 +720,10 @@ impl FileBrowser {
         // In-progress transfer destinations, to overlay as ghost rows on the
         // panel(s) they land in.
         let pending = self.transfers.pending_destinations();
+        // A half-typed chord, shown in the status bar. Read once here: the key
+        // handler is borrowed immutably while the panels are borrowed mutably
+        // below.
+        let pending_chord = self.key_handler.pending_chord();
 
         // Focus lives in one place: a browser panel, or the transfer sidebar.
         // `state.active` used to mean "is the active panel index", which stopped
@@ -736,6 +744,7 @@ impl FileBrowser {
                 if let Screen::Main(state) = panel.current_screen_mut() {
                     state.active = panel_has_focus && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
+                    state.pending_chord = pending_chord;
                 }
                 panel.current_screen_mut().render(f, cols[i]);
             }
@@ -745,6 +754,7 @@ impl FileBrowser {
             if let Screen::Main(state) = self.panels[0].current_screen_mut() {
                 state.active = panel_has_focus;
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
+                state.pending_chord = pending_chord;
             }
             self.panels[0].current_screen_mut().render(f, area);
         }
@@ -2840,6 +2850,10 @@ impl FileBrowser {
                 self.open_pattern_rename();
                 true
             }
+            Action::Bell => {
+                self.ring_bell();
+                true
+            }
             Action::TogglePreview => {
                 self.toggle_preview();
                 true
@@ -3152,7 +3166,8 @@ impl FileBrowser {
                     | Action::Redraw
                     | Action::ToggleShallow
                     | Action::OpenSortMenu
-                    | Action::PatternRename => unreachable!(),
+                    | Action::PatternRename
+                    | Action::Bell => unreachable!(),
                     Action::None => true,
                 }
             }
@@ -3574,6 +3589,34 @@ impl FileBrowser {
             _ => return,
         };
         self.modal = Modal::SortMenu(SortMenu::new(current));
+    }
+
+    /// Ring the terminal bell.
+    ///
+    /// Written straight to stdout rather than drawn, since it is a sound and not
+    /// a thing on screen. Whether it is audible, a flash, or nothing at all is
+    /// the terminal's business — many are configured for a visual bell, and some
+    /// for neither, which is why this is not the only feedback: the status bar
+    /// shows the pending chord while it is waiting.
+    ///
+    /// Counted for tests, which cannot hear it.
+    fn ring_bell(&mut self) {
+        use std::io::Write;
+        self.bells_rung += 1;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x07");
+        let _ = out.flush();
+    }
+
+    /// How many times the bell has rung (for tests).
+    pub fn bells_rung_for_test(&self) -> usize {
+        self.bells_rung
+    }
+
+    /// The chord prefix waiting for its second key, if any (for tests and the
+    /// status bar).
+    pub fn pending_chord_for_test(&self) -> Option<char> {
+        self.key_handler.pending_chord()
     }
 
     /// The files a patterned rename would act on: the tagged set, or the
