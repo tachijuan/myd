@@ -2345,14 +2345,18 @@ impl FileBrowser {
         } else {
             Some(state.tree.size_cache.clone())
         };
-        self.active_panel_mut()
-            .screen_stack
-            .push(Screen::loading_with_source_sorted(
-                source,
-                root.clone(),
-                cache,
-                sort_mode,
-            ));
+        // Replaced rather than pushed. The stack is the navigation history, so
+        // only entering a directory belongs on it: pushing here meant `S` left a
+        // screen behind showing the *same* directory in the other mode, and the
+        // next `q` looked like it had done nothing — it popped back to the
+        // measured view of where you already were instead of returning to the
+        // parent. Toggling twice buried the real parent two screens down.
+        *self.active_panel_mut().current_screen_mut() = Screen::loading_with_source_sorted(
+            source,
+            root.clone(),
+            cache,
+            sort_mode,
+        );
 
         // The `S` toggle is the explicit change of mode the startup flag defers
         // to, so it redirects the session as well as this one directory —

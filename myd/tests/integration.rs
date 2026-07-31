@@ -10015,6 +10015,103 @@ async fn returning_to_full_measurement_asks_first() {
     assert!(!tree_is_shallow(&app), "confirming measures the tree");
 }
 
+/// Changing the traversal mode rebuilds the view; it does not navigate.
+#[tokio::test]
+async fn toggling_the_mode_does_not_deepen_the_navigation_stack() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The stack is the navigation history, so only entering a directory belongs
+    // on it. `S` used to push, which left a screen behind showing the same
+    // directory in the other mode: the next `o` popped back to where you already
+    // were and looked like it had done nothing, and two toggles buried the real
+    // parent two screens down.
+    let (_cfg, root, mut app) = shallow_app().await;
+    let depth_at_root = app.screen_stack_depth();
+
+    // Descend once, so there is a genuine parent to come back to.
+    let mut target = None;
+    for _ in 0..6 {
+        app.handle_key_for_test(char_key('j'));
+        if let myd::screen::Screen::Main(s) = app.current_screen() {
+            if s.selected_is_dir() && s.selected_path() != Some(&root.path().to_path_buf()) {
+                target = s.selected_path().cloned();
+                break;
+            }
+        }
+    }
+    let target = target.expect("a subdirectory under the cursor");
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle_into(&mut app, &target).await;
+    let depth_in_child = app.screen_stack_depth();
+    assert_eq!(
+        depth_in_child,
+        depth_at_root + 1,
+        "entering a directory is the one thing that does push"
+    );
+
+    // Toggle measuring off, then back on. Neither is a traversal.
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "S turned measuring off");
+    assert_eq!(
+        app.screen_stack_depth(),
+        depth_in_child,
+        "going shallow rebuilds the view in place"
+    );
+
+    app.handle_key_for_test(char_key('S'));
+    app.handle_key_for_test(char_key('y'));
+    settle(&mut app).await;
+    assert!(!tree_is_shallow(&app), "and back on");
+    assert_eq!(
+        app.screen_stack_depth(),
+        depth_in_child,
+        "measuring again rebuilds it in place too"
+    );
+
+    // The consequence that matters: one Ctrl-o still returns to the parent,
+    // rather than to a stale copy of the directory it was already showing.
+    app.handle_key_for_test(ctrl_key('o'));
+    settle(&mut app).await;
+    assert_eq!(
+        app.screen_stack_depth(),
+        depth_at_root,
+        "one step back leaves the panel at the root"
+    );
+    let landed = app.panel_current_dir(0).expect("a directory");
+    assert_ne!(landed, target, "and not still inside the child");
+    assert_eq!(
+        landed,
+        root.path().canonicalize().unwrap(),
+        "it is the parent the descent started from"
+    );
+}
+
+/// Re-sorting reorders the tree in memory; it does not navigate either.
+#[tokio::test]
+async fn changing_the_sort_order_does_not_deepen_the_navigation_stack() {
+    let (_cfg, _root, mut app) = shallow_app().await;
+    let depth = app.screen_stack_depth();
+
+    let before = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tree.sort_mode,
+        _ => unreachable!("settled onto a main screen"),
+    };
+    app.handle_key_for_test(char_key('s'));
+    settle(&mut app).await;
+
+    let after = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tree.sort_mode,
+        _ => unreachable!("still a main screen"),
+    };
+    assert_ne!(before, after, "s moved to the next sort order");
+    assert_eq!(
+        app.screen_stack_depth(),
+        depth,
+        "sorting reorders the nodes already loaded, so nothing is pushed"
+    );
+}
+
 #[tokio::test]
 async fn the_traversal_mode_is_remembered_per_directory() {
     let (cfg, root, mut app) = shallow_app().await;
