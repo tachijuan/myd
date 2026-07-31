@@ -9851,6 +9851,124 @@ async fn shallow_flag_applies_to_both_panes() {
     assert!(panel_is_shallow(&app, 1), "and so is the right");
 }
 
+/// Drive ticks until panel 0 is showing `dir` as a resolved Main screen.
+///
+/// `settle` returns as soon as the top screen is Main, which after Enter is
+/// still the *old* screen — the pushed loading screen has not been polled yet.
+/// Asserting on the mode there reads the directory the user just left.
+async fn settle_into(app: &mut FileBrowser, dir: &std::path::Path) {
+    use myd::screen::Screen;
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if matches!(app.current_screen(), Screen::Main(_))
+            && app.panel_current_dir(0).as_deref() == Some(dir)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("never arrived at {}", dir.display());
+}
+
+/// `-s` survives drilling into a subdirectory.
+#[tokio::test]
+async fn shallow_flag_is_honoured_when_entering_a_subdirectory() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The flag describes how the session should browse, so a subdirectory with
+    // no preference of its own inherits it. Entering one used to fall back to a
+    // full scan — the recursive walk `-s` exists to avoid.
+    let cfg = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("sub/inner")).unwrap();
+    std::fs::write(root.path().join("sub/inner/f.bin"), vec![0u8; 4_000]).unwrap();
+
+    let mut app =
+        FileBrowser::new_shallow(Some(root.path().to_path_buf()), None, false, true);
+    app.set_hosts_for_test(myd::hosts::HostCatalog::load_from_unseeded(
+        &cfg.path().join("hosts.toml"),
+    ));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "starts shallow, from the flag");
+
+    // Into "sub", which has never been recorded either way. The cursor starts on
+    // the root row, so step onto the child first.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle_into(&mut app, &root.path().join("sub")).await;
+    assert!(
+        tree_is_shallow(&app),
+        "the startup mode must hold until the user changes it in the interface"
+    );
+}
+
+/// The `S` toggle redirects the session, not just the directory it was pressed in.
+#[tokio::test]
+async fn toggling_the_mode_changes_it_for_later_directories() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // `S` is the explicit change the startup flag defers to. Turning measuring
+    // off here and walking on must not start measuring again one level down.
+    let (_cfg, root, mut app) = shallow_app().await;
+    assert!(!tree_is_shallow(&app), "starts measured");
+
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app));
+
+    // Step down to the first subdirectory, whichever it is: shallow mode sorts
+    // unmeasured directories as unknown, so the order of alpha/beta/loose.txt is
+    // not the point of this test.
+    let mut target = None;
+    for _ in 0..6 {
+        app.handle_key_for_test(char_key('j'));
+        if let myd::screen::Screen::Main(s) = app.current_screen() {
+            if s.selected_is_dir() && s.selected_path() != Some(&root.path().to_path_buf()) {
+                target = s.selected_path().cloned();
+                break;
+            }
+        }
+    }
+    let target = target.expect("a subdirectory under the cursor");
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle_into(&mut app, &target).await;
+    assert!(
+        tree_is_shallow(&app),
+        "a directory entered after S stays unmeasured"
+    );
+}
+
+/// A directory explicitly recorded as measured stays measured under `-s`.
+#[tokio::test]
+async fn a_recorded_preference_outranks_the_session_mode() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The session mode is only the fallback. Somewhere the user decided to
+    // measure is a decision about that directory, and opening the app with `-s`
+    // does not overrule it.
+    let cfg = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("sub")).unwrap();
+    std::fs::write(root.path().join("sub/f.bin"), vec![0u8; 4_000]).unwrap();
+
+    let mut hosts = myd::hosts::HostCatalog::load_from_unseeded(&cfg.path().join("hosts.toml"));
+    hosts.set_dir_shallow(&root.path().join("sub").to_string_lossy(), false);
+
+    let mut app =
+        FileBrowser::new_shallow(Some(root.path().to_path_buf()), None, false, true);
+    app.set_hosts_for_test(hosts);
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "the root follows the flag");
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle_into(&mut app, &root.path().join("sub")).await;
+    assert!(
+        !tree_is_shallow(&app),
+        "a directory recorded as measured keeps measuring"
+    );
+}
+
 #[tokio::test]
 async fn s_stops_measuring_directories() {
     // Shallow mode reports directory sizes as unknown — the same display the

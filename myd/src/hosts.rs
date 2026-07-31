@@ -716,6 +716,17 @@ impl HostCatalog {
 
     /// Whether this directory was last browsed without measuring.
     pub fn dir_is_shallow(&self, path: &str) -> bool {
+        self.dir_shallow_pref(path).unwrap_or(false)
+    }
+
+    /// This directory's remembered traversal mode, or `None` when it has never
+    /// been recorded.
+    ///
+    /// The distinction matters on arrival: a directory with no entry should
+    /// inherit the mode the session is already browsing in, whereas one recorded
+    /// as measured should stay measured even inside a shallow session. Folding
+    /// both into `false` is what made `-s` evaporate on the first `Enter`.
+    pub fn dir_shallow_pref(&self, path: &str) -> Option<bool> {
         let canonical = std::fs::canonicalize(path)
             .ok()
             .map(|p| p.to_string_lossy().to_string());
@@ -723,7 +734,6 @@ impl HostCatalog {
             .iter()
             .find(|f| f.path == path || canonical.as_deref() == Some(f.path.as_str()))
             .map(|f| f.shallow)
-            .unwrap_or(false)
     }
 
     /// Change a saved directory's path, keeping everything else about it.
