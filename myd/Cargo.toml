@@ -3,6 +3,35 @@ name = "myd"
 version = "0.25.0"
 edition = "2021"
 
+[features]
+# The diagnostic binaries in src/bin are gated behind this and off by default,
+# so `cargo build --release` produces `myd` alone. They are development tools —
+# an escape-sequence dumper, a terminal capability probe, and a headless
+# transfer benchmark — and shipping them in a release tarball invites someone to
+# run one and wonder what it is for.
+#
+#     cargo build --features tools --bin myd-transfer
+tools = []
+
+[[bin]]
+name = "myd"
+path = "src/main.rs"
+
+[[bin]]
+name = "myd-escape"
+path = "src/bin/myd-escape.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "myd-sizeprobe"
+path = "src/bin/myd-sizeprobe.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "myd-transfer"
+path = "src/bin/myd-transfer.rs"
+required-features = ["tools"]
+
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
