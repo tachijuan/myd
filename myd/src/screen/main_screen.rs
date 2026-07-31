@@ -886,13 +886,21 @@ impl MainScreenState {
         } else {
             ""
         };
+        // A remote pane says so, and says it first. "File Tree (/var/log)" is
+        // identical whether that path is on this machine or a server, which on a
+        // split with one of each is the difference between deleting your own
+        // files and someone else's. Leading like FILTERED does, for the same
+        // reason: the tail is what a narrow terminal loses.
+        let remote = self.tree.source.is_remote();
+        let kind = if remote { "SFTP" } else { "File Tree" };
         let prefix = if self.tree.filter_pattern().is_some() {
             // "FILTERED" leads, because ratatui truncates a title at the right
             // border: on a narrow terminal the tail is the first thing lost, and
             // this is the part that must not be.
             format!(
-                "{} FILTERED | File Tree ({}) | {} shown | {} dirs | {} files | ",
+                "{} FILTERED | {} ({}) | {} shown | {} dirs | {} files | ",
                 shallow_mark,
+                kind,
                 self.root_path.display(),
                 total,
                 dirs,
@@ -900,8 +908,9 @@ impl MainScreenState {
             )
         } else {
             format!(
-                "{} File Tree ({}) | {} items | {} dirs | {} files | ",
+                "{} {} ({}) | {} items | {} dirs | {} files | ",
                 shallow_mark,
+                kind,
                 self.root_path.display(),
                 total,
                 dirs,
@@ -909,7 +918,20 @@ impl MainScreenState {
             )
         };
         let sort_text = format!("Sort: {} ▾ ", self.tree.sort_mode.label());
-        let title = format!("{}{}", prefix, sort_text);
+        // Coloured rather than lengthened: the title is the most contested row in
+        // the app, and a colour costs no columns. The word "SFTP" above carries
+        // the same thing for a monochrome terminal or a reader who cannot pick
+        // the hue out — neither signal is load-bearing on its own.
+        let title = if remote {
+            Line::from(Span::styled(
+                format!("{}{}", prefix, sort_text),
+                Style::default()
+                    .fg(crate::widget::file_tree::REMOTE_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(format!("{}{}", prefix, sort_text))
+        };
 
         // Remember where "Sort: …" landed so a click on it can open the sort
         // menu. The title is drawn inside the top border starting one column in,

@@ -6571,6 +6571,63 @@ fn shallow_remote_tree(mode: ShallowSortMode) -> ShallowTree {
     .expect("remote tree should build")
 }
 
+/// A remote pane must be distinguishable from a local one at a glance.
+#[test]
+fn a_remote_title_bar_says_sftp_and_is_coloured() {
+    use myd::screen::{MainScreenState, ScreenState};
+
+    let tree = shallow_remote_tree(ShallowSortMode::Largest);
+    let mut screen =
+        MainScreenState::from_tree(std::path::PathBuf::from("/remote"), tree);
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 8)).unwrap();
+    term.draw(|f| screen.render(f, f.area())).unwrap();
+    let buf = term.backend().buffer();
+    let title: String = (0..buf.area.width).map(|x| buf[(x, 0u16)].symbol()).collect();
+
+    assert!(
+        title.contains("SFTP (/remote)"),
+        "a remote pane must name the protocol, not say 'File Tree': {}",
+        title
+    );
+    assert!(
+        !title.contains("File Tree"),
+        "and must not also claim to be a plain file tree: {}",
+        title
+    );
+
+    // The colour is the part that costs no columns, so it carries the same
+    // signal on a narrow terminal where the text is truncated away.
+    let coloured = (0..buf.area.width)
+        .any(|x| buf[(x, 0u16)].fg == myd::widget::file_tree::REMOTE_COLOR);
+    assert!(coloured, "the remote title must be drawn in REMOTE_COLOR");
+}
+
+/// A local pane keeps the plain title and is not tinted.
+#[test]
+fn a_local_title_bar_is_unchanged() {
+    use myd::screen::{MainScreenState, ScreenState, SortMode};
+    use myd::widget::file_tree::FileTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, true, true);
+    let mut screen = MainScreenState::from_tree(dir.path().to_path_buf(), tree);
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 8)).unwrap();
+    term.draw(|f| screen.render(f, f.area())).unwrap();
+    let buf = term.backend().buffer();
+    let title: String = (0..buf.area.width).map(|x| buf[(x, 0u16)].symbol()).collect();
+
+    assert!(title.contains("File Tree ("), "local keeps its title: {}", title);
+    assert!(!title.contains("SFTP"), "and says nothing about SFTP: {}", title);
+    let tinted = (0..buf.area.width)
+        .any(|x| buf[(x, 0u16)].fg == myd::widget::file_tree::REMOTE_COLOR);
+    assert!(!tinted, "a local pane must not wear the remote colour");
+}
+
 /// Names of the depth-1 entries, in render order.
 fn child_names(tree: &ShallowTree) -> Vec<String> {
     tree.lines

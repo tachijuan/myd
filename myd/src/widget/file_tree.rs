@@ -30,6 +30,23 @@ pub const GHOST_COLOR: Color = Color::Rgb(120, 180, 190);
 /// directories, since a link may point at either a file or a directory.
 pub const SYMLINK_COLOR: Color = Color::Rgb(80, 220, 220);
 
+/// Color for a remote pane's title bar — a warm violet.
+///
+/// Remote and local panes are otherwise identical on screen: same layout, same
+/// border, and a path like `/var/log` that says nothing about which machine it
+/// is on. On a split with one of each, or after connecting to a host whose paths
+/// mirror your own, there was no way to tell which pane you were about to delete
+/// from.
+///
+/// Colour rather than a longer title because the title bar is the scarcest space
+/// in the app — it already carries the path, four counts and the sort order, and
+/// ratatui truncates it at the right border. This costs no columns at all.
+///
+/// Deliberately not one of the greens, ambers or teals already spoken for by
+/// tags, filtering, ghosts and symlinks, and not the cyan of the active border,
+/// which would make "remote" and "focused" indistinguishable.
+pub const REMOTE_COLOR: Color = Color::Rgb(200, 140, 255);
+
 /// Width of the bar drawn beside the size, and of the size text column itself.
 /// Shared by the known- and unknown-size builders so the two cannot drift apart
 /// and misalign a listing that contains both.

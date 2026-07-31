@@ -309,7 +309,9 @@ sftp_test!(remote_navigation_does_not_block_the_event_loop, env, {
     let text: String = (0..buf.area.height)
         .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
         .map(|(x, y)| buf[(x, y)].symbol().to_string()).collect();
-    assert!(text.contains("File Tree"), "remote tree not rendering after navigation");
+    // A remote pane titles itself "SFTP (path)" rather than "File Tree", so the
+    // machine you are looking at is visible without reading the path.
+    assert!(text.contains("SFTP ("), "remote tree not rendering after navigation");
 });
 
 sftp_test!(remote_refresh_stays_async_and_the_app_can_quit, env, {
@@ -412,7 +414,7 @@ sftp_test!(remote_sort_and_hidden_toggle_do_not_block, env, {
     let text: String = (0..buf.area.height)
         .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
         .map(|(x, y)| buf[(x, y)].symbol().to_string()).collect();
-    assert!(text.contains("File Tree"), "remote tree not rendering after sort");
+    assert!(text.contains("SFTP ("), "remote tree not rendering after sort");
 });
 
 sftp_test!(gr_opens_remote_in_the_active_panel, env, {
