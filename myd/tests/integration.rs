@@ -10585,7 +10585,7 @@ async fn test_esc_unfocuses_the_preview_without_closing_it() {
     assert!(!app.preview_focused_for_test());
 }
 
-/// Space is now a global binding, and a two-button dialog must still refuse it.
+/// Space is now a global binding, and a question dialog must still refuse it.
 /// This is the regression that overwrote a file once: keys that are not an
 /// explicit answer have to be inert at a question.
 #[tokio::test]
@@ -10604,7 +10604,7 @@ async fn test_space_does_not_answer_a_confirm_dialog() {
     assert_eq!(
         app.modal_kind_for_test(),
         "confirm",
-        "space must not answer a two-button question"
+        "space must not answer a question"
     );
     assert!(
         !app.preview_open_for_test(),
@@ -10614,6 +10614,137 @@ async fn test_space_does_not_answer_a_confirm_dialog() {
     // Esc still cancels, leaving the file alone.
     app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
     assert_eq!(app.modal_kind_for_test(), "none");
+}
+
+// ---------------------------------------------------------------------------
+// "Always" on the delete prompt: stop asking for the rest of this session.
+// ---------------------------------------------------------------------------
+
+/// A directory of files to delete one at a time, cursor on the first.
+async fn delete_app() -> (tempfile::TempDir, myd::app::FileBrowser) {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(n), "x").unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    // The root row is the directory itself; step onto the first file.
+    app.handle_key_for_test(char_key('j'));
+    (dir, app)
+}
+
+/// The path under the cursor.
+fn selected(app: &myd::app::FileBrowser) -> std::path::PathBuf {
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => {
+            s.selected_path().cloned().expect("something is selected")
+        }
+        _ => panic!("expected a main screen"),
+    }
+}
+
+/// Drive ticks until `path` is gone, or give up.
+async fn settle_gone(app: &mut myd::app::FileBrowser, path: &std::path::Path) {
+    for _ in 0..200 {
+        app.resolve_loading_for_test();
+        if !path.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{} was never deleted", path.display());
+}
+
+#[tokio::test]
+async fn always_on_the_delete_prompt_stops_it_asking_again() {
+    let (dir, mut app) = delete_app().await;
+
+    // The first delete asks, as always.
+    app.handle_key_for_test(char_key('D'));
+    assert_eq!(app.modal_kind_for_test(), "confirm", "the first D asks");
+
+    // 'a' means "yes, and stop asking": this file goes too.
+    app.handle_key_for_test(char_key('a'));
+    assert_eq!(app.modal_kind_for_test(), "none", "answering closes it");
+    let first = selected(&app);
+    settle_gone(&mut app, &first).await;
+
+    // The next delete goes straight through with no dialog at all.
+    app.handle_key_for_test(char_key('j'));
+    let next = selected(&app);
+    app.handle_key_for_test(char_key('D'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "after 'always' the prompt must not come back"
+    );
+    settle_gone(&mut app, &next).await;
+
+    // Two of the three are gone; the fixture had no others deleted behind our back.
+    let left = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(left, 1, "exactly the two chosen files were deleted");
+}
+
+#[tokio::test]
+async fn always_lasts_only_for_this_run_of_the_app() {
+    // The whole point of keeping it in memory: a fresh app asks again. Somebody
+    // who turned the guard off while clearing out a directory should not find it
+    // still off tomorrow.
+    let (dir, mut app) = delete_app().await;
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('a'));
+    let first = selected(&app);
+    settle_gone(&mut app, &first).await;
+    drop(app);
+
+    let mut next = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut next).await;
+    next.handle_key_for_test(char_key('j'));
+    next.handle_key_for_test(char_key('D'));
+    assert_eq!(
+        next.modal_kind_for_test(),
+        "confirm",
+        "a new session must ask again"
+    );
+}
+
+#[tokio::test]
+async fn the_delete_prompt_still_takes_yes_and_no() {
+    // Adding a third button must not disturb the two answers that were already
+    // there — 'n' and Esc leave the file alone, 'y' deletes just that one.
+    let (dir, mut app) = delete_app().await;
+
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(app.modal_kind_for_test(), "none", "'n' closes the dialog");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        3,
+        "'n' must not delete anything"
+    );
+
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        3,
+        "Esc must not delete anything either"
+    );
+
+    // 'y' deletes this one, and leaves the prompt in place for the next.
+    let target = selected(&app);
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('y'));
+    settle_gone(&mut app, &target).await;
+
+    app.handle_key_for_test(char_key('D'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "'y' is a one-off, so the next delete still asks"
+    );
 }
 
 /// Motions inside the pane must not also move the tree underneath: that is what
