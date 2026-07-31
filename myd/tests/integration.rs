@@ -10573,6 +10573,92 @@ async fn test_space_opens_and_closes_the_preview() {
     assert!(!app.preview_focused_for_test(), "focus must not linger");
 }
 
+/// A default build ships one binary; the diagnostics stay behind `tools`.
+#[test]
+fn only_myd_is_built_by_default() {
+    // The three helpers in src/bin are development tools — an escape dumper, a
+    // terminal probe, a headless transfer benchmark. Cargo auto-discovers
+    // src/bin, so before they were gated they landed in every release build and
+    // in `cargo install`, which put three unexplained binaries on people's PATH.
+    //
+    // Reads the manifest rather than shelling out to cargo: the question is what
+    // the package declares, and a build here would cost a minute to answer it.
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .expect("the manifest is readable");
+
+    // Every [[bin]] other than myd itself must carry required-features.
+    let mut current: Option<String> = None;
+    let mut guarded: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut in_bin = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line == "[[bin]]" {
+            in_bin = true;
+            current = None;
+            continue;
+        }
+        if line.starts_with('[') && line != "[[bin]]" {
+            in_bin = false;
+            continue;
+        }
+        if !in_bin {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name = ") {
+            let name = rest.trim_matches('"').to_string();
+            names.push(name.clone());
+            current = Some(name);
+        }
+        if line.starts_with("required-features") {
+            if let Some(n) = current.clone() {
+                guarded.push(n);
+            }
+        }
+    }
+
+    assert!(
+        names.contains(&"myd".to_string()),
+        "myd must be declared: {:?}",
+        names
+    );
+    for name in &names {
+        if name == "myd" {
+            assert!(
+                !guarded.contains(name),
+                "myd itself must not be gated behind a feature"
+            );
+        } else {
+            assert!(
+                guarded.contains(name),
+                "{} is a development tool and needs required-features, \
+                 or it ships in every release build",
+                name
+            );
+        }
+    }
+
+    // And any file dropped into src/bin later has to be declared, since cargo
+    // would otherwise auto-discover it into the default build.
+    let bin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+        for e in entries.flatten() {
+            let file = e.file_name().to_string_lossy().to_string();
+            let Some(stem) = file.strip_suffix(".rs") else {
+                continue;
+            };
+            assert!(
+                names.iter().any(|n| n == stem),
+                "src/bin/{} is auto-discovered into the default build; \
+                 declare it as [[bin]] with required-features",
+                file
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_click_in_the_preview_scrolls_it_instead_of_the_tree_underneath() {
     // Reported: clicks went to the hidden tree. The preview covers the panels,

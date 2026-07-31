@@ -255,12 +255,15 @@ Every performance-relevant setting is an environment variable, so a slow link ca
 
 The log records connection timing, the SFTP read limit the server negotiated, and one line per file with the path taken, chunk size, window depth and achieved rate. Per-chunk latencies are accumulated into a histogram and summarised once per file, so tracing never becomes the bottleneck it is measuring.
 
-`myd-transfer` runs a single transfer with no TUI, for timing without the render loop in the way:
+`myd-transfer` runs a single transfer with no TUI, for timing without the render loop in the way. It is one of three development tools kept out of ordinary builds behind the `tools` feature — a release build produces `myd` alone — so build it explicitly:
 
 ```bash
-myd-transfer sftp://user@host/big.bin /tmp/big.bin
+cargo build --release --features tools --bin myd-transfer
+./target/release/myd-transfer sftp://user@host/big.bin /tmp/big.bin
 scripts/compare_sftp.sh user@host 512M    # myd vs the native sftp client
 ```
+
+The other two are `myd-escape`, which dumps the exact graphics escape the preview pane would send for a file, and `myd-sizeprobe`, which reports which kitty sizing keys a terminal honours. `cargo build --features tools` builds all three.
 
 ## Sort Modes
 
