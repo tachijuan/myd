@@ -15,6 +15,8 @@ pub struct Cli {
     pub right: Option<PathBuf>,
 
     /// Start in dual-panel mode (two views side by side).
+    // Also how a lone remote gets a local pane beside it: `myd sftp://host`
+    // opens the remote alone, and `--dual` puts the current directory opposite.
     #[arg(long, short = '2')]
     pub dual: bool,
 
@@ -103,11 +105,15 @@ impl Cli {
             };
         }
         if let Some(target) = as_remote(&self.path) {
-            // A second, local path shares the split; otherwise the remote takes
-            // the pane on its own and the cwd sits beside it.
-            let (local, dual) = match &self.right {
-                Some(right) => (Some(right.clone()), true),
-                None => (cwd, self.dual),
+            // A second, local path shares the split. On its own the remote gets
+            // the whole window: `myd sftp://host` used to open the cwd beside it
+            // and split, which is a layout nobody asked for — one argument, one
+            // pane. `--dual` still puts the cwd alongside for the copy pairing,
+            // which is what that flag is for.
+            let (local, dual) = match (&self.right, self.dual) {
+                (Some(right), _) => (Some(right.clone()), true),
+                (None, true) => (cwd, true),
+                (None, false) => (None, false),
             };
             return Startup::Remote {
                 target,
@@ -166,23 +172,28 @@ mod tests {
     }
 
     #[test]
-    fn a_leading_remote_still_opens_beside_the_current_directory() {
-        // The long-standing form: the remote takes a pane and the cwd sits in the
-        // other, so the two are ready to copy between.
+    fn a_lone_remote_opens_by_itself() {
+        // One argument, one pane. This used to open the cwd beside the remote
+        // and split, so connecting to a host gave a two-pane layout that was
+        // never asked for.
         let cli = Cli::try_parse_from(["myd", "sftp://gb10"]).unwrap();
         assert_eq!(
             cli.startup(Some(PathBuf::from("/cwd"))),
             Startup::Remote {
                 target: "sftp://gb10".into(),
                 panel: 0,
-                local: Some(PathBuf::from("/cwd")),
+                local: None,
                 dual: false,
                 shallow: false,
-            }
+            },
+            "a remote on its own takes the whole window"
         );
+    }
 
+    #[test]
+    fn a_leading_remote_splits_only_when_asked() {
         // With an explicit local path it shares the split rather than being
-        // dropped, which is the same pairing read the other way round.
+        // dropped — the pairing read the other way round.
         let cli = Cli::try_parse_from(["myd", "sftp://gb10", "/tmp"]).unwrap();
         assert_eq!(
             cli.startup(Some(PathBuf::from("/cwd"))),
@@ -190,6 +201,20 @@ mod tests {
                 target: "sftp://gb10".into(),
                 panel: 0,
                 local: Some(PathBuf::from("/tmp")),
+                dual: true,
+                shallow: false,
+            }
+        );
+
+        // `--dual` asks for the split without naming a second path, so the cwd
+        // fills the other pane. This is the way to get the old default back.
+        let cli = Cli::try_parse_from(["myd", "--dual", "sftp://gb10"]).unwrap();
+        assert_eq!(
+            cli.startup(Some(PathBuf::from("/cwd"))),
+            Startup::Remote {
+                target: "sftp://gb10".into(),
+                panel: 0,
+                local: Some(PathBuf::from("/cwd")),
                 dual: true,
                 shallow: false,
             }
