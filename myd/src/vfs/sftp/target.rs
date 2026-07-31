@@ -44,8 +44,26 @@ impl SftpTarget {
 
         // Split the path off the host. The first '/' starts the path; a ':'
         // before it introduces either a port or (scp-style) a path.
+        //
+        // A lone trailing '/' is dropped rather than read as the root. Typing
+        // `sftp://host/` is how a URL is habitually ended, and taking it as "/"
+        // opened the server's root instead of the home directory the same
+        // address without the slash would have given — a surprise, and a slow
+        // one on a large filesystem. `sftp://host//` still asks for the root,
+        // which is the only way left to say it explicitly.
         let (hostport, path) = match hostpart.find('/') {
-            Some(i) => (&hostpart[..i], Some(PathBuf::from(&hostpart[i..]))),
+            Some(i) => {
+                let raw = &hostpart[i..];
+                // `//` is normalised to `/` rather than passed on literally: it
+                // is a way of spelling the root here, not part of the name, and
+                // the server should be addressed with the path it expects.
+                let path = match raw {
+                    "/" => None,
+                    "//" => Some(PathBuf::from("/")),
+                    other => Some(PathBuf::from(other)),
+                };
+                (&hostpart[..i], path)
+            }
             None => (hostpart, None),
         };
 
@@ -101,6 +119,14 @@ impl SftpTarget {
         if let Some(path) = &self.path {
             let p = path.to_string_lossy();
             if !p.starts_with('/') {
+                s.push('/');
+            }
+            // The root has to be written as '//', because a single trailing
+            // slash now parses as "no path given". Saved hosts round-trip
+            // through here, so emitting "sftp://host/" for a host pinned to the
+            // root would quietly move it to the home directory the next time it
+            // was opened.
+            if p == "/" {
                 s.push('/');
             }
             s.push_str(&p);
@@ -182,8 +208,60 @@ mod tests {
 
     #[test]
     fn port_and_path_together() {
+        // The trailing slash is dropped here as everywhere else, so this is a
+        // port with no path rather than a port plus the root.
         let t = SftpTarget::parse("sftp://h:22/").unwrap();
         assert_eq!(t.port, Some(22));
+        assert_eq!(t.path, None);
+        // Spelled out, the port survives alongside the root.
+        let t = SftpTarget::parse("sftp://h:22//").unwrap();
+        assert_eq!(t.port, Some(22));
         assert_eq!(t.path, Some(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_the_root() {
+        // Ending a URL with '/' is habit, not a request for the server's root —
+        // it means the same as leaving it off, which is the default directory.
+        for s in ["sftp://gb10/", "gb10/", "sftp://me@gb10/"] {
+            let t = SftpTarget::parse(s).unwrap();
+            assert_eq!(t.host, "gb10");
+            assert_eq!(t.path, None, "{} should not select the root", s);
+        }
+    }
+
+    #[test]
+    fn a_double_slash_asks_for_the_root() {
+        // The explicit way to say "the root", now that one slash does not.
+        // Normalised to a single '/', since '//' is this app's notation rather
+        // than a path the server should be sent.
+        for s in ["sftp://gb10//", "gb10//", "sftp://me@gb10//"] {
+            let t = SftpTarget::parse(s).unwrap();
+            assert_eq!(t.host, "gb10");
+            assert_eq!(t.path, Some(PathBuf::from("/")), "{} should be the root", s);
+        }
+    }
+
+    #[test]
+    fn a_real_path_keeps_its_trailing_slash_behaviour() {
+        // Only a *lone* slash is dropped. A path that happens to end in one is
+        // still that path — the rule is about the empty case, not about
+        // stripping separators generally.
+        let t = SftpTarget::parse("sftp://gb10/srv/data/").unwrap();
+        assert_eq!(t.path, Some(PathBuf::from("/srv/data/")));
+        let t = SftpTarget::parse("sftp://gb10/srv").unwrap();
+        assert_eq!(t.path, Some(PathBuf::from("/srv")));
+    }
+
+    #[test]
+    fn the_root_round_trips_through_a_url() {
+        // Saved hosts are stored as URLs and re-parsed on use, so a saved root
+        // has to come back as the root. to_url emits "sftp://h/" for it, which
+        // now parses as the default directory — so it must emit the double
+        // slash instead.
+        let t = SftpTarget::parse("sftp://gb10//").unwrap();
+        let round = SftpTarget::parse(&t.to_url()).unwrap();
+        assert_eq!(round.path, Some(PathBuf::from("/")), "url was {}", t.to_url());
+        assert_eq!(round, t);
     }
 }
