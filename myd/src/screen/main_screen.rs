@@ -1243,7 +1243,7 @@ impl MainScreenState {
 mod tests {
     use super::*;
     use crate::utils::sizes::{CancelToken, SizeCache};
-    use crate::vfs::{BackendId, Vfs};
+    use crate::vfs::BackendId;
     use crate::widget::file_tree::FileTree;
     use crate::widget::progress::OpProgress;
     use crate::widget::source::{RemoteSource, Source};

@@ -21,6 +21,9 @@ pub enum ArchiveFormat {
     /// A single compressed file with no archive inside — `notes.txt.gz`. It has
     /// exactly one member, named after the container minus its suffix.
     Single(Compression),
+    /// A 7-Zip container. Indexed like a zip; compresses whole blocks that may
+    /// span members, so it has no per-member compressed size.
+    SevenZ,
 }
 
 /// A whole-stream compressor wrapped around a tar, or around one file.
@@ -46,6 +49,7 @@ impl ArchiveFormat {
             ArchiveFormat::Single(Compression::Bzip2) => "bzip2",
             ArchiveFormat::Single(Compression::Xz) => "xz",
             ArchiveFormat::Single(Compression::Zstd) => "zstd",
+            ArchiveFormat::SevenZ => "7z",
         }
     }
 
@@ -57,7 +61,10 @@ impl ArchiveFormat {
     /// member means decompressing the first nine again, which is why those are
     /// held decompressed rather than re-scanned per read.
     pub fn is_seekable(&self) -> bool {
-        matches!(self, ArchiveFormat::Zip | ArchiveFormat::Tar)
+        matches!(
+            self,
+            ArchiveFormat::Zip | ArchiveFormat::Tar | ArchiveFormat::SevenZ
+        )
     }
 }
 
@@ -122,6 +129,7 @@ pub fn archive_format(path: &Path) -> Option<ArchiveFormat> {
             Some(ArchiveFormat::Zip)
         }
         "tar" => Some(ArchiveFormat::Tar),
+        "7z" => Some(ArchiveFormat::SevenZ),
         "gz" => Some(ArchiveFormat::Single(Compression::Gzip)),
         "bz2" => Some(ArchiveFormat::Single(Compression::Bzip2)),
         "xz" => Some(ArchiveFormat::Single(Compression::Xz)),
@@ -207,7 +215,7 @@ mod tests {
     fn formats_we_cannot_open_are_not_claimed() {
         // These are FileCategory::Archive for the treemap's colouring, which is
         // a different question from whether anything here can list them.
-        for name in ["disk.iso", "app.dmg", "old.7z", "movie.rar", "pack.lz4"] {
+        for name in ["disk.iso", "app.dmg", "pack.lz4"] {
             assert_eq!(archive_format(Path::new(name)), None, "{name}");
         }
     }

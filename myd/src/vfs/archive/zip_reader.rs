@@ -10,7 +10,7 @@ use std::io::Cursor;
 use anyhow::{Context, Result};
 
 use super::format::ArchiveFormat;
-use super::index::{normalise, ArchiveIndex, ArchiveNode, MemberLocator, Rejection};
+use super::index::{normalise, ArchiveIndex, ArchiveNode, MemberLocator, Normalised, Rejection};
 use super::index::{MAX_EXPANSION_RATIO, MAX_MEMBERS};
 
 /// Build an index from a zip container held in memory.
@@ -44,9 +44,16 @@ pub fn index_zip(bytes: &[u8], limit: usize) -> Result<ArchiveIndex> {
         };
 
         let stored = entry.name().to_string();
-        let Some(path) = normalise(&stored) else {
-            index.rejected.push((stored, Rejection::Unsafe));
-            continue;
+        let path = match normalise(&stored) {
+            Normalised::Member(p) => p,
+            // `tar c .` writes the root as its first entry. It is not a member
+            // and not a problem, so it is skipped without a warning — counting
+            // it as an escape made every such archive look tampered with.
+            Normalised::Root => continue,
+            Normalised::Escapes => {
+                index.rejected.push((stored, Rejection::Unsafe));
+                continue;
+            }
         };
 
         let len = entry.size();

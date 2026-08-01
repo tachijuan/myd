@@ -70,9 +70,10 @@ impl ArchiveFs {
         // into it too. A compressed tar has its own decompressed stream and the
         // container is dead weight once indexed.
         let container = match format {
-            ArchiveFormat::Zip | ArchiveFormat::Tar | ArchiveFormat::Single(_) => {
-                Some(Arc::new(bytes))
-            }
+            ArchiveFormat::Zip
+            | ArchiveFormat::Tar
+            | ArchiveFormat::SevenZ
+            | ArchiveFormat::Single(_) => Some(Arc::new(bytes)),
             ArchiveFormat::TarCompressed(_) => None,
         };
 
@@ -124,6 +125,16 @@ impl ArchiveFs {
         }
 
         match node.locator {
+            // 7z is keyed on the stored name rather than the ordinal, and
+            // decompresses whole blocks that may span members — so it gets its
+            // own reader rather than sharing the zip path.
+            MemberLocator::Index(_) if self.format == ArchiveFormat::SevenZ => {
+                let container = self
+                    .container
+                    .as_ref()
+                    .context("this archive's container was not kept")?;
+                super::sevenz_reader::read_member(container, &node.stored_path)
+            }
             MemberLocator::Index(i) => {
                 let container = self
                     .container
