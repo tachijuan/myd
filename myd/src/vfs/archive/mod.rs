@@ -22,6 +22,7 @@ pub mod format;
 mod fs;
 pub mod index;
 pub mod listing;
+pub mod sevenz_reader;
 pub mod tar_reader;
 pub mod zip_reader;
 
@@ -57,6 +58,10 @@ pub fn open(
     match format {
         ArchiveFormat::Zip => Ok(Opened {
             index: zip_reader::index_zip(bytes, limit)?,
+            stream: None,
+        }),
+        ArchiveFormat::SevenZ => Ok(Opened {
+            index: sevenz_reader::index_7z(bytes, limit)?,
             stream: None,
         }),
         ArchiveFormat::Tar => Ok(Opened {

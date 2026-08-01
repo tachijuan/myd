@@ -263,28 +263,42 @@ impl ArchiveIndex {
     }
 }
 
+/// What a stored archive name turns out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Normalised {
+    /// A member, at this absolute virtual path.
+    Member(PathBuf),
+    /// The archive root itself — `.` or `./`, which `tar c .` writes as its
+    /// first entry. Not a member and not a problem: it is the directory
+    /// everything else is already inside.
+    Root,
+    /// A name that escapes the archive root, and must not be indexed.
+    Escapes,
+}
+
 /// Normalise a stored archive name into an absolute virtual path.
 ///
-/// Returns `None` for a name that escapes the archive root. Archives are
-/// untrusted input and `../../../etc/passwd` is the oldest trick there is (Zip
-/// Slip); the extract path joins these onto a real destination directory, so a
-/// name that climbs out would write outside it. Rejecting here means no later
-/// code has to remember to check.
+/// Rejects any name that escapes the archive root. Archives are untrusted input
+/// and `../../../etc/passwd` is the oldest trick there is (Zip Slip); the
+/// extract path joins these onto a real destination directory, so a name that
+/// climbs out would write outside it. Deciding here means no later code has to
+/// remember to check.
 ///
 /// Backslashes become separators: a zip written on Windows stores
 /// `docs\readme.md`, and treating that as a single filename buries the whole
 /// tree under one unopenable entry.
-pub fn normalise(stored: &str) -> Option<PathBuf> {
+pub fn normalise(stored: &str) -> Normalised {
     if stored.contains('\0') {
-        return None;
+        return Normalised::Escapes;
     }
     // A drive letter or UNC prefix is absolute on the machine that wrote it.
     let unwindowsed = stored.replace('\\', "/");
     if unwindowsed.starts_with('/') || unwindowsed.get(1..3) == Some(":/") {
-        return None;
+        return Normalised::Escapes;
     }
 
     let mut parts: Vec<&str> = Vec::new();
+    let mut climbed_out = false;
     for part in unwindowsed.split('/') {
         match part {
             // A trailing slash marks a directory; interior empties are just
@@ -294,15 +308,23 @@ pub fn normalise(stored: &str) -> Option<PathBuf> {
                 // Popping past the root is the escape we are here to stop —
                 // and `a/../../b` escapes just as surely as `../b` does, which
                 // is why this is checked after the pop rather than up front.
-                parts.pop()?;
+                if parts.pop().is_none() {
+                    climbed_out = true;
+                    break;
+                }
             }
             other => parts.push(other),
         }
     }
-    if parts.is_empty() {
-        return None;
+    if climbed_out {
+        return Normalised::Escapes;
     }
-    Some(PathBuf::from("/").join(parts.join("/")))
+    if parts.is_empty() {
+        // Everything cancelled out, so the name denotes the root. Benign for
+        // `.` or `./`; a `..` that climbed out was caught above.
+        return Normalised::Root;
+    }
+    Normalised::Member(PathBuf::from("/").join(parts.join("/")))
 }
 
 #[cfg(test)]
@@ -443,7 +465,11 @@ mod tests {
             "..",
             "a/../..",
         ] {
-            assert_eq!(normalise(name), None, "{name} must be rejected");
+            assert_eq!(
+                normalise(name),
+                Normalised::Escapes,
+                "{name} must be rejected"
+            );
         }
     }
 
@@ -451,26 +477,36 @@ mod tests {
     fn interior_parent_references_that_stay_inside_are_kept() {
         // `a/b/../c` never leaves the archive, so it is a real path and
         // rejecting it would lose a member the archive genuinely contains.
-        assert_eq!(normalise("a/b/../c"), Some(PathBuf::from("/a/c")));
-        assert_eq!(normalise("./docs/x.md"), Some(PathBuf::from("/docs/x.md")));
-        assert_eq!(normalise("a//b"), Some(PathBuf::from("/a/b")));
-        assert_eq!(normalise("dir/"), Some(PathBuf::from("/dir")));
+        assert_eq!(normalise("a/b/../c"), Normalised::Member("/a/c".into()));
+        assert_eq!(
+            normalise("./docs/x.md"),
+            Normalised::Member("/docs/x.md".into())
+        );
+        assert_eq!(normalise("a//b"), Normalised::Member("/a/b".into()));
+        assert_eq!(normalise("dir/"), Normalised::Member("/dir".into()));
     }
 
     #[test]
     fn windows_separators_are_normalised() {
         assert_eq!(
             normalise("docs\\readme.md"),
-            Some(PathBuf::from("/docs/readme.md"))
+            Normalised::Member("/docs/readme.md".into())
         );
     }
 
     #[test]
-    fn empty_and_nul_bearing_names_are_rejected() {
-        assert_eq!(normalise(""), None);
-        assert_eq!(normalise("."), None);
-        assert_eq!(normalise("/"), None);
-        assert_eq!(normalise("a\0b"), None);
+    fn the_archive_root_is_named_but_is_not_a_member() {
+        // `tar c .` writes "./" as its first entry. Treating that as an escape
+        // made every such archive report a skipped entry it did not have.
+        assert_eq!(normalise("."), Normalised::Root);
+        assert_eq!(normalise("./"), Normalised::Root);
+        assert_eq!(normalise(""), Normalised::Root);
+    }
+
+    #[test]
+    fn absolute_and_nul_bearing_names_are_rejected() {
+        assert_eq!(normalise("/"), Normalised::Escapes);
+        assert_eq!(normalise("a\0b"), Normalised::Escapes);
     }
 
     #[test]

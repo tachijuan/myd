@@ -13,7 +13,7 @@ use std::io::Read;
 use anyhow::{bail, Context, Result};
 
 use super::format::{ArchiveFormat, Compression};
-use super::index::{normalise, ArchiveIndex, ArchiveNode, MemberLocator, Rejection};
+use super::index::{normalise, ArchiveIndex, ArchiveNode, MemberLocator, Normalised, Rejection};
 use super::index::{MAX_EXPANSION_RATIO, MAX_MEMBERS};
 
 /// Largest decompressed stream held in memory.
@@ -108,9 +108,16 @@ pub fn index_tar(bytes: &[u8], format: ArchiveFormat, limit: usize) -> Result<Ar
         // Read as bytes, not as a `Path`: a tar name is arbitrary bytes and may
         // not be UTF-8, and `path()` would reject it rather than show it.
         let stored = String::from_utf8_lossy(&entry.path_bytes()).to_string();
-        let Some(path) = normalise(&stored) else {
-            index.rejected.push((stored, Rejection::Unsafe));
-            continue;
+        let path = match normalise(&stored) {
+            Normalised::Member(p) => p,
+            // `tar c .` writes the root as its first entry. It is not a member
+            // and not a problem, so it is skipped without a warning — counting
+            // it as an escape made every such archive look tampered with.
+            Normalised::Root => continue,
+            Normalised::Escapes => {
+                index.rejected.push((stored, Rejection::Unsafe));
+                continue;
+            }
         };
 
         let len = header.size().unwrap_or(0);
