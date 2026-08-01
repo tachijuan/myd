@@ -5,6 +5,7 @@
 //! already made rather than trying to model a filesystem in general. Adding a
 //! protocol means writing one `impl Vfs` and registering it; no widget changes.
 
+pub mod archive;
 mod local;
 pub mod ops;
 mod path;

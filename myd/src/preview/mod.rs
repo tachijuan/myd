@@ -163,6 +163,17 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
         return render_image(fs, req).await;
     }
 
+    // An archive previews as its table of contents. This has to come before the
+    // text sniff below, which would stop at "Binary file" — true, and useless:
+    // what someone wants to know about an archive is what is in it.
+    if let Some(format) = crate::vfs::archive::archive_format(label) {
+        let name = label
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| label.display().to_string());
+        return crate::vfs::archive::listing::preview(fs, path, format, &name).await;
+    }
+
     let meta = fs.stat(path).await?;
     if meta.is_dir {
         // Directories have their own panel; the preview has nothing to add.
@@ -257,7 +268,7 @@ async fn native_iterm_image(
 /// SFTP backends get a positioned read, which is a single round trip. Note the
 /// `Vfs` contract: a short read is legal at any point, not only at EOF, so this
 /// loops until it has what it asked for or the file ends.
-async fn read_head(fs: Arc<dyn Vfs>, path: &VPath, len: u64) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn read_head(fs: Arc<dyn Vfs>, path: &VPath, len: u64) -> anyhow::Result<Vec<u8>> {
     if fs.supports_parallel_read() {
         if let Ok(reader) = fs.open_positioned_read(path).await {
             let mut buf = Vec::with_capacity(len as usize);
