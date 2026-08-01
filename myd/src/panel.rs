@@ -133,6 +133,16 @@ impl Panel {
         let prefs = self.view_prefs;
         if let Some(Screen::Main(state)) = self.screen_stack.last_mut() {
             state.apply_view_prefs(prefs);
+            // The revealed tree is the authority on which backend this panel is
+            // showing, exactly as it is when a load resolves (see
+            // `resolve_loading_reporting`) and for the same reason. Only loads
+            // used to set this, and a pop reveals a screen that already resolved
+            // — so leaving an SFTP tree with `h` left the panel still tagged
+            // remote, and the next copy addressed the destination as
+            // `remote:/…`, which the server does not have. A pop to a `Loading`
+            // screen is left alone deliberately: it sets the backend itself when
+            // it resolves on the next tick.
+            self.backend = state.tree.source.backend();
         }
     }
 
@@ -351,4 +361,103 @@ fn expand_user(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::SortMode;
+    use crate::utils::sizes::{CancelToken, SizeCache};
+    use crate::vfs::{BackendId, Vfs};
+    use crate::widget::file_tree::FileTree;
+    use crate::widget::progress::OpProgress;
+    use crate::widget::source::{RemoteSource, Source};
+    use std::sync::Arc;
+
+    /// Build a `Screen::Main` over `path` from `source`.
+    ///
+    /// The tree is built synchronously here rather than through a loading
+    /// screen: these tests are about what a *resolved* stack does, and driving
+    /// the async load would only add a poll loop between the setup and the
+    /// assertion.
+    fn main_screen(source: Source, path: &std::path::Path) -> Screen {
+        let tree = FileTree::with_source_cancellable_progress(
+            source,
+            path.to_path_buf(),
+            SortMode::default(),
+            true,
+            true,
+            SizeCache::new(),
+            &CancelToken::new(),
+            &OpProgress::new(),
+        )
+        .expect("tree builds");
+        Screen::Main(MainScreenState::from_tree(path.to_path_buf(), tree))
+    }
+
+    /// A non-local `Source` that needs no network: `LocalFs` behind a
+    /// `RemoteSource`, the same stand-in `source.rs`'s own tests use.
+    fn nonlocal_source(id: BackendId) -> Source {
+        let vfs: Arc<dyn Vfs> = Arc::new(crate::vfs::LocalFs::new());
+        Source::Remote(RemoteSource::new(id, vfs).expect("driver thread starts"))
+    }
+
+    #[test]
+    fn popping_back_to_a_local_screen_restores_the_panel_backend() {
+        // Leaving a non-local tree with `h` used to leave the panel still
+        // tagged with the non-local backend, because only a *load* set the
+        // field and a pop reveals a screen that already resolved. The next copy
+        // or delete then addressed the wrong filesystem.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+
+        let mut panel = Panel::new_on_screen(main_screen(Source::Local, dir.path()));
+        assert_eq!(panel.backend, BackendId::LOCAL);
+
+        panel
+            .screen_stack
+            .push(main_screen(nonlocal_source(BackendId(1)), dir.path()));
+        panel.backend = BackendId(1);
+
+        panel.pop_screen();
+
+        assert_eq!(
+            panel.backend,
+            BackendId::LOCAL,
+            "popping back to a local screen must retag the panel local"
+        );
+    }
+
+    #[test]
+    fn popping_back_to_a_nonlocal_screen_restores_that_backend() {
+        // The mirror case: descending from a non-local tree into a local one
+        // and back must restore the *non-local* id, not merely reset to local.
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut panel = Panel::new_on_screen(main_screen(nonlocal_source(BackendId(3)), dir.path()));
+        panel.backend = BackendId(3);
+        panel.screen_stack.push(main_screen(Source::Local, dir.path()));
+        panel.backend = BackendId::LOCAL;
+
+        panel.pop_screen();
+
+        assert_eq!(panel.backend, BackendId(3));
+    }
+
+    #[test]
+    fn popping_to_a_screen_with_no_tree_leaves_the_backend_alone() {
+        // Only a tree can answer which backend a panel is showing. A pop onto a
+        // picker (or onto a `Loading` screen, which sets the field itself when
+        // it resolves) must not guess.
+        let dir = tempfile::tempdir().unwrap();
+        let mut panel = Panel::new_on_screen(Screen::dir_picker());
+        panel.backend = BackendId(2);
+        panel
+            .screen_stack
+            .push(main_screen(Source::Local, dir.path()));
+
+        panel.pop_screen();
+
+        assert_eq!(panel.backend, BackendId(2));
+    }
 }

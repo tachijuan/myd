@@ -277,6 +277,25 @@ impl Source {
         matches!(self, Source::Remote(_))
     }
 
+    /// What kind of thing this pane is showing, for the title.
+    ///
+    /// Reads the backend's own scheme rather than assuming every non-local
+    /// source is SFTP. A pane showing a zip that says "SFTP" is not a cosmetic
+    /// problem: it is the same category of mistake as a remote pane that says
+    /// "File Tree", which is why the title says which it is at all.
+    pub fn display_kind(&self) -> &'static str {
+        match self {
+            Source::Local | Source::LocalShallow => "File Tree",
+            Source::Remote(r) => match r.vfs.scheme() {
+                "sftp" => "SFTP",
+                "archive" => "ARCHIVE",
+                // A backend added later shows up as itself rather than as a
+                // lie; the scheme is a `&'static str` for exactly this.
+                other => other,
+            },
+        }
+    }
+
     /// Wrap a path as a [`VPath`] on this source's backend.
     fn vpath(&self, path: &Path) -> VPath {
         VPath::new(self.backend(), path.to_path_buf())
@@ -478,5 +497,25 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(src.is_dir(&dir.path().join("d")));
         assert_eq!(src.file_size(&dir.path().join("x.bin")), 42);
+    }
+
+    #[test]
+    fn display_kind_names_the_backend_rather_than_assuming_sftp() {
+        assert_eq!(Source::Local.display_kind(), "File Tree");
+        assert_eq!(Source::LocalShallow.display_kind(), "File Tree");
+
+        // A non-local source is not automatically SFTP. The title used to say
+        // so unconditionally, which would label a zip "SFTP". An unrecognised
+        // scheme shows up as itself rather than as a lie.
+        let vfs: Arc<dyn Vfs> = Arc::new(crate::vfs::LocalFs::new());
+        let src = Source::Remote(RemoteSource::new(BackendId(1), vfs).unwrap());
+        assert_eq!(src.display_kind(), "file");
+
+        let other: Arc<dyn Vfs> = crate::vfs::testing::LatencyVfs::new(
+            crate::vfs::testing::LatencyProfile::default(),
+        )
+        .shared();
+        let src = Source::Remote(RemoteSource::new(BackendId(2), other).unwrap());
+        assert_eq!(src.display_kind(), "latency");
     }
 }
