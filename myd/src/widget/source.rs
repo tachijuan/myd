@@ -296,6 +296,27 @@ impl Source {
         }
     }
 
+    /// What this source is showing the inside of, when that is not a path.
+    ///
+    /// An archive's paths are relative to its own root, so the title's `(/docs)`
+    /// says nothing about *which* archive — this supplies the container's name
+    /// to put in front of it. `None` for a source whose paths already name
+    /// themselves.
+    pub fn container_name(&self) -> Option<String> {
+        match self {
+            Source::Remote(r) if r.vfs.is_read_only() => Some(r.vfs.display_name()),
+            _ => None,
+        }
+    }
+
+    /// Whether this source refuses every mutation.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Source::Remote(r) => r.vfs.is_read_only(),
+            _ => false,
+        }
+    }
+
     /// Wrap a path as a [`VPath`] on this source's backend.
     fn vpath(&self, path: &Path) -> VPath {
         VPath::new(self.backend(), path.to_path_buf())
