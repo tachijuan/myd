@@ -24,6 +24,12 @@ pub enum ArchiveFormat {
     /// A 7-Zip container. Indexed like a zip; compresses whole blocks that may
     /// span members, so it has no per-member compressed size.
     SevenZ,
+    /// A RAR archive. Read through the system `bsdtar`; see
+    /// [`crate::vfs::archive::libarchive_reader`] for why it is not a crate.
+    Rar,
+    /// One of the formats libarchive reads that nothing here would implement on
+    /// its own: disc and package images, and the older unix archive formats.
+    Libarchive(&'static str),
 }
 
 /// A whole-stream compressor wrapped around a tar, or around one file.
@@ -50,7 +56,14 @@ impl ArchiveFormat {
             ArchiveFormat::Single(Compression::Xz) => "xz",
             ArchiveFormat::Single(Compression::Zstd) => "zstd",
             ArchiveFormat::SevenZ => "7z",
+            ArchiveFormat::Rar => "rar",
+            ArchiveFormat::Libarchive(name) => name,
         }
+    }
+
+    /// Whether this format is read by asking the system `bsdtar`.
+    pub fn needs_bsdtar(&self) -> bool {
+        matches!(self, ArchiveFormat::Rar | ArchiveFormat::Libarchive(_))
     }
 
     /// Whether members can be reached in any order without re-reading what came
@@ -130,6 +143,16 @@ pub fn archive_format(path: &Path) -> Option<ArchiveFormat> {
         }
         "tar" => Some(ArchiveFormat::Tar),
         "7z" => Some(ArchiveFormat::SevenZ),
+        "rar" => Some(ArchiveFormat::Rar),
+        // Read only if the user has bsdtar; `archive_format` claims them either
+        // way so the pane can explain what is missing rather than falling
+        // through to "binary file", which explains nothing.
+        "iso" => Some(ArchiveFormat::Libarchive("iso")),
+        "cab" => Some(ArchiveFormat::Libarchive("cab")),
+        "cpio" => Some(ArchiveFormat::Libarchive("cpio")),
+        "lha" | "lzh" => Some(ArchiveFormat::Libarchive("lha")),
+        "xar" | "pkg" => Some(ArchiveFormat::Libarchive("xar")),
+        "deb" | "rpm" => Some(ArchiveFormat::Libarchive("package")),
         "gz" => Some(ArchiveFormat::Single(Compression::Gzip)),
         "bz2" => Some(ArchiveFormat::Single(Compression::Bzip2)),
         "xz" => Some(ArchiveFormat::Single(Compression::Xz)),
@@ -215,7 +238,7 @@ mod tests {
     fn formats_we_cannot_open_are_not_claimed() {
         // These are FileCategory::Archive for the treemap's colouring, which is
         // a different question from whether anything here can list them.
-        for name in ["disk.iso", "app.dmg", "pack.lz4"] {
+        for name in ["app.dmg", "pack.lz4", "notes.txt", "image.png"] {
             assert_eq!(archive_format(Path::new(name)), None, "{name}");
         }
     }

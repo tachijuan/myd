@@ -20,6 +20,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **High-resolution images where the terminal allows** — in a terminal that implements the kitty graphics protocol (kitty, ghostty, Konsole 22.04+), iTerm2's inline images (iTerm2, WezTerm, mintty) or **sixel**, the image is handed over as real pixel data instead of being approximated with block characters. myd asks the terminal directly at startup what it supports, falling back to environment variables when there is nothing to ask. Detection is deliberately conservative, because a terminal that does not understand the sequence *prints* it — anything unrecognized falls back to blocks, which work everywhere. Override with `MYD_PREVIEW_GRAPHICS=kitty|iterm2|sixel|blocks`.
 - **Works inside tmux** — tmux parses sixel itself, so sixel is preferred there and needs no configuration beyond telling tmux your terminal supports it. The kitty and iTerm2 protocols instead ride tmux's passthrough escape, which is off by default; see *Terminal graphics* below for the two settings involved. When myd has to fall back, the preview footer says which setting would change that rather than leaving you guessing.
 - **Page through a PDF** — with a multi-page document open, `j`/`k` turn pages rather than scrolling (a rendered page is drawn to fit and has nothing to scroll); `g`/`G` jump to the first and last page, and the footer shows `page 5/19`. The page count comes from `pdfinfo` when poppler-utils is installed; without it you can still page forward, just without a known end.
+- **Archive browsing** — press `space` on a `.zip`, `.tar.gz`, `.7z`, `.rar` (and the rest) to list what is inside it, with the path exactly as the archive stores it and the permissions where the format records them. Press `Enter` to go *in*: the archive becomes an ordinary-looking tree where tagging, filtering, searching, sorting, the treemap and the preview pane all work, and `c` extracts. Directory sizes inside an archive are real recursive totals, because every member's size is already in the index. Archives are read-only here, which the pane says in its title and footer — `D`, `R`, `N` and `m` refuse rather than half-working.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
@@ -496,6 +497,74 @@ Everything works the same on a remote panel: the file is read from the server ov
 SFTP, never from a same-named path on your own machine. A remote image is fetched
 to a temporary file first (capped at 32 MB) because the renderers take a path
 rather than a stream.
+
+## Archives
+
+Press **`space`** on an archive to see what is in it, and **`Enter`** to go in.
+
+The listing shows each member's permissions, size, timestamp and **the path
+exactly as the archive stores it** — a member written as `./docs/x.md` is shown
+that way, not tidied up, because what is stored is what you are asking about. A
+format that records no permissions shows `?---------` rather than a guessed
+`0644`. Like any other preview it scrolls, and `/` searches it.
+
+Pressing `Enter` opens the archive as a panel. It is a filesystem from there on:
+tag with `t`, filter with `f`, search with `/`, sort with `s`, switch to the
+treemap with `v`, preview a file inside it with `space`. Directory sizes are
+real recursive totals — unlike a remote panel, an archive already knows every
+member's size, so the size bars and the treemap mean something.
+
+**Extracting** is the ordinary copy: `c` into the other pane in a split, or `c`
+and a destination in a single pane. Directories extract recursively. It rides
+the transfer queue, so a large extract shows progress and does not block the
+interface.
+
+**Archives are read-only.** `D`, `R`, `N` and `m` refuse with a message rather
+than appearing to work — the pane says so in its title, which names the archive
+and tints amber-brown, and in a `📦 ARCHIVE (read-only)` badge in the footer.
+Leaving with `h` puts you back where you were, with the panel retagged so the
+next delete addresses your own disk again.
+
+### Formats
+
+Read in-process, with no external tools: **zip** (and `.jar`, `.apk`, `.whl`,
+`.xpi`, …), **tar** and its compressed forms (`.tar.gz`/`.tgz`, `.tar.bz2`,
+`.tar.xz`, `.tar.zst`), single compressed files (`.gz`, `.bz2`, `.xz`, `.zst`,
+shown as the one member they hold), and **7z**.
+
+**RAR**, along with `.iso`, `.cab`, `.cpio`, `.lha`, `.xar`, `.deb` and `.rpm`,
+goes through **`bsdtar`** (libarchive) if it is on your `PATH`. That is a
+licensing decision, not a technical one: the only Rust crate that reads RAR
+vendors the non-free UnRAR C source, whose licence restricts what may be done
+with the algorithm and would be compiled into every copy of myd. libarchive has
+a RAR reader as standard, so myd asks your own copy instead. Without `bsdtar`
+these formats say what is missing rather than failing obscurely — the same
+arrangement as `timg`/`chafa` for images.
+
+Office formats are deliberately *not* treated as archives. `.docx` and `.odt`
+are zips, but a table of `word/document.xml` entries is less useful than the
+preview they get today.
+
+### Limits
+
+An archive on a **remote panel** is refused: opening one means downloading it
+whole, and that should be a copy you asked for with visible progress. Copy it
+across first.
+
+An archive **inside another archive** is refused for browsing, though `space`
+still lists it. It would compose, but the cost multiplies through a
+stream-compressed outer archive and the nesting depth is the archive's choice
+rather than yours. Extract the inner one first.
+
+Containers are read whole to be indexed and capped at 512 MB; past that, `space`
+still lists the contents. The `bsdtar` formats have no such cap, since the tool
+seeks in the file itself. Names that escape the archive root ("Zip Slip") are
+refused at index time and reported in the listing rather than silently dropped.
+
+Extraction does **not** restore the executable bit — a `chmod +x` script comes
+out of an archive non-executable. The mode is in the index and shown in the
+listing; passing it through would mean widening the write path for every
+backend.
 
 ## Dual-Panel Mode
 

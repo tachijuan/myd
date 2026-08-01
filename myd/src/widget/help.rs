@@ -128,9 +128,18 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             ],
         },
         HelpCategory {
+            title: "Archives",
+            items: &[
+                ("space", "List a zip/tar/7z/rar's contents"),
+                ("Enter", "Browse an archive as a filesystem"),
+                ("c", "Extract the tagged or selected entries"),
+                ("h", "Leave the archive"),
+            ],
+        },
+        HelpCategory {
             title: "Preview",
             items: &[
-                ("space", "Show / hide the file preview"),
+                ("space", "Show / hide the preview (archives: list)"),
                 ("j / k", "Scroll; PDF: page; image: next file"),
                 ("Ctrl+F/B", "Scroll a page (or turn one)"),
                 ("Ctrl+D/U", "Scroll half a page"),

@@ -3952,8 +3952,6 @@ impl FileBrowser {
     /// already drawn and the cancel token already works — rather than on the
     /// event loop. That is the same reason a remote directory loads there.
     fn open_archive(&mut self, container: PathBuf, format: crate::vfs::archive::ArchiveFormat) {
-        use crate::widget::source::{RemoteSource, Source};
-
         let panel = self.active_panel();
 
         // An archive inside an archive would compose — the inner container's
@@ -3992,6 +3990,20 @@ impl FileBrowser {
             return;
         }
 
+        // A format read through `bsdtar` is never held in memory: the tool
+        // seeks in the file itself, so a DVD-sized `.iso` costs nothing to open
+        // and the size cap below would refuse it for no reason.
+        if format.needs_bsdtar() {
+            if !crate::vfs::archive::libarchive_reader::available() {
+                self.modal = Modal::Confirm(ConfirmDialog::notice(
+                    crate::vfs::archive::libarchive_reader::explain_missing(format),
+                ));
+                return;
+            }
+            self.finish_opening_archive(Vec::new(), container, format);
+            return;
+        }
+
         let bytes = match std::fs::metadata(&container) {
             Ok(meta) if meta.len() > crate::vfs::archive::MAX_CONTAINER_BYTES => {
                 self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
@@ -4015,6 +4027,21 @@ impl FileBrowser {
                 }
             },
         };
+
+        self.finish_opening_archive(bytes, container, format);
+    }
+
+    /// Index a container, register it as a backend, and open a panel on it.
+    ///
+    /// `bytes` is the container's contents for the readers that parse in
+    /// process, and empty for the ones that hand the path to `bsdtar`.
+    fn finish_opening_archive(
+        &mut self,
+        bytes: Vec<u8>,
+        container: PathBuf,
+        format: crate::vfs::archive::ArchiveFormat,
+    ) {
+        use crate::widget::source::{RemoteSource, Source};
 
         let fs = match crate::vfs::archive::ArchiveFs::open(bytes, format, container.clone()) {
             Ok(fs) => std::sync::Arc::new(fs),
