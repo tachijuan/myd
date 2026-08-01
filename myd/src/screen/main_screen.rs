@@ -893,28 +893,25 @@ impl MainScreenState {
         // reason: the tail is what a narrow terminal loses.
         let remote = self.tree.source.is_remote();
         let kind = self.tree.source.display_kind();
+        // Inside an archive the path is relative to its root, so `(/docs)` on
+        // its own does not say *which* archive is open — and with two panes it
+        // could be either of two. Name it.
+        let where_ = match self.tree.source.container_name() {
+            Some(name) => format!("{} {}", name, self.root_path.display()),
+            None => self.root_path.display().to_string(),
+        };
         let prefix = if self.tree.filter_pattern().is_some() {
             // "FILTERED" leads, because ratatui truncates a title at the right
             // border: on a narrow terminal the tail is the first thing lost, and
             // this is the part that must not be.
             format!(
                 "{} FILTERED | {} ({}) | {} shown | {} dirs | {} files | ",
-                shallow_mark,
-                kind,
-                self.root_path.display(),
-                total,
-                dirs,
-                files,
+                shallow_mark, kind, where_, total, dirs, files,
             )
         } else {
             format!(
                 "{} {} ({}) | {} items | {} dirs | {} files | ",
-                shallow_mark,
-                kind,
-                self.root_path.display(),
-                total,
-                dirs,
-                files,
+                shallow_mark, kind, where_, total, dirs, files,
             )
         };
         let sort_text = format!("Sort: {} ▾ ", self.tree.sort_mode.label());
@@ -922,15 +919,22 @@ impl MainScreenState {
         // the app, and a colour costs no columns. The kind word above carries the
         // same thing for a monochrome terminal or a reader who cannot pick the
         // hue out — neither signal is load-bearing on its own.
-        let title = if remote {
-            Line::from(Span::styled(
-                format!("{}{}", prefix, sort_text),
-                Style::default()
-                    .fg(crate::widget::file_tree::REMOTE_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ))
+        let tint = if self.tree.source.is_read_only() {
+            // An archive and a server are both "not this directory tree", but
+            // only one of them is read-only, and a split showing one of each
+            // has to be tellable apart without reading the words.
+            Some(crate::widget::file_tree::ARCHIVE_COLOR)
+        } else if remote {
+            Some(crate::widget::file_tree::REMOTE_COLOR)
         } else {
-            Line::from(format!("{}{}", prefix, sort_text))
+            None
+        };
+        let title = match tint {
+            Some(colour) => Line::from(Span::styled(
+                format!("{}{}", prefix, sort_text),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            )),
+            None => Line::from(format!("{}{}", prefix, sort_text)),
         };
 
         // Remember where "Sort: …" landed so a click on it can open the sort
@@ -1142,6 +1146,25 @@ impl MainScreenState {
             }
             FocusTarget::Tree => {
                 let mut spans = Vec::new();
+                // Being somewhere read-only leads, because it is the thing that
+                // changes what the keys below do: `D`, `R`, `N` and `m` all
+                // refuse here, and finding that out by pressing one is a worse
+                // way to learn it. The title's tint says the same thing for
+                // anyone reading the top of the pane instead of the bottom.
+                if self.tree.source.is_read_only() {
+                    let width = area.width as usize;
+                    spans.push(Span::styled(
+                        if width < 60 {
+                            " 📦 RO ".to_string()
+                        } else {
+                            " 📦 ARCHIVE (read-only) ".to_string()
+                        },
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(crate::widget::file_tree::ARCHIVE_COLOR)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
                 // A tagged/visual indicator takes precedence — it's transient
                 // state the user needs to see. Prefix it before the keybindings.
                 let tagged = self.tree.tagged.len();
@@ -1213,5 +1236,83 @@ impl MainScreenState {
                 frame.render_widget(Paragraph::new(Line::from(spans)), area);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::sizes::{CancelToken, SizeCache};
+    use crate::vfs::{BackendId, Vfs};
+    use crate::widget::file_tree::FileTree;
+    use crate::widget::progress::OpProgress;
+    use crate::widget::source::{RemoteSource, Source};
+    use std::sync::Arc;
+
+    /// Render a screen over `source` and return the whole buffer as text.
+    fn rendered(source: Source, path: &std::path::Path) -> String {
+        let tree = FileTree::with_source_cancellable_progress(
+            source,
+            path.to_path_buf(),
+            SortMode::default(),
+            true,
+            true,
+            SizeCache::new(),
+            &CancelToken::new(),
+            &OpProgress::new(),
+        )
+        .expect("tree builds");
+        let mut state = MainScreenState::from_tree(path.to_path_buf(), tree);
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| state.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn archive_source() -> Source {
+        let bytes = crate::vfs::archive::zip_reader::tests::fixture();
+        let fs = crate::vfs::archive::ArchiveFs::open(
+            bytes,
+            crate::vfs::archive::ArchiveFormat::Zip,
+            std::path::PathBuf::from("/tmp/photos.zip"),
+        )
+        .expect("fixture opens");
+        Source::Remote(RemoteSource::new(BackendId(1), Arc::new(fs)).unwrap())
+    }
+
+    #[test]
+    fn an_archive_pane_says_so_in_the_title_and_the_footer() {
+        // Being read-only changes what D/R/N/m do, so it has to be visible
+        // before one of them is pressed rather than discovered by pressing one.
+        let screen = rendered(archive_source(), std::path::Path::new("/"));
+        assert!(screen.contains("ARCHIVE"), "title should say ARCHIVE:\n{screen}");
+        assert!(
+            screen.contains("photos.zip"),
+            "the title must name which archive is open — inside one, the path is \
+             just '/' and says nothing:\n{screen}"
+        );
+        assert!(
+            screen.contains("read-only"),
+            "the footer should carry the read-only badge:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_pane_carries_neither_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+        let screen = rendered(Source::Local, dir.path());
+        assert!(screen.contains("File Tree"));
+        assert!(!screen.contains("ARCHIVE"));
+        assert!(!screen.contains("read-only"));
     }
 }

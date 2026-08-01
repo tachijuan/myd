@@ -47,6 +47,15 @@ pub const SYMLINK_COLOR: Color = Color::Rgb(80, 220, 220);
 /// which would make "remote" and "focused" indistinguishable.
 pub const REMOTE_COLOR: Color = Color::Rgb(200, 140, 255);
 
+/// Title tint for a pane showing the inside of an archive.
+///
+/// Distinct from [`REMOTE_COLOR`] because the two are genuinely different
+/// places with different rules — an archive is read-only and a server is not —
+/// and a split with one of each has to be tellable apart at a glance. Amber-
+/// brown reads as "package"; it is close to [`TAG_COLOR`] in hue but that one
+/// only ever appears as a row background, never in the title.
+pub const ARCHIVE_COLOR: Color = Color::Rgb(205, 140, 60);
+
 /// Width of the bar drawn beside the size, and of the size text column itself.
 /// Shared by the known- and unknown-size builders so the two cannot drift apart
 /// and misalign a listing that contains both.
