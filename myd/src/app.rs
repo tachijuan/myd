@@ -3459,28 +3459,20 @@ impl FileBrowser {
                                 // to a remote server that has no `/private`.
                                 let dir = PathBuf::from(&value).expand_user();
                                 let src_backend = self.active_panel().backend;
-                                // Which machine the typed path names. It used to
-                                // be assumed to be the panel's own, so a local
-                                // destination typed from a remote panel was sent
-                                // to the server — `/Volumes/…` on a Mac went to
-                                // the SFTP host, which reported it missing.
-                                //
-                                // An existing local directory is taken at its
-                                // word; anything else is a path on the server,
-                                // which is the only reading that keeps a
-                                // server-side copy to a not-yet-created directory
-                                // working.
-                                let dest_backend = if !src_backend.is_local() && dir.is_dir() {
-                                    crate::vfs::BackendId::LOCAL
-                                } else {
-                                    src_backend
-                                };
-                                // Only a local destination can be checked from
-                                // here; a remote one is validated by the transfer
-                                // itself, which now reports a missing destination
-                                // directory as exactly that.
-                                let is_local = src_backend.is_local();
-                                if !is_local || dir.is_dir() {
+                                let src_read_only =
+                                    self.backends.get(src_backend).is_read_only();
+                                let dest_backend = resolve_copy_dest_backend(
+                                    src_backend,
+                                    src_read_only,
+                                    dir.is_dir(),
+                                );
+                                // A destination that can be checked here should
+                                // be, because "that is not a directory" beats a
+                                // transfer that joins the queue and fails. Only
+                                // a server's own paths cannot be checked from
+                                // this machine.
+                                let can_check_locally = src_backend.is_local() || src_read_only;
+                                if !can_check_locally || dir.is_dir() {
                                     let active = self.active;
                                     if copy_needs_transfer_queue(src_backend, dest_backend) {
                                         // Either endpoint is remote, so this goes
@@ -4273,6 +4265,20 @@ impl FileBrowser {
             return;
         }
 
+        // The archive root has no name to give the copy — `file_name()` on "/"
+        // is `None` — so the queue would skip it and nothing would happen at
+        // all. Copying the archive whole is a thing you do from the directory
+        // it sits in, where it is an ordinary file.
+        if self.active_backend_is_read_only()
+            && srcs.iter().any(|p| p.parent().is_none())
+        {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot copy the archive root from inside it. Leave the archive (h) \
+                 and copy the file itself, or copy the entries within it.",
+            ));
+            return;
+        }
+
         match self.other_index() {
             Some(other) => {
                 // Dual mode: copy into the directory the other panel's cursor is
@@ -5041,6 +5047,33 @@ pub fn copy_needs_transfer_queue(
     dest: crate::vfs::BackendId,
 ) -> bool {
     !src.is_local() || !dest.is_local()
+}
+
+/// Which backend a *typed* copy destination names.
+///
+/// The dialog gives a bare path with no way to say which machine it is on, so
+/// it has to be inferred. Three cases:
+///
+/// - From a **read-only** source there is no "over there" to copy to — an
+///   archive cannot be written — so every destination is on this machine.
+///   Without this, typing a directory that does not exist yet resolved to the
+///   archive's own backend and the extract was routed into the zip: it failed,
+///   and surfaced as a red transfer row rather than "that directory does not
+///   exist".
+/// - From a **remote** source an existing local directory is taken at its word;
+///   anything else is a path on the server, which is the only reading that
+///   keeps a server-side copy into a not-yet-created directory working.
+/// - From a **local** source it is local, there being nowhere else.
+pub fn resolve_copy_dest_backend(
+    src: crate::vfs::BackendId,
+    src_read_only: bool,
+    dest_exists_locally: bool,
+) -> crate::vfs::BackendId {
+    if src_read_only || (!src.is_local() && dest_exists_locally) {
+        crate::vfs::BackendId::LOCAL
+    } else {
+        src
+    }
 }
 
 /// The saved label for `url`, so a successful connect promotes the right entry.
