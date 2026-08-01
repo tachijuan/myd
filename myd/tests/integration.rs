@@ -11421,7 +11421,7 @@ async fn help_documents_the_preview_keys() {
     let text = help_text(&mut app, 80, 130);
     assert!(text.contains("Preview"), "no Preview category:\n{text}");
     assert!(
-        text.contains("Show / hide the file preview"),
+        text.contains("Show / hide the preview"),
         "space is not documented:\n{text}"
     );
     assert!(
@@ -12682,5 +12682,93 @@ async fn a_destination_that_does_not_exist_says_so_rather_than_failing_later() {
     assert!(
         !app.transfer_queue().has_work(),
         "nothing should have been queued"
+    );
+}
+
+/// Whether `bsdtar` is on this machine, so the tests that need it can skip
+/// rather than fail on a box without libarchive.
+fn has_bsdtar() -> bool {
+    std::process::Command::new("bsdtar")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn a_cpio_is_browsable_through_bsdtar() {
+    // The libarchive route exists for RAR, which nothing here can write a
+    // fixture for. cpio goes down the identical code path and bsdtar *can*
+    // write one, so it stands in: same parser, same reader, same extract.
+    use myd::app::FileBrowser;
+    if !has_bsdtar() {
+        eprintln!("skipping: bsdtar is not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), "hello\n").unwrap();
+    std::fs::write(src.join("sub/b.txt"), "xx\n").unwrap();
+
+    let container = dir.path().join("bundle.cpio");
+    let ok = std::process::Command::new("bsdtar")
+        .args(["-cf".as_ref(), container.as_os_str(), "--format".as_ref(), "cpio".as_ref(), "src".as_ref()])
+        .current_dir(dir.path())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "bsdtar could not write the fixture");
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.cpio");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    assert_eq!(app.panel_current_dir(0).unwrap(), std::path::Path::new("/"));
+    assert!(!app.panel_backend_for_test(0).is_local());
+
+    // And a member extracts with its real bytes, which is the half that runs a
+    // second process rather than reading an index.
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    cursor_onto(&mut app, "src");
+    app.handle_key_for_test(char_key('c'));
+    for ch in out.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_copy(&mut app).await;
+
+    let landed = out.join("src/a.txt");
+    for _ in 0..400 {
+        app.tick_for_test();
+        app.tick_transfers_for_test();
+        if landed.is_file() && !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&landed).unwrap(), "hello\n");
+}
+
+#[tokio::test]
+async fn help_documents_the_archive_keys() {
+    // The help list is where a binding is discovered; one that is not in it may
+    // as well not exist.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('?'));
+    let text = help_text(&mut app, 80, 160);
+    assert!(text.contains("Archives"), "no Archives category:\n{text}");
+    assert!(
+        text.contains("Browse an archive"),
+        "entering an archive is not documented:\n{text}"
     );
 }

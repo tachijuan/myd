@@ -63,7 +63,7 @@ impl ArchiveFs {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| origin.display().to_string());
 
-        let Opened { index, stream } = super::open(&bytes, format, &label, usize::MAX)
+        let Opened { index, stream } = super::open(&bytes, &origin, format, usize::MAX)
             .with_context(|| format!("could not read {label}"))?;
 
         // A zip seeks into the container per read; a plain tar's offsets point
@@ -74,7 +74,12 @@ impl ArchiveFs {
             | ArchiveFormat::Tar
             | ArchiveFormat::SevenZ
             | ArchiveFormat::Single(_) => Some(Arc::new(bytes)),
-            ArchiveFormat::TarCompressed(_) => None,
+            // A compressed tar has its own decompressed stream, and the
+            // bsdtar-backed formats re-read the file per member — neither has
+            // any use for a second copy of the container.
+            ArchiveFormat::TarCompressed(_)
+            | ArchiveFormat::Rar
+            | ArchiveFormat::Libarchive(_) => None,
         };
 
         Ok(Self {
@@ -121,6 +126,17 @@ impl ArchiveFs {
                 "{} is {} — too large to extract in one piece",
                 path.display(),
                 crate::utils::sizes::format_size(node.len)
+            );
+        }
+
+        // The bsdtar-backed formats have no locator: the tool is asked for the
+        // member by name and re-reads the container itself. That is a process
+        // per member, which is why these are the formats of last resort.
+        if self.format.needs_bsdtar() {
+            return super::libarchive_reader::read_member_via_bsdtar(
+                &self.origin,
+                &node.stored_path,
+                self.format,
             );
         }
 

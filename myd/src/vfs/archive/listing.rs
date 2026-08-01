@@ -56,6 +56,21 @@ pub async fn preview(
     format: ArchiveFormat,
     label: &str,
 ) -> Result<PreviewContent> {
+    // The bsdtar-backed formats hand the file to a child process, so they need
+    // a real path on this machine — which a file on a remote panel is not.
+    if format.needs_bsdtar() && !path.is_local() {
+        return Ok(PreviewContent::Note {
+            message: format!(
+                "Listing a {} archive needs it on this machine. Copy it here first (c).",
+                format.label()
+            ),
+        });
+    }
+    if format.needs_bsdtar() && !super::libarchive_reader::available() {
+        return Ok(PreviewContent::Note {
+            message: super::libarchive_reader::explain_missing(format),
+        });
+    }
     let meta = fs.stat(path).await?;
     if meta.len == 0 {
         return Ok(PreviewContent::Note {
@@ -71,13 +86,21 @@ pub async fn preview(
         });
     }
 
-    let bytes = crate::preview::read_head(fs, path, meta.len).await?;
+    // The bsdtar formats read the file themselves; only the in-process readers
+    // need it in memory, and reading a DVD-sized .iso to list it would be
+    // absurd when the tool can seek within it.
+    let bytes = if format.needs_bsdtar() {
+        Vec::new()
+    } else {
+        crate::preview::read_head(fs, path, meta.len).await?
+    };
 
     // Parsing is CPU-bound over a buffer that may be a hundred megabytes; on an
     // async worker it would block every other task sharing that thread.
     let label = label.to_string();
+    let container = path.as_path().to_path_buf();
     let content = tokio::task::spawn_blocking(move || {
-        let index = super::read_index(&bytes, format, &label, MAX_PREVIEW_MEMBERS)?;
+        let index = super::read_index(&bytes, &container, format, MAX_PREVIEW_MEMBERS)?;
         Ok::<_, anyhow::Error>(render(&index, &label, format))
     })
     .await??;

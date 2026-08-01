@@ -21,6 +21,7 @@
 pub mod format;
 mod fs;
 pub mod index;
+pub mod libarchive_reader;
 pub mod listing;
 pub mod sevenz_reader;
 pub mod tar_reader;
@@ -45,17 +46,30 @@ pub struct Opened {
     pub stream: Option<Vec<u8>>,
 }
 
-/// Index a container held in memory.
+/// Index a container.
 ///
 /// The one place that maps a format onto a reader, so adding a format is one
 /// arm here plus one module beside `zip_reader`.
+///
+/// Takes both the bytes and the path they came from: the in-process readers
+/// parse the bytes, while the ones that shell out to `bsdtar` hand it the path,
+/// since a child process cannot be given a slice.
 pub fn open(
     bytes: &[u8],
+    container: &std::path::Path,
     format: ArchiveFormat,
-    container_name: &str,
     limit: usize,
 ) -> Result<Opened> {
+    let container_name = container
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let container_name = container_name.as_str();
     match format {
+        ArchiveFormat::Rar | ArchiveFormat::Libarchive(_) => Ok(Opened {
+            index: libarchive_reader::index_via_bsdtar(container, format, limit)?,
+            stream: None,
+        }),
         ArchiveFormat::Zip => Ok(Opened {
             index: zip_reader::index_zip(bytes, limit)?,
             stream: None,
@@ -92,9 +106,9 @@ pub fn open(
 /// For a listing, which never reads a member's contents.
 pub fn read_index(
     bytes: &[u8],
+    container: &std::path::Path,
     format: ArchiveFormat,
-    container_name: &str,
     limit: usize,
 ) -> Result<ArchiveIndex> {
-    Ok(open(bytes, format, container_name, limit)?.index)
+    Ok(open(bytes, container, format, limit)?.index)
 }
