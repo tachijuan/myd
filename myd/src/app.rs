@@ -189,6 +189,13 @@ pub struct FileBrowser {
     move_dest_dir: PathBuf,
     /// Live filesystem backends. Index 0 is always the local filesystem.
     backends: BackendRegistry,
+    /// Archives opened this session, keyed by the container's path.
+    ///
+    /// The registry cannot unregister, so re-entering an archive has to reuse
+    /// its backend: browsing in and out of one zip a dozen times would
+    /// otherwise leave a dozen copies of its index resident, each with its own
+    /// driver thread. Re-entry is also then instant, since the index is built.
+    archive_backends: std::collections::HashMap<PathBuf, crate::widget::source::Source>,
     /// Queued and running transfers, drained by the event loop each tick.
     transfers: TransferQueue,
     /// Manual override for the transfer sidebar's visibility.
@@ -427,6 +434,7 @@ impl FileBrowser {
             dest_probe: None,
             copy_source_panel: 0,
             backends: BackendRegistry::new(),
+            archive_backends: std::collections::HashMap::new(),
             transfers: TransferQueue::default(),
             transfer_panel_override: None,
             connect_task: None,
@@ -1309,6 +1317,15 @@ impl FileBrowser {
     pub fn selected_name_for_test(&self) -> Option<String> {
         match self.panels[self.active].current_screen() {
             Screen::Main(state) => state.tree.selected_line().map(|l| l.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// The text of whichever modal is up, for tests that assert a refusal says
+    /// the right thing — the wording *is* the feature for a guard.
+    pub fn modal_message_for_test(&self) -> Option<String> {
+        match &self.modal {
+            Modal::Confirm(d) => Some(d.message.clone()),
             _ => None,
         }
     }
@@ -2383,6 +2400,15 @@ impl FileBrowser {
     /// keystroke.
     fn toggle_shallow(&mut self) {
         let panel = self.active_panel();
+        // An archive is also not local, but for the opposite reason: its sizes
+        // are already exact, so there is nothing a walk would discover.
+        if self.backends.get(panel.backend).is_read_only() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "An archive's directory sizes are already exact — every member's \
+                 size is in its index, so there is nothing to measure.",
+            ));
+            return;
+        }
         if !panel.backend.is_local() {
             self.modal = Modal::Confirm(ConfirmDialog::notice(
                 "Remote directories are never measured — a recursive walk over \
@@ -2461,6 +2487,15 @@ impl FileBrowser {
     /// which is the same trap that made remote copies land in the wrong place.
     fn open_selection_externally(&mut self) {
         let panel = self.active_panel();
+        // Both cases are "there is no path on this machine to hand over", but
+        // the fix differs enough to be worth saying which one applies.
+        if self.backends.get(panel.backend).is_read_only() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot open a file inside an archive with a local application. \
+                 Copy it out first (c), then open the copy.",
+            ));
+            return;
+        }
         if !panel.backend.is_local() {
             self.modal = Modal::Confirm(ConfirmDialog::notice(
                 "Cannot open remote files with a local application. Copy it across first (c).",
@@ -2702,6 +2737,9 @@ impl FileBrowser {
                 true
             }
             Action::CreateDir => {
+                if self.refuse_if_read_only("create directories") {
+                    return true;
+                }
                 self.modal_target = Some(ModalTarget::CreateDir);
                 self.modal = Modal::Input(InputDialog::new("New directory name:", "name"));
                 true
@@ -2797,6 +2835,22 @@ impl FileBrowser {
                 // answers for whichever view has focus — asking the tree directly
                 // meant Enter on a treemap tile consulted the tree's cursor, which
                 // is somewhere else entirely.
+                // Enter on an archive browses its contents rather than doing
+                // nothing. Checked before the directory case, since an archive
+                // is a file and would otherwise fall through it.
+                if let Screen::Main(state) = panel.current_screen() {
+                    if !state.selected_is_dir() {
+                        let archive = state.selected_path().and_then(|p| {
+                            crate::vfs::archive::archive_format(p).map(|f| (p.clone(), f))
+                        });
+                        if let Some((path, format)) = archive {
+                            self.open_archive(path, format);
+                            return true;
+                        }
+                    }
+                }
+
+                let panel = self.active_panel_mut();
                 let target = if let Screen::Main(state) = panel.current_screen() {
                     if state.selected_is_dir() {
                         state.selected_path().cloned().map(|p| {
@@ -2900,6 +2954,12 @@ impl FileBrowser {
                 true
             }
             Action::Delete => {
+                // Refused up front rather than left to the backend: the delete
+                // task discards its error and the rows leave the tree either
+                // way, so a backend-level failure would look like it worked.
+                if self.refuse_if_read_only("delete files") {
+                    return true;
+                }
                 // Tagged files are the operation set; fall back to the cursor
                 // selection when nothing is tagged. Extract before touching the
                 // modal fields so the panel borrow ends first.
@@ -2942,6 +3002,9 @@ impl FileBrowser {
                 true
             }
             Action::Rename => {
+                if self.refuse_if_read_only("rename files") {
+                    return true;
+                }
                 let target = match self.active_panel().current_screen() {
                     Screen::Main(state) => state.selected_path().cloned(),
                     _ => None,
@@ -3050,6 +3113,24 @@ impl FileBrowser {
                 true
             }
             Action::Expand => {
+                // `l` on an archive enters it, matching Enter. An archive is a
+                // file, so the expand below would otherwise do nothing at all.
+                if let Screen::Main(state) = self.active_panel().current_screen() {
+                    let is_dir = state
+                        .tree
+                        .selected_line()
+                        .map(|l| l.is_dir)
+                        .unwrap_or(false);
+                    if !is_dir {
+                        let archive = state.selected_path().and_then(|p| {
+                            crate::vfs::archive::archive_format(p).map(|f| (p.clone(), f))
+                        });
+                        if let Some((path, format)) = archive {
+                            self.open_archive(path, format);
+                            return true;
+                        }
+                    }
+                }
                 // On a remote panel, expanding a directory in place would run
                 // the SFTP round trips on the event-loop thread and lock the UI.
                 // Route it through the async loading screen instead, exactly as
@@ -3691,6 +3772,9 @@ impl FileBrowser {
 
     /// Open the patterned-rename dialog over the tagged files.
     fn open_pattern_rename(&mut self) {
+        if self.refuse_if_read_only("rename files") {
+            return;
+        }
         let targets = self.rename_targets();
         if targets.is_empty() {
             return;
@@ -3841,6 +3925,131 @@ impl FileBrowser {
 
         self.connect_task = Some(ConnectTask { rx, target_panel });
         self.modal = Modal::Operation { verb: "Connecting" };
+    }
+
+    /// Whether the active panel's backend refuses mutations.
+    ///
+    /// Distinct from "not local": a server is remote and writable, an archive
+    /// is local and is not.
+    fn active_backend_is_read_only(&self) -> bool {
+        self.backends
+            .get(self.active_panel().backend)
+            .is_read_only()
+    }
+
+    /// Refuse a mutation on a read-only backend, saying why and what to do.
+    ///
+    /// Returns `true` when the caller should stop. Follows the shape
+    /// `open_selection_externally` established for "this operation does not
+    /// apply to this backend": a notice, and no state touched.
+    fn refuse_if_read_only(&mut self, verb: &str) -> bool {
+        if !self.active_backend_is_read_only() {
+            return false;
+        }
+        self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+            "Cannot {verb} inside an archive — archives are read-only here. \
+             Copy what you need out first (c), then work on the copy."
+        )));
+        true
+    }
+
+    /// Open the selected archive as a panel, browsing its contents as files.
+    ///
+    /// Reading and indexing the container is blocking work, so it happens
+    /// inside the loading screen's `spawn_blocking` — where the spinner is
+    /// already drawn and the cancel token already works — rather than on the
+    /// event loop. That is the same reason a remote directory loads there.
+    fn open_archive(&mut self, container: PathBuf, format: crate::vfs::archive::ArchiveFormat) {
+        use crate::widget::source::{RemoteSource, Source};
+
+        let panel = self.active_panel();
+
+        // An archive inside an archive would compose — the inner container's
+        // bytes come from the outer one — but the cost multiplies through a
+        // stream format and the nesting depth is the archive's to choose, not
+        // ours. Extracting first is one keystroke.
+        if self.backends.get(panel.backend).is_read_only() {
+            let name = container
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                "Cannot open an archive inside another archive. \
+                 Copy '{name}' out first (c), then open it."
+            )));
+            return;
+        }
+
+        // The container has to be read whole to be indexed, which over a
+        // network is a download the user did not ask for. Copying it across
+        // first makes that transfer explicit, and shows its progress.
+        if !panel.backend.is_local() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot browse an archive on a remote panel — it would have to be \
+                 downloaded whole first. Copy it here (c), then open it.",
+            ));
+            return;
+        }
+
+        // Already open: reuse it, so the index is built once however many times
+        // the user steps in and out.
+        if let Some(source) = self.archive_backends.get(&container).cloned() {
+            self.active_panel_mut()
+                .screen_stack
+                .push(Screen::loading_remote(source, PathBuf::from("/"), None));
+            return;
+        }
+
+        let bytes = match std::fs::metadata(&container) {
+            Ok(meta) if meta.len() > crate::vfs::archive::MAX_CONTAINER_BYTES => {
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                    "This archive is {} — too large to open. Press space to list its \
+                     contents instead.",
+                    crate::utils::sizes::format_size(meta.len())
+                )));
+                return;
+            }
+            // Read on the event loop: this is one local read of a file already
+            // bounded above, and threading it through a second async state
+            // machine to save a few milliseconds is not worth the machinery.
+            // The *indexing* is the slow part, and that runs on the pool.
+            _ => match std::fs::read(&container) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                        "Could not read this archive: {e}"
+                    )));
+                    return;
+                }
+            },
+        };
+
+        let fs = match crate::vfs::archive::ArchiveFs::open(bytes, format, container.clone()) {
+            Ok(fs) => std::sync::Arc::new(fs),
+            Err(e) => {
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!("{e}")));
+                return;
+            }
+        };
+
+        let backend = self.backends.register(fs.clone());
+        let source = match RemoteSource::new(backend, fs) {
+            Ok(s) => Source::Remote(s),
+            Err(e) => {
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                    "Could not open this archive: {e}"
+                )));
+                return;
+            }
+        };
+        self.archive_backends.insert(container, source.clone());
+
+        // A fresh size cache, not the panel's: cache keys are bare paths, and
+        // every archive has a `/README.md`. Sharing one would have two
+        // different archives reporting each other's sizes.
+        self.active_panel_mut()
+            .screen_stack
+            .push(Screen::loading_remote(source, PathBuf::from("/"), None));
     }
 
     /// Whether the active panel is showing a remote (non-local) tree.
@@ -4444,6 +4653,13 @@ impl FileBrowser {
     /// no matter how large the files are; across backends the bytes are copied
     /// and the sources removed only once their copies have landed.
     fn start_move(&mut self) {
+        // A move out of an archive is a copy followed by deleting the source,
+        // and the delete cannot happen — so it is a copy wearing the wrong
+        // name. Say so rather than half-doing it.
+        if self.refuse_if_read_only("move files out of") {
+            return;
+        }
+
         let mut srcs = self.active_panel().current_screen().tagged_paths();
         if srcs.is_empty() {
             if let Some(p) = self.active_panel().selected_resolved_path() {
@@ -4462,6 +4678,12 @@ impl FileBrowser {
             ));
             return;
         };
+        if self.backends.get(self.panels[other].backend).is_read_only() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot move files into an archive — archives are read-only here.",
+            ));
+            return;
+        }
         // The cursor's directory, matching copy — see `Panel::dest_dir`.
         let Some(dest_dir) = self.panels[other].dest_dir() else {
             return;
