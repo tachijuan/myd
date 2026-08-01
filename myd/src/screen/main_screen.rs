@@ -892,7 +892,7 @@ impl MainScreenState {
         // files and someone else's. Leading like FILTERED does, for the same
         // reason: the tail is what a narrow terminal loses.
         let remote = self.tree.source.is_remote();
-        let kind = if remote { "SFTP" } else { "File Tree" };
+        let kind = self.tree.source.display_kind();
         let prefix = if self.tree.filter_pattern().is_some() {
             // "FILTERED" leads, because ratatui truncates a title at the right
             // border: on a narrow terminal the tail is the first thing lost, and
@@ -919,9 +919,9 @@ impl MainScreenState {
         };
         let sort_text = format!("Sort: {} ▾ ", self.tree.sort_mode.label());
         // Coloured rather than lengthened: the title is the most contested row in
-        // the app, and a colour costs no columns. The word "SFTP" above carries
-        // the same thing for a monochrome terminal or a reader who cannot pick
-        // the hue out — neither signal is load-bearing on its own.
+        // the app, and a colour costs no columns. The kind word above carries the
+        // same thing for a monochrome terminal or a reader who cannot pick the
+        // hue out — neither signal is load-bearing on its own.
         let title = if remote {
             Line::from(Span::styled(
                 format!("{}{}", prefix, sort_text),
