@@ -77,7 +77,7 @@ pub async fn preview(
     // async worker it would block every other task sharing that thread.
     let label = label.to_string();
     let content = tokio::task::spawn_blocking(move || {
-        let index = super::read_index(&bytes, format, MAX_PREVIEW_MEMBERS)?;
+        let index = super::read_index(&bytes, format, &label, MAX_PREVIEW_MEMBERS)?;
         Ok::<_, anyhow::Error>(render(&index, &label, format))
     })
     .await??;
@@ -93,20 +93,28 @@ pub fn render(index: &ArchiveIndex, label: &str, format: ArchiveFormat) -> Previ
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let total = index.total_len();
-    let stored = index.total_compressed();
-    let ratio = match stored.checked_mul(100).and_then(|s| s.checked_div(total)) {
-        Some(pct) => format!(", {}% of size", pct.min(100)),
-        // An archive of nothing but empty files and directories has no ratio to
-        // report, and neither does one whose sizes overflow a u64 multiply.
-        None => String::new(),
+    let n = index.declared_members;
+    // Only a zip compresses its members individually, so only a zip can say
+    // what each one cost. A tar's members are stored whole and the compression,
+    // where there is any, is applied to the container afterwards — quoting a
+    // per-member total there would report the uncompressed size twice and call
+    // the second one "stored".
+    let stored = if format == ArchiveFormat::Zip {
+        let compressed = index.total_compressed();
+        match compressed.checked_mul(100).and_then(|c| c.checked_div(total)) {
+            Some(pct) => format!(", {} stored, {pct}%", format_size(compressed)),
+            // Nothing but empty files and directories: no ratio to report.
+            None => String::new(),
+        }
+    } else {
+        String::new()
     };
     lines.push(Line::from(Span::styled(
         format!(
-            "{label} — {}, {} members, {} uncompressed ({} stored{ratio})",
+            "{label} — {}, {n} member{}, {} uncompressed{stored}",
             format.label(),
-            index.declared_members,
+            if n == 1 { "" } else { "s" },
             format_size(total),
-            format_size(stored),
         ),
         Style::default().add_modifier(Modifier::BOLD),
     )));
@@ -136,6 +144,8 @@ pub fn render(index: &ArchiveIndex, label: &str, format: ArchiveFormat) -> Previ
     }
     lines.push(Line::from(""));
 
+    let per_member_ratios = format == ArchiveFormat::Zip;
+
     // Sorted by virtual path so a directory's contents follow it, which is how
     // the tree will show them; the stored name is what is *displayed*, but
     // ordering by it would interleave `./a` and `a` arbitrarily.
@@ -148,8 +158,11 @@ pub fn render(index: &ArchiveIndex, label: &str, format: ArchiveFormat) -> Previ
         } else {
             format_size(node.len)
         };
-        let ratio = match (node.is_dir, node.len) {
-            (false, len) if len > 0 => {
+        // Per-member only where the format stores one. A tar's rows would all
+        // read 100%, which looks like a measurement rather than the absence of
+        // one.
+        let ratio = match (per_member_ratios, node.is_dir, node.len) {
+            (true, false, len) if len > 0 => {
                 format!("{:>4}%", (node.compressed_len * 100 / len).min(999))
             }
             _ => format!("{:>5}", "—"),
@@ -324,6 +337,48 @@ mod tests {
         assert!(text[0].contains("fixture.zip"));
         assert!(text[0].contains("zip"));
         assert!(text[0].contains("members"));
+    }
+
+    #[test]
+    fn a_lone_member_is_not_pluralised() {
+        use crate::vfs::archive::format::Compression;
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"hello\n").unwrap();
+        let gz = enc.finish().unwrap();
+
+        let index =
+            crate::vfs::archive::tar_reader::index_single(&gz, "note.txt.gz", Compression::Gzip)
+                .unwrap();
+        let text = text_of(&render(
+            &index,
+            "note.txt.gz",
+            ArchiveFormat::Single(Compression::Gzip),
+        ));
+        assert!(text[0].contains("1 member,"), "got {:?}", text[0]);
+    }
+
+    #[test]
+    fn only_a_zip_claims_per_member_compression() {
+        // A tar stores its members whole; the compression, where there is any,
+        // wraps the container. Quoting a per-member ratio there would print
+        // 100% on every row and read as a measurement rather than its absence.
+        let tar = crate::vfs::archive::tar_reader::tests::fixture_tar();
+        let index =
+            crate::vfs::archive::tar_reader::index_tar(&tar, ArchiveFormat::Tar, 10_000).unwrap();
+        let text = text_of(&render(&index, "a.tar", ArchiveFormat::Tar));
+
+        assert!(
+            !text[0].contains("stored"),
+            "a tar header must not quote a stored total, got {:?}",
+            text[0]
+        );
+        let row = text.iter().find(|l| l.ends_with("run.sh")).unwrap();
+        assert!(!row.contains('%'), "got {row:?}");
+
+        // The zip case still does, which is the point of distinguishing them.
+        let zip = text_of(&fixture_listing());
+        assert!(zip[0].contains("stored"));
     }
 
     #[test]

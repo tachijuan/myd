@@ -19,27 +19,77 @@
 //! trait for every backend.
 
 pub mod format;
+mod fs;
 pub mod index;
 pub mod listing;
+pub mod tar_reader;
 pub mod zip_reader;
 
 pub use format::{archive_format, ArchiveFormat};
+pub use fs::{ArchiveFs, MAX_CONTAINER_BYTES};
 pub use index::ArchiveIndex;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-/// Build an index from a container held in memory.
+/// An indexed container, together with whatever bytes reading its members needs.
+///
+/// A compressed tar has to be decompressed before it can be indexed at all, and
+/// the resulting stream is what member offsets point into — so it has to be kept
+/// alongside the index rather than thrown away and rebuilt per read.
+pub struct Opened {
+    pub index: ArchiveIndex,
+    /// Bytes that [`index::MemberLocator::StreamOffset`] offsets index into:
+    /// the container itself for a plain tar, the decompressed stream for a
+    /// compressed one. `None` when members are located another way.
+    pub stream: Option<Vec<u8>>,
+}
+
+/// Index a container held in memory.
 ///
 /// The one place that maps a format onto a reader, so adding a format is one
-/// arm here and one module beside `zip_reader`.
-pub fn read_index(bytes: &[u8], format: ArchiveFormat, limit: usize) -> Result<ArchiveIndex> {
+/// arm here plus one module beside `zip_reader`.
+pub fn open(
+    bytes: &[u8],
+    format: ArchiveFormat,
+    container_name: &str,
+    limit: usize,
+) -> Result<Opened> {
     match format {
-        ArchiveFormat::Zip => zip_reader::index_zip(bytes, limit),
-        // Reached only once `archive_format` claims these, which it does not
-        // yet. Named individually so adding a reader is a compile error here
-        // rather than a silent fallthrough.
-        ArchiveFormat::Tar | ArchiveFormat::TarCompressed(_) | ArchiveFormat::Single(_) => {
-            bail!("{} archives cannot be listed yet", format.label())
+        ArchiveFormat::Zip => Ok(Opened {
+            index: zip_reader::index_zip(bytes, limit)?,
+            stream: None,
+        }),
+        ArchiveFormat::Tar => Ok(Opened {
+            index: tar_reader::index_tar(bytes, format, limit)?,
+            // Offsets are into the container as it stands, which the caller
+            // already has; no second copy.
+            stream: None,
+        }),
+        ArchiveFormat::TarCompressed(how) => {
+            let stream = tar_reader::decompress(bytes, how)?;
+            let index = tar_reader::index_tar(&stream, format, limit)?;
+            Ok(Opened {
+                index,
+                stream: Some(stream),
+            })
         }
+        ArchiveFormat::Single(how) => Ok(Opened {
+            index: tar_reader::index_single(bytes, container_name, how)?,
+            // The single member's bytes are the whole decompressed stream, so
+            // it is rebuilt on read rather than held twice.
+            stream: None,
+        }),
     }
+}
+
+/// Index a container, keeping only the index.
+///
+/// For a listing, which never reads a member's contents.
+pub fn read_index(
+    bytes: &[u8],
+    format: ArchiveFormat,
+    container_name: &str,
+    limit: usize,
+) -> Result<ArchiveIndex> {
+    Ok(open(bytes, format, container_name, limit)?.index)
 }

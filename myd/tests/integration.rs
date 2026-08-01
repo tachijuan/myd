@@ -12318,3 +12318,228 @@ async fn the_sort_order_survives_a_shallow_toggle() {
         "going shallow must not reset the order"
     );
 }
+
+// ==== Archive support ====
+
+/// Build a zip in `dir` with a known shape: a nested tree, an executable, and a
+/// name that escapes the archive root.
+fn archive_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::io::Write;
+    let path = dir.join("bundle.zip");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut w = zip::ZipWriter::new(file);
+    let exec: zip::write::FileOptions<'_, ()> =
+        zip::write::FileOptions::default().unix_permissions(0o755);
+    let plain: zip::write::FileOptions<'_, ()> =
+        zip::write::FileOptions::default().unix_permissions(0o644);
+
+    w.start_file("run.sh", exec).unwrap();
+    w.write_all(b"#!/bin/sh\necho hi\n").unwrap();
+    w.start_file("docs/deep/notes.md", plain).unwrap();
+    w.write_all(b"# notes\n").unwrap();
+    w.start_file("../escape.txt", plain).unwrap();
+    w.write_all(b"nope\n").unwrap();
+    w.finish().unwrap();
+    path
+}
+
+/// Move the cursor onto the entry named `name`, or panic saying what was there.
+fn cursor_onto(app: &mut myd::app::FileBrowser, name: &str) {
+    for _ in 0..40 {
+        if app.selected_name_for_test().as_deref() == Some(name) {
+            return;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    panic!("never reached {name}");
+}
+
+#[tokio::test]
+async fn enter_on_an_archive_browses_its_contents() {
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    // The panel is now rooted at the archive root, on its own backend.
+    assert_eq!(app.panel_current_dir(0).unwrap(), std::path::Path::new("/"));
+    assert!(
+        !app.panel_backend_for_test(0).is_local(),
+        "an archive panel must not be tagged as the local filesystem, or a copy \
+         out of it would be a plain std::fs copy of paths that do not exist"
+    );
+}
+
+#[tokio::test]
+async fn leaving_an_archive_restores_the_local_backend() {
+    // Otherwise the next delete or copy addresses the archive — which discards
+    // its errors, so it would look like it worked.
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(!app.panel_backend_for_test(0).is_local());
+
+    // `h` at the root pops back out.
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert!(
+        app.panel_backend_for_test(0).is_local(),
+        "coming out of an archive must retag the panel local"
+    );
+}
+
+#[tokio::test]
+async fn mutations_inside_an_archive_are_refused_with_a_reason() {
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    for (k, expected) in [
+        ('D', "delete"),
+        ('R', "rename"),
+        ('N', "create directories"),
+    ] {
+        app.handle_key_for_test(char_key(k));
+        assert_eq!(app.modal_kind_for_test(), "confirm", "{k} was not refused");
+        let msg = app.modal_message_for_test().unwrap_or_default();
+        assert!(
+            msg.contains(expected) && msg.contains("archive"),
+            "{k} refused with the wrong message: {msg:?}"
+        );
+        // Dismiss before the next one.
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    }
+}
+
+#[tokio::test]
+async fn a_delete_inside_an_archive_leaves_the_tree_alone() {
+    // The guard has to be at the UI, not the backend: the delete task discards
+    // its error and the rows leave the tree regardless of whether anything was
+    // removed, so a backend-only refusal would look like a successful delete.
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "run.sh");
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('y'));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "run.sh");
+    assert_eq!(
+        app.selected_name_for_test().as_deref(),
+        Some("run.sh"),
+        "the member must still be in the tree"
+    );
+}
+
+#[tokio::test]
+async fn an_archive_inside_an_archive_is_refused() {
+    use myd::app::FileBrowser;
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+
+    // An outer zip whose only member is the fixture zip.
+    let inner = {
+        let d = tempfile::tempdir().unwrap();
+        let p = archive_fixture(d.path());
+        let bytes = std::fs::read(p).unwrap();
+        (d, bytes)
+    };
+    let outer = dir.path().join("outer.zip");
+    {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+        let o: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        w.start_file("inner.zip", o).unwrap();
+        w.write_all(&inner.1).unwrap();
+        w.finish().unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "outer.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "inner.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("archive inside another archive"),
+        "nesting should be refused, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn re_entering_an_archive_reuses_its_backend() {
+    // The registry cannot unregister, so a second registration per visit would
+    // leave one index and one driver thread resident per trip.
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        cursor_onto(&mut app, "bundle.zip");
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+        settle(&mut app).await;
+        seen.push(app.panel_backend_for_test(0));
+        app.handle_key_for_test(char_key('h'));
+        settle(&mut app).await;
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "the same archive must reuse one backend across visits"
+    );
+    assert_eq!(seen[1], seen[2]);
+}
+
+#[tokio::test]
+async fn directory_sizes_inside_an_archive_are_real_totals() {
+    // Unlike a remote panel, where a recursive walk is unaffordable: every
+    // member's size is already in the index.
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    let myd::screen::Screen::Main(state) = app.current_screen() else {
+        panic!("expected a main screen");
+    };
+    assert!(
+        state.tree.measures_directories(),
+        "an archive knows its sizes and should say so"
+    );
+}

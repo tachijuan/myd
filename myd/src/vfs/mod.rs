@@ -241,6 +241,20 @@ pub trait Vfs: Send + Sync {
     fn has_recursive_sizes(&self) -> bool {
         false
     }
+
+    /// Whether this backend refuses every mutation.
+    ///
+    /// An archive is browsable but not writable. The UI consults this to refuse
+    /// the destructive keys up front, because letting the backend fail instead
+    /// is invisible: `spawn_delete_batch` discards the error and the row leaves
+    /// the tree regardless, so the files would *appear* to have been deleted.
+    ///
+    /// Distinct from `!BackendId::is_local()`, which several call sites use to
+    /// mean "reached over a network". A remote filesystem is writable; an
+    /// archive is local and is not.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }
 
 /// The set of live backends, indexed by [`BackendId`].
