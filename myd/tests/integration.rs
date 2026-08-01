@@ -12543,3 +12543,144 @@ async fn directory_sizes_inside_an_archive_are_real_totals() {
         "an archive knows its sizes and should say so"
     );
 }
+
+#[test]
+fn a_typed_destination_from_an_archive_is_always_local() {
+    use myd::app::resolve_copy_dest_backend;
+    use myd::vfs::BackendId;
+
+    let archive = BackendId(2);
+    // The bug this replaced: a directory that does not exist yet resolved to
+    // the archive's own backend, so the extract was routed into the zip. It
+    // failed, and showed up as a red transfer row instead of "that directory
+    // does not exist".
+    assert_eq!(
+        resolve_copy_dest_backend(archive, true, false),
+        BackendId::LOCAL
+    );
+    assert_eq!(
+        resolve_copy_dest_backend(archive, true, true),
+        BackendId::LOCAL
+    );
+
+    // A server is different: an unrecognised path names somewhere on it, which
+    // is what keeps a server-side copy into a new directory working.
+    let remote = BackendId(1);
+    assert_eq!(resolve_copy_dest_backend(remote, false, false), remote);
+    assert_eq!(
+        resolve_copy_dest_backend(remote, false, true),
+        BackendId::LOCAL
+    );
+
+    // From a local panel there is nowhere else to mean.
+    assert_eq!(
+        resolve_copy_dest_backend(BackendId::LOCAL, false, true),
+        BackendId::LOCAL
+    );
+    assert_eq!(
+        resolve_copy_dest_backend(BackendId::LOCAL, false, false),
+        BackendId::LOCAL
+    );
+}
+
+#[tokio::test]
+async fn extracting_a_member_writes_its_real_bytes() {
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "run.sh");
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "input", "expected the dest prompt");
+    for ch in out.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    // Nothing on screen shows the typed destination, so it is listed in the
+    // background first and the overwrite prompts follow from that.
+    settle_copy(&mut app).await;
+
+    // The extract rides the transfer queue, so let it drain.
+    let landed = out.join("run.sh");
+    for _ in 0..400 {
+        app.tick_for_test();
+        app.tick_transfers_for_test();
+        if landed.is_file() && !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&landed).unwrap(),
+        "#!/bin/sh\necho hi\n",
+        "the extracted file must hold the member's real bytes"
+    );
+}
+
+#[tokio::test]
+async fn copying_the_archive_root_from_inside_is_refused() {
+    // `file_name()` of "/" is None, so the queue would skip it and nothing at
+    // all would happen — a silent no-op is the worst of the options.
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    // The cursor starts on the root row.
+    app.handle_key_for_test(char_key('c'));
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("archive root"),
+        "expected a refusal naming the root, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_that_does_not_exist_says_so_rather_than_failing_later() {
+    // Before the read-only branch, a typed directory that did not exist yet
+    // resolved to the archive's own backend: the extract was routed into the
+    // zip, `open_write` refused, and it surfaced as a red transfer row reading
+    // "remote:/…". The user's actual mistake — a typo in the path — was
+    // nowhere on screen.
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+    let missing = dir.path().join("no-such-dir");
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "run.sh");
+    app.handle_key_for_test(char_key('c'));
+    for ch in missing.to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("is not a directory"),
+        "expected a plain refusal, got {msg:?}"
+    );
+    assert!(
+        !app.transfer_queue().has_work(),
+        "nothing should have been queued"
+    );
+}
