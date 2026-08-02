@@ -13077,3 +13077,32 @@ async fn the_picker_claims_no_traversal_for_a_remote_target() {
         "a remote target must not be labelled with a traversal mode:\n{rendered}"
     );
 }
+
+/// The help must document that `t` tags in the treemap, not only the tree.
+///
+/// The tree-only guard on `t` was invisible precisely because nothing said
+/// which views it applied to. A help screen that goes quiet about the
+/// distinction is how the bug stayed unnoticed, so the text is asserted.
+#[tokio::test]
+async fn help_documents_tagging_in_both_views() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('?'));
+    // Tall enough that the whole list is on screen at once.
+    let text = help_text(&mut app, 100, 200);
+
+    assert!(
+        text.contains("Tag / untag the selected tile"),
+        "the Treemap section must say t tags a tile:\n{text}"
+    );
+    assert!(
+        text.contains("tree or treemap"),
+        "the tagging section must say t works in both views:\n{text}"
+    );
+    assert!(
+        text.contains("V (visual range) needs the tree view"),
+        "and that V is the tree-only exception:\n{text}"
+    );
+}

@@ -11,7 +11,8 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree, `Enter` to open a directory, and `v` again to return to the tree with the same entry highlighted. Directory tiles end in a `/`.
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
-- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`) or delete (`D`) every tagged file at once. Tagged rows are highlighted. Untag one with `t`, all with `U`.
+- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`), delete (`D`) or bulk-rename (`gr`) every tagged file at once. Tagging works in the treemap as well as the tree, and both share one set of tags, so switching views with `v` never changes what is staged. Tagged rows are highlighted and tagged tiles carry a `▶` marker and a green outline. Untag one with `t`, all with `U`.
+- **Patterned rename** — `gr` renames every tagged file by regex, with `$1` for the first capture group. The dialog previews the pattern against the first tagged file before it is applied, and files the pattern doesn't match are skipped rather than treated as failures.
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item.
@@ -21,7 +22,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Works inside tmux** — tmux parses sixel itself, so sixel is preferred there and needs no configuration beyond telling tmux your terminal supports it. The kitty and iTerm2 protocols instead ride tmux's passthrough escape, which is off by default; see *Terminal graphics* below for the two settings involved. When myd has to fall back, the preview footer says which setting would change that rather than leaving you guessing.
 - **Page through a PDF** — with a multi-page document open, `j`/`k` turn pages rather than scrolling (a rendered page is drawn to fit and has nothing to scroll); `g`/`G` jump to the first and last page, and the footer shows `page 5/19`. The page count comes from `pdfinfo` when poppler-utils is installed; without it you can still page forward, just without a known end.
 - **Archive browsing** — press `space` on a `.zip`, `.tar.gz`, `.7z`, `.rar` (and the rest) to list what is inside it, with the path exactly as the archive stores it and the permissions where the format records them. Press `Enter` to go *in*: the archive becomes an ordinary-looking tree where tagging, filtering, searching, sorting, the treemap and the preview pane all work, and `c` extracts. Directory sizes inside an archive are real recursive totals, because every member's size is already in the index. Archives are read-only here, which the pane says in its title and footer — `D`, `R`, `N` and `m` refuse rather than half-working.
-- **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`.
+- **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`, or pick one outright from a numbered menu with `gs` (`gs5` is "sort by newest" as one gesture; clicking the `Sort:` indicator opens the same menu).
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
 - **Rename, move and delete** — rename with `R`, move to the other panel with `m`, delete with `D`. Like `mv`, a move within one filesystem is a rename (instant, whatever the file size); a move between two different hosts goes through the transfer queue like a copy — with per-file progress, rate and ETA in the transfer panel — and removes each source only once its copy has landed. If a name is already taken at the destination you're asked whether to overwrite it, skip that file, or cancel the whole move. All of these work on remote panels too.
@@ -31,7 +32,7 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 - **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
 - **Remote browsing over SFTP** — connect from the `gd` picker (pick a saved host, or type an `sftp://` URL into its path field) or launch with `myd sftp://[user@]host[:port][/path]`, and browse it in the active panel. A remote pane titles itself `SFTP (path)` in violet rather than `File Tree` in the ordinary colour, so on a split you can tell at a glance which machine a pane is showing. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Remote trees are fully manageable: create directories (`N`), rename (`R`), delete (`D`) and move (`m`) all act on the server. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
 - **Saved hosts** — kept in the same `gd` picker as your directories, most recently connected first, with vi navigation (`j`/`k`/`g`/`G`), `/` to search, and `a`/`e`/`d` to add, edit and delete entries. Saved to `~/.config/myd/hosts.toml`, which you can edit by hand. **Passwords are never stored** — an entry holds only where to connect and as whom, and authentication still goes through `ssh-agent`, your `~/.ssh` keys, or a prompt.
-- **Shallow traversal** — press `S` to browse without measuring directory sizes, or start that way with `--shallow` (`-s`), which applies to both panes of a split. The recursive walk is the slowest thing myd does, and over a large archive or a network mount it is rarely worth waiting for just to look around; unmeasured directories show a dash and sort last, exactly as remote ones do. Turning measuring back on asks first, and the choice is remembered per directory — `S` in the `gd` picker sets it for a saved directory without opening it.
+- **Shallow traversal** — press `S` to browse without measuring directory sizes, or start that way with `--shallow` (`-s`), which applies to both panes of a split. The recursive walk is the slowest thing myd does, and over a large archive or a network mount it is rarely worth waiting for just to look around; unmeasured directories show a dash and sort last, exactly as remote ones do. Turning measuring back on asks first, and the choice is remembered per directory — `S` in the `gd` picker sets it for a saved directory without opening it. The flag combines with `-d`, carrying through the picker to whatever you choose from it, and the picker's path field names the mode a path will open in — `shallow` or `full` — so which traversal you'll get is visible before `Enter`.
 - **Open with the desktop** — press `o` to hand the selected file or directory to the system's default application (`open` on macOS, `xdg-open` on Linux and the BSDs). The launcher runs detached, so myd stays responsive and nothing it prints disturbs the display.
 - **Mouse support** — scroll with the wheel, click to focus a panel and select a row or treemap tile, right-click to open a directory. Press `Ctrl+N` to release the mouse when you want your terminal's own text selection back.
 - **Non-blocking transfers** — copy (`c`) tagged files between a remote panel and a local one and the transfer runs in the background: the interface stays fully interactive, so you can keep browsing and queue more. Up to 16 transfers run at once and the rest stack up, and the files within a directory are copied concurrently — which is what makes a folder of small files usable over a high-latency link.
@@ -86,6 +87,7 @@ myd --directory               # or -d, matching the gd chord
 
 # Skip measuring directory sizes — handy on a network mount or a huge archive
 myd --shallow /mnt/archive    # or -s; applies to both panes of a split
+myd -s -d                     # carries through the picker to whatever you pick
 
 # Dual-panel mode — two independent views side by side
 myd --dual                    # split; left panel picks a directory
@@ -125,8 +127,9 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 
 | Key       | Action                                 |
 |-----------|----------------------------------------|
-| `D`       | Delete tagged / selected (confirmation)|
+| `D`       | Delete tagged / selected (`y` / `n` / `a` to stop asking) |
 | `R`       | Rename                                  |
+| `gr`      | Rename every tagged file by regex       |
 | `N`       | Create a new directory here            |
 | `S`       | Browse without measuring directories    |
 | `o`       | Open with the system default app        |
@@ -136,14 +139,17 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 
 | Key       | Action                                        |
 |-----------|-----------------------------------------------|
-| `t`       | Tag / untag the file under the cursor          |
-| `V`       | Visual mode — sweep `j`/`k` to tag a range     |
+| `t`       | Tag / untag the selection (tree **or** treemap) |
+| `V`       | Visual mode — sweep `j`/`k` to tag a range (tree only) |
 | `U`       | Untag everything                               |
 | `c`       | Copy tagged / selected files                   |
 | `m`       | Move tagged / selected files to the other panel |
 | `D`       | Delete tagged / selected files                 |
+| `gr`      | Rename every tagged file by regex              |
 
-Tagged files are highlighted; `c`, `m` and `D` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
+Tagged files are highlighted; `c`, `m`, `D` and `gr` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
+
+`t` works in both views, and the two share a single set of tags — switching with `v` never changes what is staged. `V` is the exception: a visual range is a span of consecutive rows, and the treemap's tiles have no such order, so it applies in the tree view only and says so if pressed in the treemap.
 
 ### Search & Filter
 
@@ -162,6 +168,7 @@ Search wraps around at the ends. Filtering hides non-matching entries at every l
 |-----------|-------------------------------|
 | `v`       | Toggle tree / treemap view    |
 | `s`       | Cycle sort mode               |
+| `gs`      | Pick a sort order from a numbered menu (`gs5` = newest) |
 | `H`       | Toggle hidden files           |
 | `B`       | Toggle size bars              |
 | `P`       | Toggle permissions column     |
@@ -243,6 +250,7 @@ Every performance-relevant setting is an environment variable, so a slow link ca
 |---------------------------|---------|---------------------------------------------------|
 | `MYD_SSH_WINDOW`          | 64 MiB  | SSH channel window — the hard ceiling on in-flight data (`window / rtt`) |
 | `MYD_SSH_NODELAY`         | `true`  | Disable Nagle on the SSH socket                   |
+| `MYD_SSH_MAX_PACKET`      | 32 KiB  | SSH maximum packet size — russh's default; exposed only so it can be ruled out, and raising it risks a disconnect from strict servers |
 | `MYD_SFTP_WRITE_LIMIT`    | 16 MiB  | Outstanding bytes on the sequential write path    |
 | `MYD_SFTP_MAX_PENDING`    | 1024    | SFTP requests in flight on one connection         |
 | `MYD_CHUNK_SIZE`          | 256 KiB | Bytes per chunk (one wire request on the parallel path) |
@@ -317,15 +325,19 @@ Press `v` to toggle between the file tree and a squarified treemap. The treemap 
 
 Each tile is filled with a color for its content category — **code**, **docs**, **images**, **video**, **audio**, **archives**, **data**, **binaries**, or **other**. A file's color comes from its extension; a directory takes the color of the category holding most of its bytes. A legend in the status bar names the categories currently on screen. When a tile is too narrow to show its full name, the selected item's name appears in the status bar instead.
 
+Tiles can be tagged with `t` exactly as tree rows can, and the two views share one set of tags — `c`, `m` and `D` act on the same set from either. A tagged tile shows a `▶` marker and a green outline. Visual mode (`V`) is the one exception, and stays tree-only; see *Tagging & Multi-File Operations*.
+
 ## Tagging & Multi-File Operations
 
 Most operations act on a single file — the one under the cursor. To act on several at once, **tag** them first:
 
-- Press **`t`** to tag (or untag) the file under the cursor. Tagged rows are highlighted with a bright marker so their staged state is obvious.
-- Press **`V`** to enter **visual mode**, then move with `j`/`k` to sweep-tag a whole range. Leaving visual mode keeps the tags, so you can re-enter it elsewhere to tag files that aren't next to each other.
+- Press **`t`** to tag (or untag) the current selection. Tagged rows are highlighted with a bright marker so their staged state is obvious. This works in the **treemap** as well as the tree — a tagged tile carries a `▶` marker and a green outline, so it reads as tagged even when it is too small for a label. Both views share one set of tags, so switching with `v` never changes what is staged.
+- Press **`V`** to enter **visual mode**, then move with `j`/`k` to sweep-tag a whole range. Leaving visual mode keeps the tags, so you can re-enter it elsewhere to tag files that aren't next to each other. Visual mode is tree-only: a range is a span of consecutive rows and the treemap's squarified tiles have no such order, so pressing `V` there says so rather than doing nothing.
 - Press **`U`** to clear every tag.
 
-Once files are tagged, **`c`** (copy) and **`D`** (delete) operate on the entire tagged set instead of just the cursor. Copying tagged files into another directory prompts once per name collision; deleting asks for a single confirmation. Tags are cleared automatically when the operation completes. When nothing is tagged, `c` and `D` fall back to the file under the cursor.
+Once files are tagged, **`c`** (copy), **`m`** (move), **`D`** (delete) and **`gr`** (patterned rename) operate on the entire tagged set instead of just the cursor. Copying tagged files into another directory prompts once per name collision; deleting asks for a single confirmation (`y`, `n`, or `a` to stop asking for the session). Tags are cleared automatically when the operation completes. When nothing is tagged, these fall back to the file under the cursor.
+
+**`gr`** renames the whole tagged set by regex: enter a pattern and a replacement, where `$1` is the first capture group, and `Tab` moves between the two fields. The dialog previews the transformation against the first tagged file, so the pattern can be checked before it runs. Files the pattern doesn't match are skipped rather than reported as failures — tagging a mixed set and renaming only part of it is the ordinary case.
 
 Large copies and deletes show a progress overlay with an item-by-item count and bar.
 

@@ -108,6 +108,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("v", "Toggle TREE/TREEMAP view"),
                 ("j / k / h / l", "Navigate treemap tiles"),
                 ("G / gg", "First / Last tile"),
+                ("t", "Tag / untag the selected tile"),
+                ("", "V (visual range) needs the tree view"),
             ],
         },
         HelpCategory {
@@ -155,8 +157,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
         HelpCategory {
             title: "Tagging & selection",
             items: &[
-                ("t", "Tag / untag file under cursor"),
-                ("V", "Visual mode: tag a range as you move"),
+                ("t", "Tag / untag the selection (tree or treemap)"),
+                ("V", "Visual mode: tag a range as you move (tree)"),
                 ("U", "Untag all files"),
                 ("c", "Copy tagged files (or selection)"),
                 ("m", "Move tagged files (or selection)"),
