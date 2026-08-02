@@ -4046,7 +4046,7 @@ impl FileBrowser {
         let fs = match crate::vfs::archive::ArchiveFs::open(bytes, format, container.clone()) {
             Ok(fs) => std::sync::Arc::new(fs),
             Err(e) => {
-                self.modal = Modal::Confirm(ConfirmDialog::notice(format!("{e}")));
+                self.modal = Modal::Confirm(ConfirmDialog::notice(explain_error(&e)));
                 return;
             }
         };
@@ -5074,6 +5074,24 @@ pub fn copy_needs_transfer_queue(
     dest: crate::vfs::BackendId,
 ) -> bool {
     !src.is_local() || !dest.is_local()
+}
+
+/// An error with everything that caused it, for a dialog.
+///
+/// `format!("{e}")` on an `anyhow::Error` prints only the outermost context, so
+/// a failure wrapped in "could not read geeu.rar" showed exactly that and threw
+/// away the part that said *why* — which was the only useful half. The chain is
+/// joined rather than nested because the dialog is prose, not a stack trace.
+pub fn explain_error(e: &anyhow::Error) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for cause in e.chain() {
+        let text = cause.to_string();
+        // A context line that merely repeats its cause adds nothing but width.
+        if !text.is_empty() && !seen.iter().any(|s| s == &text) {
+            seen.push(text);
+        }
+    }
+    seen.join(": ")
 }
 
 /// Which backend a *typed* copy destination names.
