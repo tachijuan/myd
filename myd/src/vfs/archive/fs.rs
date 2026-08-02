@@ -73,13 +73,12 @@ impl ArchiveFs {
             ArchiveFormat::Zip
             | ArchiveFormat::Tar
             | ArchiveFormat::SevenZ
+            | ArchiveFormat::Rar
             | ArchiveFormat::Single(_) => Some(Arc::new(bytes)),
             // A compressed tar has its own decompressed stream, and the
             // bsdtar-backed formats re-read the file per member — neither has
             // any use for a second copy of the container.
-            ArchiveFormat::TarCompressed(_)
-            | ArchiveFormat::Rar
-            | ArchiveFormat::Libarchive(_) => None,
+            ArchiveFormat::TarCompressed(_) | ArchiveFormat::Libarchive(_) => None,
         };
 
         Ok(Self {
@@ -132,7 +131,7 @@ impl ArchiveFs {
         // The bsdtar-backed formats have no locator: the tool is asked for the
         // member by name and re-reads the container itself. That is a process
         // per member, which is why these are the formats of last resort.
-        if self.format.needs_bsdtar() {
+        if matches!(self.format, ArchiveFormat::Libarchive(_)) {
             return super::libarchive_reader::read_member_via_bsdtar(
                 &self.origin,
                 &node.stored_path,
@@ -186,6 +185,13 @@ impl ArchiveFs {
                     .get(start..end)
                     .context("this member points outside the archive")?;
                 Ok(bytes.to_vec())
+            }
+            MemberLocator::ByName => {
+                let container = self
+                    .container
+                    .as_ref()
+                    .context("this archive's container was not kept")?;
+                super::rar_reader::read_member(container, &node.stored_path, node.len)
             }
             MemberLocator::None => Ok(Vec::new()),
         }

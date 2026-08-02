@@ -532,14 +532,15 @@ Read in-process, with no external tools: **zip** (and `.jar`, `.apk`, `.whl`,
 `.tar.xz`, `.tar.zst`), single compressed files (`.gz`, `.bz2`, `.xz`, `.zst`,
 shown as the one member they hold), and **7z**.
 
-**RAR**, along with `.iso`, `.cab`, `.cpio`, `.lha`, `.xar`, `.deb` and `.rpm`,
-goes through **`bsdtar`** (libarchive) if it is on your `PATH`. That is a
-licensing decision, not a technical one: the only Rust crate that reads RAR
-vendors the non-free UnRAR C source, whose licence restricts what may be done
-with the algorithm and would be compiled into every copy of myd. libarchive has
-a RAR reader as standard, so myd asks your own copy instead. Without `bsdtar`
-these formats say what is missing rather than failing obscurely — the same
-arrangement as `timg`/`chafa` for images.
+**RAR** is read in process by [`rars`](https://lib.rs/crates/rars), which is
+pure Rust and MIT/Apache. It handles all three RAR generations, including solid
+archives, so it needs nothing installed.
+
+`.iso`, `.cab`, `.cpio`, `.lha`, `.xar`, `.deb` and `.rpm` go through
+**`bsdtar`** (libarchive) if it is on your `PATH` — the long tail nobody would
+write a reader for individually. Without `bsdtar` these say what is missing
+rather than failing obscurely, the same arrangement as `timg`/`chafa` for
+images.
 
 Office formats are deliberately *not* treated as archives. `.docx` and `.odt`
 are zips, but a table of `word/document.xml` entries is less useful than the

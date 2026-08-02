@@ -70,6 +70,7 @@ zstd = "0.13"
 # dependencies, so a separate dev entry would not have kept it out of the
 # release binary — it would only have hidden that it was there.
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["bzip2", "ppmd", "util", "aes256", "deflate", "zstd", "compress"] }
+rars = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

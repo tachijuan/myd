@@ -754,15 +754,15 @@ compressed forms (\fB.tar.gz\fR/\fB.tgz\fR, \fB.tar.bz2\fR, \fB.tar.xz\fR,
 \fB.tar.zst\fR), single compressed files (\fB.gz\fR, \fB.bz2\fR, \fB.xz\fR,
 \fB.zst\fR, shown as the one member they hold), and \fB7z\fR.
 .PP
-\fBRAR\fR, along with \fB.iso\fR, \fB.cab\fR, \fB.cpio\fR, \fB.lha\fR,
-\fB.xar\fR, \fB.deb\fR and \fB.rpm\fR, is read through \fBbsdtar\fR(1)
-(libarchive) when it is on the \fBPATH\fR. This is a licensing decision rather
-than a technical one: the only Rust crate that reads RAR vendors the non\-free
-UnRAR C source, whose licence restricts what may be done with the algorithm and
-would be compiled into every copy of myd. libarchive carries a RAR reader as
-standard, so myd asks the system's own copy. Without \fBbsdtar\fR these formats
-report what is missing rather than failing obscurely \(em the same arrangement
-as \fBtimg\fR/\fBchafa\fR for images.
+\fBRAR\fR is read in process by the \fBrars\fR crate, which is pure Rust and
+handles all three RAR generations including solid archives. Nothing needs to be
+installed for it.
+.PP
+\fB.iso\fR, \fB.cab\fR, \fB.cpio\fR, \fB.lha\fR, \fB.xar\fR, \fB.deb\fR and
+\fB.rpm\fR are read through \fBbsdtar\fR(1) (libarchive) when it is on the
+\fBPATH\fR \(em the long tail nobody would write a reader for individually.
+Without \fBbsdtar\fR these report what is missing rather than failing obscurely,
+the same arrangement as \fBtimg\fR/\fBchafa\fR for images.
 .PP
 Office formats are deliberately not treated as archives. \fB.docx\fR and
 \fB.odt\fR are zips, but a table of \fBword/document.xml\fR entries is less

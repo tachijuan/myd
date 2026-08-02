@@ -37,6 +37,10 @@ pub enum MemberLocator {
     Index(usize),
     /// A byte range within the (possibly decompressed) stream.
     StreamOffset { offset: u64, len: u64 },
+    /// Found by its stored name, because the format has no per-member offset
+    /// worth recording — a solid RAR shares one compression window across
+    /// members, so the tenth cannot be decoded without the nine before it.
+    ByName,
     /// A directory, or an entry with no data of its own.
     None,
 }

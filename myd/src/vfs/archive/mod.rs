@@ -23,6 +23,7 @@ mod fs;
 pub mod index;
 pub mod libarchive_reader;
 pub mod listing;
+pub mod rar_reader;
 pub mod sevenz_reader;
 pub mod tar_reader;
 pub mod zip_reader;
@@ -66,7 +67,14 @@ pub fn open(
         .unwrap_or_default();
     let container_name = container_name.as_str();
     match format {
-        ArchiveFormat::Rar | ArchiveFormat::Libarchive(_) => Ok(Opened {
+        // RAR is read in process. It used to go through `bsdtar`, whose RAR4
+        // support is partial — which is why some RAR files opened and others
+        // did not.
+        ArchiveFormat::Rar => Ok(Opened {
+            index: rar_reader::index_rar(bytes, limit)?,
+            stream: None,
+        }),
+        ArchiveFormat::Libarchive(_) => Ok(Opened {
             index: libarchive_reader::index_via_bsdtar(container, format, limit)?,
             stream: None,
         }),
