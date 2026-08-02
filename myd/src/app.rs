@@ -468,7 +468,11 @@ impl FileBrowser {
     pub fn new_on_picker_with_hosts_for_test(hosts: HostCatalog) -> Self {
         let mut browser = Self::with_panels(Vec::new());
         browser.hosts = hosts;
-        let picker = crate::screen::DirPickerState::with_catalog(&browser.hosts);
+        let mut picker = crate::screen::DirPickerState::with_catalog(&browser.hosts);
+        picker.set_traversal_context(
+            browser.shallow_default,
+            Self::dir_shallow_prefs(&browser.hosts),
+        );
         browser.panels = vec![Panel::new_on_screen(Screen::DirPicker(picker))];
         browser
     }
@@ -480,12 +484,24 @@ impl FileBrowser {
     /// constructor has run — a panel-built picker would come up empty, which is
     /// the one thing the flag exists to avoid.
     pub fn new_on_picker() -> Self {
+        Self::new_on_picker_shallow(false)
+    }
+
+    /// As [`Self::new_on_picker`], carrying the `-s` flag into the session.
+    ///
+    /// `-d` opens nothing, so there is no panel for the flag to apply to yet —
+    /// but it still describes how the directory the picker eventually chooses
+    /// should be opened. Dropping it here made `myd -s -d` measure everything,
+    /// which is exactly what `-s` was asked to prevent.
+    pub fn new_on_picker_shallow(shallow: bool) -> Self {
         // No panels yet: the picker has to list the saved directories and hosts,
         // and the catalog is not read until the app is built. Starting a panel on
         // the current directory first would spawn a full walk for a tree that is
         // about to be replaced.
         let mut browser = Self::with_panels(Vec::new());
-        let picker = crate::screen::DirPickerState::with_catalog(&browser.hosts);
+        browser.shallow_default = shallow;
+        let mut picker = crate::screen::DirPickerState::with_catalog(&browser.hosts);
+        picker.set_traversal_context(shallow, Self::dir_shallow_prefs(&browser.hosts));
         // The picker is the panel's only screen rather than one stacked on a
         // directory: there is nothing underneath to go back to, and `q` on it
         // quits, which is what someone who asked to be shown the picker expects.
@@ -2368,10 +2384,23 @@ impl FileBrowser {
     /// Pushed rather than replacing the current screen, so dismissing it returns
     /// to what was underneath instead of leaving the panel with nothing to show.
     fn open_dir_picker(&mut self) {
-        let picker = crate::screen::DirPickerState::with_catalog(&self.hosts);
+        let mut picker = crate::screen::DirPickerState::with_catalog(&self.hosts);
+        picker.set_traversal_context(self.shallow_default, Self::dir_shallow_prefs(&self.hosts));
         self.active_panel_mut()
             .screen_stack
             .push(Screen::DirPicker(picker));
+    }
+
+    /// Every directory's remembered traversal mode, keyed as the catalog stores
+    /// it, for the picker's mode indicator.
+    fn dir_shallow_prefs(
+        catalog: &HostCatalog,
+    ) -> std::collections::HashMap<String, bool> {
+        catalog
+            .favorites()
+            .iter()
+            .map(|f| (f.path.clone(), f.shallow))
+            .collect()
     }
 
     /// Rebuild the open directory picker over the current catalog.
@@ -2381,9 +2410,12 @@ impl FileBrowser {
     /// list or dump the user back into the path field.
     fn rebuild_dir_picker(&mut self) {
         let catalog = self.hosts.clone();
+        let shallow_default = self.shallow_default;
+        let prefs = Self::dir_shallow_prefs(&catalog);
         if let Screen::DirPicker(state) = self.active_panel_mut().current_screen_mut() {
             let keep = state.selected().map(|o| o.path.clone());
             let mut rebuilt = crate::screen::DirPickerState::with_catalog(&catalog);
+            rebuilt.set_traversal_context(shallow_default, prefs);
             rebuilt.adopt_focus_from(state);
             if let Some(path) = keep {
                 rebuilt.select_path(&path);

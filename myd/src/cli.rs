@@ -54,7 +54,13 @@ pub fn is_remote_arg(arg: &std::path::Path) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Startup {
     /// Show the picker and open nothing until a destination is chosen.
-    Picker,
+    Picker {
+        /// Open whatever the picker chooses without measuring directory sizes.
+        /// `-s` describes the session, so it has to survive the detour through
+        /// the picker — a directory typed into the field is still a directory
+        /// the user asked to open shallow.
+        shallow: bool,
+    },
     /// Open local panels: left, optional right, and whether to split.
     Local {
         left: Option<PathBuf>,
@@ -88,7 +94,7 @@ impl Cli {
         };
 
         if self.directory {
-            return Startup::Picker;
+            return Startup::Picker { shallow: self.shallow };
         }
         // Either positional may be the remote one. Checking only the first left
         // `myd /tmp sftp://host` handing "sftp://host" to a panel as a path,
@@ -243,7 +249,7 @@ mod tests {
 
         // The flag wins over everything else.
         let cli = Cli::try_parse_from(["myd", "--directory"]).unwrap();
-        assert_eq!(cli.startup(None), Startup::Picker);
+        assert_eq!(cli.startup(None), Startup::Picker { shallow: false });
     }
 
     #[test]
@@ -286,6 +292,13 @@ mod tests {
                 shallow: true,
             }
         );
+
+        // Including the picker, which opens nothing up front but still has to
+        // carry the flag to whatever it eventually opens. This was the gap:
+        // `-d` returned a Picker with nowhere to put `-s`, so the flag was
+        // parsed and then silently discarded.
+        let cli = Cli::try_parse_from(["myd", "-s", "-d"]).unwrap();
+        assert_eq!(cli.startup(None), Startup::Picker { shallow: true });
 
         // Off unless asked for.
         assert!(!Cli::try_parse_from(["myd", "/tmp"]).unwrap().shallow);

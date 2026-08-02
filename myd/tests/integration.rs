@@ -12999,3 +12999,81 @@ async fn visual_mode_explains_itself_in_the_treemap() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `-s` has to survive the detour through the picker that `-d` opens, and the
+// picker has to say which way a path will open before Enter is pressed.
+// ---------------------------------------------------------------------------
+
+/// `myd -s -d` must open the picker in shallow mode.
+///
+/// Reported: the shallow flag was ignored entirely under `-d`. `Startup::Picker`
+/// carried no `shallow` field, so the flag was parsed and then dropped — the
+/// directory chosen from the picker was measured in full.
+#[test]
+fn the_shallow_flag_survives_the_directory_picker() {
+    use myd::cli::{Cli, Startup};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["myd", "-s", "-d"]).unwrap();
+    assert_eq!(
+        cli.startup(None),
+        Startup::Picker { shallow: true },
+        "-s must reach the picker startup, not be discarded by -d"
+    );
+
+    let plain = Cli::try_parse_from(["myd", "-d"]).unwrap();
+    assert_eq!(
+        plain.startup(None),
+        Startup::Picker { shallow: false },
+        "without -s the picker stays in full-traversal mode"
+    );
+}
+
+/// The picker names the traversal mode a typed path will open in.
+#[tokio::test]
+async fn the_picker_shows_which_traversal_a_path_will_get() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A shallow session: the field must say so before Enter.
+    let mut shallow = FileBrowser::new_on_picker_shallow(true);
+    for ch in dir.path().to_string_lossy().chars() {
+        shallow.handle_key_for_test(char_key(ch));
+    }
+    let rendered = app_screen_text(&mut shallow, 100, 30);
+    assert!(
+        rendered.contains("shallow"),
+        "a shallow session must say so on the path field:\n{rendered}"
+    );
+
+    // A full session says the opposite, so the two are told apart on sight.
+    let mut full = FileBrowser::new_on_picker_shallow(false);
+    for ch in dir.path().to_string_lossy().chars() {
+        full.handle_key_for_test(char_key(ch));
+    }
+    let rendered = app_screen_text(&mut full, 100, 30);
+    assert!(
+        rendered.contains("full"),
+        "a full-traversal session must say so on the path field:\n{rendered}"
+    );
+}
+
+/// A remote destination gets no traversal claim — it is never measured.
+#[tokio::test]
+async fn the_picker_claims_no_traversal_for_a_remote_target() {
+    use myd::app::FileBrowser;
+
+    let mut app = FileBrowser::new_on_picker_shallow(true);
+    for ch in "sftp://gb10".chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    let rendered = app_screen_text(&mut app, 100, 30);
+    // The path field's title must not promise a local traversal mode for
+    // something that will be connected to rather than walked.
+    assert!(
+        !rendered.contains("Path (Enter to go) — shallow")
+            && !rendered.contains("Path (Enter to go) — full"),
+        "a remote target must not be labelled with a traversal mode:\n{rendered}"
+    );
+}

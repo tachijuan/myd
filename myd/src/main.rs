@@ -30,7 +30,7 @@ async fn run() -> Result<()> {
         // Asked to be shown the picker, so nothing is opened until a destination
         // is chosen. Clap rejects a path alongside the flag, so there is no
         // argument being ignored here.
-        Startup::Picker => FileBrowser::new_on_picker(),
+        Startup::Picker { shallow } => FileBrowser::new_on_picker_shallow(shallow),
         Startup::Local {
             left,
             right,
