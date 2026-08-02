@@ -209,6 +209,8 @@ pub struct FileBrowser {
     /// In-flight SFTP connection attempt, if any. Polled each tick; on success
     /// it registers a backend and opens a remote panel.
     connect_task: Option<ConnectTask>,
+    /// An archive being indexed off the event loop.
+    archive_open_task: Option<ArchiveOpenTask>,
     /// Connection details being retried after a credential prompt.
     pending_connect: Option<PendingConnect>,
     /// Saved remote locations, loaded once at startup and written back on every
@@ -312,6 +314,20 @@ struct ConnectTask {
     rx: tokio::sync::oneshot::Receiver<ConnectResult>,
     /// The panel that was active when the connect was issued — the remote opens
     /// here on success, so connecting replaces the pane the user was looking at.
+    target_panel: usize,
+}
+
+/// An archive being indexed in the background, with a channel for its result.
+///
+/// Indexing is CPU-bound and proportional to the member count — a hundred
+/// thousand members is a few hundred milliseconds even at its fastest — so it
+/// cannot run in the key handler. It used to, which is what made `Enter` on a
+/// large archive freeze the interface until it finished.
+struct ArchiveOpenTask {
+    rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::vfs::archive::ArchiveFs>>,
+    /// The container being opened, to register it under when it arrives.
+    container: PathBuf,
+    /// The panel that asked, so the archive opens where the user was looking.
     target_panel: usize,
 }
 
@@ -438,6 +454,7 @@ impl FileBrowser {
             transfers: TransferQueue::default(),
             transfer_panel_override: None,
             connect_task: None,
+            archive_open_task: None,
             pending_connect: None,
             hosts: HostCatalog::load(),
             connecting_label: None,
@@ -652,6 +669,8 @@ impl FileBrowser {
             self.advance_transfers();
             // Advance any in-flight connection attempt.
             self.resolve_connect();
+            // And any archive being indexed off the event loop.
+            self.resolve_archive_open();
             // And any listing of a typed copy destination.
             self.resolve_dest_probe();
             // Install a finished preview, and start one if the cursor has moved
@@ -1215,6 +1234,7 @@ impl FileBrowser {
     /// connect + browse flow headlessly.
     pub fn tick_for_test(&mut self) {
         self.resolve_connect();
+        self.resolve_archive_open();
         self.resolve_dest_probe();
         self.resolve_loading();
         self.resolve_deleting();
@@ -1417,6 +1437,12 @@ impl FileBrowser {
     }
 
     /// How many screens deep a panel's stack is (for tests).
+    /// Whether an archive is still being indexed (for tests, which have to wait
+    /// for it rather than assert against the panel it has not replaced yet).
+    pub fn archive_opening_for_test(&self) -> bool {
+        self.archive_open_task.is_some()
+    }
+
     pub fn panel_depth_for_test(&self, index: usize) -> usize {
         self.panels.get(index).map(|p| p.depth()).unwrap_or(0)
     }
@@ -4058,15 +4084,69 @@ impl FileBrowser {
     ///
     /// `bytes` is the container's contents for the readers that parse in
     /// process, and empty for the ones that hand the path to `bsdtar`.
+    /// Start indexing off the event loop; [`Self::resolve_archive_open`] finishes
+    /// the job when it lands.
+    ///
+    /// Indexing walks every member, so its cost is the archive's member count.
+    /// Running it here would block the key handler for as long as that takes —
+    /// half a second for a hundred thousand members, and far worse before the
+    /// index's own counting was made incremental — during which nothing
+    /// redraws and no key is read.
     fn finish_opening_archive(
         &mut self,
         bytes: Vec<u8>,
         container: PathBuf,
         format: crate::vfs::archive::ArchiveFormat,
     ) {
+        // One at a time: a second Enter while the first is still indexing would
+        // otherwise leave a task whose result nothing is waiting for.
+        if self.archive_open_task.is_some() {
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let path = container.clone();
+        // `spawn_blocking`, not `spawn`: this is CPU-bound and would otherwise
+        // stall every other task sharing that worker thread.
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(crate::vfs::archive::ArchiveFs::open(bytes, format, path));
+        });
+
+        self.archive_open_task = Some(ArchiveOpenTask {
+            rx,
+            container,
+            target_panel: self.active,
+        });
+        // Says what is happening while it happens, rather than letting the
+        // interface look wedged.
+        self.modal = Modal::Operation { verb: "Reading archive" };
+    }
+
+    /// Register a freshly indexed archive and open a panel on it.
+    fn resolve_archive_open(&mut self) {
         use crate::widget::source::{RemoteSource, Source};
 
-        let fs = match crate::vfs::archive::ArchiveFs::open(bytes, format, container.clone()) {
+        let Some(task) = self.archive_open_task.as_mut() else {
+            return;
+        };
+        let result = match task.rx.try_recv() {
+            Ok(r) => r,
+            // Still indexing.
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.archive_open_task = None;
+                self.modal = Modal::None;
+                return;
+            }
+        };
+        let Some(task) = self.archive_open_task.take() else {
+            return;
+        };
+        // The overlay goes now, whatever the answer: an error replaces it with
+        // its own dialog, and success has a panel to show.
+        self.modal = Modal::None;
+
+        let fs = match result {
             Ok(fs) => std::sync::Arc::new(fs),
             Err(e) => {
                 self.modal = Modal::Confirm(ConfirmDialog::notice(explain_error(&e)));
@@ -4084,12 +4164,16 @@ impl FileBrowser {
                 return;
             }
         };
-        self.archive_backends.insert(container, source.clone());
+        self.archive_backends.insert(task.container, source.clone());
 
+        // Into the panel that asked, guarded in case the layout changed while
+        // indexing — the same care `resolve_connect` takes for the same reason.
+        //
         // A fresh size cache, not the panel's: cache keys are bare paths, and
         // every archive has a `/README.md`. Sharing one would have two
         // different archives reporting each other's sizes.
-        self.active_panel_mut()
+        let panel = task.target_panel.min(self.panels.len().saturating_sub(1));
+        self.panels[panel]
             .screen_stack
             .push(Screen::loading_remote(source, PathBuf::from("/"), None));
     }
