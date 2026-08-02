@@ -597,15 +597,25 @@ mod tests {
             t.elapsed()
         }
 
-        let small = build(4_000);
-        let large = build(16_000);
-        // 4x the members. Linear would be ~4x the time; quadratic ~16x.
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
-        assert!(
-            ratio < 9.0,
-            "member_count looks quadratic: 4x the members cost {ratio:.1}x the time \
-             ({small:?} -> {large:?})"
-        );
+        // 20k and 80k rather than something smaller: at 4k/16k this passed
+        // against the quadratic implementation it exists to catch, which made
+        // it worthless. Verified to fail there at 13.7x.
+        //
+        // Best of three, because a wall-clock ratio on a machine building the
+        // rest of the suite in parallel will occasionally see one run
+        // descheduled. A quadratic implementation is 13x+ every time, so the
+        // best run still catches it; retrying only removes the noise.
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let small = build(20_000);
+            let large = build(80_000);
+            // 4x the members. Linear would be ~4x the time; quadratic ~16x.
+            best = best.min(large.as_secs_f64() / small.as_secs_f64().max(1e-9));
+            if best < 9.0 {
+                return;
+            }
+        }
+        panic!("member_count looks quadratic: 4x the members cost {best:.1}x the time");
     }
 
     /// The running count matches a full walk, including placeholder promotion.
