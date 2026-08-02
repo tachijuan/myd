@@ -472,10 +472,14 @@ impl Screen {
             _ => true,
         }
     }
+    /// Toggle visual mode, reporting whether the focused view supports it.
+    ///
+    /// `false` means the keystroke did nothing — the treemap has no row order to
+    /// range over — so the caller can say so instead of leaving `V` silent.
     pub fn toggle_visual(&mut self) -> bool {
         match self {
             Screen::Main(s) => s.toggle_visual(),
-            _ => true,
+            _ => false,
         }
     }
     pub fn exit_visual(&mut self) {

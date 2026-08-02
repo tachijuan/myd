@@ -307,12 +307,19 @@ impl TreeMap {
     ///
     /// - `selected`: the cursor index (reversed colors)
     /// - `highlighted_path`: path from the tree view's selection (brighter color)
+    /// - `tagged`: the resolved paths currently tagged
+    ///
+    /// A tile the user tagged from this view has to be visibly tagged in it.
+    /// Without the marker `t` on a tile changed nothing on screen, which is
+    /// indistinguishable from `t` not working — and it did not work, until the
+    /// tree-only guard came off.
     pub fn render(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         selected: usize,
         highlighted_path: Option<&Path>,
+        tagged: &std::collections::HashSet<PathBuf>,
     ) {
         // First compute layout for this area.
         if self.cells.is_empty() {
@@ -344,8 +351,14 @@ impl TreeMap {
             // reads as one group. Selection and tree-highlight change only the
             // border and label weight — never the fill, which carries meaning.
             let bg = cell.category.bg_color();
+            let is_tagged = tagged.contains(&cell.resolved_path);
             let (border_color, label_modifier) = if is_selected {
                 (Color::White, Modifier::BOLD | Modifier::UNDERLINED)
+            } else if is_tagged {
+                // Ahead of the tree-highlight: a tag is something the user set
+                // deliberately and is about to act on, and a tile too small for
+                // a label has only its border left to say so.
+                (Color::LightGreen, Modifier::BOLD)
             } else if is_highlighted {
                 (Color::Yellow, Modifier::BOLD)
             } else {
@@ -370,8 +383,17 @@ impl TreeMap {
                 rect.height.saturating_sub(2),
             );
             if inner.width >= 1 && inner.height >= 1 {
+                // The same `▶` the tree puts on a tagged row, so one mark means
+                // "tagged" in both views. Prefixed into the label rather than
+                // drawn separately so it truncates with it instead of being
+                // overwritten on a narrow tile.
+                let label = if is_tagged {
+                    format!("▶ {}", cell.label)
+                } else {
+                    cell.label.clone()
+                };
                 let para = Paragraph::new(Line::from(Span::styled(
-                    truncate_for_width(&cell.label, inner.width as usize),
+                    truncate_for_width(&label, inner.width as usize),
                     Style::default()
                         .fg(cell.category.fg_color())
                         .bg(bg)
@@ -813,7 +835,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let a = f.area();
-                tm.render(f, a, 0, None);
+                tm.render(f, a, 0, None, &std::collections::HashSet::new());
             })
             .unwrap();
 
@@ -1018,7 +1040,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let a = f.area();
-                tm.render(f, a, 0, None);
+                tm.render(f, a, 0, None, &std::collections::HashSet::new());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
