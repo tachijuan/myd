@@ -943,8 +943,13 @@ fn test_info_panel_visibility_persists_across_view_switches() {
 async fn settle(app: &mut myd::app::FileBrowser) {
     use myd::screen::Screen;
     for _ in 0..400 {
+        // `tick_for_test` too, not just the loading screen: opening an archive
+        // indexes it on the blocking pool and installs the panel from a tick, so
+        // a settle that only resolved loading would return on the screen the
+        // user was already on and assert against the wrong panel.
+        app.tick_for_test();
         app.resolve_loading_for_test();
-        if matches!(app.current_screen(), Screen::Main(_)) {
+        if matches!(app.current_screen(), Screen::Main(_)) && !app.archive_opening_for_test() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -13217,5 +13222,61 @@ async fn a_stored_member_is_located_by_offset_not_buffered() {
         matches!(deflated.locator, MemberLocator::Index(_)),
         "a deflated member cannot be sliced, got {:?}",
         deflated.locator
+    );
+}
+
+/// Enter on an archive must not block the key handler while it is indexed.
+///
+/// Reported: a 6.5GB zip that `unzip -v` lists instantly took a very long time
+/// to do anything, including accepting further keys. Two causes, both fixed:
+/// the index counted its members by walking the map on every insert (quadratic
+/// — 14.6s for 120k members against 3ms for the zip crate's own parse), and
+/// indexing then ran synchronously inside the key handler, so the interface was
+/// frozen for the whole of it.
+///
+/// The handler is what this asserts. A budget rather than an exact figure: the
+/// point is that it does not scale with the archive, and a wall-clock bound
+/// tight enough to catch "it indexed inline" is loose enough to survive a busy
+/// machine.
+#[tokio::test]
+async fn enter_on_an_archive_returns_immediately() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.zip");
+
+    // Enough members that indexing inline would be plainly visible, while the
+    // file itself stays small — the cost is per member, not per byte.
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        for i in 0..20_000 {
+            w.start_file(format!("d{:03}/f{:06}.txt", i / 500, i), opts)
+                .unwrap();
+            std::io::Write::write_all(&mut w, b"x").unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "many.zip");
+
+    let t = std::time::Instant::now();
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    let handler = t.elapsed();
+
+    assert!(
+        handler < std::time::Duration::from_millis(50),
+        "Enter blocked the event loop for {handler:?} — indexing must happen off it"
+    );
+
+    // And it does finish, arriving through a tick like any other background work.
+    settle(&mut app).await;
+    assert_eq!(
+        app.panel_current_dir(0).unwrap(),
+        std::path::Path::new("/"),
+        "the archive panel must open once indexing lands"
     );
 }

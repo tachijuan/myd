@@ -118,6 +118,12 @@ pub struct ArchiveIndex {
     pub truncated: bool,
     /// Members the container declared, including any skipped.
     pub declared_members: usize,
+    /// Running count of non-implicit nodes, behind [`Self::member_count`].
+    ///
+    /// Kept in step by [`Self::insert`], which is the only thing that can turn a
+    /// node real — either by adding one or by replacing a synthesised
+    /// placeholder with the entry the archive actually declared.
+    members: usize,
 }
 
 impl ArchiveIndex {
@@ -135,6 +141,8 @@ impl ArchiveIndex {
             rejected: Vec::new(),
             truncated: false,
             declared_members: 0,
+            // The root is implicit, so it is not a member.
+            members: 0,
         }
     }
 
@@ -147,20 +155,41 @@ impl ArchiveIndex {
     pub fn insert(&mut self, node: ArchiveNode) {
         let path = node.path.clone();
         self.ensure_parents(&path);
-        match self.nodes.get_mut(&path) {
+        // Whether this path is new decides whether it has to be linked to its
+        // parent, and `nodes` already knows. The child list used to be scanned
+        // for the path instead — a linear search per insert, and quadratic in
+        // the number of files in one directory.
+        //
+        // A node counts as a member once it is no longer implicit, whether it
+        // arrived as a new entry or replaced a placeholder — so both arms below
+        // bump the count, and only those two.
+        let is_new = match self.nodes.get_mut(&path) {
             // Only a synthesised placeholder may be overwritten. Two real
             // entries for one path means the archive is self-contradictory;
             // keeping the first is arbitrary but stable.
-            Some(existing) if existing.implicit => *existing = node,
+            Some(existing) if existing.implicit => {
+                let now_real = !node.implicit;
+                *existing = node;
+                if now_real {
+                    self.members += 1;
+                }
+                // The placeholder was already linked to its parent by
+                // `ensure_parents`; linking it again would duplicate the row.
+                false
+            }
             Some(_) => return,
             None => {
+                let now_real = !node.implicit;
                 self.nodes.insert(path.clone(), node);
+                if now_real {
+                    self.members += 1;
+                }
+                true
             }
-        }
-        if let Some(parent) = path.parent() {
-            let siblings = self.children.entry(parent.to_path_buf()).or_default();
-            if !siblings.contains(&path) {
-                siblings.push(path);
+        };
+        if is_new {
+            if let Some(parent) = path.parent() {
+                self.children.entry(parent.to_path_buf()).or_default().push(path);
             }
         }
     }
@@ -248,8 +277,15 @@ impl ArchiveIndex {
     }
 
     /// Members actually indexed, not counting synthesised directories.
+    /// How many real (non-synthesised) members have been indexed.
+    ///
+    /// Maintained as members are inserted rather than counted on demand. Every
+    /// reader calls this once per entry to test the limit, and counting by
+    /// walking the map made that O(n) per member — quadratic overall, and the
+    /// entire cost of opening a large archive: 120,000 members took 14.6
+    /// seconds, of which the zip crate's own work was 3 milliseconds.
     pub fn member_count(&self) -> usize {
-        self.nodes.values().filter(|n| !n.implicit).count()
+        self.members
     }
 
     /// Total uncompressed bytes.
@@ -521,5 +557,92 @@ mod tests {
         // Two directories were invented; only the real member counts.
         assert_eq!(idx.member_count(), 1);
         assert_eq!(idx.total_len(), 10);
+    }
+
+    /// `member_count` must not walk the map.
+    ///
+    /// Every reader calls it once per entry to test the limit, so an O(n) count
+    /// makes indexing quadratic. That was the whole cost of opening a large
+    /// archive: 120,000 members took 14.6 seconds, against 3 milliseconds for
+    /// the zip crate's own parse of the same central directory.
+    ///
+    /// Asserted by shape rather than by timing, which would be flaky on a busy
+    /// machine: inserting n members must cost O(n), so doubling n may not
+    /// quadruple the work. A generous factor catches the quadratic case (which
+    /// is 4x) without failing on ordinary scheduling noise.
+    #[test]
+    fn member_count_is_not_a_scan() {
+        fn build(n: usize) -> std::time::Duration {
+            let mut idx = ArchiveIndex::new(ArchiveFormat::Zip);
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                // One directory, so every insert lands among the same siblings —
+                // the shape that made the old linear scan worst.
+                idx.insert(ArchiveNode {
+                    path: PathBuf::from(format!("/d/f{i:07}")),
+                    stored_path: format!("d/f{i:07}"),
+                    is_dir: false,
+                    is_symlink: false,
+                    len: 1,
+                    compressed_len: 1,
+                    mode: None,
+                    mtime: None,
+                    locator: MemberLocator::Index(i),
+                    recursive_len: 0,
+                    implicit: false,
+                });
+                // The call under test: what every reader does per entry.
+                assert_eq!(idx.member_count(), i + 1);
+            }
+            t.elapsed()
+        }
+
+        let small = build(4_000);
+        let large = build(16_000);
+        // 4x the members. Linear would be ~4x the time; quadratic ~16x.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 9.0,
+            "member_count looks quadratic: 4x the members cost {ratio:.1}x the time \
+             ({small:?} -> {large:?})"
+        );
+    }
+
+    /// The running count matches a full walk, including placeholder promotion.
+    ///
+    /// The count is maintained incrementally now, so the invariant that it
+    /// equals "every non-implicit node" has to be asserted rather than assumed —
+    /// a promoted placeholder is the case that is easy to miscount.
+    #[test]
+    fn the_member_count_matches_a_full_walk() {
+        let mut idx = ArchiveIndex::new(ArchiveFormat::Zip);
+        let node = |p: &str, dir: bool| ArchiveNode {
+            path: PathBuf::from(p),
+            stored_path: p.trim_start_matches('/').to_string(),
+            is_dir: dir,
+            is_symlink: false,
+            len: if dir { 0 } else { 4 },
+            compressed_len: 0,
+            mode: None,
+            mtime: None,
+            locator: MemberLocator::None,
+            recursive_len: 0,
+            implicit: false,
+        };
+
+        // A leaf whose parents are synthesised: the implicit ones must not count.
+        idx.insert(node("/a/b/c.txt", false));
+        assert_eq!(idx.member_count(), 1, "only the real member counts");
+
+        // Declaring one of those parents promotes it to a real member.
+        idx.insert(node("/a/b", true));
+        assert_eq!(idx.member_count(), 2, "a promoted placeholder counts");
+
+        // A duplicate is ignored and must not double-count.
+        idx.insert(node("/a/b/c.txt", false));
+        assert_eq!(idx.member_count(), 2, "a duplicate must not count twice");
+
+        let walked = idx.nodes.values().filter(|n| !n.implicit).count();
+        assert_eq!(idx.member_count(), walked, "running count must match a walk");
     }
 }
