@@ -608,10 +608,23 @@ impl MainScreenState {
         self.rebuild_treemap_and_info();
     }
 
-    /// Toggle the tag on the tree cursor's file. Tree-only (no-op in treemap).
+    /// Toggle the tag on the focused view's selection.
+    ///
+    /// Works from the treemap too. It used to be tree-only, which made `t`
+    /// silently do nothing after `v` — while `c`, `D` and `m` went on using the
+    /// treemap's cursor. Tagging four tiles and copying therefore copied one
+    /// file, the one under the cursor, with nothing on screen to say the tags
+    /// had not registered. Tags live on the tree and are keyed by resolved path,
+    /// which is exactly what a treemap cell carries, so the two views share one
+    /// tag set rather than each keeping its own.
     pub fn toggle_tag(&mut self) -> bool {
-        if self.focus == FocusTarget::Tree {
-            self.tree.toggle_tag();
+        match self.focus {
+            FocusTarget::Tree => self.tree.toggle_tag(),
+            FocusTarget::Treemap => {
+                if let Some(path) = self.treemap.selected_cell().map(|c| c.resolved_path.clone()) {
+                    self.tree.toggle_tag_path(path);
+                }
+            }
         }
         true
     }
@@ -622,12 +635,18 @@ impl MainScreenState {
         true
     }
 
-    /// Toggle visual (range-tag) mode. Tree-only.
+    /// Toggle visual (range-tag) mode.
+    ///
+    /// Genuinely tree-only, unlike `t`: a visual range is a span of consecutive
+    /// rows, and the treemap's squarified tiles have no such order — "everything
+    /// between these two tiles" names nothing. Returns whether it applied, so
+    /// the caller can say so rather than leave `V` looking broken.
     pub fn toggle_visual(&mut self) -> bool {
         if self.focus == FocusTarget::Tree {
             self.tree.toggle_visual();
+            return true;
         }
-        true
+        false
     }
 
     /// Exit visual mode without clearing tags (called before non-motion actions).
@@ -988,9 +1007,12 @@ impl MainScreenState {
         // immutable borrow of `self.tree` ends before `self.treemap` is borrowed mutably.
         let highlighted_path = self.tree.selected_line().map(|l| l.path.clone());
         let cursor = self.treemap.cursor;
+        // Cloned for the same borrow reason as `highlighted_path`: the tag set
+        // lives on the tree and the treemap is about to be borrowed mutably.
+        let tagged = self.tree.tagged.clone();
 
         self.treemap
-            .render(frame, area, cursor, highlighted_path.as_deref());
+            .render(frame, area, cursor, highlighted_path.as_deref(), &tagged);
     }
 
     fn render_info(&mut self, frame: &mut Frame, area: Rect) {

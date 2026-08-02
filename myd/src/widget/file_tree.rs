@@ -1105,9 +1105,18 @@ impl FileTree {
     pub fn toggle_tag(&mut self) {
         if let Some(line) = self.lines.get(self.cursor) {
             let path = line.resolved_path.clone();
-            if !self.tagged.remove(&path) {
-                self.tagged.insert(path);
-            }
+            self.toggle_tag_path(path);
+        }
+    }
+
+    /// Toggle the tag on `path` directly.
+    ///
+    /// The treemap addresses entries by path rather than by tree row, and both
+    /// views tag into this one set — a second set per view would let a copy see
+    /// only half of what the user tagged.
+    pub fn toggle_tag_path(&mut self, path: PathBuf) {
+        if !self.tagged.remove(&path) {
+            self.tagged.insert(path);
         }
     }
 

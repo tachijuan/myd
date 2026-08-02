@@ -474,7 +474,7 @@ fn test_treemap_from_real_directory() {
         .draw(|f| {
             let a = f.area();
             let cursor = tm.cursor;
-            tm.render(f, a, cursor, None);
+            tm.render(f, a, cursor, None, &std::collections::HashSet::new());
         })
         .unwrap();
 
@@ -521,14 +521,14 @@ fn test_treemap_survives_degenerate_area() {
     terminal
         .draw(|f| {
             let cursor = tm.cursor;
-            tm.render(f, Rect::new(0, 0, 0, 0), cursor, None);
+            tm.render(f, Rect::new(0, 0, 0, 0), cursor, None, &std::collections::HashSet::new());
         })
         .unwrap();
     terminal
         .draw(|f| {
             let a = f.area();
             let cursor = tm.cursor;
-            tm.render(f, a, cursor, None);
+            tm.render(f, a, cursor, None, &std::collections::HashSet::new());
         })
         .unwrap();
 }
@@ -673,7 +673,7 @@ fn test_render_fills_tiles_with_category_color() {
         .draw(|f| {
             let a = f.area();
             let cursor = tm.cursor;
-            tm.render(f, a, cursor, None);
+            tm.render(f, a, cursor, None, &std::collections::HashSet::new());
         })
         .unwrap();
     let buf = terminal.backend().buffer().clone();
@@ -12802,3 +12802,200 @@ fn a_repeated_context_line_is_not_shown_twice() {
         .unwrap_err();
     assert_eq!(myd::app::explain_error(&e), "same thing");
 }
+
+// ---------------------------------------------------------------------------
+// Tagging must behave the same in every mode: local, remote, and inside an
+// archive — and from either view, tree or treemap.
+// ---------------------------------------------------------------------------
+
+/// Tagged paths on the active panel's screen.
+fn tags_of(app: &myd::app::FileBrowser) -> usize {
+    match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tagged_paths().len(),
+        _ => 0,
+    }
+}
+
+/// Tagging several files on a remote pane and copying must transfer all of them.
+#[tokio::test]
+async fn a_remote_pane_copies_every_tagged_file() {
+    let dest = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(
+        Some(dest.path().to_path_buf()),
+        Some(dest.path().to_path_buf()),
+        true,
+    );
+    settle_all(&mut app).await;
+
+    let twin = tempfile::tempdir().unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tags_of(&app), 3, "three remote entries tagged");
+
+    app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        3,
+        "all three tagged files must be queued, not just the cursor's"
+    );
+}
+
+/// Every confirmed collision in a tagged remote batch must still be queued.
+#[tokio::test]
+async fn a_remote_tagged_batch_queues_every_confirmed_collision() {
+    let dest = tempfile::tempdir().unwrap();
+    // The mock remote lists dir_a, dir_b, small_file, big_file. Make each name
+    // already exist locally so every one of them collides.
+    std::fs::create_dir(dest.path().join("dir_a")).unwrap();
+    std::fs::create_dir(dest.path().join("dir_b")).unwrap();
+    std::fs::write(dest.path().join("small_file"), b"old").unwrap();
+    std::fs::write(dest.path().join("big_file"), b"old").unwrap();
+
+    let mut app = FileBrowser::new(
+        Some(dest.path().to_path_buf()),
+        Some(dest.path().to_path_buf()),
+        true,
+    );
+    settle_all(&mut app).await;
+
+    let twin = tempfile::tempdir().unwrap();
+    app.replace_panel_with_remote_for_test(remote_tree_rooted_at(twin.path()));
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+
+    app.handle_key_for_test(char_key('c'));
+    settle_copy(&mut app).await;
+
+    for _ in 0..10 {
+        if app.modal_kind_for_test() != "confirm" {
+            break;
+        }
+        app.handle_key_for_test(char_key('y'));
+        settle_copy(&mut app).await;
+    }
+
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        3,
+        "answering yes to each collision must queue each one"
+    );
+}
+
+/// Tagging several members inside an archive and extracting must take all of them.
+#[tokio::test]
+async fn an_archive_extracts_every_tagged_member() {
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+    let out = tempfile::tempdir().unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "run.sh");
+    app.handle_key_for_test(char_key('t'));
+    cursor_onto(&mut app, "docs");
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tags_of(&app), 2, "two archive members tagged");
+
+    app.handle_key_for_test(char_key('c'));
+    assert_eq!(app.modal_kind_for_test(), "input", "expected the dest prompt");
+    for ch in out.path().to_string_lossy().chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_copy(&mut app).await;
+
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        2,
+        "both tagged archive members must be queued"
+    );
+}
+
+/// `t` must tag from the treemap view, not only the tree.
+///
+/// Reported as "I tagged several files and only one was copied". After `v` the
+/// treemap has focus, and `t` was tree-only — so it silently did nothing while
+/// `c` went on using the treemap cursor. The tags never existed; the copy fell
+/// back to the single selected file, with nothing on screen to say so.
+#[tokio::test]
+async fn t_tags_from_the_treemap_view_too() {
+    use myd::app::FileBrowser;
+    let left = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("one.bin"), vec![1u8; 300]).unwrap();
+    std::fs::write(left.path().join("two.bin"), vec![2u8; 200]).unwrap();
+    let mut app = FileBrowser::new(Some(left.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // `v` moves focus to the treemap pane.
+    app.handle_key_for_test(char_key('v'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tags_of(&app), 1, "t in treemap focus must tag the selected cell");
+
+    // And it toggles off again, as it does in the tree.
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tags_of(&app), 0, "t must untag the same cell");
+}
+
+/// Tags set in one view are visible to the other — there is one tag set, not two.
+#[tokio::test]
+async fn the_two_views_share_one_tag_set() {
+    use myd::app::FileBrowser;
+    let left = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("one.bin"), vec![1u8; 300]).unwrap();
+    std::fs::write(left.path().join("two.bin"), vec![2u8; 200]).unwrap();
+    let mut app = FileBrowser::new(Some(left.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag one row in the tree, then a tile in the treemap.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('v'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    let from_treemap = tags_of(&app);
+
+    // Back in the tree, both are still tagged.
+    app.handle_key_for_test(char_key('v'));
+    assert_eq!(
+        tags_of(&app),
+        from_treemap,
+        "switching views must not change what is tagged"
+    );
+    assert!(from_treemap >= 1, "the treemap tag must have registered");
+}
+
+/// `V` says so when it cannot apply, rather than swallowing the key.
+#[tokio::test]
+async fn visual_mode_explains_itself_in_the_treemap() {
+    use myd::app::FileBrowser;
+    let left = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("one.bin"), vec![1u8; 300]).unwrap();
+    let mut app = FileBrowser::new(Some(left.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('v'));
+    app.handle_key_for_test(char_key('V'));
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("tree view"),
+        "V in the treemap should explain itself, got {msg:?}"
+    );
+}
+

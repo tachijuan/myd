@@ -2727,7 +2727,17 @@ impl FileBrowser {
             }
             Action::ToggleTag => self.active_panel_mut().current_screen_mut().toggle_tag(),
             Action::UntagAll => self.active_panel_mut().current_screen_mut().untag_all(),
-            Action::VisualMode => self.active_panel_mut().current_screen_mut().toggle_visual(),
+            Action::VisualMode => {
+                // A range needs an order to range over, and the treemap has
+                // none. Say so rather than swallow the key.
+                if !self.active_panel_mut().current_screen_mut().toggle_visual() {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(
+                        "Visual range-tagging needs the tree view — press v to switch \
+                         back. Individual tiles can still be tagged with t.",
+                    ));
+                }
+                true
+            }
             Action::Filter => {
                 self.modal_target = Some(ModalTarget::Filter);
                 self.modal = Modal::Input(InputDialog::new(
