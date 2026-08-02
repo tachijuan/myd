@@ -1,10 +1,10 @@
-.TH "MYD" "1" "July 2026" "myd 0.24.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.30.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
 \fBmyd\fR [\fB\-2\fR] [\fB\-s\fR] [\fIPATH\fR [\fIRIGHT\fR]]
 .br
-\fBmyd\fR \fB\-d\fR
+\fBmyd\fR [\fB\-s\fR] \fB\-d\fR
 .br
 \fBmyd\fR [\fIPATH\fR] \fBsftp://\fR[\fIuser\fR@]\fIhost\fR[:\fIport\fR][/\fIpath\fR]
 .SH DESCRIPTION
@@ -35,6 +35,12 @@ Browse without measuring directory sizes, as though \fBS\fR had been pressed on
 arrival. Applies to both panes of a split. Useful over a network mount or a
 large archive, where the recursive walk is the slowest part of opening a
 directory and is rarely worth waiting for just to look around.
+.IP
+Combines with \fB\-d\fR: the flag describes the session, so it carries through
+the picker to whichever directory you choose from it. The picker's path field
+names the mode it will use \(em \fBshallow\fR or \fBfull\fR \(em so which way a
+path will open is visible before \fBEnter\fR. A directory with a remembered
+preference of its own keeps it; the flag supplies the default for the rest.
 .TP
 .B \-h, \-\-help
 Print a usage summary and exit.
@@ -120,6 +126,14 @@ clears it).
 \fB/\fR only starts a search when the path field is empty, since that is also
 how most absolute paths begin.
 .IP
+The path field's title names the traversal the destination will get \(em
+\fBshallow\fR or \fBfull\fR \(em resolved exactly as opening it will resolve it:
+the directory's own remembered preference when it has one, otherwise the
+session default that \fB\-s\fR sets. Which way a path will open is therefore
+visible before \fBEnter\fR rather than inferred afterwards from whether sizes
+appeared. A remote target is labelled with neither, since it is connected to
+rather than walked.
+.IP
 Remembered directories are stored in the \fB[[favorite]]\fR section of
 \fB~/.config/myd/hosts.toml\fR beside the saved hosts, and shown in three
 groups: pinned entries (\fB\[u25B2]\fR) at the top in an order you arrange,
@@ -152,15 +166,47 @@ Collapse all expanded directories.
 .TP
 .B *
 Expand all directories.
+.SS Tagging
+Most operations act on the file under the cursor. To act on several at once,
+tag them first: \fBc\fR, \fBm\fR, \fBD\fR and \fBg r\fR all take the tagged set
+when there is one, and fall back to the single selection when there is not.
+.TP
+.B t
+Tag or untag the current selection. Works in both views \(em the tree row under
+the cursor, or the selected treemap tile \(em and the two share one set of tags,
+so switching views with \fBv\fR never changes what is tagged. A tagged tree row
+is highlighted; a tagged tile is marked \fB\[u25B6]\fR and outlined in green.
+.TP
+.B V
+Visual mode: tag a range as the cursor moves. Every row swept between the anchor
+and the cursor is tagged; leaving visual mode keeps them, so ranges elsewhere in
+the tree can be added the same way. Tree view only \(em a range is a span of
+consecutive rows, and the treemap's tiles have no such order \(em pressing it in
+the treemap says so rather than doing nothing.
+.TP
+.B U
+Remove every tag.
 .SS File Operations
 .TP
 .B D
 Delete the tagged files, or the selected one when nothing is tagged (with a
 confirmation dialog). Directories are removed recursively.
+.IP
+The confirmation takes \fBy\fR, \fBn\fR, or \fBa\fR \(em delete and stop asking
+for the rest of the session.
 .TP
 .B R
 Rename the currently selected file or directory. An existing name is never
 overwritten.
+.TP
+.B g r
+Rename every tagged file by regular expression \(em the same operation as
+\fBR\fR, applied across the tagged set. The dialog takes a pattern and a
+replacement, in which \fB$1\fR is the first capture group; \fBTab\fR moves
+between the two fields. The preview shows the first tagged file transformed, so
+the pattern can be checked before it is applied. Files the pattern does not
+match are skipped rather than treated as failures, since tagging a mixed set and
+renaming only part of it is the ordinary case.
 .TP
 .B N
 Create a new directory in the current location.
@@ -224,6 +270,14 @@ below.
 Cycle through sort modes: largest, smallest, dirs-first, files-first, newest
 (modification time), oldest (modification time), and recently accessed (access
 time).
+.TP
+.B g s
+Open a numbered menu of the sort orders and pick one outright, rather than
+cycling to it. The number chooses directly, so \fBg s 5\fR is "sort by newest"
+as a single gesture; \fBj\fR and \fBk\fR move through the menu and \fBEnter\fR
+accepts. Clicking the \fBSort:\fR indicator in the status bar opens the same
+menu. \fBs\fR remains quicker once the order is known \(em this is for going
+straight to one, and for discovering what the orders are.
 .TP
 .B H
 Toggle visibility of hidden (dot) files and directories.
@@ -439,6 +493,11 @@ request pipeline is.
 .B MYD_SSH_NODELAY
 Disable Nagle's algorithm on the SSH socket (default true).
 .TP
+.B MYD_SSH_MAX_PACKET
+SSH maximum packet size in bytes (default 32768, \fBrussh\fR's own default).
+Not a bottleneck, and exposed only so it can be ruled out \(em raising it risks
+a disconnect from strict servers.
+.TP
 .B MYD_SFTP_WRITE_LIMIT
 Outstanding bytes on the sequential write path (default 16 MiB).
 .TP
@@ -520,6 +579,14 @@ its extension; a directory takes the category holding most of its bytes. A
 legend in the status bar names the categories currently on screen. When a tile
 is too narrow to show its full name, the selected item's name is shown in the
 status bar.
+.PP
+Tiles can be tagged with \fBt\fR just as tree rows can, and the two views share
+one set of tags \(em switching with \fBv\fR never changes what is tagged, and
+\fBc\fR, \fBm\fR and \fBD\fR act on the same set from either. A tagged tile
+carries the \fB\[u25B6]\fR marker and a green outline, so it reads as tagged even
+when it is too small for a label. \fBV\fR is the exception: a visual range is a
+span of consecutive rows and the treemap has no such order, so it applies in the
+tree view only and says so if pressed here.
 .SH INFO PANEL
 The right-hand sidebar (hidden by default; toggle with \fBCtrl+p\fR)
 displays detailed metadata for the currently selected item:
@@ -624,6 +691,18 @@ survives a multiplexer cleanly: it is a single escape sequence, where a kitty
 image is a chain of dozens that each have to be wrapped individually. When myd
 falls back to blocks anyway, the preview footer names the setting that would
 change that.
+.PP
+Inside tmux the kitty protocol is used whatever the terminal's own protocol is.
+This is about how the image is carried rather than what decodes it: kitty splits
+a picture into roughly 4 KB chunks, each its own escape, while iTerm2 sends one
+sequence however large \(em and a single large escape is what a multiplexer will
+not deliver. iTerm2 understands kitty's protocol, so this costs nothing and
+removes the size ceiling, keeping full resolution in tmux rather than shrinking
+images to fit.
+.PP
+The per-escape limit remains as a backstop. \fBMYD_PREVIEW_MAX_PAYLOAD\fR sets
+it in kilobytes, and \fB0\fR removes it. It is judged per sequence rather than
+per image, which is the point of chunking.
 .PP
 Block output is captured and drawn as part of the interface rather than written to
 the terminal, so it cannot corrupt the display. A graphics image necessarily does
