@@ -68,6 +68,20 @@ pub struct DirPickerState {
     /// on the app — so an edit is recorded here and drained on the next key
     /// dispatch, in the same spirit as the loading screens' pending results.
     pending_edit: Option<FavoriteEdit>,
+    /// The traversal mode a directory with no remembered preference will open
+    /// in — the session default, which `-s` sets.
+    ///
+    /// Held here only to be *shown*: the app resolves the mode for real when
+    /// Enter is pressed. A typed path used to give no clue which way it would
+    /// go, so `myd -s -d` and `myd -d` looked identical right up until one of
+    /// them started measuring.
+    shallow_default: bool,
+    /// Remembered per-directory preferences, keyed as the catalog stores them.
+    ///
+    /// The typed field can name any path, including one the list does not show,
+    /// so answering "how will *this* open" needs the same lookup `Confirm`
+    /// does rather than the highlighted row's flag.
+    dir_prefs: std::collections::HashMap<String, bool>,
 }
 
 /// What confirming the picker asked for.
@@ -333,12 +347,74 @@ impl DirPickerState {
             visible: Vec::new(),
             moving: None,
             pending_edit: None,
+            shallow_default: false,
+            dir_prefs: std::collections::HashMap::new(),
         };
         // `visible` is what the cursor indexes and what render walks, so it has
         // to be populated before the picker is handed out — an empty one leaves
         // a list with rows that cannot be selected or drawn.
         picker.recompute_visible();
         picker
+    }
+
+    /// Tell the picker how a directory with no remembered preference will open,
+    /// and what the remembered ones are, so it can show the mode before Enter.
+    ///
+    /// Pushed in by the app rather than read here: the catalog lives on the app,
+    /// and the picker is deliberately unable to touch it.
+    pub fn set_traversal_context(
+        &mut self,
+        shallow_default: bool,
+        dir_prefs: std::collections::HashMap<String, bool>,
+    ) {
+        self.shallow_default = shallow_default;
+        self.dir_prefs = dir_prefs;
+    }
+
+    /// How the current selection would open: `true` for shallow.
+    ///
+    /// Resolves exactly as `Action::Confirm` does — the directory's remembered
+    /// preference if it has one, else the session default — so what the picker
+    /// promises and what it does cannot drift apart.
+    pub fn effective_shallow(&self) -> Option<bool> {
+        let target = self.pending_target();
+        if target.is_empty() {
+            return None;
+        }
+        // A remote destination is a connect, not a local walk: it is never
+        // measured, so claiming either mode for it would be a lie. A host row's
+        // path *is* its URL, so this one check covers both a typed URL and a
+        // highlighted host.
+        if is_remote_url(target.trim()) {
+            return None;
+        }
+        Some(self.dir_pref_for(&target).unwrap_or(self.shallow_default))
+    }
+
+    /// The path Enter would act on: what is typed, or the highlighted row.
+    ///
+    /// The same precedence [`Self::confirm`] applies, so the indicator describes
+    /// the destination that will actually open.
+    fn pending_target(&self) -> String {
+        let typed = self.input.trim();
+        if !typed.is_empty() {
+            return expand_tilde(typed).to_string_lossy().to_string();
+        }
+        self.selected()
+            .map(|o| o.path.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    /// A remembered preference for `path`, matching [`HostCatalog::dir_shallow_pref`]
+    /// — the literal string, or its canonical form.
+    fn dir_pref_for(&self, path: &str) -> Option<bool> {
+        if let Some(v) = self.dir_prefs.get(path) {
+            return Some(*v);
+        }
+        let canonical = std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())?;
+        self.dir_prefs.get(&canonical).copied()
     }
 
     /// Rebuild the visible index list from the scope and the search query.
@@ -1135,10 +1211,17 @@ impl super::ScreenState for DirPickerState {
                 } else {
                     unfocused_border
                 }))
-                .title(if field_focused {
-                    " Path (Enter to go) "
-                } else {
-                    " Path "
+                // The traversal mode rides in the title so it is visible before
+                // Enter rather than inferred afterwards from whether sizes
+                // appeared. Nothing is claimed for a remote target or an empty
+                // field, where there is no local walk to describe.
+                .title(match (field_focused, self.effective_shallow()) {
+                    (true, Some(true)) => " Path (Enter to go) — shallow ".to_string(),
+                    (true, Some(false)) => " Path (Enter to go) — full ".to_string(),
+                    (true, None) => " Path (Enter to go) ".to_string(),
+                    (false, Some(true)) => " Path — shallow ".to_string(),
+                    (false, Some(false)) => " Path — full ".to_string(),
+                    (false, None) => " Path ".to_string(),
                 }),
         );
         frame.render_widget(input_para, vertical[1]);
