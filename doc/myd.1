@@ -833,9 +833,13 @@ compressed forms (\fB.tar.gz\fR/\fB.tgz\fR, \fB.tar.bz2\fR, \fB.tar.xz\fR,
 \fB.tar.zst\fR), single compressed files (\fB.gz\fR, \fB.bz2\fR, \fB.xz\fR,
 \fB.zst\fR, shown as the one member they hold), and \fB7z\fR.
 .PP
-\fBRAR\fR is read in process by the \fBrars\fR crate, which is pure Rust and
-handles all three RAR generations including solid archives. Nothing needs to be
-installed for it.
+\fBRAR\fR is listed in process by the \fBrars\fR crate, which is pure Rust and
+handles all three RAR generations including solid archives, so browsing one
+needs nothing installed. Reading a member out of one prefers \fBbsdtar\fR(1)
+where it is present: \fBrars\fR cannot seek to a member and decodes everything
+ahead of it, which made stepping through a large archive with the preview open
+cost tens of seconds per file. Without \fBbsdtar\fR it still works, at that
+cost for members late in the archive.
 .PP
 \fB.iso\fR, \fB.cab\fR, \fB.cpio\fR, \fB.lha\fR, \fB.xar\fR, \fB.deb\fR and
 \fB.rpm\fR are read through \fBbsdtar\fR(1) (libarchive) when it is on the

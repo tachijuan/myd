@@ -544,9 +544,13 @@ Read in-process, with no external tools: **zip** (and `.jar`, `.apk`, `.whl`,
 `.tar.xz`, `.tar.zst`), single compressed files (`.gz`, `.bz2`, `.xz`, `.zst`,
 shown as the one member they hold), and **7z**.
 
-**RAR** is read in process by [`rars`](https://lib.rs/crates/rars), which is
-pure Rust and MIT/Apache. It handles all three RAR generations, including solid
-archives, so it needs nothing installed.
+**RAR** is listed in process by [`rars`](https://lib.rs/crates/rars), which is
+pure Rust and MIT/Apache and handles all three RAR generations including solid
+archives, so browsing one needs nothing installed. Reading a member out of it
+prefers `bsdtar` where you have it: `rars` cannot seek to a member and so
+decodes everything ahead of it, which made stepping through a large archive
+with the preview open cost tens of seconds per file. Without `bsdtar` it still
+works, just with that cost for members late in the archive.
 
 `.iso`, `.cab`, `.cpio`, `.lha`, `.xar`, `.deb` and `.rpm` go through
 **`bsdtar`** (libarchive) if it is on your `PATH` — the long tail nobody would

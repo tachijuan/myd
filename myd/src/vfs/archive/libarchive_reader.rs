@@ -95,10 +95,14 @@ fn run(args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
         buf
     });
 
-    // `wait_timeout` is not in the dependency tree, so this polls. The interval
-    // is short enough not to add noticeable latency to a fast listing and long
-    // enough not to spin.
+    // `wait_timeout` is not in the dependency tree, so this polls, backing off
+    // as it waits. A flat 20ms interval added up to 20ms of pure latency to
+    // every call — invisible on a one-off listing, and half the cost of reading
+    // one member when the preview does it per keystroke. Extracting a member
+    // takes tens of milliseconds, so the early polls are sub-millisecond and
+    // the interval only grows once it is clear this is a long one.
     let deadline = std::time::Instant::now() + TOOL_TIMEOUT;
+    let mut wait = std::time::Duration::from_micros(50);
     let status = loop {
         match child.try_wait().context("bsdtar could not be waited on")? {
             Some(status) => break status,
@@ -110,7 +114,12 @@ fn run(args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
                 let _ = stderr_reader.join();
                 bail!("bsdtar took longer than {}s", TOOL_TIMEOUT.as_secs());
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            None => {
+                std::thread::sleep(wait);
+                // Doubling, capped: a slow call costs at most one extra 10ms of
+                // waiting rather than a busy loop for its whole duration.
+                wait = (wait * 2).min(std::time::Duration::from_millis(10));
+            }
         }
     };
 
