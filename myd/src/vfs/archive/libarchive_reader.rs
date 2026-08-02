@@ -63,6 +63,8 @@ fn version_output(bin: &str) -> Option<String> {
 
 /// Run `bsdtar` with `args`, returning stdout, or failing with its stderr.
 fn run(args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
+    use std::io::Read;
+
     let mut child = Command::new("bsdtar")
         .args(args)
         .stdin(Stdio::null())
@@ -71,28 +73,59 @@ fn run(args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
         .spawn()
         .context("could not run bsdtar")?;
 
+    // Drain both pipes on their own threads, starting *now*.
+    //
+    // A pipe holds about 64KB before a write blocks. Waiting for the child to
+    // exit before reading its output therefore deadlocks on any listing bigger
+    // than that: bsdtar blocks writing, we block waiting, and the only thing
+    // that breaks the tie is the timeout below — which then reports the tool as
+    // slow when it had in fact finished its work and was waiting for us. A
+    // 61,000-entry cpio lists in 90ms and produces 4.7MB, so it hit this every
+    // time, while the small archives in the tests fit the buffer and passed.
+    let mut stdout_pipe = child.stdout.take().context("bsdtar produced no stdout")?;
+    let mut stderr_pipe = child.stderr.take().context("bsdtar produced no stderr")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
     // `wait_timeout` is not in the dependency tree, so this polls. The interval
     // is short enough not to add noticeable latency to a fast listing and long
     // enough not to spin.
     let deadline = std::time::Instant::now() + TOOL_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait().context("bsdtar could not be waited on")? {
-            Some(_) => break,
+            Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
+                // Join the drainers so their threads end with the process they
+                // were reading, rather than outliving this call.
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 bail!("bsdtar took longer than {}s", TOOL_TIMEOUT.as_secs());
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
-    }
+    };
 
-    let out = child
-        .wait_with_output()
-        .context("could not read bsdtar's output")?;
-    if !out.status.success() {
-        bail!("{}", first_complaint(&out.stderr));
+    // The child has exited, so both pipes are at EOF and these return at once.
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("could not read bsdtar's output"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("could not read bsdtar's errors"))?;
+
+    if !status.success() {
+        bail!("{}", first_complaint(&stderr));
     }
-    Ok(out.stdout)
+    Ok(stdout)
 }
 
 /// bsdtar's first real complaint, with its own prefix stripped.
@@ -422,7 +455,9 @@ bsdtar: Error exit delayed from previous errors
         assert!(why.contains("cpio"), "should name the format: {why}");
 
         // Whitespace-only output is just as empty.
-        assert!(empty_listing_error(4096, "  \n \n", ArchiveFormat::Libarchive("cpio")).is_some());
+        assert!(empty_listing_error(4096, "  
+ 
+", ArchiveFormat::Libarchive("cpio")).is_some());
 
         // A real listing passes, and so does a zero-length file — which is not
         // a damaged archive, just an empty one.
@@ -457,5 +492,65 @@ bsdtar: Error exit delayed from previous errors
         let msg = explain_missing(ArchiveFormat::Libarchive("cpio"));
         assert!(msg.contains("bsdtar"), "{msg}");
         assert!(msg.contains("cpio"), "{msg}");
+    }
+
+
+    /// A listing far larger than a pipe buffer must not deadlock.
+    ///
+    /// `run` used to wait for bsdtar to exit and only then read its output. A
+    /// pipe holds about 64KB before a write blocks, so any listing past that
+    /// deadlocked: bsdtar blocked writing, we blocked waiting, and the tool
+    /// timeout eventually fired and reported the tool as slow — when it had in
+    /// fact finished and was waiting for us. A 61,000-entry cpio lists in 90ms
+    /// and produces 4.7MB of text, so it hit this every time; the small
+    /// archives in these tests fit the buffer and passed throughout.
+    ///
+    /// Built here rather than committed as a fixture: the whole point is that
+    /// it is bigger than a pipe buffer, which is not a thing to keep in git.
+    #[test]
+    fn a_listing_larger_than_a_pipe_buffer_does_not_deadlock() {
+        if !available() {
+            eprintln!("skipping: bsdtar is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        // Long names, so the *listing* passes 64KB with far fewer files than
+        // the entry count alone would need.
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..1_200 {
+            let name = format!("{}_{i:05}.txt", "n".repeat(80));
+            std::fs::write(src.join(name), b"x").unwrap();
+        }
+
+        let container = dir.path().join("many.cpio");
+        let built = std::process::Command::new("bsdtar")
+            .args([
+                std::ffi::OsStr::new("-cf"),
+                container.as_os_str(),
+                std::ffi::OsStr::new("--format"),
+                std::ffi::OsStr::new("cpio"),
+                std::ffi::OsStr::new("-C"),
+                dir.path().as_os_str(),
+                std::ffi::OsStr::new("src"),
+            ])
+            .status();
+        if !matches!(built, Ok(s) if s.success()) {
+            eprintln!("skipping: bsdtar could not write a cpio here");
+            return;
+        }
+
+        let listing = run(&[std::ffi::OsStr::new("-tvf"), container.as_os_str()])
+            .expect("a large listing must come back rather than time out");
+        assert!(
+            listing.len() > 64 * 1024,
+            "fixture must exceed a pipe buffer to be the regression, got {} bytes",
+            listing.len()
+        );
+
+        // And it indexes, rather than merely not hanging.
+        let idx = index_via_bsdtar(&container, ArchiveFormat::Libarchive("cpio"), MAX_MEMBERS)
+            .expect("a large cpio must index");
+        assert_eq!(idx.member_count(), 1_201, "every entry plus the src directory");
     }
 }
