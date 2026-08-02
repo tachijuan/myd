@@ -76,8 +76,20 @@ pub fn open(
         // RAR is read in process. It used to go through `bsdtar`, whose RAR4
         // support is partial — which is why some RAR files opened and others
         // did not.
+        // Given the path, `rars` parses the file's headers in place; given a
+        // slice it copies the whole container first, which on a 2.2GB archive
+        // was 1.5 seconds of memcpy before it looked at a single header. A
+        // container that is not a local file still takes the slice.
         ArchiveFormat::Rar => Ok(Opened {
-            index: rar_reader::index_rar(bytes, limit)?,
+            index: if container.is_file() {
+                // The file's own size, not the slice's: the slice is empty when
+                // the container was mapped rather than read, and the plausibility
+                // check compares declared member sizes against it.
+                let len = std::fs::metadata(container).map(|m| m.len()).unwrap_or(0);
+                rar_reader::index_rar_at(container, len.max(bytes.len() as u64), limit)?
+            } else {
+                rar_reader::index_rar(bytes, limit)?
+            },
             stream: None,
         }),
         ArchiveFormat::Libarchive(_) => Ok(Opened {

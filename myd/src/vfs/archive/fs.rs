@@ -214,6 +214,16 @@ impl ArchiveFs {
                 Ok(bytes.to_vec())
             }
             MemberLocator::ByName => {
+                // By path where the container is a local file, for the same
+                // reason indexing prefers it: handed a slice, the crate copies
+                // the whole archive before extracting anything.
+                if self.origin.is_file() {
+                    return super::rar_reader::read_member_at(
+                        &self.origin,
+                        &node.stored_path,
+                        node.len,
+                    );
+                }
                 let container = self
                     .container
                     .as_ref()
