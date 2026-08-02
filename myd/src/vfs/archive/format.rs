@@ -142,12 +142,16 @@ pub fn archive_format(path: &Path) -> Option<ArchiveFormat> {
         // Everything that is a zip container. `jar`/`war`/`apk`/`whl` are zips
         // whose contents are worth browsing as files, unlike the Office
         // formats, whose internals are an implementation detail.
-        "zip" | "jar" | "war" | "ear" | "apk" | "whl" | "egg" | "xpi" | "crx" | "nupkg" => {
-            Some(ArchiveFormat::Zip)
-        }
-        "tar" => Some(ArchiveFormat::Tar),
-        "7z" => Some(ArchiveFormat::SevenZ),
-        "rar" => Some(ArchiveFormat::Rar),
+        //
+        // `cbz` is a comic book archive, which is a zip of page images and
+        // exactly the thing someone opens a file browser to page through.
+        "zip" | "jar" | "war" | "ear" | "apk" | "whl" | "egg" | "xpi" | "crx" | "nupkg"
+        | "cbz" => Some(ArchiveFormat::Zip),
+        // The rest of the comic book family sit with their own container:
+        // `cbt` is a tar, `cb7` a 7z, `cbr` a rar.
+        "tar" | "cbt" => Some(ArchiveFormat::Tar),
+        "7z" | "cb7" => Some(ArchiveFormat::SevenZ),
+        "rar" | "cbr" => Some(ArchiveFormat::Rar),
         // Read only if the user has bsdtar; `archive_format` claims them either
         // way so the pane can explain what is missing rather than falling
         // through to "binary file", which explains nothing.
@@ -187,6 +191,59 @@ mod tests {
             archive_format(Path::new("notes.txt.gz")),
             Some(ArchiveFormat::Single(Compression::Gzip))
         );
+    }
+
+    /// Comic book archives are ordinary containers under another name.
+    ///
+    /// A `.cbz` is a zip and a `.cbr` is a rar — of page images, which is
+    /// exactly the thing someone opens a browser to page through. Recognising
+    /// them costs one arm each and they used to preview as "binary file".
+    #[test]
+    fn comic_book_archives_are_their_underlying_container() {
+        assert_eq!(
+            archive_format(Path::new("Vol 1.cbz")),
+            Some(ArchiveFormat::Zip),
+            "a cbz is a zip"
+        );
+        assert_eq!(
+            archive_format(Path::new("Vol 1.cbr")),
+            Some(ArchiveFormat::Rar),
+            "a cbr is a rar"
+        );
+        assert_eq!(
+            archive_format(Path::new("Vol 1.cbt")),
+            Some(ArchiveFormat::Tar),
+            "a cbt is a tar"
+        );
+        assert_eq!(
+            archive_format(Path::new("Vol 1.cb7")),
+            Some(ArchiveFormat::SevenZ),
+            "a cb7 is a 7z"
+        );
+
+        // And they colour as archives rather than falling through to "other",
+        // which is what the treemap and the tree icon read.
+        for name in ["a.cbz", "a.cbr", "a.cbt", "a.cb7"] {
+            assert_eq!(
+                crate::utils::filetype::categorize(Path::new(name)),
+                crate::utils::filetype::FileCategory::Archive,
+                "{name} should read as an archive"
+            );
+        }
+
+        // Case-insensitively, like every other extension here.
+        assert_eq!(
+            archive_format(Path::new("VOL 1.CBZ")),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(
+            archive_format(Path::new("VOL 1.CBR")),
+            Some(ArchiveFormat::Rar)
+        );
+
+        // A bare suffix is still a hidden file, not an archive.
+        assert_eq!(archive_format(Path::new(".cbz")), None);
+        assert_eq!(archive_format(Path::new(".cbr")), None);
     }
 
     #[test]

@@ -544,6 +544,10 @@ Read in-process, with no external tools: **zip** (and `.jar`, `.apk`, `.whl`,
 `.tar.xz`, `.tar.zst`), single compressed files (`.gz`, `.bz2`, `.xz`, `.zst`,
 shown as the one member they hold), and **7z**.
 
+**Comic book archives** are the containers they are wearing another name, and
+open as such: `.cbz` is a zip, `.cbr` a rar, `.cbt` a tar, `.cb7` a 7z. Press
+`space` for the page list and `Enter` to page through them with the preview.
+
 **RAR** is listed in process by [`rars`](https://lib.rs/crates/rars), which is
 pure Rust and MIT/Apache and handles all three RAR generations including solid
 archives, so browsing one needs nothing installed. Reading a member out of it
