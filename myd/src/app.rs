@@ -4046,31 +4046,12 @@ impl FileBrowser {
             return;
         }
 
-        let bytes = match std::fs::metadata(&container) {
-            Ok(meta) if meta.len() > crate::vfs::archive::MAX_CONTAINER_BYTES => {
-                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
-                    "This archive is {} — too large to open. Press space to list its \
-                     contents instead.",
-                    crate::utils::sizes::format_size(meta.len())
-                )));
-                return;
-            }
-            // Read on the event loop: this is one local read of a file already
-            // bounded above, and threading it through a second async state
-            // machine to save a few milliseconds is not worth the machinery.
-            // The *indexing* is the slow part, and that runs on the pool.
-            _ => match std::fs::read(&container) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
-                        "Could not read this archive: {e}"
-                    )));
-                    return;
-                }
-            },
-        };
-
-        self.finish_opening_archive(bytes, container, format);
+        // Nothing is read here: a local container is memory-mapped when it is
+        // opened, so the file's size costs address space rather than memory and
+        // an archive of any size opens. Indexing touches a zip's tail or walks a
+        // tar's headers; neither faults in the bulk of the file. That is what
+        // removed the size ceiling this used to refuse above.
+        self.finish_opening_archive(Vec::new(), container, format);
     }
 
     /// Index a container, register it as a backend, and open a panel on it.

@@ -77,8 +77,18 @@ pub fn index_zip(bytes: &[u8], limit: usize) -> Result<ArchiveIndex> {
             compressed_len: if is_dir { 0 } else { entry.compressed_size() },
             mode: entry.unix_mode(),
             mtime: entry.last_modified().and_then(zip_time_to_system),
+            // A stored member is a contiguous run of bytes in the container, so
+            // it gets an offset and is read straight out of the mapping — no
+            // decompressor, no buffer, and a member larger than memory extracts
+            // fine. Anything actually compressed needs the decoder, and only
+            // the ordinal identifies it.
             locator: if is_dir {
                 MemberLocator::None
+            } else if entry.compression() == zip::CompressionMethod::Stored {
+                MemberLocator::StreamOffset {
+                    offset: entry.data_start(),
+                    len,
+                }
             } else {
                 MemberLocator::Index(i)
             },

@@ -18,6 +18,7 @@
 //! script comes out of an extract non-executable. Fixing it means widening the
 //! trait for every backend.
 
+pub mod container;
 pub mod format;
 mod fs;
 pub mod index;
@@ -28,8 +29,9 @@ pub mod sevenz_reader;
 pub mod tar_reader;
 pub mod zip_reader;
 
+pub use container::Container;
 pub use format::{archive_format, ArchiveFormat};
-pub use fs::{ArchiveFs, MAX_CONTAINER_BYTES};
+pub use fs::ArchiveFs;
 pub use index::ArchiveIndex;
 
 use anyhow::Result;
@@ -44,7 +46,11 @@ pub struct Opened {
     /// Bytes that [`index::MemberLocator::StreamOffset`] offsets index into:
     /// the container itself for a plain tar, the decompressed stream for a
     /// compressed one. `None` when members are located another way.
-    pub stream: Option<Vec<u8>>,
+    ///
+    /// A `Container` rather than a `Vec` because a decompressed stream too large
+    /// to hold is spilled to a mapped temporary file — so this may be memory or
+    /// may be disk, and the readers cannot tell.
+    pub stream: Option<Container>,
 }
 
 /// Index a container.
@@ -93,7 +99,10 @@ pub fn open(
             stream: None,
         }),
         ArchiveFormat::TarCompressed(how) => {
-            let stream = tar_reader::decompress(bytes, how)?;
+            // Spills to a mapped temporary file if the stream is larger than
+            // memory should hold, so a huge tarball indexes rather than being
+            // refused.
+            let stream = tar_reader::decompress_to_container(bytes, how)?;
             let index = tar_reader::index_tar(&stream, format, limit)?;
             Ok(Opened {
                 index,

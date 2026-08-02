@@ -71,6 +71,7 @@ zstd = "0.13"
 # release binary — it would only have hidden that it was there.
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["bzip2", "ppmd", "util", "aes256", "deflate", "zstd", "compress"] }
 rars = "0.4"
+memmap2 = "0.9.11"
 
 [dev-dependencies]
 tempfile = "3"

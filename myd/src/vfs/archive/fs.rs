@@ -10,26 +10,10 @@ use crate::utils::sizes::{CancelToken, SizeCache};
 use crate::vfs::{VEntry, VMetadata, VPath, VRead, VWrite, Vfs};
 use crate::widget::progress::OpProgress;
 
+use super::container::Container;
 use super::format::ArchiveFormat;
 use super::index::{ArchiveIndex, MemberLocator};
 use super::Opened;
-
-/// Largest container this will open for browsing.
-///
-/// The whole file is read to be indexed — a zip's directory is at its tail and
-/// a compressed tar has no directory at all — so this is a real read of a real
-/// file, not a lazy mapping. 512MB covers the archives people browse and is the
-/// same ceiling the resident decompressed stream gets.
-pub const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Largest single member decompressed in one piece.
-///
-/// A preview asks for at most a megabyte and an extract writes what it reads,
-/// but both go through one buffered `Vec` because that is the only shape the
-/// zip and tar crates offer. This bounds it, so a header claiming a size the
-/// container could not possibly hold cannot exhaust memory before the read
-/// fails.
-pub const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// An archive, presented as a filesystem.
 ///
@@ -44,9 +28,12 @@ pub struct ArchiveFs {
     index: Arc<ArchiveIndex>,
     /// Bytes that stream offsets point into: the container for a plain tar, the
     /// decompressed stream for a compressed one.
-    stream: Option<Arc<Vec<u8>>>,
+    stream: Option<Container>,
     /// The container's bytes, kept for formats that seek into them per read.
-    container: Option<Arc<Vec<u8>>>,
+    ///
+    /// A local container is mapped rather than read, so "kept" costs address
+    /// space rather than memory however large the archive is.
+    container: Option<Container>,
     /// Where the container came from, so a member read can say so.
     origin: PathBuf,
 }
@@ -58,12 +45,25 @@ impl ArchiveFs {
     /// so callers run it on the blocking pool. That is also where the loading
     /// screen's spinner and cancel token already are.
     pub fn open(bytes: Vec<u8>, format: ArchiveFormat, origin: PathBuf) -> Result<Self> {
+        // Empty bytes mean "it is on this machine, go and get it": the local
+        // container is mapped rather than read, which is what lets an archive of
+        // any size be opened at all. Bytes in hand are a container that came
+        // from somewhere unmappable and are used as they are.
+        Self::open_container(Container::map_or_owned(&origin, bytes), format, origin)
+    }
+
+    /// As [`Self::open`], over a container that has already been obtained.
+    pub fn open_container(
+        container: Container,
+        format: ArchiveFormat,
+        origin: PathBuf,
+    ) -> Result<Self> {
         let label = origin
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| origin.display().to_string());
 
-        let Opened { index, stream } = super::open(&bytes, &origin, format, usize::MAX)
+        let Opened { index, stream } = super::open(&container, &origin, format, usize::MAX)
             .with_context(|| format!("could not read {label}"))?;
 
         // A zip seeks into the container per read; a plain tar's offsets point
@@ -74,7 +74,7 @@ impl ArchiveFs {
             | ArchiveFormat::Tar
             | ArchiveFormat::SevenZ
             | ArchiveFormat::Rar
-            | ArchiveFormat::Single(_) => Some(Arc::new(bytes)),
+            | ArchiveFormat::Single(_) => Some(container),
             // A compressed tar has its own decompressed stream, and the
             // bsdtar-backed formats re-read the file per member — neither has
             // any use for a second copy of the container.
@@ -85,7 +85,7 @@ impl ArchiveFs {
             label,
             format,
             index: Arc::new(index),
-            stream: stream.map(Arc::new),
+            stream,
             container,
             origin,
         })
@@ -105,11 +105,45 @@ impl ArchiveFs {
         &self.index
     }
 
+    /// A member that can be read without decompressing it first.
+    ///
+    /// A stored member of a mapped container — every member of a plain tar, and
+    /// a zip entry written without compression — is already a contiguous run of
+    /// bytes in the file. Handing back a reader over that slice lets an extract
+    /// of any size run in constant memory, since the kernel pages the run in as
+    /// it is copied out and drops it again behind.
+    ///
+    /// `None` when the member has to go through a decoder, which is the case
+    /// this cannot help with: a deflate stream is not addressable by offset.
+    fn slice_of(&self, path: &std::path::Path) -> Option<(Container, usize, usize)> {
+        let node = self.index.get(path)?;
+        if node.is_dir {
+            return None;
+        }
+        // `Single` is a compressed whole and has to be decoded, even though its
+        // locator looks like an offset into the container.
+        if matches!(self.format, ArchiveFormat::Single(_)) {
+            return None;
+        }
+        let MemberLocator::StreamOffset { offset, len } = node.locator else {
+            return None;
+        };
+        let bytes = self.stream.as_ref().or(self.container.as_ref())?;
+        let (start, end) = (offset as usize, offset.checked_add(len)? as usize);
+        if end > bytes.len() {
+            return None;
+        }
+        Some((bytes.clone(), start, end))
+    }
+
     /// Decompress one member into memory.
     ///
     /// Returns an owned buffer rather than a reader borrowing the archive, so
     /// nothing holds a lock across an await and concurrent extracts of
     /// different members cannot serialise on each other.
+    ///
+    /// Used for members that need a decoder. A member that is merely stored
+    /// goes through [`Self::slice_of`] instead and is never buffered.
     fn read_member_blocking(&self, path: &std::path::Path) -> Result<Vec<u8>> {
         use std::io::Read;
 
@@ -119,13 +153,6 @@ impl ArchiveFs {
             .with_context(|| format!("no such member: {}", path.display()))?;
         if node.is_dir {
             bail!("{} is a directory", path.display());
-        }
-        if node.len > MAX_MEMBER_BYTES {
-            bail!(
-                "{} is {} — too large to extract in one piece",
-                path.display(),
-                crate::utils::sizes::format_size(node.len)
-            );
         }
 
         // The bsdtar-backed formats have no locator: the tool is asked for the
@@ -298,8 +325,17 @@ impl Vfs for ArchiveFs {
     }
 
     async fn open_read(&self, path: &VPath) -> Result<Box<dyn VRead>> {
-        // Decompression is CPU work; on an async worker it would block every
-        // other task on that thread, and an extract runs several at once.
+        // A stored member is already a run of bytes in the container, so it is
+        // read straight out of the mapping. Nothing is buffered and nothing is
+        // decompressed, so a member larger than memory extracts fine.
+        if let Some((container, start, end)) = self.slice_of(&path.path) {
+            return Ok(Box::new(super::container::SliceReader::new(
+                container, start, end,
+            )));
+        }
+        // Everything else needs a decoder, which is CPU work: on an async worker
+        // it would block every other task on that thread, and an extract runs
+        // several at once.
         let this = self.clone_for_read();
         let target = path.path.clone();
         let bytes =
