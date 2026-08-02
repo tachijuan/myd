@@ -1,10 +1,15 @@
 //! Which archive format a file is, and what can be done with it.
 //!
-//! Recognition is by name rather than by content. That is the same trade the
-//! preview's [`is_image_like`](crate::utils::filetype::is_image_like) makes and
-//! for the same reason: sniffing means reading the file before deciding whether
-//! it is worth reading, and a `.zip` that is not a zip fails at parse time with
-//! a message either way.
+//! Recognition starts from the name. That is the same trade the preview's
+//! [`is_image_like`](crate::utils::filetype::is_image_like) makes and for the
+//! same reason: it costs no I/O, and it is right almost always.
+//!
+//! Almost. [`resolved_format`] reads the container's first bytes and lets them
+//! overrule the name when the two disagree, because one family gets this wrong
+//! routinely: `.cbr` means "comic book rar" and is handed out by tools that
+//! wrote a zip. Opening that as a rar fails with "unsupported archive
+//! signature", which describes the *name* being wrong and reads as the file
+//! being broken. Eight bytes settle it.
 
 use std::path::Path;
 
@@ -169,6 +174,82 @@ pub fn archive_format(path: &Path) -> Option<ArchiveFormat> {
     }
 }
 
+/// Bytes of the container needed to recognise it by content.
+///
+/// Every signature checked below sits in the first few bytes. 8 is enough for
+/// all of them and small enough that reading it costs nothing.
+pub const SNIFF_LEN: usize = 8;
+
+/// Which format a container's *first bytes* say it is.
+///
+/// Recognition is by name everywhere else, and that is the right default: it
+/// costs no I/O and a mislabelled file is rare. But it is a guess, and comic
+/// book archives are where the guess is routinely wrong — `.cbr` means "comic
+/// book rar" and is handed out by tools that wrote a zip, so a `.cbr` holding
+/// `PK\x03\x04` is ordinary rather than corrupt. Guessing rar there produces
+/// "unsupported archive signature", which describes the *name* being wrong and
+/// reads as the file being broken.
+///
+/// Only the formats with an unambiguous magic number are here. A tar's magic
+/// sits 257 bytes in and a plain `.gz` is a single compressed file rather than
+/// an archive, so neither is worth sniffing to correct a name that already
+/// said so.
+pub fn sniff_format(head: &[u8]) -> Option<ArchiveFormat> {
+    // A zip's local file header. `PK\x05\x06` and `PK\x07\x08` are the empty
+    // and spanned variants, which the reader also handles.
+    if head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(b"PK\x07\x08")
+    {
+        return Some(ArchiveFormat::Zip);
+    }
+    // RAR 4 and earlier, then RAR 5, which appends one byte.
+    if head.starts_with(b"Rar!\x1a\x07\x00") || head.starts_with(b"Rar!\x1a\x07\x01\x00") {
+        return Some(ArchiveFormat::Rar);
+    }
+    if head.starts_with(b"7z\xbc\xaf\x27\x1c") {
+        return Some(ArchiveFormat::SevenZ);
+    }
+    None
+}
+
+/// The format to actually open `path` as.
+///
+/// The name decides, and the container's own bytes overrule it when they
+/// disagree — see [`sniff_format`]. Falls back to the name whenever the head
+/// cannot be read or carries no signature we know, so a container that is
+/// merely unusual is still opened as its extension asks.
+pub fn resolved_format(path: &Path) -> Option<ArchiveFormat> {
+    let by_name = archive_format(path)?;
+    let Some(head) = read_head(path) else {
+        return Some(by_name);
+    };
+    match sniff_format(&head) {
+        // The bytes know better. Only when they actually disagree: a `.zip`
+        // that is a zip goes through unchanged.
+        Some(by_content) if by_content != by_name => Some(by_content),
+        _ => Some(by_name),
+    }
+}
+
+/// The first [`SNIFF_LEN`] bytes of a local file, or `None`.
+fn read_head(path: &Path) -> Option<[u8; SNIFF_LEN]> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; SNIFF_LEN];
+    // A short read is not a failure: a container smaller than the buffer still
+    // has whatever signature it has, and the unread tail stays zero.
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    Some(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +325,80 @@ mod tests {
         // A bare suffix is still a hidden file, not an archive.
         assert_eq!(archive_format(Path::new(".cbz")), None);
         assert_eq!(archive_format(Path::new(".cbr")), None);
+    }
+
+    /// The container's own bytes overrule a name that disagrees.
+    ///
+    /// `.cbr` means "comic book rar" and is routinely handed out by tools that
+    /// wrote a zip. Trusting the name gave "unsupported archive signature",
+    /// which describes the name being wrong and reads as the file being broken.
+    #[test]
+    fn a_signature_overrules_the_extension() {
+        assert_eq!(sniff_format(b"PK\x03\x04...."), Some(ArchiveFormat::Zip));
+        assert_eq!(sniff_format(b"PK\x05\x06...."), Some(ArchiveFormat::Zip));
+        assert_eq!(sniff_format(b"Rar!\x1a\x07\x00"), Some(ArchiveFormat::Rar));
+        assert_eq!(sniff_format(b"Rar!\x1a\x07\x01\x00"), Some(ArchiveFormat::Rar));
+        assert_eq!(sniff_format(b"7z\xbc\xaf\x27\x1c.."), Some(ArchiveFormat::SevenZ));
+
+        // Nothing recognised, so the name stands.
+        assert_eq!(sniff_format(b"not a thing"), None);
+        assert_eq!(sniff_format(b""), None);
+        // A tar's magic is 257 bytes in and is deliberately not sniffed.
+        assert_eq!(sniff_format(b"ustar\0\0\0"), None);
+    }
+
+    /// `resolved_format` prefers the bytes, and falls back to the name.
+    #[test]
+    fn resolution_prefers_content_but_keeps_the_name_as_a_fallback() {
+        use std::io::Write;
+
+        // A .cbr holding a zip: the reported case.
+        let dir = tempfile::tempdir().unwrap();
+        let mislabelled = dir.path().join("Vol 1.cbr");
+        let mut f = std::fs::File::create(&mislabelled).unwrap();
+        f.write_all(b"PK\x03\x04 and then some").unwrap();
+        drop(f);
+        assert_eq!(
+            resolved_format(&mislabelled),
+            Some(ArchiveFormat::Zip),
+            "a cbr whose bytes are a zip must open as a zip"
+        );
+        assert_eq!(
+            archive_format(&mislabelled),
+            Some(ArchiveFormat::Rar),
+            "the name alone still says rar — that is what is being overruled"
+        );
+
+        // A .cbr that really is a rar keeps its format.
+        let honest = dir.path().join("Vol 2.cbr");
+        let mut f = std::fs::File::create(&honest).unwrap();
+        f.write_all(b"Rar!\x1a\x07\x01\x00rest").unwrap();
+        drop(f);
+        assert_eq!(resolved_format(&honest), Some(ArchiveFormat::Rar));
+
+        // A container with no signature we know falls back to the extension,
+        // so anything unusual still opens the way its name asks.
+        let unknown = dir.path().join("Vol 3.cbt");
+        let mut f = std::fs::File::create(&unknown).unwrap();
+        f.write_all(b"who knows").unwrap();
+        drop(f);
+        assert_eq!(resolved_format(&unknown), Some(ArchiveFormat::Tar));
+
+        // A file that is not there at all is still classified by name rather
+        // than vanishing: the caller decides what to do about the missing file.
+        assert_eq!(
+            resolved_format(Path::new("/no/such/file.cbz")),
+            Some(ArchiveFormat::Zip)
+        );
+
+        // And something that is not an archive by either measure stays None.
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, b"PK\x03\x04").unwrap();
+        assert_eq!(
+            resolved_format(&text),
+            None,
+            "sniffing must not claim files the name never offered"
+        );
     }
 
     #[test]

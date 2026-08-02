@@ -2908,8 +2908,12 @@ impl FileBrowser {
                 // is a file and would otherwise fall through it.
                 if let Screen::Main(state) = panel.current_screen() {
                     if !state.selected_is_dir() {
+                        // `resolved_format`, not `archive_format`: the name is
+                        // the guess and the container's own first bytes
+                        // overrule it. A `.cbr` that is really a zip is
+                        // ordinary rather than corrupt.
                         let archive = state.selected_path().and_then(|p| {
-                            crate::vfs::archive::archive_format(p).map(|f| (p.clone(), f))
+                            crate::vfs::archive::resolved_format(p).map(|f| (p.clone(), f))
                         });
                         if let Some((path, format)) = archive {
                             self.open_archive(path, format);
@@ -3190,8 +3194,12 @@ impl FileBrowser {
                         .map(|l| l.is_dir)
                         .unwrap_or(false);
                     if !is_dir {
+                        // `resolved_format`, not `archive_format`: the name is
+                        // the guess and the container's own first bytes
+                        // overrule it. A `.cbr` that is really a zip is
+                        // ordinary rather than corrupt.
                         let archive = state.selected_path().and_then(|p| {
-                            crate::vfs::archive::archive_format(p).map(|f| (p.clone(), f))
+                            crate::vfs::archive::resolved_format(p).map(|f| (p.clone(), f))
                         });
                         if let Some((path, format)) = archive {
                             self.open_archive(path, format);

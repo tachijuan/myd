@@ -30,7 +30,7 @@ pub mod tar_reader;
 pub mod zip_reader;
 
 pub use container::Container;
-pub use format::{archive_format, ArchiveFormat};
+pub use format::{archive_format, resolved_format, ArchiveFormat};
 pub use fs::ArchiveFs;
 pub use index::ArchiveIndex;
 
