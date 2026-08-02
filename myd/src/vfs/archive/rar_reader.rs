@@ -17,13 +17,18 @@
 //! slice, `rars` copies the whole thing before parsing a byte, which on a large
 //! archive costs more than all the real work put together.
 //!
-//! **Known limitation:** the crate exposes no way to seek to one member, so an
-//! extract decodes every member ahead of the wanted one — about a second for
-//! the last member of a 2GB archive, against ~12ms for `bsdtar`, which seeks
-//! directly. That is inherent to the API rather than to the format, and it is
-//! why extraction runs on the blocking pool: the wait shows as transfer
-//! progress instead of a frozen interface. Listing and browsing, which is what
-//! opening an archive does, are unaffected.
+//! **Reading a member goes through `bsdtar` where it is installed**, and only
+//! falls back to here when it cannot. The crate exposes no way to seek to one
+//! member, so extracting decodes every member ahead of the wanted one: 26
+//! seconds for one in the middle of a 5GB archive and 54 at the end, against a
+//! flat ~50ms for `bsdtar`, which seeks. Stepping through files with the
+//! preview open paid that per keystroke.
+//!
+//! Indexing stays here regardless. That is the half libarchive gets wrong —
+//! its RAR4 support is partial, so an older archive fails there while a RAR5
+//! one beside it works — and it is the half that decides whether an archive
+//! opens at all. So the reader that can always list is the one that lists, and
+//! the reader that can seek is the one that reads.
 
 use anyhow::{Context, Result};
 

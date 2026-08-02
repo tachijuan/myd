@@ -236,10 +236,42 @@ impl ArchiveFs {
                 Ok(bytes.to_vec())
             }
             MemberLocator::ByName => {
-                // By path where the container is a local file, for the same
-                // reason indexing prefers it: handed a slice, the crate copies
-                // the whole archive before extracting anything.
                 if self.origin.is_file() {
+                    // `bsdtar` seeks to the member and decodes only that one, so
+                    // its cost is flat wherever the member sits: 40-58ms across
+                    // a 5GB archive, against 26 *seconds* for one in the middle
+                    // through `rars`, which has no seek-to-member entry point
+                    // and decodes everything ahead of the target. Stepping
+                    // through files with the preview open made that per
+                    // keystroke.
+                    //
+                    // Only for the read. Indexing stays with `rars`, whose RAR4
+                    // support is complete where libarchive's is partial — the
+                    // "some of my RAR files open and some don't" that moving to
+                    // `rars` fixed. A container bsdtar cannot read falls through
+                    // to `rars` below, so nothing that opens today stops
+                    // opening.
+                    if super::libarchive_reader::available() {
+                        match super::libarchive_reader::read_member_via_bsdtar(
+                            &self.origin,
+                            &node.stored_path,
+                            self.format,
+                        ) {
+                            Ok(bytes) if bytes.len() as u64 == node.len => return Ok(bytes),
+                            // A short or failed read means bsdtar did not
+                            // understand this archive the way the index does.
+                            // Say nothing and let the reader that built the
+                            // index answer instead.
+                            Ok(_) | Err(_) => {
+                                tracing::debug!(
+                                    member = %node.stored_path,
+                                    "bsdtar could not extract this rar member; falling back"
+                                );
+                            }
+                        }
+                    }
+                    // By path rather than by slice: handed a slice, the crate
+                    // copies the whole archive before extracting anything.
                     return super::rar_reader::read_member_at(
                         &self.origin,
                         &node.stored_path,

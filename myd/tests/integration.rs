@@ -13360,3 +13360,77 @@ async fn a_compressed_member_streams_rather_than_buffering() {
     }
     assert_eq!(total, member_len, "the whole member must stream out");
 }
+
+/// Reading a RAR member must not cost more the deeper it sits in the archive.
+///
+/// Reported: stepping through files with the preview open took "a very long
+/// time" per keystroke. `rars` has no seek-to-member entry point, so it decoded
+/// every member ahead of the target — 26 seconds for one in the middle of a 5GB
+/// archive, growing to 54 seconds at the end, while `bsdtar` seeks and takes
+/// ~50ms wherever the member sits. Reads now go through `bsdtar` when it is
+/// available, and fall back to `rars` when it cannot read the container.
+///
+/// Asserted by shape: the cost of a late member against an early one. A wall
+/// clock bound would have to be loose enough to survive a slow machine, and
+/// this failure mode is a ratio in the hundreds.
+#[tokio::test]
+async fn a_rar_member_costs_the_same_wherever_it_sits() {
+    use myd::vfs::archive::{archive_format, ArchiveFs};
+    use myd::vfs::{BackendId, VPath, Vfs};
+    use tokio::io::AsyncReadExt;
+
+    // The RAR samples vendored by other crates are tiny — too small for a
+    // position effect to show — and nothing in the tree writes a RAR. Without a
+    // real one there is nothing to measure, so this reports and returns rather
+    // than asserting on a fixture that cannot exercise the bug.
+    let Some(container) = ["/home/juan/code/untest/myd/Nonsane_-_Adicktion_Therapy_V_Text.rar"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    else {
+        eprintln!("skipping: no large RAR on this machine");
+        return;
+    };
+
+    let fmt = archive_format(&container).expect("a rar");
+    let fs = ArchiveFs::open(Vec::new(), fmt, container.clone()).unwrap();
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut queue = vec![std::path::PathBuf::from("/")];
+    while let Some(dir) = queue.pop() {
+        let Ok(entries) = fs.read_dir(&VPath::new(BackendId(9), dir.clone())).await else {
+            continue;
+        };
+        for e in entries {
+            let child = dir.join(&e.name);
+            if e.is_dir {
+                queue.push(child);
+            } else if e.len > 0 {
+                files.push(child);
+            }
+        }
+    }
+    files.sort();
+    assert!(files.len() > 100, "need a real archive to measure position");
+
+    let read = |path: std::path::PathBuf| {
+        let fs = &fs;
+        async move {
+            let t = std::time::Instant::now();
+            let mut r = fs.open_read(&VPath::new(BackendId(9), path)).await.unwrap();
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).await.unwrap();
+            (t.elapsed(), buf.len())
+        }
+    };
+
+    let (early, n_early) = read(files[0].clone()).await;
+    let (late, n_late) = read(files[files.len() - 1].clone()).await;
+    assert!(n_early > 0 && n_late > 0, "both members must read back");
+
+    assert!(
+        late < early * 20,
+        "the last member took {late:?} against {early:?} for the first — reads are \
+         scaling with position, so they are decoding everything ahead of the target"
+    );
+}
