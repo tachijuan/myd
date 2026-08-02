@@ -136,6 +136,28 @@ impl ArchiveFs {
         Some((bytes.clone(), start, end))
     }
 
+    /// A reader that inflates a compressed zip member as it is read.
+    ///
+    /// `None` unless this is a zip member with a decoder — everything else
+    /// either slices the container directly or has no streaming form here.
+    fn stream_zip_member(&self, path: &std::path::Path) -> Option<ZipMemberReader> {
+        if self.format != ArchiveFormat::Zip {
+            return None;
+        }
+        let node = self.index.get(path)?;
+        if node.is_dir {
+            return None;
+        }
+        let MemberLocator::Index(i) = node.locator else {
+            return None;
+        };
+        Some(ZipMemberReader::new(
+            self.container.as_ref()?.clone(),
+            i,
+            node.len,
+        ))
+    }
+
     /// Decompress one member into memory.
     ///
     /// Returns an owned buffer rather than a reader borrowing the archive, so
@@ -232,6 +254,124 @@ impl ArchiveFs {
             }
             MemberLocator::None => Ok(Vec::new()),
         }
+    }
+}
+
+/// Inflates one zip member on demand.
+///
+/// A compressed member has to be decoded from its start, so reading the head of
+/// one used to mean decoding all of it: previewing a 1.3GB video inside an
+/// archive decompressed the whole member to sniff its first 8KB. This decodes
+/// only as far as it is read.
+///
+/// The decoder runs on its own thread and hands chunks over a bounded channel.
+/// That is what keeps a *sequential* read linear — the alternative, re-opening
+/// the entry and skipping forward per refill, is quadratic over a large member —
+/// and the bound is what keeps memory flat: the decoder blocks once a couple of
+/// chunks are outstanding, so a member larger than memory streams fine. Dropping
+/// the reader closes the channel, and the decoder stops at its next send rather
+/// than running to completion for a preview nobody is waiting for.
+struct ZipMemberReader {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    /// The chunk being handed out, and how much of it has gone.
+    current: Vec<u8>,
+    offset: usize,
+    done: bool,
+}
+
+/// Bytes per decoded chunk, and how many may be outstanding. Two chunks in
+/// flight is enough to keep the decoder busy without holding much.
+const CHUNK: usize = 256 * 1024;
+const CHUNKS_IN_FLIGHT: usize = 2;
+
+impl ZipMemberReader {
+    fn new(container: Container, index: usize, len: u64) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHUNKS_IN_FLIGHT);
+
+        std::thread::spawn(move || {
+            use std::io::Read;
+
+            let decode = || -> std::io::Result<()> {
+                let mut zip = zip::ZipArchive::new(std::io::Cursor::new(container.as_slice()))
+                    .map_err(std::io::Error::other)?;
+                let entry = zip.by_index(index).map_err(std::io::Error::other)?;
+                // Bounded by the declared size rather than trusting the stream:
+                // a header that lies about its length would otherwise decode
+                // without limit.
+                let mut entry = entry.take(len);
+                loop {
+                    let mut buf = vec![0u8; CHUNK];
+                    let mut filled = 0;
+                    // `read` may return short; fill the chunk before sending so
+                    // the channel carries whole buffers rather than dribbles.
+                    while filled < buf.len() {
+                        match entry.read(&mut buf[filled..]) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    if filled == 0 {
+                        return Ok(());
+                    }
+                    buf.truncate(filled);
+                    // A closed channel means the reader was dropped: stop
+                    // decoding rather than finish a member nobody wants.
+                    if tx.blocking_send(Ok(buf)).is_err() {
+                        return Ok(());
+                    }
+                }
+            };
+
+            if let Err(e) = decode() {
+                let _ = tx.blocking_send(Err(e));
+            }
+        });
+
+        Self {
+            rx,
+            current: Vec::new(),
+            offset: 0,
+            done: false,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ZipMemberReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        if this.offset >= this.current.len() {
+            if this.done {
+                return Poll::Ready(Ok(()));
+            }
+            match this.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                // Channel closed: the decoder finished or stopped.
+                Poll::Ready(None) => {
+                    this.done = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.done = true;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.current = chunk;
+                    this.offset = 0;
+                }
+            }
+        }
+
+        let take = (this.current.len() - this.offset).min(out.remaining());
+        out.put_slice(&this.current[this.offset..this.offset + take]);
+        this.offset += take;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -342,6 +482,16 @@ impl Vfs for ArchiveFs {
             return Ok(Box::new(super::container::SliceReader::new(
                 container, start, end,
             )));
+        }
+
+        // A deflated zip member decodes as a stream, so a reader that pulls from
+        // it delivers the first bytes immediately and never holds the whole
+        // member. Buffering it whole instead meant a 1.3GB video inside an
+        // archive was fully decompressed just so the preview could sniff its
+        // first 8KB and report "binary file" — half a second of work, and an
+        // allocation the size of the member.
+        if let Some(reader) = self.stream_zip_member(&path.path) {
+            return Ok(Box::new(reader));
         }
         // Everything else needs a decoder, which is CPU work: on an async worker
         // it would block every other task on that thread, and an extract runs

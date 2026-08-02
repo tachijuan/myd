@@ -13280,3 +13280,83 @@ async fn enter_on_an_archive_returns_immediately() {
         "the archive panel must open once indexing lands"
     );
 }
+
+/// A compressed archive member must stream, not decompress whole to be sniffed.
+///
+/// Previewing a 1.3GB video inside a zip took 758ms and allocated the whole
+/// member: `open_read` buffered it entirely so that `read_head` could look at
+/// the first 8KB and report "binary file". Reading now decodes only as far as
+/// it is read, so the same preview is a couple of milliseconds.
+#[tokio::test]
+async fn a_compressed_member_streams_rather_than_buffering() {
+    use myd::vfs::archive::{archive_format, ArchiveFs};
+    use myd::vfs::{BackendId, VPath, Vfs};
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big-member.zip");
+
+    // One deflated member far larger than anything a preview wants. Highly
+    // compressible, so the fixture is small while the member is not.
+    let member_len: u64 = 128 * 1024 * 1024;
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("big.bin", opts).unwrap();
+        // Not zeros: 256MB of zeros deflates past the 1000:1 ratio the index
+        // rejects as a zip bomb. This still compresses, just not absurdly.
+        let mut chunk = vec![0u8; 1 << 20];
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = ((i * 7) % 251) as u8;
+        }
+        for _ in 0..(member_len >> 20) {
+            std::io::Write::write_all(&mut w, &chunk).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let fmt = archive_format(&path).unwrap();
+    let fs = ArchiveFs::open(Vec::new(), fmt, path.clone()).unwrap();
+    let vp = VPath::new(BackendId(9), std::path::PathBuf::from("/big.bin"));
+
+    // Reading the head must not scale with the member. Asserted by shape rather
+    // than a wall-clock budget: a fast machine decompresses 128MB inside any
+    // threshold loose enough to be non-flaky, so an absolute bound does not
+    // distinguish streaming from buffering. Reading 8KB against reading it all
+    // does — buffering makes them equal, streaming makes the head far cheaper.
+    let t = std::time::Instant::now();
+    let mut r = fs.open_read(&vp).await.unwrap();
+    let mut head_buf = vec![0u8; 8192];
+    let n = r.read(&mut head_buf).await.unwrap();
+    let head = t.elapsed();
+    assert_eq!(n, 8192, "the head must come back");
+    drop(r);
+
+    let t = std::time::Instant::now();
+    let mut r = fs.open_read(&vp).await.unwrap();
+    let mut sink = Vec::new();
+    r.read_to_end(&mut sink).await.unwrap();
+    let whole = t.elapsed();
+
+    assert!(
+        head * 4 < whole,
+        "reading 8KB took {head:?} against {whole:?} for the whole {}MB member — \
+         the head is being decompressed in full",
+        member_len >> 20
+    );
+
+    // And the whole member still reads back correctly, at its declared size.
+    let mut r = fs.open_read(&vp).await.unwrap();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = r.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+    }
+    assert_eq!(total, member_len, "the whole member must stream out");
+}
