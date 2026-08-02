@@ -1,15 +1,12 @@
 //! Formats read through the system `bsdtar`.
 //!
-//! RAR has no pure-Rust reader worth shipping: the one crate that reads it
-//! vendors the non-free UnRAR C source, whose licence restricts what may be
-//! done with the algorithm and would be compiled into every distributed binary.
-//! libarchive has a RAR reader built in as standard, and `bsdtar` is its
-//! command-line face — so this asks the user's own copy rather than shipping
-//! one.
+//! `.iso`, `.cab`, `.cpio`, `.lha`, `.xar` and the package formats: the long
+//! tail nobody would write a reader for individually, all of which libarchive
+//! already reads. Rather than ship a copy, this asks the user's own `bsdtar`.
 //!
-//! That also buys `.iso`, `.cab`, `.cpio`, `.ar`, `.lha` and `.xar` for the
-//! same integration, which is most of the long tail nobody would write a
-//! reader for individually.
+//! RAR used to come through here too, and no longer does — libarchive's RAR4
+//! support is partial, so an older archive failed while a RAR5 one beside it
+//! worked. See [`super::rar_reader`].
 //!
 //! The probe-and-explain shape here is deliberately the one
 //! [`crate::preview::image`] already uses for `timg`/`chafa`: check once, cache
@@ -115,6 +112,27 @@ fn first_complaint(stderr: &[u8]) -> String {
         .to_string()
 }
 
+/// Why a listing that came back empty should be refused, if it should.
+///
+/// `bsdtar` can exit *zero* having printed nothing: it recognises the
+/// signature, finds no headers behind it, and reports success. That was taken
+/// as a valid empty archive, so the pane opened on an empty tree and explained
+/// nothing — the bug that started this. A damaged RAR5 was the case that did
+/// it, and RAR no longer comes through here, but any format libarchive
+/// half-recognises can do the same and the failure is silent.
+///
+/// A genuinely empty archive is refused too. That is a real loss, and a small
+/// one against opening on nothing with no explanation.
+fn empty_listing_error(container_len: u64, listing: &str, format: ArchiveFormat) -> Option<String> {
+    (container_len > 0 && listing.trim().is_empty()).then(|| {
+        format!(
+            "bsdtar read no entries from it — the file is probably damaged, \
+             or is not really {}",
+            format.label()
+        )
+    })
+}
+
 /// Build an index by asking `bsdtar` to list the container.
 pub fn index_via_bsdtar(
     path: &std::path::Path,
@@ -128,18 +146,8 @@ pub fn index_via_bsdtar(
     let listing = run(&[std::ffi::OsStr::new("-tvf"), path.as_os_str()])?;
     let listing = String::from_utf8_lossy(&listing);
 
-    // A container with bytes in it that lists nothing was not understood. A
-    // damaged RAR5 is the case that matters: bsdtar reads the signature, finds
-    // no headers behind it, prints nothing and *exits zero* — which was taken
-    // as a valid empty archive, so the pane opened on nothing and said nothing.
-    // A genuinely empty archive is a real but unimportant thing to lose here;
-    // reporting it as unreadable is far less confusing than an empty tree.
-    if container_len > 0 && listing.trim().is_empty() {
-        bail!(
-            "bsdtar read no entries from it — the file is probably damaged, \
-             or is not really {}",
-            format.label()
-        );
+    if let Some(why) = empty_listing_error(container_len, &listing, format) {
+        bail!("{why}");
     }
 
     let mut index = ArchiveIndex::new(format);
@@ -402,25 +410,27 @@ bsdtar: Error exit delayed from previous errors
     }
 
     #[test]
-    fn a_container_that_lists_nothing_is_an_error_not_an_empty_archive() {
-        // The case that started this: a damaged RAR5. bsdtar reads the
-        // signature, finds no headers behind it, prints nothing and exits
-        // *zero* — which was taken as a valid empty archive, so the pane opened
-        // on an empty tree and explained nothing.
-        if !has_bsdtar() {
-            eprintln!("skipping: bsdtar is not installed");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("damaged.rar");
-        std::fs::write(&p, b"Rar!\x1a\x07\x01\x00garbage").unwrap();
+    fn a_listing_that_came_back_empty_is_refused() {
+        // bsdtar can exit zero having printed nothing, which was taken as a
+        // valid empty archive: the pane opened on an empty tree and said
+        // nothing. Checked on the decision rather than through the tool, since
+        // provoking the zero-exit needs a format no longer in this set.
+        let why = empty_listing_error(4096, "", ArchiveFormat::Libarchive("cpio"))
+            .expect("a container with bytes that lists nothing is not readable");
+        assert!(why.contains("no entries"), "unhelpful: {why}");
+        assert!(why.contains("damaged"), "unhelpful: {why}");
+        assert!(why.contains("cpio"), "should name the format: {why}");
 
-        let err = index_via_bsdtar(&p, ArchiveFormat::Rar, MAX_MEMBERS)
-            .err()
-            .expect("a container that lists nothing must not succeed");
-        let msg = err.to_string();
-        assert!(msg.contains("no entries"), "unhelpful message: {msg}");
-        assert!(msg.contains("damaged"), "unhelpful message: {msg}");
+        // Whitespace-only output is just as empty.
+        assert!(empty_listing_error(4096, "  \n \n", ArchiveFormat::Libarchive("cpio")).is_some());
+
+        // A real listing passes, and so does a zero-length file — which is not
+        // a damaged archive, just an empty one.
+        assert!(
+            empty_listing_error(4096, "-rw-r--r--  1 u g 5 Jan 1 00:00 a", ArchiveFormat::Libarchive("cpio"))
+                .is_none()
+        );
+        assert!(empty_listing_error(0, "", ArchiveFormat::Libarchive("cpio")).is_none());
     }
 
     #[test]
@@ -430,10 +440,10 @@ bsdtar: Error exit delayed from previous errors
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("notreally.rar");
-        std::fs::write(&p, b"this is definitely not a rar").unwrap();
+        let p = dir.path().join("notreally.cpio");
+        std::fs::write(&p, b"this is definitely not a cpio").unwrap();
 
-        let err = index_via_bsdtar(&p, ArchiveFormat::Rar, MAX_MEMBERS)
+        let err = index_via_bsdtar(&p, ArchiveFormat::Libarchive("cpio"), MAX_MEMBERS)
             .err()
             .expect("rubbish must not open");
         assert!(
@@ -444,8 +454,8 @@ bsdtar: Error exit delayed from previous errors
 
     #[test]
     fn a_missing_tool_explains_itself() {
-        let msg = explain_missing(ArchiveFormat::Rar);
+        let msg = explain_missing(ArchiveFormat::Libarchive("cpio"));
         assert!(msg.contains("bsdtar"), "{msg}");
-        assert!(msg.contains("rar"), "{msg}");
+        assert!(msg.contains("cpio"), "{msg}");
     }
 }

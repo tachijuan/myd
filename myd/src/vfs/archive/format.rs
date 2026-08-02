@@ -62,8 +62,12 @@ impl ArchiveFormat {
     }
 
     /// Whether this format is read by asking the system `bsdtar`.
+    ///
+    /// RAR is deliberately *not* in this set. It used to be, and libarchive's
+    /// partial RAR4 support is why some RAR files opened and others did not;
+    /// it is now read in process by the `rars` crate.
     pub fn needs_bsdtar(&self) -> bool {
-        matches!(self, ArchiveFormat::Rar | ArchiveFormat::Libarchive(_))
+        matches!(self, ArchiveFormat::Libarchive(_))
     }
 
     /// Whether members can be reached in any order without re-reading what came
