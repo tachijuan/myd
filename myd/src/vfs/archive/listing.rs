@@ -24,14 +24,14 @@ use crate::widget::file_info::format_mode;
 use super::format::ArchiveFormat;
 use super::index::{ArchiveIndex, Rejection};
 
-/// Largest container that will be read to produce a listing.
+/// Largest *remote* container that will be downloaded to produce a listing.
 ///
-/// The whole file is held in memory to be parsed. A zip only strictly needs its
-/// tail, but reading just that means a seeking reader over the `Vfs`, which is
-/// worth building only if this limit turns out to bite; 128MB covers every
-/// archive anyone browses casually and is a quarter of what the image preview
-/// is willing to stage.
-const MAX_LISTING_BYTES: u64 = 128 * 1024 * 1024;
+/// A local container is memory-mapped, so its size does not matter and there is
+/// no ceiling on listing one. A remote container has nothing to map: listing it
+/// means pulling it across the wire into memory first, and doing that silently
+/// for a multi-gigabyte file is a surprise rather than a feature. Opening it
+/// with `Enter` is refused for the same reason and says so.
+const MAX_REMOTE_LISTING_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Largest number of members shown in a preview.
 ///
@@ -77,30 +77,37 @@ pub async fn preview(
             message: "This archive is empty.".to_string(),
         });
     }
-    if meta.len > MAX_LISTING_BYTES {
+    // A remote container has to come across the wire before it can be parsed,
+    // and a large one is a download nobody asked for. A local one is mapped
+    // below and has no such cost, so no limit applies to it.
+    if !path.is_local() && !format.needs_bsdtar() && meta.len > MAX_REMOTE_LISTING_BYTES {
         return Ok(PreviewContent::Note {
             message: format!(
-                "This archive is {} — too large to list. Open it with Enter to browse it instead.",
+                "This archive is {} and is on a remote panel — listing it would download \
+                 it whole. Copy it here (c) first.",
                 format_size(meta.len)
             ),
         });
     }
 
     // The bsdtar formats read the file themselves; only the in-process readers
-    // need it in memory, and reading a DVD-sized .iso to list it would be
-    // absurd when the tool can seek within it.
-    let bytes = if format.needs_bsdtar() {
-        Vec::new()
+    // need the bytes, and reading a DVD-sized .iso to list it would be absurd
+    // when the tool can seek within it. A local container is mapped, so nothing
+    // is read here either — only a remote one is actually pulled across.
+    let container = if format.needs_bsdtar() {
+        super::Container::empty()
+    } else if path.is_local() {
+        super::Container::map(path.as_path())?
     } else {
-        crate::preview::read_head(fs, path, meta.len).await?
+        super::Container::owned(crate::preview::read_head(fs, path, meta.len).await?)
     };
 
-    // Parsing is CPU-bound over a buffer that may be a hundred megabytes; on an
-    // async worker it would block every other task sharing that thread.
+    // Parsing is CPU-bound, and over a mapping it also faults pages in; on an
+    // async worker either would block every other task sharing that thread.
     let label = label.to_string();
-    let container = path.as_path().to_path_buf();
+    let container_path = path.as_path().to_path_buf();
     let content = tokio::task::spawn_blocking(move || {
-        let index = super::read_index(&bytes, &container, format, MAX_PREVIEW_MEMBERS)?;
+        let index = super::read_index(&container, &container_path, format, MAX_PREVIEW_MEMBERS)?;
         Ok::<_, anyhow::Error>(render(&index, &label, format))
     })
     .await??;

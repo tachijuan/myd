@@ -13106,3 +13106,116 @@ async fn help_documents_tagging_in_both_views() {
         "and that V is the tree-only exception:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Archives are not size-limited. A container is memory-mapped rather than read,
+// so opening one costs address space rather than memory, and a stored member is
+// served straight out of the mapping rather than being buffered.
+// ---------------------------------------------------------------------------
+
+/// A container far larger than the old 512MB ceiling opens and lists.
+///
+/// Built with stored (uncompressed) entries so the file on disk really is that
+/// large. Before mapping, this was refused outright with "too large to open".
+#[tokio::test]
+async fn a_large_archive_opens_and_lists_its_members() {
+    use myd::vfs::archive::{archive_format, ArchiveFs};
+    use myd::vfs::{BackendId, VPath, Vfs};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.zip");
+
+    // 600MB in three stored members: past the ceiling that used to apply, and
+    // small enough to build quickly since the bytes are never compressed.
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let chunk = vec![7u8; 1 << 20];
+        for i in 0..3 {
+            w.start_file(format!("f{i}.bin"), opts).unwrap();
+            for _ in 0..200 {
+                std::io::Write::write_all(&mut w, &chunk).unwrap();
+            }
+        }
+        w.finish().unwrap();
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        size > 512 * 1024 * 1024,
+        "fixture must exceed the old ceiling, got {size}"
+    );
+
+    let fmt = archive_format(&path).expect("a zip");
+    let fs = ArchiveFs::open(Vec::new(), fmt, path.clone()).expect("a large archive must open");
+
+    let entries = fs
+        .read_dir(&VPath::new(BackendId(9), std::path::PathBuf::from("/")))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 3, "every member is listed");
+
+    // And a member reads back whole, streamed out of the mapping.
+    use tokio::io::AsyncReadExt;
+    let mut r = fs
+        .open_read(&VPath::new(BackendId(9), std::path::PathBuf::from("/f1.bin")))
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        assert!(buf[..n].iter().all(|b| *b == 7), "bytes must round-trip");
+        total += n as u64;
+    }
+    assert_eq!(total, 200 * (1 << 20), "the whole member is read");
+}
+
+/// A stored member is read from the mapping rather than copied into memory.
+///
+/// The distinction is what makes a member larger than RAM extractable, so it is
+/// asserted on the locator rather than left to be inferred from timing.
+#[tokio::test]
+async fn a_stored_member_is_located_by_offset_not_buffered() {
+    use myd::vfs::archive::index::MemberLocator;
+    use myd::vfs::archive::{archive_format, ArchiveFs};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.zip");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let deflated: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("stored.txt", stored).unwrap();
+        std::io::Write::write_all(&mut w, b"stored bytes").unwrap();
+        w.start_file("deflated.txt", deflated).unwrap();
+        std::io::Write::write_all(&mut w, &vec![b'a'; 4096]).unwrap();
+        w.finish().unwrap();
+    }
+
+    let fmt = archive_format(&path).unwrap();
+    let fs = ArchiveFs::open(Vec::new(), fmt, path.clone()).unwrap();
+    let idx = fs.index();
+
+    let stored = idx.get(std::path::Path::new("/stored.txt")).unwrap();
+    assert!(
+        matches!(stored.locator, MemberLocator::StreamOffset { .. }),
+        "a stored member must be addressable in the container, got {:?}",
+        stored.locator
+    );
+
+    // A compressed one still needs the decoder, and says so.
+    let deflated = idx.get(std::path::Path::new("/deflated.txt")).unwrap();
+    assert!(
+        matches!(deflated.locator, MemberLocator::Index(_)),
+        "a deflated member cannot be sliced, got {:?}",
+        deflated.locator
+    );
+}

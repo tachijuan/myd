@@ -853,11 +853,28 @@ archive inside another archive is refused for browsing, though \fBspace\fR still
 lists it \(em the cost multiplies through a stream\-compressed outer archive, and
 the nesting depth is the archive's choice rather than the user's.
 .PP
-Containers are read whole to be indexed and capped at 512 MB; past that,
-\fBspace\fR still lists the contents. The \fBbsdtar\fR formats have no such cap,
-since the tool seeks within the file itself. Names that escape the archive root
-("Zip Slip") are refused at index time and reported in the listing rather than
-dropped silently.
+There is no limit on the size of a local container. It is memory\-mapped rather
+than read, so its size costs address space rather than memory: indexing a zip
+touches its tail, indexing a tar walks the headers and skips the data, and
+neither faults in the bulk of the file. A stored member \(em every member of a
+plain tar, and any zip entry written uncompressed \(em is a contiguous run of
+bytes in the container and is read straight out of the mapping, so it extracts
+in constant memory however large it is.
+.PP
+A compressed tar cannot be mapped: it has no directory, so it has to be
+decompressed in full before anything can be indexed. That decompression fills a
+buffer sized from the memory actually available (a quarter of it, honouring a
+cgroup cap where there is one) and spills the remainder to a temporary file,
+which is mapped and unlinked. Memory therefore stays bounded whatever the stream
+expands to \(em a decompression bomb costs disk the system reclaims when the
+archive is closed rather than the machine's RAM.
+.PP
+A container on a remote panel has nothing to map, so listing one means pulling it
+across the wire; past 128 MB that is refused with a note suggesting it be copied
+across first. Names that escape the archive root ("Zip Slip") are refused at
+index time and reported in the listing rather than dropped silently. The number
+of members is still bounded \(em 100,000 browsing, 20,000 in a preview \(em since
+the index holds a record per member; that is a count rather than a size.
 .PP
 Extraction does not restore the executable bit: a \fBchmod +x\fR script comes out
 of an archive non\-executable. The mode is held in the index and shown in the

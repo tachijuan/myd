@@ -8,58 +8,189 @@
 //! decompressed bytes, because decompressing it once and keeping the result is
 //! the only way to stop every member read from re-scanning from the start.
 
-use std::io::Read;
+use std::io::{Read, Write};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
+use super::container::Container;
 use super::format::{ArchiveFormat, Compression};
 use super::index::{normalise, ArchiveIndex, ArchiveNode, MemberLocator, Normalised, Rejection};
 use super::index::{MAX_EXPANSION_RATIO, MAX_MEMBERS};
 
-/// Largest decompressed stream held in memory.
+/// Decompressed bytes held in memory before spilling to disk, when the machine's
+/// own free memory cannot be read.
 ///
-/// A compressed tar has to be decompressed to be read at all, and holding the
-/// result is what turns each later member read into a slice copy rather than
-/// another full decompression. 512MB is roughly a large source tree and the
-/// point past which holding it starts to compete with the machine's own
-/// working set.
-pub const MAX_RESIDENT_STREAM_BYTES: u64 = 512 * 1024 * 1024;
+/// Not a ceiling: past this the stream keeps going, into a temporary file that
+/// is then mapped. Anything below it is served from memory, which is the common
+/// case and avoids touching the disk for an ordinary source tarball.
+pub const DEFAULT_SPILL_ABOVE: u64 = 512 * 1024 * 1024;
 
-/// Decompress a whole-stream container, refusing one that would not fit.
+/// How much of the memory actually available this will fill before spilling.
 ///
-/// The reader is bounded by [`MAX_RESIDENT_STREAM_BYTES`] rather than trusted:
-/// a compressed stream declares nothing about its output size, so the only way
-/// to find out is to decompress, and a decompression bomb is a few kilobytes
-/// that expands without limit.
-pub fn decompress(bytes: &[u8], how: Compression) -> Result<Vec<u8>> {
-    let limit = MAX_RESIDENT_STREAM_BYTES;
-    let mut out = Vec::new();
-    let taken = &mut match how {
-        Compression::Gzip => {
-            Box::new(flate2::read::MultiGzDecoder::new(bytes)) as Box<dyn Read>
+/// A quarter, so decompressing a large tarball leaves the machine — and the
+/// rest of this process — room to work. A fixed budget cannot do that: 512MB is
+/// nothing on a workstation and fatal in a 256MB container, and the second case
+/// is the one that gets OOM-killed rather than merely being slow.
+const SPILL_FRACTION: u64 = 4;
+
+/// Bytes to buffer before spilling to disk.
+///
+/// Read from the cgroup's limit where there is one — a container's memory cap is
+/// the number that matters inside it, and `MemAvailable` describes the host —
+/// and from `/proc/meminfo` otherwise. Falls back to [`DEFAULT_SPILL_ABOVE`]
+/// where neither can be read, which is every non-Linux target.
+pub fn spill_threshold() -> u64 {
+    // Clamped at both ends: a tiny cgroup should still buffer something rather
+    // than spill every stream, and a huge machine should not sit on gigabytes
+    // of decompressed tar just because it can.
+    const FLOOR: u64 = 32 * 1024 * 1024;
+    const CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+    let budget = cgroup_limit()
+        .or_else(mem_available)
+        .map(|b| b / SPILL_FRACTION)
+        .unwrap_or(DEFAULT_SPILL_ABOVE);
+    budget.clamp(FLOOR, CEILING)
+}
+
+/// This process's cgroup memory ceiling, if it has a finite one.
+///
+/// The limit that applies is not necessarily on the process's own cgroup: it is
+/// the tightest one anywhere up the tree, since a parent's cap binds every
+/// descendant. So this walks from the leaf to the root and takes the smallest.
+/// Reading only `/sys/fs/cgroup/memory.max` finds the *root's* limit, which is
+/// almost always "max" — the reason an earlier version of this saw no limit and
+/// was OOM-killed inside a 256MB scope.
+fn cgroup_limit() -> Option<u64> {
+    // cgroup v2: "0::/path". v1 lists a controller per line; the memory one is
+    // what matters here.
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = own
+        .lines()
+        .find(|l| l.starts_with("0::"))
+        .and_then(|l| l.strip_prefix("0::"))
+        .or_else(|| {
+            own.lines()
+                .find(|l| l.split(':').nth(1) == Some("memory"))
+                .and_then(|l| l.split(':').nth(2))
+        })?
+        .trim();
+
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup");
+    dir.push(rel.trim_start_matches('/'));
+
+    let mut tightest: Option<u64> = None;
+    loop {
+        for name in ["memory.max", "memory.limit_in_bytes"] {
+            if let Ok(s) = std::fs::read_to_string(dir.join(name)) {
+                let s = s.trim();
+                if s == "max" {
+                    continue;
+                }
+                if let Ok(v) = s.parse::<u64>() {
+                    // v1 reports an absurd sentinel rather than "max".
+                    if v > 0 && v < u64::MAX / 2 {
+                        tightest = Some(tightest.map_or(v, |t: u64| t.min(v)));
+                    }
+                }
+            }
         }
+        if !dir.pop() || !dir.starts_with("/sys/fs/cgroup") {
+            break;
+        }
+    }
+    tightest
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes.
+fn mem_available() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Decompress a whole-stream container into memory.
+///
+/// A compressed tar has no directory, so it has to be decompressed in full
+/// before anything can be indexed, and holding the result is what turns each
+/// later member read into a slice copy rather than another full decompression.
+///
+/// This is the in-memory form, used for a stream that fits. See
+/// [`decompress_to_container`] for the one that spills.
+pub fn decompress(bytes: &[u8], how: Compression) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decoder(bytes, how)?
+        .read_to_end(&mut out)
+        .with_context(|| format!("could not decompress this {} stream", label(how)))?;
+    Ok(out)
+}
+
+/// Decompress a whole-stream container, spilling to disk if it is large.
+///
+/// A compressed stream declares nothing about its output size, so the only way
+/// to learn it is to decompress. Rather than refuse past a limit — which is what
+/// made a large `.tar.gz` un-openable — this fills a buffer sized by
+/// [`spill_threshold`] and, if the stream is still going, writes the rest to a
+/// temporary file and maps it. Memory stays bounded at that threshold whatever
+/// the stream expands to, so a decompression bomb costs disk that the OS
+/// reclaims when the archive is closed rather than the machine's RAM.
+pub fn decompress_to_container(bytes: &[u8], how: Compression) -> Result<Container> {
+    decompress_spilling_above(bytes, how, spill_threshold())
+}
+
+/// As [`decompress_to_container`], with the threshold given rather than probed.
+///
+/// Separated so a test can drive the spill path without allocating whatever the
+/// machine happens to consider a quarter of its free memory.
+pub fn decompress_spilling_above(
+    bytes: &[u8],
+    how: Compression,
+    threshold: u64,
+) -> Result<Container> {
+    let mut reader = decoder(bytes, how)?;
+    let cx = || format!("could not decompress this {} stream", label(how));
+
+    // Fill the in-memory budget first, one byte past it so "full" is
+    // distinguishable from "exactly that long". Saturating, so a caller asking
+    // for an unbounded budget gets one rather than an overflow.
+    let mut head = Vec::new();
+    (&mut reader)
+        .take(threshold.saturating_add(1))
+        .read_to_end(&mut head)
+        .with_context(cx)?;
+
+    if head.len() as u64 <= threshold {
+        return Ok(Container::owned(head));
+    }
+
+    // Still going: spill. The head already read goes out first, then the rest
+    // streams through a fixed buffer, so this never holds more than the
+    // threshold no matter how large the stream turns out to be.
+    let mut spill = tempfile::NamedTempFile::new().context("could not create a spill file")?;
+    spill.write_all(&head).context("could not write spill")?;
+    drop(head);
+    std::io::copy(&mut reader, &mut spill).with_context(cx)?;
+    spill.flush().context("could not flush spill")?;
+
+    // Mapped, then unlinked: the mapping keeps the bytes alive, so the file
+    // leaves no litter behind even if the process is killed.
+    let container = Container::map(spill.path())?;
+    drop(spill);
+    Ok(container)
+}
+
+/// The decoder for one compression, as a boxed reader.
+fn decoder<'a>(bytes: &'a [u8], how: Compression) -> Result<Box<dyn Read + 'a>> {
+    Ok(match how {
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)) as Box<dyn Read>,
         Compression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(bytes)) as Box<dyn Read>,
         Compression::Xz => Box::new(liblzma::read::XzDecoder::new(bytes)) as Box<dyn Read>,
         Compression::Zstd => {
             Box::new(zstd::stream::read::Decoder::new(bytes).context("bad zstd stream")?)
                 as Box<dyn Read>
         }
-    }
-    // One byte past the limit, so hitting it is distinguishable from a stream
-    // that happens to be exactly the limit long.
-    .take(limit + 1);
-
-    taken
-        .read_to_end(&mut out)
-        .with_context(|| format!("could not decompress this {} stream", label(how)))?;
-
-    if out.len() as u64 > limit {
-        bail!(
-            "this archive expands to more than {} and will not be held in memory",
-            crate::utils::sizes::format_size(limit)
-        );
-    }
-    Ok(out)
+    })
 }
 
 fn label(how: Compression) -> &'static str {
@@ -319,5 +450,58 @@ pub(crate) mod tests {
         for cut in [1, full.len() / 3, full.len() / 2, full.len() - 1] {
             let _ = decompress(&full[..cut], Compression::Gzip);
         }
+    }
+
+    /// A stream larger than the budget spills to disk instead of being refused.
+    ///
+    /// This is what replaced a hard ceiling: a `.tar.gz` that expands past what
+    /// memory should hold used to be un-openable, which is the limit the user
+    /// asked to have removed.
+    #[test]
+    fn a_stream_past_the_budget_spills_rather_than_failing() {
+        // Highly compressible, so the fixture stays small while the output is
+        // comfortably past the tiny threshold used here.
+        let raw = fixture_tar();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &raw).unwrap();
+        let compressed = gz.finish().unwrap();
+
+        // Threshold of 1 byte forces the spill path for any real stream.
+        let spilled = decompress_spilling_above(&compressed, Compression::Gzip, 1).unwrap();
+        assert!(
+            matches!(spilled, Container::Mapped(_)),
+            "past the budget the stream must land in a mapped file"
+        );
+        assert_eq!(&spilled[..], &raw[..], "spilling must not alter the bytes");
+
+        // Under the threshold it stays in memory, and agrees byte for byte.
+        let held = decompress_spilling_above(&compressed, Compression::Gzip, u64::MAX).unwrap();
+        assert!(matches!(held, Container::Owned(_)), "a small stream stays in memory");
+        assert_eq!(&held[..], &spilled[..]);
+    }
+
+    /// The spill threshold tracks what the machine can actually spare.
+    #[test]
+    fn the_spill_threshold_is_bounded_and_sane() {
+        let t = spill_threshold();
+        assert!(
+            (32 * 1024 * 1024..=2 * 1024 * 1024 * 1024).contains(&t),
+            "threshold {t} outside its clamp"
+        );
+    }
+
+    /// A tar.gz whose members are located by offset reads them back correctly
+    /// whether the stream was spilled or held.
+    #[test]
+    fn members_read_the_same_from_a_spilled_stream() {
+        let raw = fixture_tar();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &raw).unwrap();
+        let compressed = gz.finish().unwrap();
+
+        let spilled = decompress_spilling_above(&compressed, Compression::Gzip, 1).unwrap();
+        let idx = index_tar(&spilled, ArchiveFormat::TarCompressed(Compression::Gzip), MAX_MEMBERS)
+            .unwrap();
+        assert!(idx.member_count() > 0, "a spilled stream still indexes");
     }
 }

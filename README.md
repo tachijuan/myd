@@ -569,10 +569,31 @@ still lists it. It would compose, but the cost multiplies through a
 stream-compressed outer archive and the nesting depth is the archive's choice
 rather than yours. Extract the inner one first.
 
-Containers are read whole to be indexed and capped at 512 MB; past that, `space`
-still lists the contents. The `bsdtar` formats have no such cap, since the tool
-seeks in the file itself. Names that escape the archive root ("Zip Slip") are
-refused at index time and reported in the listing rather than silently dropped.
+**There is no size limit.** A local container is memory-mapped rather than read,
+so its size costs address space rather than memory: indexing a zip touches its
+tail, indexing a tar walks the headers and skips the data, and neither faults in
+the bulk of the file. A stored member — every member of a plain tar, and any zip
+entry written uncompressed — is a contiguous run of bytes in the container, so
+it is read straight out of the mapping and extracts in constant memory however
+large it is.
+
+A compressed tar is the one case that cannot be mapped: it has no directory, so
+it has to be decompressed in full before anything can be indexed. That
+decompression fills a buffer sized from the machine's actually-available memory
+(a quarter of it, honouring a cgroup cap where there is one) and then spills the
+rest to a temporary file, which is mapped and unlinked. Memory therefore stays
+bounded whatever the stream expands to — a decompression bomb costs disk the OS
+reclaims when the archive closes, rather than the machine's RAM.
+
+The one remaining limit is on a container *on a remote panel*, which has nothing
+to map: listing it means pulling it across the wire, so past 128 MB it says so
+and suggests copying it here first. Opening one with `Enter` is already refused
+for the same reason.
+
+Names that escape the archive root ("Zip Slip") are refused at index time and
+reported in the listing rather than silently dropped. Member *counts* are still
+bounded (100,000 for a browse, 20,000 in a preview) since the index is a real
+data structure per member — that is a count, not a size.
 
 Extraction does **not** restore the executable bit — a `chmod +x` script comes
 out of an archive non-executable. The mode is in the index and shown in the
