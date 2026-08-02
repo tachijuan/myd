@@ -169,11 +169,30 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
     // An archive previews as its table of contents. This has to come before the
     // text sniff below, which would stop at "Binary file" — true, and useless:
     // what someone wants to know about an archive is what is in it.
-    if let Some(format) = crate::vfs::archive::archive_format(label) {
+    if let Some(by_name) = crate::vfs::archive::archive_format(label) {
         let name = label
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| label.display().to_string());
+        // The extension is a guess; the container's first bytes settle it. A
+        // `.cbr` is routinely a zip — the extension means "comic book rar" and
+        // is handed out by tools that wrote a zip — and listing it as a rar
+        // fails with a signature error that reads as the file being broken.
+        //
+        // Read through the `Vfs` rather than from disk, so this works on a
+        // remote panel and inside another archive, where there is no local
+        // path to open.
+        let head = read_head(
+            fs.clone(),
+            path,
+            crate::vfs::archive::format::SNIFF_LEN as u64,
+        )
+        .await
+        .unwrap_or_default();
+        let format = match crate::vfs::archive::format::sniff_format(&head) {
+            Some(by_content) if by_content != by_name => by_content,
+            _ => by_name,
+        };
         return crate::vfs::archive::listing::preview(fs, path, format, &name).await;
     }
 

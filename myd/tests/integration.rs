@@ -13493,3 +13493,89 @@ async fn a_cbz_browses_as_a_zip() {
         .unwrap();
     assert_eq!(entries.len(), 3, "every page is listed");
 }
+
+/// A `.cbr` that is really a zip must open, not report a signature error.
+///
+/// Reported: a real comic archive would not open, saying the signature was
+/// wrong. `.cbr` means "comic book rar" and is routinely written by tools that
+/// produced a zip, so the extension is a guess the bytes disagree with. Opening
+/// consults the first eight bytes and lets them win.
+#[tokio::test]
+async fn a_mislabelled_cbr_opens_as_what_it_actually_is() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A zip, named .cbr — exactly the reported shape.
+    let path = dir.path().join("Issue 1.cbr");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        for i in 1..=4 {
+            w.start_file(format!("Episode 1/{i:02}.jpg"), opts).unwrap();
+            std::io::Write::write_all(&mut w, format!("page {i}").as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    // The name says rar; the bytes say zip, and the bytes are what is used.
+    assert_eq!(
+        myd::vfs::archive::archive_format(&path),
+        Some(myd::vfs::archive::ArchiveFormat::Rar),
+        "the extension alone still reads as rar"
+    );
+    assert_eq!(
+        myd::vfs::archive::resolved_format(&path),
+        Some(myd::vfs::archive::ArchiveFormat::Zip),
+        "the container's own bytes must decide"
+    );
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "Issue 1.cbr");
+
+    // `space` lists it rather than failing on the signature.
+    app.handle_key_for_test(char_key(' '));
+    for _ in 0..400 {
+        app.tick_for_test();
+        if app.preview_has_content_for_test() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        app.preview_has_content_for_test(),
+        "a mislabelled cbr must still preview as its listing"
+    );
+
+    // And `Enter` opens it, with no error modal and the pages reachable.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(
+        app.modal_message_for_test().is_none(),
+        "opening must not raise an error: {:?}",
+        app.modal_message_for_test()
+    );
+    assert_eq!(
+        app.panel_current_dir(0).unwrap(),
+        std::path::Path::new("/"),
+        "the archive must open as a panel"
+    );
+
+    use myd::vfs::archive::ArchiveFs;
+    use myd::vfs::{BackendId, VPath, Vfs};
+    let fs = ArchiveFs::open(
+        Vec::new(),
+        myd::vfs::archive::resolved_format(&path).unwrap(),
+        path.clone(),
+    )
+    .unwrap();
+    let entries = fs
+        .read_dir(&VPath::new(
+            BackendId(9),
+            std::path::PathBuf::from("/Episode 1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 4, "every page is listed");
+}
