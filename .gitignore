@@ -11,6 +11,10 @@ myd/target/
 *.tar
 *.tar.*
 *.tgz
+*.cbz
+*.cbr
+*.cbt
+*.cb7
 
 # General
 __pycache__/
