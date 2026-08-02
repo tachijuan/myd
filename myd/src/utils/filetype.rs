@@ -142,8 +142,11 @@ pub fn categorize(path: &Path) -> FileCategory {
             FileCategory::Audio
         }
 
+        // The `cb*` family are comic book archives: a zip, rar, tar or 7z of
+        // page images. They colour as archives because that is what they are,
+        // and browsing into one is the point of recognising them.
         "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" | "tgz" | "lz4" | "iso"
-        | "dmg" => FileCategory::Archive,
+        | "dmg" | "cbz" | "cbr" | "cbt" | "cb7" => FileCategory::Archive,
 
         "json" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv" | "ini" | "cfg" | "conf"
         | "db" | "sqlite" | "sqlite3" | "parquet" | "avro" | "proto" | "lock" => {

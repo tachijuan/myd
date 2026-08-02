@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.30.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.31.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -832,6 +832,11 @@ Read in process, with no external tools: \fBzip\fR (and \fB.jar\fR, \fB.apk\fR,
 compressed forms (\fB.tar.gz\fR/\fB.tgz\fR, \fB.tar.bz2\fR, \fB.tar.xz\fR,
 \fB.tar.zst\fR), single compressed files (\fB.gz\fR, \fB.bz2\fR, \fB.xz\fR,
 \fB.zst\fR, shown as the one member they hold), and \fB7z\fR.
+.PP
+Comic book archives are the containers they are wearing another name, and open
+as such: \fB.cbz\fR is a zip, \fB.cbr\fR a rar, \fB.cbt\fR a tar and \fB.cb7\fR
+a 7z. \fBspace\fR lists the pages and \fBEnter\fR opens the archive to page
+through them with the preview.
 .PP
 \fBRAR\fR is listed in process by the \fBrars\fR crate, which is pure Rust and
 handles all three RAR generations including solid archives, so browsing one

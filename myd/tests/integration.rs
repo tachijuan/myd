@@ -13434,3 +13434,62 @@ async fn a_rar_member_costs_the_same_wherever_it_sits() {
          scaling with position, so they are decoding everything ahead of the target"
     );
 }
+
+/// A comic book archive opens and browses like the container it is.
+///
+/// `.cbz` is a zip and `.cbr` a rar, of page images. Detection returning the
+/// right enum is not the same as the file opening, so this drives the real
+/// keys: space to list it, Enter to go in, and asserts the pages are there.
+#[tokio::test]
+async fn a_cbz_browses_as_a_zip() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Volume 1.cbz");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        for i in 1..=3 {
+            w.start_file(format!("pages/{i:03}.jpg"), opts).unwrap();
+            std::io::Write::write_all(&mut w, format!("page {i}").as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "Volume 1.cbz");
+
+    // `space` lists it rather than reporting a binary file.
+    app.handle_key_for_test(char_key(' '));
+    for _ in 0..400 {
+        app.tick_for_test();
+        if app.preview_has_content_for_test() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        app.preview_has_content_for_test(),
+        "a cbz must preview as its listing"
+    );
+
+    // And `Enter` goes in, with the pages reachable as files.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert_eq!(
+        app.panel_current_dir(0).unwrap(),
+        std::path::Path::new("/"),
+        "the cbz must open as a panel"
+    );
+
+    use myd::vfs::archive::{archive_format, ArchiveFs};
+    use myd::vfs::{BackendId, VPath, Vfs};
+    let fs = ArchiveFs::open(Vec::new(), archive_format(&path).unwrap(), path.clone()).unwrap();
+    let entries = fs
+        .read_dir(&VPath::new(BackendId(9), std::path::PathBuf::from("/pages")))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 3, "every page is listed");
+}
