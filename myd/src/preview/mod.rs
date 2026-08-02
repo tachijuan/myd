@@ -191,9 +191,14 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
     }
 
     let want = meta.len.min(MAX_TEXT_BYTES);
-    let bytes = read_head(fs, path, want).await?;
 
-    if !filetype::looks_like_text(&bytes[..bytes.len().min(SNIFF_BYTES)]) {
+    // Sniff before committing to the full read. Only the first `SNIFF_BYTES`
+    // decide whether this is text at all, so reading a megabyte first is a
+    // megabyte thrown away for every binary file — and inside an archive that
+    // megabyte has to be *decompressed*, which took 758ms for an .mp4 whose
+    // preview is one line of text saying it is binary.
+    let head = read_head(fs.clone(), path, want.min(SNIFF_BYTES as u64)).await?;
+    if !filetype::looks_like_text(&head) {
         return Ok(PreviewContent::Note {
             message: format!(
                 "Binary file ({}). Press o to open it with the default application.",
@@ -201,6 +206,15 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
             ),
         });
     }
+
+    // Text, so the rest is worth having. Re-read from the start rather than
+    // stitching: a second range read is cheaper than the machinery to join two,
+    // and the sniff is at most 8KB of it.
+    let bytes = if want > head.len() as u64 {
+        read_head(fs, path, want).await?
+    } else {
+        head
+    };
 
     let text = String::from_utf8_lossy(&bytes);
     // A head read almost certainly stops mid-line; dropping the partial line is
