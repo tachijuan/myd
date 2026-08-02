@@ -12772,3 +12772,33 @@ async fn help_documents_the_archive_keys() {
         "entering an archive is not documented:\n{text}"
     );
 }
+
+#[test]
+fn an_error_dialog_carries_the_reason_not_just_the_context() {
+    // `format!("{e}")` on an anyhow::Error prints only the outermost context,
+    // so a failure wrapped in "could not read geeu.rar" showed exactly that and
+    // dropped the part saying why — which was the only useful half. Reported
+    // from a real machine: a RAR that would not open, and a dialog with nothing
+    // in it but the file name.
+    use anyhow::Context;
+    let e = Err::<(), _>(anyhow::anyhow!("Unrecognized archive format"))
+        .context("could not read geeu.rar")
+        .unwrap_err();
+
+    let shown = myd::app::explain_error(&e);
+    assert!(
+        shown.contains("Unrecognized archive format"),
+        "the cause must survive: {shown}"
+    );
+    assert!(shown.contains("geeu.rar"), "the context is useful too: {shown}");
+}
+
+#[test]
+fn a_repeated_context_line_is_not_shown_twice() {
+    // Some layers restate their cause verbatim; printing both only eats width.
+    use anyhow::Context;
+    let e = Err::<(), _>(anyhow::anyhow!("same thing"))
+        .context("same thing")
+        .unwrap_err();
+    assert_eq!(myd::app::explain_error(&e), "same thing");
+}

@@ -93,11 +93,26 @@ fn run(args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
         .wait_with_output()
         .context("could not read bsdtar's output")?;
     if !out.status.success() {
-        let why = String::from_utf8_lossy(&out.stderr);
-        let why = why.lines().next().unwrap_or("bsdtar failed").trim();
-        bail!("{why}");
+        bail!("{}", first_complaint(&out.stderr));
     }
     Ok(out.stdout)
+}
+
+/// bsdtar's first real complaint, with its own prefix stripped.
+///
+/// Its messages are `bsdtar: <what went wrong>`, sometimes followed by
+/// "Error exit delayed from previous errors", which restates that something
+/// failed without saying what. The first line is the one that carries the
+/// reason.
+fn first_complaint(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains("Error exit delayed"))
+        .map(|l| l.strip_prefix("bsdtar: ").unwrap_or(l))
+        .next()
+        .unwrap_or("bsdtar could not read it")
+        .to_string()
 }
 
 /// Build an index by asking `bsdtar` to list the container.
@@ -110,11 +125,22 @@ pub fn index_via_bsdtar(
         bail!("{}", explain_missing(format));
     }
     let container_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let listing = run(&[
-        std::ffi::OsStr::new("-tvf"),
-        path.as_os_str(),
-    ])?;
+    let listing = run(&[std::ffi::OsStr::new("-tvf"), path.as_os_str()])?;
     let listing = String::from_utf8_lossy(&listing);
+
+    // A container with bytes in it that lists nothing was not understood. A
+    // damaged RAR5 is the case that matters: bsdtar reads the signature, finds
+    // no headers behind it, prints nothing and *exits zero* — which was taken
+    // as a valid empty archive, so the pane opened on nothing and said nothing.
+    // A genuinely empty archive is a real but unimportant thing to lose here;
+    // reporting it as unreadable is far less confusing than an empty tree.
+    if container_len > 0 && listing.trim().is_empty() {
+        bail!(
+            "bsdtar read no entries from it — the file is probably damaged, \
+             or is not really {}",
+            format.label()
+        );
+    }
 
     let mut index = ArchiveIndex::new(format);
     let limit = limit.min(MAX_MEMBERS);
@@ -347,6 +373,73 @@ mod tests {
         assert_eq!(parse_mode("-rwsr-xr-x"), Some(0o755));
         assert_eq!(parse_mode("-rwSr-xr-x"), Some(0o655));
         assert_eq!(parse_mode("drwxrwsr-x"), Some(0o775));
+    }
+
+    /// Whether `bsdtar` is installed, so the tests that shell out can skip.
+    fn has_bsdtar() -> bool {
+        available()
+    }
+
+    #[test]
+    fn bsdtars_own_complaint_is_what_gets_reported() {
+        // Its messages are `bsdtar: <reason>`, sometimes followed by a line
+        // that only restates that something failed. The reason is what a user
+        // can act on.
+        assert_eq!(
+            first_complaint(b"bsdtar: Error opening archive: Unrecognized archive format
+"),
+            "Error opening archive: Unrecognized archive format"
+        );
+        assert_eq!(
+            first_complaint(
+                b"bsdtar: Failed to read next header
+bsdtar: Error exit delayed from previous errors
+"
+            ),
+            "Failed to read next header"
+        );
+        assert_eq!(first_complaint(b""), "bsdtar could not read it");
+    }
+
+    #[test]
+    fn a_container_that_lists_nothing_is_an_error_not_an_empty_archive() {
+        // The case that started this: a damaged RAR5. bsdtar reads the
+        // signature, finds no headers behind it, prints nothing and exits
+        // *zero* — which was taken as a valid empty archive, so the pane opened
+        // on an empty tree and explained nothing.
+        if !has_bsdtar() {
+            eprintln!("skipping: bsdtar is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("damaged.rar");
+        std::fs::write(&p, b"Rar!\x1a\x07\x01\x00garbage").unwrap();
+
+        let err = index_via_bsdtar(&p, ArchiveFormat::Rar, MAX_MEMBERS)
+            .err()
+            .expect("a container that lists nothing must not succeed");
+        let msg = err.to_string();
+        assert!(msg.contains("no entries"), "unhelpful message: {msg}");
+        assert!(msg.contains("damaged"), "unhelpful message: {msg}");
+    }
+
+    #[test]
+    fn an_unreadable_container_reports_why() {
+        if !has_bsdtar() {
+            eprintln!("skipping: bsdtar is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notreally.rar");
+        std::fs::write(&p, b"this is definitely not a rar").unwrap();
+
+        let err = index_via_bsdtar(&p, ArchiveFormat::Rar, MAX_MEMBERS)
+            .err()
+            .expect("rubbish must not open");
+        assert!(
+            err.to_string().contains("Unrecognized archive format"),
+            "bsdtar's own reason should survive: {err}"
+        );
     }
 
     #[test]

@@ -146,8 +146,11 @@ pub struct PreviewRequest {
 pub async fn load(fs: Arc<dyn Vfs>, req: PreviewRequest) -> PreviewContent {
     match load_inner(fs, &req).await {
         Ok(content) => content,
+        // The whole chain, not just the outer context: a failure wrapped in
+        // "could not read x.rar" printed exactly that and dropped the part
+        // saying why, which was the only half worth showing.
         Err(e) => PreviewContent::Note {
-            message: format!("Could not read this file: {e}"),
+            message: format!("Could not read this file: {}", crate::app::explain_error(&e)),
         },
     }
 }
