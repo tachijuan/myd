@@ -5455,6 +5455,24 @@ fn mouse_at(
     }
 }
 
+/// A complete left click: press and release in the same cell.
+///
+/// The preview acts on release so it can tell a click from a click-drag, so a
+/// bare `Down` is only half a gesture there and does nothing on its own.
+fn click_at(app: &mut myd::app::FileBrowser, x: u16, y: u16) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), x, y));
+    app.route_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), x, y));
+}
+
+/// A left drag: press, move across, release somewhere else.
+fn drag_from_to(app: &mut myd::app::FileBrowser, from: (u16, u16), to: (u16, u16)) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), from.0, from.1));
+    app.route_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), to.0, to.1));
+    app.route_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), to.0, to.1));
+}
+
 /// Clicking a tree row must select exactly the row under the pointer.
 ///
 /// The mapping depends on the rect and scroll offset recorded during render,
@@ -10727,7 +10745,6 @@ async fn a_click_in_the_preview_scrolls_it_instead_of_the_tree_underneath() {
     // so the click moved a cursor the user could not see and swapped the file
     // they were reading — the scroll wheel already knew to stay in the preview,
     // but clicks fell straight through.
-    use crossterm::event::{MouseButton, MouseEventKind};
 
     let (_dir, mut app) = preview_app(200).await;
     app.handle_key_for_test(char_key(' '));
@@ -10740,7 +10757,7 @@ async fn a_click_in_the_preview_scrolls_it_instead_of_the_tree_underneath() {
         _ => panic!("expected a main screen"),
     };
 
-    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    click_at(&mut app, 20, 10);
     assert_eq!(
         app.preview_scroll_for_test(),
         before + 1,
@@ -10762,7 +10779,6 @@ async fn a_click_focuses_the_preview_before_advancing_it() {
     // Clicking is a way of saying "I am reading this". If the click only moved
     // focus, the first one would appear to do nothing and the second would
     // scroll — not how clicking on a page behaves.
-    use crossterm::event::{MouseButton, MouseEventKind};
 
     let (_dir, mut app) = preview_app(200).await;
     app.handle_key_for_test(char_key(' '));
@@ -10773,7 +10789,7 @@ async fn a_click_focuses_the_preview_before_advancing_it() {
     app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
     let before = app.preview_scroll_for_test();
 
-    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    click_at(&mut app, 20, 10);
     assert!(
         app.preview_focused_for_test(),
         "the click takes focus for the preview"
@@ -10789,7 +10805,6 @@ async fn a_click_focuses_the_preview_before_advancing_it() {
 async fn a_click_outside_the_preview_still_belongs_to_it() {
     // The pane is drawn over the whole frame, so there is no "outside" while it
     // is open. A click on the status row must not reach the tree either.
-    use crossterm::event::{MouseButton, MouseEventKind};
 
     let (_dir, mut app) = preview_app(200).await;
     app.handle_key_for_test(char_key(' '));
@@ -10803,7 +10818,7 @@ async fn a_click_outside_the_preview_still_belongs_to_it() {
     let before = app.preview_scroll_for_test();
 
     // Bottom-left, well away from the text body.
-    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 1, 23));
+    click_at(&mut app, 1, 23);
     assert_eq!(app.preview_scroll_for_test(), before + 1);
     let after = match app.current_screen() {
         Screen::Main(s) => s.selected_path().cloned(),
@@ -13578,4 +13593,88 @@ async fn a_mislabelled_cbr_opens_as_what_it_actually_is() {
         .await
         .unwrap();
     assert_eq!(entries.len(), 4, "every page is listed");
+}
+
+/// A click-drag in the preview must do nothing; a click must still advance.
+///
+/// Reported: dragging over an image advanced it like a click. A terminal opens
+/// a drag exactly as it opens a click — `Down`, then `Drag` events, then `Up` —
+/// so acting on the `Down` cannot tell them apart, and every drag counted as a
+/// click. The gesture is now decided on release.
+#[tokio::test]
+async fn a_drag_in_the_preview_is_ignored_but_a_click_still_advances() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    // A drag across the pane changes nothing.
+    let before = app.preview_scroll_for_test();
+    drag_from_to(&mut app, (20, 10), (40, 14));
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before,
+        "a drag must not advance the preview"
+    );
+
+    // Nor does one that wanders and comes back to where it started: the
+    // endpoints match, so only the drag events themselves give it away.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    app.route_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), 33, 12));
+    app.route_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), 20, 10));
+    app.route_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 10));
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before,
+        "a drag returning to its origin is still a drag"
+    );
+
+    // A press that comes up somewhere else is a drag whose intermediate events
+    // never arrived — some terminals only report the ends.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    app.route_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 26, 15));
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before,
+        "a release away from the press is a drag, however it was reported"
+    );
+
+    // And an ordinary click still advances, exactly as `j` does.
+    click_at(&mut app, 20, 10);
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before + 1,
+        "a click must still advance the preview"
+    );
+}
+
+/// A press with no release leaves nothing armed for the next gesture.
+#[tokio::test]
+async fn an_abandoned_press_does_not_advance_a_later_click() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (_dir, mut app) = preview_app(200).await;
+    app.handle_key_for_test(char_key(' '));
+    settle_preview(&mut app).await;
+    screen_text(&mut app, 80, 24);
+
+    let before = app.preview_scroll_for_test();
+    // Press, then a second press with no release between — the shape a lost
+    // release leaves behind.
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    app.route_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 10));
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before,
+        "presses alone must not advance"
+    );
+    // The release that follows completes exactly one click.
+    app.route_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 10));
+    assert_eq!(
+        app.preview_scroll_for_test(),
+        before + 1,
+        "and the release advances once, not twice"
+    );
 }

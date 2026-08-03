@@ -240,6 +240,8 @@ Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all 
 | Right click   | Select and open (enter a directory)           |
 | `Ctrl+N`      | Release the mouse for terminal text selection |
 
+With the preview open, a left click advances it like `j` — turning the page of a document, or stepping to the next file when you are looking at an image. A click-*drag* is ignored: the gesture is decided when the button comes up, so dragging across a picture does not page past it.
+
 Mouse capture takes over your terminal's own click-drag selection. `Ctrl+N` hands it back and re-grabs it; most terminals also honour Shift+drag while captured.
 
 ## Tuning transfers
