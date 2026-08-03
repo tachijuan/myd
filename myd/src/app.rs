@@ -235,6 +235,14 @@ pub struct FileBrowser {
     /// Cell and time of the last left click, for double-click detection.
     /// Terminals report presses individually and never a double-click.
     last_click: Option<(u16, u16, std::time::Instant)>,
+    /// Where the left button went down while the preview is open, and whether
+    /// the pointer has moved since.
+    ///
+    /// The preview acts on *release*, not press, so that a click-drag can be
+    /// told from a click: a terminal reports a drag as `Down`, then `Drag`
+    /// events, then `Up`, and the `Down` alone is indistinguishable from a
+    /// click that is about to end where it started.
+    preview_press: Option<PreviewPress>,
     /// Whether the transfer sidebar has keyboard focus instead of a panel.
     transfer_focused: bool,
     /// The transfer the sidebar has highlighted, if it is focused.
@@ -323,6 +331,18 @@ struct ConnectTask {
 /// thousand members is a few hundred milliseconds even at its fastest — so it
 /// cannot run in the key handler. It used to, which is what made `Enter` on a
 /// large archive freeze the interface until it finished.
+/// A left button held down over the preview pane.
+///
+/// Held from `Down` until `Up` so the release can tell a click from a drag —
+/// see [`FileBrowser::preview_press`].
+struct PreviewPress {
+    /// Where the button went down, to compare against where it comes up.
+    at: (u16, u16),
+    /// Set by any `Drag` event, so a drag that returns to its starting cell is
+    /// still a drag. Position alone would call that a click.
+    dragged: bool,
+}
+
 struct ArchiveOpenTask {
     rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::vfs::archive::ArchiveFs>>,
     /// The container being opened, to register it under when it arrives.
@@ -462,6 +482,7 @@ impl FileBrowser {
             panel_areas: Vec::new(),
             last_frame: ratatui::layout::Rect::new(0, 0, 0, 0),
             last_click: None,
+            preview_press: None,
             transfer_focused: false,
             transfer_cursor: None,
             transfer_rows: Default::default(),
@@ -621,9 +642,12 @@ impl FileBrowser {
                         match m.kind {
                             MouseEventKind::ScrollDown => pending_scroll += 1,
                             MouseEventKind::ScrollUp => pending_scroll -= 1,
-                            // Drags and plain moves carry no meaning here, and
-                            // acting on each would flood the loop.
-                            MouseEventKind::Moved | MouseEventKind::Drag(_) => {}
+                            // A plain move carries no meaning, and acting on
+                            // each would flood the loop. A drag does carry one
+                            // thing worth knowing — that this gesture is a
+                            // drag and not a click — so it goes through, and
+                            // `route_mouse` records it without doing work.
+                            MouseEventKind::Moved => {}
                             _ => running = self.route_mouse(m),
                         }
                     }
@@ -1632,19 +1656,49 @@ impl FileBrowser {
         // key handler rather than reimplementing it means the click cannot drift
         // from what `j` does.
         if self.preview_open {
-            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                // Clicking is also a way of saying "I am reading this", so it
-                // takes focus first — otherwise the first click would only move
-                // focus and the second would advance, which is not what a click
-                // on a page looks like.
-                self.focus_preview();
-                self.handle_preview_key(KeyEvent::new(
-                    KeyCode::Char('j'),
-                    crossterm::event::KeyModifiers::NONE,
-                ));
+            match ev.kind {
+                // Press only arms the gesture. Acting here would advance on the
+                // first event of a click-*drag* too, since a terminal opens
+                // both the same way — which is the whole difference being drawn.
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.preview_press = Some(PreviewPress {
+                        at: (x, y),
+                        dragged: false,
+                    });
+                }
+                // Any drag disqualifies the gesture, including one that wanders
+                // back to where it started.
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(p) = self.preview_press.as_mut() {
+                        p.dragged = true;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let Some(press) = self.preview_press.take() else {
+                        return true;
+                    };
+                    // A release somewhere else is a drag whose intermediate
+                    // events never arrived — some terminals report only the
+                    // ends — so position is checked as well as the flag.
+                    if press.dragged || press.at != (x, y) {
+                        return true;
+                    }
+                    // Clicking is also a way of saying "I am reading this", so
+                    // it takes focus first — otherwise the first click would
+                    // only move focus and the second would advance, which is
+                    // not what a click on a page looks like.
+                    self.focus_preview();
+                    self.handle_preview_key(KeyEvent::new(
+                        KeyCode::Char('j'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ));
+                }
+                _ => {}
             }
             return true;
         }
+        // Not over the preview any more, so an armed gesture is stale.
+        self.preview_press = None;
 
         // A click in the sidebar focuses it and selects a transfer; a
         // double-click on one asks to cancel it.

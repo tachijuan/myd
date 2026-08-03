@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.31.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.31.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -469,6 +469,11 @@ The wheel scrolls the focused view; a left click focuses a panel and selects a
 row or treemap tile; a right click selects and opens. Mouse capture takes over
 the terminal's own click-drag selection, so \fBCtrl+N\fR releases and re-grabs
 it. Most terminals also honour Shift+drag while captured.
+.PP
+With the preview open, a left click advances it as \fBj\fR does \(em turning the
+page of a document, or stepping to the next file when an image is on screen. A
+click\-drag is ignored: the gesture is decided when the button comes up, so
+dragging across a picture does not page past it.
 .SH DIAGNOSTICS
 Setting \fBMYD_TRACE=1\fR writes a log to \fB~/.cache/myd\-trace.log\fR (override
 with \fBMYD_TRACE_FILE\fR). \fBMYD_LOG\fR takes a filter directive instead, e.g.
