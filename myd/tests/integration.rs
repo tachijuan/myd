@@ -13678,3 +13678,113 @@ async fn an_abandoned_press_does_not_advance_a_later_click() {
         "and the release advances once, not twice"
     );
 }
+
+/// `q`/`Esc` in a filtered view clears the filter instead of quitting.
+///
+/// A filter is a mask the user turned on, so backing out should take it off —
+/// the same reasoning that makes `q` leave the directory picker rather than
+/// quit. Quitting the app instead lost the whole session to a key that
+/// everywhere else means "back out of this".
+#[tokio::test]
+async fn escape_clears_a_filter_before_it_quits() {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Filter to something narrow.
+    app.handle_key_for_test(char_key('f'));
+    for c in "file1".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert!(
+        app.filter_pattern_for_test().is_some(),
+        "the filter must be active to test clearing it"
+    );
+
+    // Esc takes the mask off and keeps running.
+    let running = app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(running, "clearing a filter must not quit");
+    assert!(
+        app.filter_pattern_for_test().is_none(),
+        "Esc must clear the filter"
+    );
+
+    // With no filter left, the next one quits as before.
+    let running = app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(!running, "a second Esc, with nothing to back out of, quits");
+}
+
+/// `q` inside an archive leaves it rather than quitting.
+#[tokio::test]
+async fn quit_leaves_an_archive_before_it_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(
+        !app.panel_backend_for_test(0).is_local(),
+        "we must actually be inside the archive"
+    );
+
+    // `q` backs out to the directory the archive sits in.
+    let running = app.handle_key_for_test(char_key('q'));
+    assert!(running, "leaving an archive must not quit");
+    settle(&mut app).await;
+    assert!(
+        app.panel_backend_for_test(0).is_local(),
+        "q must leave the archive and retag the panel local"
+    );
+
+    // And once out, `q` quits as before.
+    let running = app.handle_key_for_test(char_key('q'));
+    assert!(!running, "outside the archive, q quits");
+}
+
+/// A filter inside an archive comes off first, then the archive.
+///
+/// Each press undoes exactly one thing the user turned on, innermost first.
+#[tokio::test]
+async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('f'));
+    for c in "run".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert!(app.filter_pattern_for_test().is_some(), "filter is on");
+
+    // First press: the filter only.
+    assert!(app.handle_key_for_test(char_key('q')));
+    assert!(
+        app.filter_pattern_for_test().is_none(),
+        "the first press clears the filter"
+    );
+    assert!(
+        !app.panel_backend_for_test(0).is_local(),
+        "and leaves us still inside the archive"
+    );
+
+    // Second press: out of the archive.
+    assert!(app.handle_key_for_test(char_key('q')));
+    settle(&mut app).await;
+    assert!(
+        app.panel_backend_for_test(0).is_local(),
+        "the second press leaves the archive"
+    );
+
+    // Third: nothing left to back out of.
+    assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
+}
