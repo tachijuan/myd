@@ -225,11 +225,12 @@ Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all 
 
 | Key       | Action                        |
 |-----------|-------------------------------|
-| `q`       | Quit immediately              |
-| `Esc`     | Quit                          |
+| `q` / `Esc` | Back out of the current state, or quit    |
 | `Ctrl+o`  | Go back to the parent directory |
 | `r` / `Ctrl+r` | Rescan (refresh sizes from disk) |
 | `Ctrl+p`  | Toggle info panel             |
+
+`q` and `Esc` undo one thing at a time before they quit: they cancel a running scan, close the `gd` picker, clear an active filter, and leave an archive — innermost first, so a filter inside an archive takes two presses. With nothing left to back out of, they quit (asking first if transfers are still running; `Ctrl+C` force-quits regardless).
 
 ### Mouse
 

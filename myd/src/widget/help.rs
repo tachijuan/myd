@@ -224,7 +224,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
         HelpCategory {
             title: "Exit",
             items: &[
-                ("q / Esc", "Quit (asks first if transfers are running)"),
+                ("q / Esc", "Back out: scan, picker, filter, archive"),
+                ("", "  then quit (asks if transfers are running)"),
                 ("Ctrl+C", "Force quit immediately, anytime"),
             ],
         },

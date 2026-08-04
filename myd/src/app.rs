@@ -1477,6 +1477,14 @@ impl FileBrowser {
         self.active_panel().view_prefs.sort_mode
     }
 
+    /// The active panel's filter pattern, if one is masking the tree (for tests).
+    pub fn filter_pattern_for_test(&self) -> Option<String> {
+        match self.active_panel().current_screen() {
+            Screen::Main(state) => state.tree.filter_pattern().map(str::to_string),
+            _ => None,
+        }
+    }
+
     /// Which backend a panel's paths are addressed on (for tests).
     pub fn panel_backend_for_test(&self, index: usize) -> crate::vfs::BackendId {
         self.panels
@@ -2749,6 +2757,24 @@ impl FileBrowser {
                 // With nothing underneath there is nothing to return to, so it
                 // quits as before.
                 if matches!(screen, Screen::DirPicker(_)) && self.active_panel().depth() > 1 {
+                    self.pop_screen();
+                    return true;
+                }
+                // A filter is a mask over the tree, and `q`/`Esc` takes it off.
+                // Innermost first: with a filter active inside an archive, one
+                // press shows the archive whole and the next leaves it, so each
+                // keystroke undoes exactly one thing the user turned on.
+                if matches!(screen, Screen::Main(state) if state.tree.filter_pattern().is_some()) {
+                    // The same route the dialog takes for an empty pattern, so
+                    // clearing by key and clearing by prompt cannot diverge.
+                    self.active_panel_mut().current_screen_mut().filter("");
+                    return true;
+                }
+                // Inside an archive, back out to the directory it sits in rather
+                // than quitting. Entering one is somewhere you went, so leaving
+                // is what backing out should mean — the same reasoning the
+                // picker above follows, and what `h` at the root already does.
+                if self.active_backend_is_read_only() && self.active_panel().depth() > 1 {
                     self.pop_screen();
                     return true;
                 }
