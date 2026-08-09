@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.31.3" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.32.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -271,10 +271,16 @@ Cycle through sort modes: largest, smallest, dirs-first, files-first, newest
 (modification time), oldest (modification time), and recently accessed (access
 time).
 .TP
+.B 1 \- 8
+Sort by that entry of the sort menu, without opening it: \fB5\fR is "sort by
+newest". The digits are the menu's own numbering, so anything the menu offers
+has a one-key shortcut. \fB0\fR is unrelated and still collapses everything; the
+menu starts at 1.
+.TP
 .B g s
 Open a numbered menu of the sort orders and pick one outright, rather than
-cycling to it. The number chooses directly, so \fBg s 5\fR is "sort by newest"
-as a single gesture; \fBj\fR and \fBk\fR move through the menu and \fBEnter\fR
+cycling to it. The number chooses directly, so \fBg s 5\fR does what the bare
+\fB5\fR does; \fBj\fR and \fBk\fR move through the menu and \fBEnter\fR
 accepts. Clicking the \fBSort:\fR indicator in the status bar opens the same
 menu. \fBs\fR remains quicker once the order is known \(em this is for going
 straight to one, and for discovering what the orders are.
@@ -530,28 +536,33 @@ Concurrent transfers, and files per directory level (default 16).
 Ceiling on concurrent operations during a recursive copy (default 192). Without
 it the per-level windows multiply.
 .SH SORT MODES
-Press \fBs\fR to cycle through the available sort modes:
+Press \fBs\fR to cycle through the available sort modes, or type the mode's
+number (\fB1\fR\-\fB8\fR, as listed in the \fBg s\fR menu) to go straight to it:
 .TP
-.B dirs-first
-Directories are listed before files; alphabetical order within each group.
-.TP
-.B files-first
-Files are listed before directories; alphabetical order within each group.
-.TP
-.B largest
+.B 1 largest
 Items sorted by descending size. Directories are measured recursively.
 .TP
-.B smallest
+.B 2 smallest
 Items sorted by ascending size. Directories are measured recursively.
 .TP
-.B newest
+.B 3 dirs-first
+Directories are listed before files; alphabetical order within each group.
+.TP
+.B 4 files-first
+Files are listed before directories; alphabetical order within each group.
+.TP
+.B 5 newest
 Items sorted by modification time, most recent first.
 .TP
-.B oldest
+.B 6 oldest
 Items sorted by modification time, least recent first.
 .TP
-.B recently-accessed
+.B 7 recently-accessed
 Items sorted by access time, most recent first.
+.TP
+.B 8 natural
+By name, with runs of digits compared as numbers, so \fBfile2\fR sorts before
+\fBfile10\fR.
 .PP
 The time-based sorts use the timestamps from the directory listing, so they work
 identically on local and remote (SFTP) trees with no extra latency.

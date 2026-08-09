@@ -5,7 +5,9 @@
 //! for choosing directly, and for discovering what the orders are at all.
 //!
 //! Every entry is numbered, so it can be picked with the mouse or by typing the
-//! number without moving the hand from the keyboard.
+//! number without moving the hand from the keyboard. The tree binds those same
+//! digits directly, so the menu is where the numbering is learned rather than
+//! the only place it works.
 
 use ratatui::{
     layout::Rect,

@@ -4671,6 +4671,91 @@ async fn test_sort_order_survives_entering_a_directory() {
     }
 }
 
+/// The digit keys are the sort menu's numbering, usable without the menu.
+#[test]
+fn test_digits_are_bound_to_the_sort_menus_numbering() {
+    use myd::keybinding::{Action, KeyBindingHandler};
+    use myd::screen::SortMode;
+
+    let h = KeyBindingHandler::new();
+    for (i, _) in SortMode::ALL.iter().enumerate() {
+        let digit = char::from_digit(i as u32 + 1, 10).unwrap();
+        assert_eq!(
+            h.resolve_single_for_test(char_key(digit)),
+            Some(Action::SetSort(i)),
+            "{} should select entry {} of the sort menu",
+            digit,
+            i + 1
+        );
+    }
+
+    // A digit past the last mode stays unbound rather than sorting by whatever
+    // happens to sit at that index later.
+    if SortMode::ALL.len() < 9 {
+        let past = char::from_digit(SortMode::ALL.len() as u32 + 1, 10).unwrap();
+        assert_eq!(h.resolve_single_for_test(char_key(past)), None);
+    }
+
+    // `0` predates this and still collapses everything; the menu starts at 1.
+    assert_eq!(
+        h.resolve_single_for_test(char_key('0')),
+        Some(Action::CollapseAll)
+    );
+}
+
+/// A digit sorts straight away, and does it the same way `gs` + that digit does
+/// — including remembering the order for directories opened later.
+#[tokio::test]
+async fn test_a_digit_sorts_without_opening_the_menu() {
+    use myd::app::FileBrowser;
+    use myd::screen::{Screen, SortMode};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("subdir");
+    std::fs::create_dir(&sub).unwrap();
+    for i in 0..3 {
+        std::fs::write(sub.join(format!("f{}.txt", i)), vec![b'x'; 100 * (i + 1)]).unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Entry 5 in the menu, typed without the `gs` that used to be required.
+    app.handle_key_for_test(char_key('5'));
+    match app.current_screen() {
+        Screen::Main(s) => assert_eq!(s.tree.sort_mode, SortMode::ALL[4]),
+        _ => panic!("expected a main screen"),
+    }
+    // No menu was opened on the way — the digit acted, it did not start anything.
+    assert_eq!(app.modal_kind_for_test(), "none");
+
+    // And it sticks, as the menu's own choice does.
+    let mut entered = false;
+    for _ in 0..20 {
+        if let Screen::Main(s) = app.current_screen() {
+            if s.tree.selected_line().map(|l| l.name == "subdir").unwrap_or(false) {
+                entered = true;
+                break;
+            }
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert!(entered, "could not put the cursor on subdir");
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    settle(&mut app).await;
+    match app.current_screen() {
+        Screen::Main(s) => assert_eq!(
+            s.tree.sort_mode,
+            SortMode::ALL[4],
+            "a digit's order must survive entering a directory, as `gs`'s does"
+        ),
+        _ => panic!("expected a main screen after entering the directory"),
+    }
+}
+
 /// Changing the sort order must not touch the filesystem at all.
 ///
 /// Reported against a CIFS mount: sorting there was unresponsive while a local
