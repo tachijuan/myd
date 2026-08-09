@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::hosts::{HostCatalog, SavedHost};
 use crate::keybinding::{Action, KeyBindingHandler};
 use crate::panel::Panel;
-use crate::screen::Screen;
+use crate::screen::{Screen, SortMode};
 use crate::transfer::TransferQueue;
 use crate::utils::sizes::CancelToken;
 use crate::vfs::{BackendRegistry, VPath};
@@ -3078,6 +3078,12 @@ impl FileBrowser {
                 self.open_sort_menu();
                 true
             }
+            Action::SetSort(i) => {
+                if let Some(mode) = SortMode::ALL.get(i) {
+                    self.set_sort_mode(*mode);
+                }
+                true
+            }
             Action::PatternRename => {
                 self.open_pattern_rename();
                 true
@@ -3429,6 +3435,7 @@ impl FileBrowser {
                     | Action::Redraw
                     | Action::ToggleShallow
                     | Action::OpenSortMenu
+                    | Action::SetSort(_)
                     | Action::PatternRename
                     | Action::Bell => unreachable!(),
                     Action::None => true,
@@ -3821,20 +3828,25 @@ impl FileBrowser {
             SortMenuOutcome::Cancelled => self.modal = Modal::None,
             SortMenuOutcome::Chosen(mode) => {
                 self.modal = Modal::None;
-                let panel = self.active_panel_mut();
-                if let Screen::Main(st) = panel.current_screen_mut() {
-                    st.set_sort_mode(mode);
-                }
-                // Remembered for screens opened later, exactly as the `s` key
-                // does it. Without this the menu's choice lasted only until the
-                // next directory, which `s` would not have done — a difference
-                // between two ways of setting the same thing.
-                if let Screen::Main(st) = panel.current_screen() {
-                    panel.view_prefs.sort_mode = st.tree.sort_mode;
-                }
+                self.set_sort_mode(mode);
             }
         }
         true
+    }
+
+    /// Sort the active panel by `mode`, from the menu or from a digit key.
+    fn set_sort_mode(&mut self, mode: SortMode) {
+        let panel = self.active_panel_mut();
+        if let Screen::Main(st) = panel.current_screen_mut() {
+            st.set_sort_mode(mode);
+        }
+        // Remembered for screens opened later, exactly as the `s` key does it.
+        // Without this the choice lasted only until the next directory, which
+        // `s` would not have done — a difference between two ways of setting the
+        // same thing.
+        if let Screen::Main(st) = panel.current_screen() {
+            panel.view_prefs.sort_mode = st.tree.sort_mode;
+        }
     }
 
     /// Open the sort menu for the active panel.

@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::screen::SortMode;
+
 /// Actions that keybindings resolve to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -28,6 +30,12 @@ pub enum Action {
     /// Open the sort picker, to choose an order directly rather than cycling to
     /// it. Bound to the `gs` chord and to clicking the "Sort:" indicator.
     OpenSortMenu,
+    /// Sort by the nth mode in `SortMode::ALL`, zero-based.
+    ///
+    /// The digit keys are the menu's own numbering without the menu: `5` does
+    /// what `gs5` does. The menu is still there to be discovered through and to
+    /// show what is currently set — this is the shortcut for once you know.
+    SetSort(usize),
     /// Rename every tagged file through a regex and a replacement (`gr`).
     PatternRename,
     ToggleHidden,
@@ -265,6 +273,14 @@ impl KeyBindingHandler {
             // any dialog, so a modal can never mistake it for one.
             KeyCode::Char(' ') => Some(Action::TogglePreview),
             KeyCode::Char('0') => Some(Action::CollapseAll),
+            // The sort menu's numbers, usable without opening the menu: `5` and
+            // `gs5` set the same order. Derived from `SortMode::ALL` so the two
+            // numberings cannot drift apart, and so a digit past the last mode
+            // stays unbound rather than silently sorting by something else. `0`
+            // is collapse-all and predates this; the menu starts at 1 anyway.
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '0' as usize) <= SortMode::ALL.len() => {
+                Some(Action::SetSort(c as usize - '1' as usize))
+            }
             KeyCode::Char('*') => Some(Action::ExpandAll),
             KeyCode::Char('/') => Some(Action::Search),
             KeyCode::Char('?') => Some(Action::Help),
