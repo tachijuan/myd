@@ -1123,6 +1123,20 @@ impl DirPickerState {
             return None;
         }
 
+        // A reorder in progress owns the keyboard: j/k or the arrows slide the
+        // entry, Enter commits, Esc puts it back. Everything else is ignored
+        // rather than acted on half-way through a move.
+        //
+        // Checked before the arrow handling below, which would otherwise take
+        // Up/Down first and move the *highlight* without swapping any rows —
+        // leaving the cursor pointing somewhere other than the entry being
+        // dragged, so the next j/k swapped the wrong pair. `j`/`k` were
+        // unaffected, which is what made this look like "the arrows don't work
+        // during a move" rather than a dispatch-order bug.
+        if self.moving.is_some() {
+            return Some(self.handle_move_key(key.code));
+        }
+
         // Arrows always drive the list, whichever half has focus: they are
         // unambiguous, and they were the only way to browse before Tab existed.
         //
@@ -1158,13 +1172,6 @@ impl DirPickerState {
                 return Some(true);
             }
             _ => {}
-        }
-
-        // A reorder in progress owns the keyboard: j/k slide the entry, Enter
-        // commits, Esc puts it back. Everything else is ignored rather than
-        // acted on half-way through a move.
-        if self.moving.is_some() {
-            return Some(self.handle_move_key(key.code));
         }
 
         // The actions panel: j/k (and the arrows, handled above) walk it, Enter
@@ -1559,7 +1566,7 @@ impl super::ScreenState for DirPickerState {
                     unfocused_border
                 }))
                 .title(if self.moving.is_some() {
-                    " Moving — j/k reposition · Enter confirm · Esc cancel ".to_string()
+                    " Moving — j/k or ↑/↓ reposition · Enter confirm · Esc cancel ".to_string()
                 } else if self.searching {
                     format!(
                         " Search: {}_  ({} shown, Esc clears) ",

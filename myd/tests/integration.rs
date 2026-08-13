@@ -9854,6 +9854,103 @@ async fn m_reorders_within_the_pinned_block_and_enter_commits() {
 }
 
 #[tokio::test]
+async fn the_arrows_reposition_a_move_exactly_as_j_and_k_do() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The arrows were taken by the generic list-navigation branch, which ran
+    // before the move check: Up/Down slid the *highlight* without swapping any
+    // rows, so the cursor stopped pointing at the entry being dragged and the
+    // next keypress swapped the wrong pair. j/k were unaffected, which is what
+    // made it look like the arrows simply did nothing during a move.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
+    }
+    let before = pinned_paths(&app);
+
+    cursor_to(&mut app, dirs[0].path());
+    picker_action(&mut app, myd::screen::PickerAction::Move);
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(s) if s.moving().is_some()),
+        "the move should have started"
+    );
+
+    // Down, then Enter — the same gesture the j/k test makes, and it must land
+    // on the same order.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        pinned_paths(&app),
+        vec![before[1].clone(), before[0].clone(), before[2].clone()],
+        "Down must slide the entry, not just the highlight"
+    );
+}
+
+#[tokio::test]
+async fn the_arrows_walk_a_move_back_up_again() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Down then Up must return the entry to where it started: the two have to
+    // be symmetric, or a correction mid-drag leaves the block subtly wrong.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
+    }
+    let before = pinned_paths(&app);
+
+    cursor_to(&mut app, dirs[0].path());
+    picker_action(&mut app, myd::screen::PickerAction::Move);
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        pinned_paths(&app),
+        before,
+        "an equal number of Downs and Ups must be a no-op"
+    );
+}
+
+#[tokio::test]
+async fn the_down_arrow_slides_an_entry_out_of_the_pinned_block() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Sliding one step past the bottom unpins, and that has to work by arrow as
+    // well as by `j` — it is the same gesture, and the generic branch used to
+    // swallow the keypress that triggers it.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
+    }
+    assert_eq!(pinned_paths(&app).len(), 3);
+
+    cursor_to(&mut app, dirs[2].path());
+    picker_action(&mut app, myd::screen::PickerAction::Move);
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let pinned = pinned_paths(&app);
+    assert_eq!(pinned.len(), 2, "the entry left the block: {:?}", pinned);
+    assert!(
+        !pinned.contains(&dirs[2].path().to_string_lossy().to_string()),
+        "and it is the one that was slid out"
+    );
+    assert!(
+        app.hosts_for_test()
+            .favorites()
+            .iter()
+            .any(|f| f.path == dirs[2].path().to_string_lossy()),
+        "unpinning by moving must not delete the entry"
+    );
+}
+
+#[tokio::test]
 async fn esc_restores_the_original_position() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
