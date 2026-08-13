@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.33.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.34.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -132,6 +132,17 @@ host has no pin or measuring toggle, and a row that is not saved has nothing to
 forget \(em so the panel never shows a choice that would do nothing. \fBj\fR /
 \fBk\fR or the \fBarrow keys\fR walk it and \fBEnter\fR runs the highlighted
 action.
+.IP
+Each action also carries a letter, shown picked out in magenta, that runs it
+outright without walking to it: \fBg\fR go or connect, \fBs\fR save, \fBe\fR
+edit, \fBf\fR forget, \fBp\fR pin, \fBu\fR unpin, \fBm\fR move, \fBd\fR toggle
+measuring. Case does not matter. A letter the highlighted row does not offer
+does nothing rather than running whatever sits in its place, so \fBp\fR on a
+saved host is inert. Most are the label's own initial; \fBg\fR and \fBd\fR are
+not, because those two labels change with the row \(em "Go" becomes "Connect"
+on a host, and the measuring toggle reads "Skip measuring" or "Measure sizes"
+depending on which way it currently sits \(em and a shortcut that moved with the
+label would be a trap.
 .IP
 These operations were single letters bound on the list until version 0.33, which
 is what made the list unsearchable: \fBd\fR in "downloads" forgot an entry
@@ -420,6 +431,8 @@ connect, save a directory, edit, forget, pin or unpin, move, and toggle
 measuring \(em showing only those that apply to that row, so a saved host offers
 no pin and a built-in location offers no forget. \fBj\fR / \fBk\fR or the
 \fBarrow keys\fR walk the panel and \fBEnter\fR runs the highlighted action.
+Each one also has a letter, picked out in magenta, that runs it directly:
+\fBg\fR, \fBs\fR, \fBe\fR, \fBf\fR, \fBp\fR, \fBu\fR, \fBm\fR and \fBd\fR.
 These operations used to be single letters bound on the list itself, which is
 what made the list unsearchable by name.
 .IP
