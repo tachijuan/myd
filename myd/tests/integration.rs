@@ -7615,6 +7615,231 @@ async fn the_actions_panel_offers_only_what_applies_to_the_row() {
 }
 
 #[tokio::test]
+async fn every_action_offered_together_has_a_distinct_shortcut() {
+    use myd::screen::PickerAction;
+
+    // A shortcut that fires the wrong action is worse than none. The letters
+    // are assigned by hand, so this is what catches a new action colliding with
+    // an existing one — checked per row, since that is the only set that is
+    // ever on screen at once.
+    let (_cfg, dirs, mut app) = pin_app().await;
+
+    let mut checked = 0;
+    for d in &dirs {
+        cursor_to(&mut app, d.path());
+        for state in 0..2 {
+            if state == 1 {
+                // Look again with the row pinned and shallow, which swaps Pin
+                // for Unpin and flips the toggle's label.
+                picker_action(&mut app, PickerAction::Pin);
+                cursor_to(&mut app, d.path());
+                picker_action(&mut app, PickerAction::Shallow);
+                cursor_to(&mut app, d.path());
+            }
+            let actions = picker(&app).actions();
+            assert!(actions.len() > 1, "need a real set to check");
+            let mut seen: Vec<char> = Vec::new();
+            for a in &actions {
+                let key = a.shortcut().to_ascii_uppercase();
+                assert!(
+                    key.is_ascii_uppercase(),
+                    "{:?} must offer an uppercase letter, got {:?}",
+                    a,
+                    key
+                );
+                assert!(
+                    !seen.contains(&key),
+                    "{:?} collides with an earlier action on {:?}: {:?}",
+                    a,
+                    key,
+                    actions
+                );
+                seen.push(key);
+                checked += 1;
+            }
+            // j and k walk the panel, so no action may claim them.
+            assert!(
+                !seen.contains(&'J') && !seen.contains(&'K'),
+                "j/k navigate the panel and must not be shortcuts: {:?}",
+                seen
+            );
+        }
+    }
+    assert!(checked > 10, "the sweep should have covered a real spread");
+}
+
+#[tokio::test]
+async fn a_shortcut_runs_its_action_without_walking_to_it() {
+    use myd::screen::{PickerAction, PickerFocus};
+
+    // The point of the letters: one press instead of Tab plus a count of j's.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+
+    // Into the panel, where the cursor sits on Go (index 0).
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(picker(&app).focus(), PickerFocus::Actions);
+    assert_eq!(picker(&app).selected_action(), Some(PickerAction::Go));
+    assert!(pinned_paths(&app).is_empty(), "nothing pinned yet");
+
+    // `p` runs Pin from wherever the cursor happens to be.
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(
+        pinned_paths(&app),
+        vec![dirs[0].path().to_string_lossy().to_string()],
+        "the shortcut should have pinned the row"
+    );
+
+    // Case-insensitive: the shift key is never required.
+    cursor_to(&mut app, dirs[1].path());
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    app.handle_key_for_test(char_key('P'));
+    assert_eq!(pinned_paths(&app).len(), 2, "uppercase must work too");
+}
+
+#[tokio::test]
+async fn a_letter_no_action_claims_does_nothing() {
+    use myd::screen::PickerAction;
+
+    // Pressing a letter this row does not offer must be inert rather than
+    // running whatever sits at that index — a host has no Pin, and `p` there
+    // firing "Edit" because it happened to be third would be the obvious bug.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    open_picker_on_first_host(&mut app);
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    let offered = picker(&app).actions();
+    assert!(
+        !offered.contains(&PickerAction::Pin),
+        "a host row must not offer Pin for this to test anything"
+    );
+    let before = picker(&app).selected_action();
+
+    app.handle_key_for_test(char_key('p'));
+
+    assert_eq!(app.modal_kind_for_test(), "none", "nothing should have fired");
+    assert_eq!(
+        picker(&app).selected_action(),
+        before,
+        "and the cursor should not have moved"
+    );
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "still on the picker"
+    );
+}
+
+#[tokio::test]
+async fn the_shortcut_letter_is_drawn_apart_from_its_label() {
+    use myd::screen::{ActionLabel, PickerAction};
+
+    // The letter has to be visibly a key to press, not just emphasis, so it is
+    // picked out where it sits in the label. Two actions have no such position,
+    // and lead with a badge instead.
+    let marked = PickerAction::Forget.label_parts(None);
+    assert_eq!(
+        marked,
+        ActionLabel::Marked {
+            before: String::new(),
+            key: 'F',
+            after: "orget".to_string(),
+        },
+        "an initial-letter shortcut is marked in place"
+    );
+
+    match PickerAction::Edit.label_parts(None) {
+        ActionLabel::Marked { key, after, .. } => {
+            assert_eq!((key, after.as_str()), ('E', "dit"));
+        }
+        other => panic!("Edit should be marked in place, got {:?}", other),
+    }
+
+    // The toggle's label contains no `d`, so the letter leads as a badge — and
+    // stays `D` when the label flips, which is the whole reason it is not the
+    // first letter.
+    match PickerAction::Shallow.label_parts(None) {
+        ActionLabel::Badged { key, label } => {
+            assert_eq!(key, 'D');
+            assert_eq!(label, "Skip measuring");
+        }
+        other => panic!("the toggle should be badged, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn the_shallow_shortcut_survives_the_labels_flip() {
+    use myd::screen::{ActionLabel, PickerAction};
+
+    // A shortcut that moved when the toggle flipped would be a trap: you would
+    // press what worked a moment ago and run something else.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+
+    let key_now = |app: &FileBrowser| {
+        let row = picker(app).selected().cloned();
+        match PickerAction::Shallow.label_parts(row.as_ref()) {
+            ActionLabel::Badged { key, label } => (key, label),
+            other => panic!("expected a badge, got {:?}", other),
+        }
+    };
+
+    let (before_key, before_label) = key_now(&app);
+    assert_eq!(before_label, "Skip measuring");
+
+    // Run it by its letter, then look again.
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    app.handle_key_for_test(char_key('d'));
+    cursor_to(&mut app, dirs[0].path());
+
+    let (after_key, after_label) = key_now(&app);
+    assert_eq!(after_label, "Measure sizes", "the label flipped");
+    assert_eq!(after_key, before_key, "but the key did not");
+
+    // And the same letter toggles it back.
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    app.handle_key_for_test(char_key('d'));
+    cursor_to(&mut app, dirs[0].path());
+    assert_eq!(key_now(&app).1, "Skip measuring", "the same key toggles back");
+}
+
+#[tokio::test]
+async fn j_and_k_still_walk_the_panel_rather_than_running_an_action() {
+    use myd::screen::PickerAction;
+
+    // The shortcuts are matched after j/k, so navigation keeps working. If an
+    // action ever claims one of those letters this is what fails.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(picker(&app).selected_action(), Some(PickerAction::Go));
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(picker(&app).action_cursor(), 1, "j moved rather than acting");
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(picker(&app).action_cursor(), 0, "and k moved back");
+    assert_eq!(app.modal_kind_for_test(), "none", "neither ran anything");
+    assert!(pinned_paths(&app).is_empty(), "and nothing was pinned");
+}
+
+#[tokio::test]
 async fn the_shallow_action_names_the_state_it_would_move_to() {
     use myd::screen::PickerAction;
 
@@ -14113,4 +14338,5 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
 

@@ -189,6 +189,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("  ", "  A lone match opens on Enter"),
                 ("  Actions", "  Go, save, edit, forget, pin, move, shallow"),
                 ("  j / k", "  Walk the actions; Enter runs one"),
+                ("  ", "  Or press the highlighted letter to run it"),
             ],
         },
         HelpCategory {

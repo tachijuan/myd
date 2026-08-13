@@ -142,6 +142,71 @@ impl PickerAction {
             },
         }
     }
+
+    /// The key that runs this action from the panel without walking to it.
+    ///
+    /// The label's first letter wherever that is free, so the shortcut is the
+    /// one you would guess. Two need something else:
+    ///
+    /// * `Shallow` is a toggle whose label flips between "Skip measuring" and
+    ///   "Measure sizes", and both first letters are taken (`Save`, `Move`).
+    ///   A shortcut that *moved* when the state flipped would be worse than an
+    ///   unguessable one, so it is `d` for the depth both labels describe —
+    ///   stable whichever way the toggle currently sits.
+    /// * `Go`/`Connect` is one variant with two labels, so its letter would
+    ///   likewise move with the row's kind. `g` covers both, matching the `gd`
+    ///   chord that opened the picker.
+    ///
+    /// Returned uppercase for display; matching is case-insensitive, so the
+    /// shift key is never required to run one.
+    pub fn shortcut(self) -> char {
+        match self {
+            PickerAction::Go => 'G',
+            PickerAction::Save => 'S',
+            PickerAction::Forget => 'F',
+            PickerAction::Edit => 'E',
+            PickerAction::Pin => 'P',
+            PickerAction::Unpin => 'U',
+            PickerAction::Move => 'M',
+            PickerAction::Shallow => 'D',
+        }
+    }
+
+    /// How to draw this action's label with its shortcut letter picked out.
+    pub fn label_parts(self, opt: Option<&PickerOption>) -> ActionLabel {
+        let label = self.label(opt);
+        let key = self.shortcut();
+        match label
+            .char_indices()
+            .find(|(_, c)| c.eq_ignore_ascii_case(&key))
+        {
+            Some((at, c)) => ActionLabel::Marked {
+                before: label[..at].to_string(),
+                key: c.to_ascii_uppercase(),
+                after: label[at + c.len_utf8()..].to_string(),
+            },
+            None => ActionLabel::Badged { key, label },
+        }
+    }
+}
+
+/// How an action's label carries its shortcut letter.
+///
+/// Two shapes rather than one, because the letter is not always *in* the text:
+/// telling them apart by looking for an empty prefix would also catch a label
+/// that genuinely starts with its own shortcut, which is most of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionLabel {
+    /// The letter appears in the label and is picked out where it sits —
+    /// `Forget` drawn as `**F**orget`.
+    Marked {
+        before: String,
+        key: char,
+        after: String,
+    },
+    /// The label does not contain its shortcut (the `Shallow` toggle, whose
+    /// text flips, and `Connect` under `g`), so the letter leads as a badge.
+    Badged { key: char, label: String },
 }
 
 /// What confirming the picker asked for.
@@ -1108,6 +1173,9 @@ impl DirPickerState {
         // the list or the field.
         if self.focus == PickerFocus::Actions {
             return match key.code {
+                // j/k keep working even though they are also shortcuts on some
+                // rows, because they are checked first: `j` never names an
+                // action (no label begins with it), so nothing is shadowed.
                 KeyCode::Char('j') => {
                     self.action_next();
                     Some(true)
@@ -1123,6 +1191,27 @@ impl DirPickerState {
                         Some(true)
                     } else {
                         None
+                    }
+                }
+                // A shortcut runs its action outright, skipping the walk to it.
+                // Matched case-insensitively so the shift key is never needed,
+                // and only against what this row actually offers — pressing `p`
+                // on a row with no Pin does nothing rather than firing whatever
+                // happens to sit at that index.
+                KeyCode::Char(c) => {
+                    let hit = self
+                        .actions()
+                        .iter()
+                        .position(|a| a.shortcut().eq_ignore_ascii_case(&c));
+                    match hit {
+                        Some(at) => {
+                            // Moved to as well as run, so the panel shows which
+                            // one fired — and a shortcut that opens a prompt
+                            // leaves the cursor somewhere sensible behind it.
+                            self.action_cursor = at;
+                            if self.run_action() { Some(true) } else { None }
+                        }
+                        None => Some(true),
                     }
                 }
                 // Esc is the app's: it backs out of the picker.
@@ -1502,27 +1591,50 @@ impl super::ScreenState for DirPickerState {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let label = a.label(selected_opt.as_ref());
-                if actions_focused && i == action_cursor {
-                    Line::from(Span::styled(
-                        format!("> {}", label),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::REVERSED),
-                    ))
+                let parts = a.label_parts(selected_opt.as_ref());
+                let highlighted = actions_focused && i == action_cursor;
+                // The row's own colour, which the shortcut then overrides.
+                let base = if highlighted {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::REVERSED)
                 } else if actions_focused {
-                    Line::from(Span::styled(
-                        format!("  {}", label),
-                        Style::default().fg(Color::Yellow),
-                    ))
+                    Style::default().fg(Color::Yellow)
                 } else {
                     // Dimmed while another pane drives: the panel is showing
                     // what is *available*, not what is about to happen.
-                    Line::from(Span::styled(
-                        format!("  {}", label),
-                        Style::default().fg(Color::DarkGray),
-                    ))
+                    Style::default().fg(Color::DarkGray)
+                };
+                // Magenta and bold, so the letter reads as a key to press
+                // rather than as emphasis. It keeps the row's REVERSED bit on
+                // the highlighted line, or the letter would punch a hole in the
+                // selection bar.
+                let key_style = if highlighted {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                };
+
+                let mut spans = vec![Span::styled(
+                    if highlighted { "> " } else { "  " }.to_string(),
+                    base,
+                )];
+                match parts {
+                    ActionLabel::Marked { before, key, after } => {
+                        spans.push(Span::styled(before, base));
+                        spans.push(Span::styled(key.to_string(), key_style));
+                        spans.push(Span::styled(after, base));
+                    }
+                    ActionLabel::Badged { key, label } => {
+                        spans.push(Span::styled(key.to_string(), key_style));
+                        spans.push(Span::styled(format!(" {}", label), base));
+                    }
                 }
+                Line::from(spans)
             })
             .collect();
 
@@ -1535,8 +1647,10 @@ impl super::ScreenState for DirPickerState {
                 } else {
                     unfocused_border
                 }))
+                // Short enough to survive the panel's fixed width; a title that
+                // is cut off mid-word reads as a rendering bug.
                 .title(if actions_focused {
-                    " Actions (Enter runs) ".to_string()
+                    " Actions ⏎/key ".to_string()
                 } else {
                     " Actions ".to_string()
                 }),
