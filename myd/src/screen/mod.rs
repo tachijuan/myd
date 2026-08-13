@@ -6,7 +6,7 @@ use ratatui::{Frame, layout::Rect};
 use crossterm::event::KeyEvent;
 
 pub use dir_picker::{
-    DirPickerState, FavoriteEdit, PickerChoice, PickerFocus, PickerOption,
+    DirPickerState, FavoriteEdit, PickerAction, PickerChoice, PickerFocus, PickerOption,
     PickerSection,
 };
 pub use loading::LoadingState;

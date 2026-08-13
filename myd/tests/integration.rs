@@ -3255,9 +3255,10 @@ async fn connecting_from_the_directory_picker_does_not_empty_the_panel() {
     let mut app = FileBrowser::new_on_picker_with_hosts_for_test(test_catalog());
     assert_eq!(app.panel_depth_for_test(0), 1, "the picker is the only screen");
 
-    // Reproduce the reported flow: `/` to search, narrow to one host, Enter.
+    // Reproduce the reported flow: Tab to the list, type to narrow to one host,
+    // Enter.
     app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    for c in "/france".chars() {
+    for c in "france".chars() {
         app.handle_key_for_test(char_key(c));
     }
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -5272,7 +5273,7 @@ async fn gd_lists_every_saved_host() {
     }
 }
 
-/// `/` narrows `gd` to a host, which is the replacement for `gs`.
+/// Typing at the list narrows `gd` to a host, which is the replacement for `gs`.
 #[tokio::test]
 async fn searching_gd_reaches_a_saved_host() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -5285,7 +5286,7 @@ async fn searching_gd_reaches_a_saved_host() {
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
     app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    for c in "/france".chars() {
+    for c in "france".chars() {
         app.handle_key_for_test(char_key(c));
     }
 
@@ -5347,21 +5348,22 @@ fn open_picker_on_first_host(app: &mut FileBrowser) {
         myd::screen::Screen::DirPicker(p) => p.visible_count(),
         _ => panic!("gd should open the picker"),
     };
-    // Bounded by the row count: `j` wraps, so a list with no hosts at all would
-    // otherwise spin here rather than failing with something readable.
+    // Bounded by the row count: Down wraps, so a list with no hosts at all would
+    // otherwise spin here rather than failing with something readable. (Down
+    // rather than `j`, which types into the list's search now.)
     for _ in 0..rows {
         if on_host(app) {
             return;
         }
-        app.handle_key_for_test(char_key('j'));
+        app.handle_key_for_test(special_key(crossterm::event::KeyCode::Down));
     }
     panic!("no host row in the picker");
 }
 
-/// The picker owns j/k and `/` — they must navigate and search rather than
-/// reaching the global keybindings or the chord detector.
+/// The picker owns the arrows and every printable key — they must navigate and
+/// search rather than reaching the global keybindings or the chord detector.
 #[tokio::test]
-async fn picker_vi_navigation_and_search_work_through_the_app() {
+async fn picker_navigation_and_search_work_through_the_app() {
     let dir = create_test_structure();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     app.set_hosts_for_test(test_catalog());
@@ -5376,17 +5378,14 @@ async fn picker_vi_navigation_and_search_work_through_the_app() {
         _ => None,
     };
 
-    // j moves the cursor.
+    // Down moves the cursor.
     let first = label(&app).unwrap();
-    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Down));
     assert_ne!(label(&app).unwrap(), first);
 
-    // / filters incrementally, and the cursor maps back to the right host.
-    // Browsing mirrored the row into the path field; one Backspace clears that
-    // (it was a suggestion, not typed) so `/` reads as search rather than as the
-    // start of an absolute path.
-    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Backspace));
-    app.handle_key_for_test(char_key('/'));
+    // Typing filters incrementally, and the cursor maps back to the right host.
+    // No `/` first, and nothing to clear out of the path field: a search leaves
+    // it empty precisely so Enter acts on the row that was narrowed to.
     for c in "fra".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -5431,9 +5430,9 @@ async fn adding_a_host_stores_it_without_a_password() {
 
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
-    // `a` needs the list focused; the path field starts focused.
+    // Saving lives in the actions panel now: Tab past the list to reach it.
     app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
-    app.handle_key_for_test(char_key('a'));
+    picker_action(&mut app, myd::screen::PickerAction::Save);
     assert_eq!(app.modal_kind_for_test(), "input");
 
     // One prompt takes both kinds: a `label = sftp://…` line saves a host.
@@ -5471,7 +5470,7 @@ async fn deleting_a_host_requires_confirmation() {
         _ => panic!("gd should open the picker"),
     };
 
-    app.handle_key_for_test(char_key('d'));
+    picker_action(&mut app, myd::screen::PickerAction::Forget);
     assert_eq!(app.modal_kind_for_test(), "confirm");
 
     // Decline: the host stays.
@@ -5480,7 +5479,7 @@ async fn deleting_a_host_requires_confirmation() {
     assert_eq!(app.modal_kind_for_test(), "none");
 
     // Confirm: it goes.
-    app.handle_key_for_test(char_key('d'));
+    picker_action(&mut app, myd::screen::PickerAction::Forget);
     app.handle_key_for_test(char_key('y'));
     assert!(app.hosts_for_test().find(&doomed).is_none());
 }
@@ -5496,7 +5495,7 @@ async fn an_unparsable_host_form_reports_the_error() {
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
     app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
-    app.handle_key_for_test(char_key('a'));
+    picker_action(&mut app, myd::screen::PickerAction::Save);
     for c in "bad = http://nope".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -7399,7 +7398,12 @@ async fn a_typed_path_is_honoured_after_browsing_the_list() {
 
     // Look at the list first, as the screen invites.
     app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    // Then type a real path over it.
+    // Then Tab back to the field and type a real path over the suggestion the
+    // list mirrored in. (Typing straight at the list searches it now, so the
+    // Tab is what says "I mean a path" — the suggestion still has to give way.)
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(picker(&app).focus(), myd::screen::PickerFocus::Field);
     type_str(&mut app, &target.to_string_lossy());
 
     assert_eq!(
@@ -7431,6 +7435,9 @@ async fn typing_replaces_a_path_offered_by_the_list() {
     let filled = picker(&app).input_for_test().to_string();
     assert!(!filled.is_empty(), "browsing should fill the field");
 
+    // Back to the field, since typing at the list searches it now.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     app.handle_key_for_test(char_key('/'));
     assert_eq!(
         picker(&app).input_for_test(),
@@ -7461,11 +7468,12 @@ async fn a_suggestion_can_still_be_edited_deliberately() {
 }
 
 #[tokio::test]
-async fn tab_switches_focus_and_j_k_then_navigate_the_list() {
+async fn tab_cycles_the_three_panes() {
     use myd::screen::PickerFocus;
 
-    // The screen advertised "j/k to navigate" while the path field swallowed both
-    // keys, so the only way to move was the arrows.
+    // Three tab targets: the path field, the list of destinations, and the
+    // actions available for whatever the list highlights. Tab goes round them
+    // in that order — you pick a thing, then say what to do to it.
     let (_start, mut app) = picker_app().await;
     assert_eq!(
         picker(&app).focus(),
@@ -7485,23 +7493,46 @@ async fn tab_switches_focus_and_j_k_then_navigate_the_list() {
         crossterm::event::KeyModifiers::NONE,
     ));
 
-    // Tab hands the keyboard to the list, where j/k move.
-    app.handle_key_for_test(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Tab,
-        crossterm::event::KeyModifiers::NONE,
-    ));
+    let tab = |app: &mut myd::app::FileBrowser| {
+        app.handle_key_for_test(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    };
+
+    tab(&mut app);
     assert_eq!(picker(&app).focus(), PickerFocus::List);
 
+    // In the list the arrows move; j/k are search text now, not motion.
     let before = picker(&app).cursor_for_test();
-    app.handle_key_for_test(char_key('j'));
-    let after_j = picker(&app).cursor_for_test();
-    assert_ne!(after_j, before, "j must move the list once it has focus");
-    app.handle_key_for_test(char_key('k'));
-    assert_eq!(
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_ne!(
         picker(&app).cursor_for_test(),
         before,
-        "k must move back"
+        "Down must move the list once it has focus"
     );
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(picker(&app).cursor_for_test(), before, "Up must move back");
+
+    tab(&mut app);
+    assert_eq!(
+        picker(&app).focus(),
+        PickerFocus::Actions,
+        "the third target is the highlighted entry's actions"
+    );
+    assert!(
+        !picker(&app).actions().is_empty(),
+        "the panel must offer something to run"
+    );
+
+    tab(&mut app);
+    assert_eq!(picker(&app).focus(), PickerFocus::Field, "and round again");
 
     // Tab is never typed into the path.
     assert!(
@@ -7511,41 +7542,159 @@ async fn tab_switches_focus_and_j_k_then_navigate_the_list() {
 }
 
 #[tokio::test]
-async fn typing_while_the_list_has_focus_returns_to_the_field() {
+async fn j_k_walk_the_actions_panel_and_enter_runs_one() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use myd::screen::{PickerAction, PickerFocus};
+
+    // The panel is the only place the per-entry operations live now, so j/k and
+    // Enter have to work there — that is the whole replacement for the letters.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(picker(&app).focus(), PickerFocus::Actions);
+
+    // The first row is Go, so the panel always offers the obvious thing.
+    assert_eq!(picker(&app).selected_action(), Some(PickerAction::Go));
+    assert_eq!(picker(&app).action_cursor(), 0);
+
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(picker(&app).action_cursor(), 1, "j walks the panel");
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(picker(&app).action_cursor(), 0, "k walks back");
+
+    // Enter on Go opens the highlighted entry, which is what the app's Confirm
+    // does — the panel hands that one back rather than duplicating it.
+    let want = picker(&app).selected().unwrap().path.clone();
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
+    assert_eq!(app.panel_current_dir(0), Some(want), "Go opens the entry");
+}
+
+#[tokio::test]
+async fn the_actions_panel_offers_only_what_applies_to_the_row() {
+    use myd::screen::PickerAction;
+
+    // The panel replaced a fixed legend of letters, most of which did nothing on
+    // most rows with no way to tell which. Each row now shows exactly the
+    // operations that will do something.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    app.set_hosts_for_test(test_catalog());
+    app.resolve_loading_for_test();
+
+    // A saved host: editable and forgettable, but pinning and the traversal
+    // toggle are directory notions and must not be offered.
+    open_picker_on_first_host(&mut app);
+    let on_host = picker(&app).actions();
+    assert!(on_host.contains(&PickerAction::Go));
+    assert!(on_host.contains(&PickerAction::Edit));
+    assert!(on_host.contains(&PickerAction::Forget));
+    assert!(
+        !on_host.contains(&PickerAction::Pin) && !on_host.contains(&PickerAction::Shallow),
+        "a host is not a directory: {:?}",
+        on_host
+    );
+
+    // Save is offered everywhere — it prompts for a path rather than acting on
+    // the highlighted row, so it does not depend on what that row is.
+    assert!(on_host.contains(&PickerAction::Save));
+
+    // A pinned directory offers Unpin rather than Pin; the two are the same
+    // switch, and showing both would leave one of them inert.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+    assert!(picker(&app).actions().contains(&PickerAction::Pin));
+    picker_action(&mut app, PickerAction::Pin);
+    cursor_to(&mut app, dirs[0].path());
+    let pinned = picker(&app).actions();
+    assert!(
+        pinned.contains(&PickerAction::Unpin) && !pinned.contains(&PickerAction::Pin),
+        "a pinned row offers the way back out, not the way in: {:?}",
+        pinned
+    );
+}
+
+#[tokio::test]
+async fn the_shallow_action_names_the_state_it_would_move_to() {
+    use myd::screen::PickerAction;
+
+    // "Shallow" alone does not say which way a toggle goes, so the label states
+    // the outcome. Getting this backwards would be worse than no label at all.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    cursor_to(&mut app, dirs[0].path());
+
+    let row = picker(&app).selected().cloned().unwrap();
+    assert!(!row.shallow, "the fixture starts measured");
+    assert_eq!(
+        PickerAction::Shallow.label(Some(&row)),
+        "Skip measuring",
+        "a measured directory offers to stop measuring"
+    );
+
+    picker_action(&mut app, PickerAction::Shallow);
+    cursor_to(&mut app, dirs[0].path());
+    let row = picker(&app).selected().cloned().unwrap();
+    assert!(row.shallow, "the toggle took effect");
+    assert_eq!(
+        PickerAction::Shallow.label(Some(&row)),
+        "Measure sizes",
+        "and now offers the way back"
+    );
+}
+
+#[tokio::test]
+async fn a_search_survives_running_an_action_on_a_narrowed_list() {
+    use myd::screen::PickerAction;
+
+    // Acting on a row used to rebuild the picker from the catalog, which threw
+    // the filter away — the entry just acted on was somewhere else entirely by
+    // the time the screen came back, in a list of everything.
+    let (_cfg, dirs, mut app) = pin_app().await;
+    focus_list(&mut app);
+
+    // Narrow to the one entry, then pin it.
+    let name = dirs[0]
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    type_str(&mut app, &name);
+    assert_eq!(picker(&app).visible_count(), 1, "narrowed to the one row");
+    let target = picker(&app).selected().unwrap().path.clone();
+
+    picker_action(&mut app, PickerAction::Pin);
+
+    assert_eq!(picker(&app).query(), name, "the filter must survive the pin");
+    assert_eq!(
+        picker(&app).visible_count(),
+        1,
+        "and still be narrowing the list"
+    );
+    assert_eq!(
+        picker(&app).selected().map(|o| o.path.clone()),
+        Some(target),
+        "with the cursor still on the row that was acted on"
+    );
+}
+
+#[tokio::test]
+async fn typing_at_the_list_searches_it_without_a_leading_slash() {
     use myd::screen::PickerFocus;
 
-    // Typing a path is the picker's purpose; it must not be a no-op just because
-    // the list happens to hold focus.
+    // The change. Every printable character narrows the list — no `/` to press
+    // first, and no letters reserved for commands. Tabbing to a list of places
+    // and typing can only sensibly mean "find this one".
     let (_start, mut app) = picker_app().await;
     app.handle_key_for_test(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Tab,
         crossterm::event::KeyModifiers::NONE,
     ));
     assert_eq!(picker(&app).focus(), PickerFocus::List);
-
-    // A printable character that is not a list key starts a path. `/` is no
-    // longer such a character — it opens the search — so this uses `~`, which is
-    // how most typed paths begin anyway.
-    type_str(&mut app, "~/tm");
-    assert_eq!(picker(&app).focus(), PickerFocus::Field);
-    assert_eq!(picker(&app).input_for_test(), "~/tm");
-}
-
-#[tokio::test]
-async fn slash_searches_the_list_rather_than_starting_a_path() {
-    use myd::screen::PickerFocus;
-
-    // `/` narrows the list, which is what it does everywhere else in the app.
-    // The path field is still reachable with Tab or any other character.
-    let (_start, mut app) = picker_app().await;
-    app.handle_key_for_test(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Tab,
-        crossterm::event::KeyModifiers::NONE,
-    ));
     let all = picker(&app).visible_count();
     assert!(all >= 3, "need a few rows to filter");
 
-    type_str(&mut app, "/alpha");
+    type_str(&mut app, "alpha");
     assert_eq!(
         picker(&app).focus(),
         PickerFocus::List,
@@ -7558,6 +7707,18 @@ async fn slash_searches_the_list_rather_than_starting_a_path() {
         picker(&app).visible_count(),
         all
     );
+    assert_eq!(
+        picker(&app).input_for_test(),
+        "",
+        "a search is not a typed path — the field must stay clear"
+    );
+
+    // Backspace unwinds it a character at a time.
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Backspace,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(picker(&app).query(), "alph");
 
     // Esc abandons the search and restores the full list.
     app.handle_key_for_test(crossterm::event::KeyEvent::new(
@@ -7565,6 +7726,48 @@ async fn slash_searches_the_list_rather_than_starting_a_path() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert_eq!(picker(&app).visible_count(), all, "Esc clears the filter");
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "that Esc clears the filter rather than leaving the picker"
+    );
+
+    // A second Esc, with no filter left to clear, does back out.
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(
+        !matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "with nothing to clear, Esc leaves the picker"
+    );
+}
+
+#[tokio::test]
+async fn letters_that_used_to_be_commands_now_search() {
+    use myd::screen::PickerFocus;
+
+    // The bug the redesign fixes: `d` forgot an entry, `a` opened the save
+    // prompt, `p` pinned — so a list could not be searched by name at all.
+    // Typing "dad" must now do nothing but filter.
+    let (_start, mut app) = picker_app().await;
+    app.handle_key_for_test(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let saved_before = app.hosts_for_test().favorites().len();
+
+    type_str(&mut app, "dadpme");
+    assert_eq!(picker(&app).query(), "dadpme");
+    assert_eq!(picker(&app).focus(), PickerFocus::List);
+    assert_eq!(
+        app.hosts_for_test().favorites().len(),
+        saved_before,
+        "typing must not have saved or forgotten anything"
+    );
+    assert!(
+        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
+        "and must not have opened a prompt over the picker"
+    );
 }
 
 #[tokio::test]
@@ -7578,7 +7781,7 @@ async fn enter_on_a_search_with_one_match_opens_it() {
     let (start, mut app) = picker_app().await;
     app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-    type_str(&mut app, "/alpha");
+    type_str(&mut app, "alpha");
     assert_eq!(
         picker(&app).visible_count(),
         1,
@@ -7596,47 +7799,37 @@ async fn enter_on_a_search_with_one_match_opens_it() {
 }
 
 #[tokio::test]
-async fn enter_on_a_search_with_several_matches_hands_over_the_filtered_list() {
+async fn enter_on_a_search_with_several_matches_opens_the_highlighted_row() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use myd::screen::PickerFocus;
 
-    // More than one candidate is still a choice, so Enter accepts the filter and
-    // leaves the narrowed list to navigate rather than guessing at the top row.
+    // The search is always live now — there is no separate "accept the filter"
+    // step to spend an Enter on, since letters filter the moment they are typed
+    // and the arrows move within the narrowed list. So Enter means what it means
+    // everywhere else in this list: open what is highlighted.
     let (_start, mut app) = picker_app().await;
     app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
     // "a" matches alpha, beta and gamma.
-    type_str(&mut app, "/a");
+    type_str(&mut app, "a");
     assert!(
         picker(&app).visible_count() > 1,
         "need several matches: {} shown",
         picker(&app).visible_count()
     );
-    let shown = picker(&app).visible_count();
 
-    // No `settle` here on purpose: nothing should have started loading, and
-    // waiting for a load that never comes is how this test first "failed".
+    // Arrows still move inside the filtered list, so a match other than the
+    // first can be reached without abandoning the search.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let want = picker(&app).selected().unwrap().path.clone();
+
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle(&mut app).await;
 
-    assert!(
-        matches!(app.current_screen(), myd::screen::Screen::DirPicker(_)),
-        "Enter with several matches must not open anything"
-    );
     assert_eq!(
-        picker(&app).visible_count(),
-        shown,
-        "the narrowed list stays in place to choose from"
+        app.panel_current_dir(0),
+        Some(want),
+        "Enter opens the highlighted match"
     );
-    assert_eq!(
-        picker(&app).focus(),
-        PickerFocus::List,
-        "and the keyboard drives that list"
-    );
-
-    // j/k now walk the filtered rows, which is the point of handing them back.
-    let before = picker(&app).cursor_for_test();
-    app.handle_key_for_test(char_key('j'));
-    assert_ne!(picker(&app).cursor_for_test(), before);
 }
 
 #[tokio::test]
@@ -8705,16 +8898,78 @@ fn picker_rows(app: &FileBrowser) -> Vec<String> {
     }
 }
 
+/// Tab until the list has the keyboard, wherever the test happens to be.
+///
+/// One blind Tab was enough when there were two panes; with three it depends on
+/// where the previous step left the focus.
 fn focus_list(app: &mut FileBrowser) {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for _ in 0..3 {
+        if picker(app).focus() == myd::screen::PickerFocus::List {
+            return;
+        }
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+    panic!("could not reach the list");
+}
+
+/// Walk the picker's list cursor down onto `path`, by arrow key.
+///
+/// `j` used to do this; it types into the search now, so the arrows are what
+/// moves a list cursor from a test.
+fn picker_cursor_onto(app: &mut FileBrowser, path: &std::path::Path) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for _ in 0..40 {
+        let on = match app.current_screen() {
+            myd::screen::Screen::DirPicker(s) => {
+                s.selected().map(|o| o.path == path).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if on {
+            return;
+        }
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    panic!("never reached {} in the picker", path.display());
+}
+
+/// Run `want` from the actions panel and come back to the list.
+///
+/// The `favorites_app` tests act on a highlighted row and then keep going, so
+/// unlike [`run_picker_action`] this leaves the focus where it found it.
+fn picker_action(app: &mut FileBrowser, want: myd::screen::PickerAction) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Tab all the way round to the panel rather than stopping when focus is
+    // already there: entering it from the list resets the highlight to the top
+    // row, which is what makes the `j` count below mean anything. A caller that
+    // ran one action and came straight back would otherwise be walking from
+    // wherever the last one left the cursor.
+    for _ in 0..3 {
+        app.handle_key_for_test(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        if picker(app).focus() == myd::screen::PickerFocus::Actions {
+            break;
+        }
+    }
+    assert_eq!(picker(app).focus(), myd::screen::PickerFocus::Actions);
+
+    let actions = picker(app).actions();
+    let at = actions
+        .iter()
+        .position(|a| *a == want)
+        .unwrap_or_else(|| panic!("{:?} is not offered here; panel has {:?}", want, actions));
+    for _ in 0..at {
+        app.handle_key_for_test(char_key('j'));
+    }
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 }
 
 #[tokio::test]
-async fn a_prompts_for_a_directory_rather_than_saving_the_cursor_row() {
+async fn save_prompts_for_a_directory_rather_than_saving_the_cursor_row() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    // `a` used to bookmark whatever the cursor happened to be on, which is
+    // Saving used to bookmark whatever the cursor happened to be on, which is
     // rarely the directory the user wants to save — the point is to name a new
     // place. It now opens a prompt.
     let (cfg, dir, mut app) = favorites_app().await;
@@ -8726,11 +8981,11 @@ async fn a_prompts_for_a_directory_rather_than_saving_the_cursor_row() {
         _ => unreachable!(),
     };
 
-    app.handle_key_for_test(char_key('a'));
+    picker_action(&mut app, myd::screen::PickerAction::Save);
     assert_eq!(
         app.modal_kind_for_test(),
         "input",
-        "`a` must ask which directory to save"
+        "Save must ask which directory to save"
     );
 
     // Type a path that is *not* the highlighted row.
@@ -8770,7 +9025,7 @@ async fn saving_a_path_that_is_not_a_directory_is_refused() {
 
     let (_cfg, dir, mut app) = favorites_app().await;
     focus_list(&mut app);
-    app.handle_key_for_test(char_key('a'));
+    picker_action(&mut app, myd::screen::PickerAction::Save);
 
     let missing = dir.path().join("does-not-exist");
     for c in missing.to_string_lossy().chars() {
@@ -8790,7 +9045,7 @@ async fn saving_a_path_that_is_not_a_directory_is_refused() {
 }
 
 #[tokio::test]
-async fn d_forgets_a_saved_favourite() {
+async fn forget_removes_a_saved_favourite() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let (cfg, dir, mut app) = favorites_app().await;
@@ -8798,7 +9053,7 @@ async fn d_forgets_a_saved_favourite() {
 
     // Save one through the prompt.
     focus_list(&mut app);
-    app.handle_key_for_test(char_key('a'));
+    picker_action(&mut app, myd::screen::PickerAction::Save);
     for c in target.to_string_lossy().chars() {
         app.handle_key_for_test(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
@@ -8806,19 +9061,9 @@ async fn d_forgets_a_saved_favourite() {
     assert!(picker_rows(&app).iter().any(|r| r.starts_with('*')));
 
     // Put the cursor on it and forget it.
-    for _ in 0..15 {
-        let on = match app.current_screen() {
-            myd::screen::Screen::DirPicker(s) => {
-                s.selected().map(|o| o.path == target).unwrap_or(false)
-            }
-            _ => false,
-        };
-        if on {
-            break;
-        }
-        app.handle_key_for_test(char_key('j'));
-    }
-    app.handle_key_for_test(char_key('d'));
+    focus_list(&mut app);
+    picker_cursor_onto(&mut app, &target);
+    picker_action(&mut app, myd::screen::PickerAction::Forget);
 
     assert!(
         !app.hosts_for_test()
@@ -9031,8 +9276,8 @@ async fn saving_a_remembered_path_keeps_its_history() {
     app.handle_key_for_test(char_key('g'));
     app.handle_key_for_test(char_key('d'));
     focus_list(&mut app);
-    app.handle_key_for_test(char_key('a'));
-    assert_eq!(app.modal_kind_for_test(), "input", "`a` should prompt");
+    picker_action(&mut app, myd::screen::PickerAction::Save);
+    assert_eq!(app.modal_kind_for_test(), "input", "Save should prompt");
     // The prompt is seeded with the path field's contents; clear it first so the
     // typed path is the whole value.
     for _ in 0..200 {
@@ -9285,20 +9530,13 @@ fn pinned_paths(app: &FileBrowser) -> Vec<String> {
 }
 
 /// Move the cursor onto `path`.
+/// Put the picker's list cursor on `path`, from wherever the focus is.
+///
+/// Walks with the arrows rather than `j`: letters type into the list's search
+/// now, so `j` would filter the list down to nothing instead of moving.
 fn cursor_to(app: &mut FileBrowser, path: &std::path::Path) {
-    for _ in 0..30 {
-        let on = match app.current_screen() {
-            myd::screen::Screen::DirPicker(s) => {
-                s.selected().map(|o| o.path == path).unwrap_or(false)
-            }
-            _ => false,
-        };
-        if on {
-            return;
-        }
-        app.handle_key_for_test(char_key('j'));
-    }
-    panic!("never reached {}", path.display());
+    focus_list(app);
+    picker_cursor_onto(app, path);
 }
 
 #[tokio::test]
@@ -9309,7 +9547,7 @@ async fn p_pins_to_the_bottom_of_the_pinned_block() {
 
     for d in &dirs {
         cursor_to(&mut app, d.path());
-        app.handle_key_for_test(char_key('p'));
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
     }
 
     assert_eq!(
@@ -9338,11 +9576,11 @@ async fn p_pins_to_the_bottom_of_the_pinned_block() {
 async fn u_unpins_but_keeps_the_entry() {
     let (_cfg, dirs, mut app) = pin_app().await;
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('p'));
+    picker_action(&mut app, myd::screen::PickerAction::Pin);
     assert_eq!(pinned_paths(&app).len(), 1);
 
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('u'));
+    picker_action(&mut app, myd::screen::PickerAction::Unpin);
     assert!(pinned_paths(&app).is_empty(), "no longer pinned");
     assert!(
         app.hosts_for_test()
@@ -9360,13 +9598,13 @@ async fn m_reorders_within_the_pinned_block_and_enter_commits() {
     let (_cfg, dirs, mut app) = pin_app().await;
     for d in &dirs {
         cursor_to(&mut app, d.path());
-        app.handle_key_for_test(char_key('p'));
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
     }
     let before = pinned_paths(&app);
 
     // Move the first entry down one.
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('m'));
+    picker_action(&mut app, myd::screen::PickerAction::Move);
     assert!(
         matches!(app.current_screen(), myd::screen::Screen::DirPicker(s) if s.moving().is_some()),
         "m should start a move"
@@ -9399,12 +9637,12 @@ async fn esc_restores_the_original_position() {
     let (_cfg, dirs, mut app) = pin_app().await;
     for d in &dirs {
         cursor_to(&mut app, d.path());
-        app.handle_key_for_test(char_key('p'));
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
     }
     let before = pinned_paths(&app);
 
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('m'));
+    picker_action(&mut app, myd::screen::PickerAction::Move);
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -9423,13 +9661,13 @@ async fn sliding_past_the_bottom_of_the_block_unpins() {
     let (_cfg, dirs, mut app) = pin_app().await;
     for d in &dirs {
         cursor_to(&mut app, d.path());
-        app.handle_key_for_test(char_key('p'));
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
     }
     assert_eq!(pinned_paths(&app).len(), 3);
 
     // Take the last pinned entry one step further down, out of the block.
     cursor_to(&mut app, dirs[2].path());
-    app.handle_key_for_test(char_key('m'));
+    picker_action(&mut app, myd::screen::PickerAction::Move);
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -9454,7 +9692,7 @@ async fn a_pinned_order_survives_a_reload() {
     let (_cfg, dirs, mut app) = pin_app().await;
     for d in &dirs {
         cursor_to(&mut app, d.path());
-        app.handle_key_for_test(char_key('p'));
+        picker_action(&mut app, myd::screen::PickerAction::Pin);
     }
     let order = pinned_paths(&app);
 
@@ -9479,7 +9717,7 @@ async fn m_on_an_unpinned_entry_pins_it_and_starts_moving() {
     assert!(pinned_paths(&app).is_empty(), "nothing pinned yet");
 
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('m'));
+    picker_action(&mut app, myd::screen::PickerAction::Move);
 
     assert!(
         matches!(app.current_screen(), myd::screen::Screen::DirPicker(s) if s.moving().is_some()),
@@ -9501,9 +9739,9 @@ async fn sliding_out_of_the_block_shows_the_change_before_it_is_committed() {
     // to do the opposite. A second `j` also must not run away down the list.
     let (_cfg, dirs, mut app) = pin_app().await;
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('p'));
+    picker_action(&mut app, myd::screen::PickerAction::Pin);
     cursor_to(&mut app, dirs[0].path());
-    app.handle_key_for_test(char_key('m'));
+    picker_action(&mut app, myd::screen::PickerAction::Move);
     assert_eq!(pinned_paths(&app).len(), 1);
 
     // One step past the bottom of a one-entry block.
@@ -9565,7 +9803,7 @@ async fn seeded_standard_directories_can_be_pinned_and_deleted() {
         myd::screen::Screen::DirPicker(s) => s.selected().unwrap().path.clone(),
         _ => panic!("expected the picker"),
     };
-    app.handle_key_for_test(char_key('p'));
+    picker_action(&mut app, myd::screen::PickerAction::Pin);
     assert_eq!(
         pinned_paths(&app),
         vec![first.to_string_lossy().to_string()],
@@ -9574,7 +9812,7 @@ async fn seeded_standard_directories_can_be_pinned_and_deleted() {
 
     // And deletable.
     cursor_to(&mut app, &first);
-    app.handle_key_for_test(char_key('d'));
+    picker_action(&mut app, myd::screen::PickerAction::Forget);
     // One extra entry exists for the panel's own starting directory, recorded
     // when it opened; the assertion is about the delta, not the total.
     assert_eq!(
@@ -10092,11 +10330,11 @@ async fn e_edits_a_saved_directorys_path_in_place() {
     app.handle_key_for_test(special_key(KeyCode::Tab));
     cursor_to(&mut app, old_dir.path());
 
-    app.handle_key_for_test(char_key('e'));
+    picker_action(&mut app, myd::screen::PickerAction::Edit);
     assert_eq!(
         app.modal_kind_for_test(),
         "input",
-        "`e` should open an editable popup on a directory row"
+        "Edit should open an editable popup on a directory row"
     );
 
     // Replace the path with the new one.
@@ -10158,7 +10396,7 @@ async fn editing_a_directory_to_one_already_listed_is_refused() {
     app.handle_key_for_test(special_key(KeyCode::Tab));
     cursor_to(&mut app, a.path());
 
-    app.handle_key_for_test(char_key('e'));
+    picker_action(&mut app, myd::screen::PickerAction::Edit);
     for _ in 0..300 {
         app.handle_key_for_test(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
     }
@@ -10610,10 +10848,10 @@ async fn s_toggles_a_saved_directorys_traversal_mode_from_the_picker() {
     let key = target.path().to_string_lossy().to_string();
     assert!(!app.hosts_for_test().dir_is_shallow(&key), "starts measured");
 
-    app.handle_key_for_test(char_key('S'));
+    picker_action(&mut app, myd::screen::PickerAction::Shallow);
     assert!(
         app.hosts_for_test().dir_is_shallow(&key),
-        "S should mark it shallow"
+        "the toggle should mark it shallow"
     );
     // The row says so, or the toggle is invisible until the next open.
     match app.current_screen() {
@@ -10630,12 +10868,14 @@ async fn s_toggles_a_saved_directorys_traversal_mode_from_the_picker() {
         "and it must persist"
     );
 
-    // Pressing it again turns measuring back on. No prompt here: nothing is
+    // Running it again turns measuring back on — the panel's label flips with
+    // the state, so the same row is the way back. No prompt here: nothing is
     // being walked, since this only takes effect the next time it is opened.
-    app.handle_key_for_test(char_key('S'));
+    cursor_to(&mut app, target.path());
+    picker_action(&mut app, myd::screen::PickerAction::Shallow);
     assert!(
         !app.hosts_for_test().dir_is_shallow(&key),
-        "S again should clear it"
+        "toggling again should clear it"
     );
 }
 
@@ -13873,3 +14113,4 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
