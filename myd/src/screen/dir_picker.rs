@@ -8,18 +8,20 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
-/// Which half of the picker has the keyboard.
+/// Which pane of the picker has the keyboard.
 ///
-/// The screen is a path field *and* a list, so a bare `j` is ambiguous. Rather
-/// than guess, focus is explicit and `Tab` moves it, matching how `Tab` already
-/// switches panels in the main view.
+/// The screen is a path field, a list *and* a panel of per-entry actions, so a
+/// bare `j` is ambiguous. Rather than guess, focus is explicit and `Tab` cycles
+/// it, matching how `Tab` already switches panels in the main view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFocus {
     /// Typing edits the path; `j`/`k` are ordinary characters.
     Field,
-    /// `j`/`k` walk the list; typing a printable character jumps to the field so
-    /// starting to type a path never silently does nothing.
+    /// `j`/`k` walk the list, and any other printable character narrows it —
+    /// the list is a thing you search, not a thing you type paths into.
     List,
+    /// The actions available for the highlighted row; Enter runs one.
+    Actions,
 }
 
 /// State for the directory picker startup screen.
@@ -82,6 +84,64 @@ pub struct DirPickerState {
     /// so answering "how will *this* open" needs the same lookup `Confirm`
     /// does rather than the highlighted row's flag.
     dir_prefs: std::collections::HashMap<String, bool>,
+    /// Which row of the actions panel is highlighted.
+    ///
+    /// Indexes [`Self::actions`], which is derived from the highlighted entry
+    /// and so changes under this cursor whenever the list moves — every read
+    /// clamps rather than trusting it.
+    action_cursor: usize,
+}
+
+/// One operation offered for the highlighted entry.
+///
+/// The panel replaced a title-bar legend of single letters. Those letters were
+/// bound directly on the list, which is what made "type to search" impossible
+/// there: `d` in "downloads" deleted an entry instead. Naming the operations
+/// and giving them their own pane frees every printable key for the search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerAction {
+    /// Open (or connect to) the highlighted entry.
+    Go,
+    /// Save a new directory to the list.
+    Save,
+    /// Forget the highlighted entry.
+    Forget,
+    /// Edit the entry: a host's details, or a directory's path.
+    Edit,
+    /// Add the entry to the pinned block.
+    Pin,
+    /// Take the entry out of the pinned block.
+    Unpin,
+    /// Reorder the entry within the pinned block.
+    Move,
+    /// Flip whether the directory is browsed without measuring sizes.
+    Shallow,
+}
+
+impl PickerAction {
+    /// The label drawn in the panel.
+    pub fn label(self, opt: Option<&PickerOption>) -> String {
+        match self {
+            // "Go" is honest for a directory but not for a host, where Enter
+            // dials rather than opens.
+            PickerAction::Go => match opt {
+                Some(o) if o.is_host() => "Connect".to_string(),
+                _ => "Go".to_string(),
+            },
+            PickerAction::Save => "Save a directory".to_string(),
+            PickerAction::Forget => "Forget".to_string(),
+            PickerAction::Edit => "Edit".to_string(),
+            PickerAction::Pin => "Pin".to_string(),
+            PickerAction::Unpin => "Unpin".to_string(),
+            PickerAction::Move => "Move".to_string(),
+            // The label states the current setting, since the action is a
+            // toggle and "Shallow" alone does not say which way it goes.
+            PickerAction::Shallow => match opt {
+                Some(o) if o.shallow => "Measure sizes".to_string(),
+                _ => "Skip measuring".to_string(),
+            },
+        }
+    }
 }
 
 /// What confirming the picker asked for.
@@ -349,6 +409,7 @@ impl DirPickerState {
             pending_edit: None,
             shallow_default: false,
             dir_prefs: std::collections::HashMap::new(),
+            action_cursor: 0,
         };
         // `visible` is what the cursor indexes and what render walks, so it has
         // to be populated before the picker is handed out — an empty one leaves
@@ -468,6 +529,152 @@ impl DirPickerState {
             .and_then(|&i| self.options.get(i))
     }
 
+    /// The operations offered for the highlighted entry, in display order.
+    ///
+    /// Derived rather than stored: which ones apply depends entirely on what the
+    /// cursor is on, and a stored list would go stale the moment the list moved
+    /// or the catalog was rebuilt after an edit.
+    ///
+    /// Only applicable operations appear. Greying out the rest was the
+    /// alternative, but a panel of mostly-dead rows makes the user work out why
+    /// each one is dead; an absent row asks nothing.
+    pub fn actions(&self) -> Vec<PickerAction> {
+        // `Save` needs no selection — it prompts for a path — so it is the one
+        // action an empty list still offers.
+        let Some(opt) = self.selected() else {
+            return vec![PickerAction::Save];
+        };
+
+        let mut out = vec![PickerAction::Go, PickerAction::Save];
+        if opt.is_host() {
+            // A host is a saved address: it can be edited and forgotten, but
+            // pinning and the traversal toggle are directory notions.
+            out.push(PickerAction::Edit);
+            out.push(PickerAction::Forget);
+            return out;
+        }
+        if opt.is_favorite {
+            out.push(PickerAction::Edit);
+            out.push(PickerAction::Forget);
+            if opt.tier == crate::hosts::DirTier::Pinned {
+                out.push(PickerAction::Unpin);
+            } else {
+                out.push(PickerAction::Pin);
+            }
+            // `m` pinned an unpinned entry first; the panel keeps that, so
+            // "Move" is offered on any saved directory.
+            out.push(PickerAction::Move);
+            out.push(PickerAction::Shallow);
+        }
+        out
+    }
+
+    /// The highlighted action, if the panel has any rows.
+    pub fn selected_action(&self) -> Option<PickerAction> {
+        let actions = self.actions();
+        actions.get(self.action_cursor.min(actions.len().saturating_sub(1))).copied()
+    }
+
+    /// Index of the highlighted action, clamped to what is currently offered.
+    ///
+    /// The list of actions changes as the entry under the list cursor changes,
+    /// so a raw `action_cursor` can point past the end; every reader goes
+    /// through this.
+    pub fn action_cursor(&self) -> usize {
+        let len = self.actions().len();
+        self.action_cursor.min(len.saturating_sub(1))
+    }
+
+    fn action_next(&mut self) {
+        let len = self.actions().len();
+        if len > 0 {
+            self.action_cursor = (self.action_cursor() + 1) % len;
+        }
+    }
+
+    fn action_prev(&mut self) {
+        let len = self.actions().len();
+        if len > 0 {
+            self.action_cursor = if self.action_cursor() == 0 {
+                len - 1
+            } else {
+                self.action_cursor() - 1
+            };
+        }
+    }
+
+    /// Run the highlighted action. Returns `false` when the caller must handle
+    /// it instead — `Go` is the app's `Confirm`, which this screen cannot do.
+    fn run_action(&mut self) -> bool {
+        let Some(action) = self.selected_action() else {
+            return true;
+        };
+        // Cloned up front: each arm needs the row, and `pending_edit` borrows
+        // `self` mutably.
+        let opt = self.selected().cloned();
+        match action {
+            // Handed back unconsumed so the app's Confirm resolves it, which is
+            // the one place that knows how to open a directory or dial a host.
+            PickerAction::Go => return false,
+            PickerAction::Save => self.pending_edit = Some(FavoriteEdit::PromptAdd),
+            PickerAction::Forget => {
+                if let Some(o) = opt {
+                    self.pending_edit = match &o.host {
+                        Some(h) => Some(FavoriteEdit::DeleteHost(h.label.clone())),
+                        None if o.is_favorite => Some(FavoriteEdit::Remove(o.path.clone())),
+                        None => None,
+                    };
+                }
+            }
+            PickerAction::Edit => {
+                if let Some(o) = opt {
+                    self.pending_edit = match &o.host {
+                        Some(h) => Some(FavoriteEdit::EditHost(h.label.clone())),
+                        None if o.is_favorite => Some(FavoriteEdit::EditDir(o.path.clone())),
+                        None => None,
+                    };
+                }
+            }
+            PickerAction::Pin => {
+                if let Some(o) = opt {
+                    if o.is_favorite && o.tier != crate::hosts::DirTier::Pinned {
+                        self.pending_edit = Some(FavoriteEdit::Pin(o.path.clone()));
+                    }
+                }
+            }
+            PickerAction::Unpin => {
+                if let Some(o) = opt {
+                    if o.tier == crate::hosts::DirTier::Pinned {
+                        self.pending_edit = Some(FavoriteEdit::Unpin(o.path.clone()));
+                    }
+                }
+            }
+            PickerAction::Move => {
+                // A reorder only has meaning inside the pinned block, so an
+                // unpinned entry is pinned first and the new pin is what moves.
+                // The keys go back to the list, which is where a move is driven.
+                match opt {
+                    Some(o) if o.tier == crate::hosts::DirTier::Pinned => {
+                        self.focus = PickerFocus::List;
+                        self.begin_move(o.path.clone());
+                    }
+                    Some(o) if o.is_favorite => {
+                        self.pending_edit = Some(FavoriteEdit::PinAndMove(o.path.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            PickerAction::Shallow => {
+                if let Some(o) = opt {
+                    if !o.is_host() && o.is_favorite {
+                        self.pending_edit = Some(FavoriteEdit::ToggleShallow(o.path.clone()));
+                    }
+                }
+            }
+        }
+        true
+    }
+
 
     /// Carry the keyboard state across a rebuild, so adding or removing a
     /// favourite does not dump the user back into the path field.
@@ -476,6 +683,13 @@ impl DirPickerState {
         self.input.clone_from(&other.input);
         self.input_cursor = other.input_cursor;
         self.input_is_suggestion = other.input_is_suggestion;
+        self.action_cursor = other.action_cursor;
+        // The search survives too. Pinning from a narrowed list used to dump the
+        // user back into the unfiltered one, so the entry they had just acted on
+        // was somewhere else entirely by the time the screen came back.
+        self.query.clone_from(&other.query);
+        self.searching = other.searching;
+        self.recompute_visible();
     }
 
     /// Highlight the row for `path`, if it is still listed. Leaves the cursor
@@ -520,11 +734,22 @@ impl DirPickerState {
         self.focus
     }
 
-    /// Move the keyboard between the path field and the list.
+    /// Move the keyboard on to the next pane: field → list → actions → field.
+    ///
+    /// The actions belong to the highlighted entry, so they sit *after* the list
+    /// in the cycle: you choose what to act on, then what to do to it.
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             PickerFocus::Field => PickerFocus::List,
-            PickerFocus::List => PickerFocus::Field,
+            PickerFocus::List => {
+                // Entering the panel starts at its first row rather than
+                // wherever the last entry's panel happened to leave the cursor —
+                // the lists differ per row, so a carried-over index points at an
+                // unrelated action.
+                self.action_cursor = 0;
+                PickerFocus::Actions
+            }
+            PickerFocus::Actions => PickerFocus::Field,
         };
     }
 
@@ -628,6 +853,13 @@ impl DirPickerState {
             return;
         }
         self.cursor = index.min(self.visible.len() - 1);
+        // Not while a search is narrowing the list. The field is what `confirm`
+        // prefers, so mirroring into it mid-search would make Enter open the
+        // suggestion rather than the row the user filtered down to — and the
+        // field is drawn empty during a search, so the text would be invisible.
+        if self.searching {
+            return;
+        }
         if let Some(opt) = self.selected() {
             let shown = opt.path.to_string_lossy().to_string();
             self.set_suggestion(shown);
@@ -835,6 +1067,17 @@ impl DirPickerState {
         // land on the second entry and the first one unreachable that way. Tab
         // was unaffected, since it only moves focus.
         match key.code {
+            // In the actions panel the arrows walk *it*, not the list: it is the
+            // pane with focus, and moving the list from under it would swap the
+            // actions out beneath the cursor.
+            KeyCode::Up | KeyCode::Down if self.focus == PickerFocus::Actions => {
+                if key.code == KeyCode::Down {
+                    self.action_next();
+                } else {
+                    self.action_prev();
+                }
+                return Some(true);
+            }
             KeyCode::Up | KeyCode::Down => {
                 let engaging = self.focus == PickerFocus::Field;
                 self.focus = PickerFocus::List;
@@ -859,71 +1102,48 @@ impl DirPickerState {
             return Some(self.handle_move_key(key.code));
         }
 
-        // While searching, printable keys narrow the list rather than doing
-        // whatever they normally would — otherwise typing "desktop" would fire
-        // `d` (delete), `e` (edit), `p` (pin) and the rest along the way.
-        if self.searching {
-            match key.code {
-                KeyCode::Char(c) => {
-                    self.query.push(c);
-                    self.recompute_visible();
-                    return Some(true);
+        // The actions panel: j/k (and the arrows, handled above) walk it, Enter
+        // runs the highlighted operation. Nothing here searches — the panel is a
+        // fixed handful of rows, and typing at it is almost certainly meant for
+        // the list or the field.
+        if self.focus == PickerFocus::Actions {
+            return match key.code {
+                KeyCode::Char('j') => {
+                    self.action_next();
+                    Some(true)
                 }
-                KeyCode::Backspace => {
-                    // Backspacing past the start leaves search rather than
-                    // sitting in an empty prompt that swallows every key.
-                    if self.query.pop().is_none() {
-                        self.searching = false;
-                    }
-                    self.recompute_visible();
-                    return Some(true);
+                KeyCode::Char('k') => {
+                    self.action_prev();
+                    Some(true)
                 }
-                KeyCode::Esc => {
-                    // Abandon the search and show everything again.
-                    self.searching = false;
-                    self.query.clear();
-                    self.recompute_visible();
-                    return Some(true);
-                }
-                // Enter on a search that has narrowed to exactly one row opens
-                // it: having typed enough to leave a single candidate, being
-                // made to press Enter twice is pure ceremony. With any other
-                // count it accepts the filter and hands the keys back, leaving
-                // the narrowed list in place to choose from.
                 KeyCode::Enter => {
-                    self.searching = false;
-                    // The keys go to the list either way: what the search
-                    // narrowed to is on screen, and j/k are how you pick from it.
-                    self.focus = PickerFocus::List;
-                    if self.visible.len() == 1 {
-                        self.cursor = 0;
-                        // `confirm` prefers the path field, which may still hold
-                        // a suggestion mirrored in before the search began — not
-                        // what the user narrowed to. Clearing it makes the sole
-                        // match the thing Enter acts on.
-                        self.input.clear();
-                        self.input_cursor = 0;
-                        self.input_is_suggestion = false;
-                        // Unconsumed, so the app's Enter runs `confirm` on it.
-                        return None;
+                    // `run_action` returns false for `Go`, which only the app can
+                    // carry out; that falls through to `Action::Confirm`.
+                    if self.run_action() {
+                        Some(true)
+                    } else {
+                        None
                     }
-                    return Some(true);
                 }
-                // Arrows still move, so a match can be picked without leaving.
-                KeyCode::Up => {
-                    self.select_prev();
-                    return Some(true);
-                }
-                KeyCode::Down => {
-                    self.select_next();
-                    return Some(true);
-                }
-                _ => return Some(true),
-            }
+                // Esc is the app's: it backs out of the picker.
+                _ => None,
+            };
         }
 
         if self.focus == PickerFocus::List {
             return match key.code {
+                // Mid-search, Home/End are the only way left to reach the ends
+                // of the list in one press: `g`/`G` type into the query like
+                // every other letter, and jumping to the field would abandon
+                // the filter the user is in the middle of building.
+                KeyCode::Home if self.searching || !self.query.is_empty() => {
+                    self.select_first();
+                    Some(true)
+                }
+                KeyCode::End if self.searching || !self.query.is_empty() => {
+                    self.select_last();
+                    Some(true)
+                }
                 // Text-editing keys mean the user wants the field, so hand it
                 // back rather than ignoring them. `End` after arrowing to an
                 // entry is how you append a subdirectory to a listed path.
@@ -940,157 +1160,63 @@ impl DirPickerState {
                     }
                     Some(true)
                 }
-                // vi motion over the list — what the screen has always claimed
-                // these keys did, while the field was in fact swallowing them.
-                KeyCode::Char('j') => {
-                    self.select_next();
-                    Some(true)
-                }
-                KeyCode::Char('k') => {
-                    self.select_prev();
-                    Some(true)
-                }
-                KeyCode::Char('g') => {
-                    self.select_first();
-                    Some(true)
-                }
-                KeyCode::Char('G') => {
-                    self.select_last();
-                    Some(true)
-                }
-                // Incremental search over everything on screen — but only when
-                // the field is empty. Most typed paths start with `/`, and after
-                // browsing the list the field holds a suggestion the user is
-                // about to type over; hijacking that keystroke made absolute
-                // paths impossible to enter from the list.
+                // Typing narrows the list. Every printable character does, with
+                // no `/` to press first: having tabbed to a list of places, what
+                // else would typing mean? The operations that used to own these
+                // letters live in the actions panel now, which is what freed
+                // them — `d` in "downloads" filters rather than forgetting an
+                // entry, and a path is still typed by tabbing back to the field.
                 //
-                // Only on an empty field. `/` is how nearly every absolute path
-                // starts, and browsing the list leaves a suggestion the user is
-                // usually about to type over — taking that keystroke would make
-                // "arrow to something nearby, then type the real path" impossible.
-                // From a suggestion, one Backspace clears the field (it was never
-                // typed) and `/` then searches.
-                KeyCode::Char('/') if self.input.is_empty() => {
+                // This costs the vi motions: `j` and `k` filter like anything
+                // else, since a list you search with bare letters cannot also
+                // reserve two of them. The arrows are handled above and move
+                // regardless of focus, so the list is still navigable mid-search.
+                KeyCode::Char(c) => {
                     self.searching = true;
+                    self.query.push(c);
+                    self.recompute_visible();
+                    // The narrowed list is what Enter should act on, so the
+                    // suggestion mirrored in from the previously highlighted row
+                    // has to go: `confirm` prefers the field, and would
+                    // otherwise open whatever was highlighted before the search.
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.input_is_suggestion = false;
+                    Some(true)
+                }
+                KeyCode::Backspace => {
+                    // Backspace unwinds the search a character at a time. Past
+                    // the start it hands the field back, which is the only way
+                    // Backspace can still mean "edit the path I typed".
+                    if self.query.pop().is_none() {
+                        self.searching = false;
+                        self.focus = PickerFocus::Field;
+                        self.input_backspace();
+                    } else {
+                        if self.query.is_empty() {
+                            self.searching = false;
+                        }
+                        self.recompute_visible();
+                    }
+                    Some(true)
+                }
+                // Esc drops the filter and shows everything again. Only when
+                // there is one: with no search running it is the app's, and
+                // backs out of the picker.
+                KeyCode::Esc if !self.query.is_empty() => {
+                    self.searching = false;
                     self.query.clear();
                     self.recompute_visible();
                     Some(true)
                 }
-                // Edit a saved host's details. Directories have nothing to edit
-                // beyond their path, which `a` and `d` already cover.
-                KeyCode::Char('e') => {
-                    if let Some(opt) = self.selected() {
-                        self.pending_edit = match &opt.host {
-                            Some(host) => Some(FavoriteEdit::EditHost(host.label.clone())),
-                            // A saved directory is edited as its path, so a typo
-                            // or a moved directory can be corrected in place
-                            // rather than deleted and re-added.
-                            None if opt.is_favorite => {
-                                Some(FavoriteEdit::EditDir(opt.path.clone()))
-                            }
-                            None => None,
-                        };
-                    }
-                    Some(true)
-                }
-                // Flip whether this directory is browsed with its sizes
-                // measured. Reachable from here as well as from the tree, so a
-                // directory known to be slow can be marked before opening it
-                // rather than after waiting for the walk it was meant to avoid.
-                KeyCode::Char('S') => {
-                    if let Some(opt) = self.selected() {
-                        if !opt.is_host() && opt.is_favorite {
-                            self.pending_edit =
-                                Some(FavoriteEdit::ToggleShallow(opt.path.clone()));
-                        }
-                    }
-                    Some(true)
-                }
-                // Pin the highlighted entry to the bottom of the pinned block,
-                // or take it out of that block again.
-                KeyCode::Char('p') => {
-                    if let Some(opt) = self.selected() {
-                        if opt.is_favorite && opt.tier != crate::hosts::DirTier::Pinned {
-                            self.pending_edit = Some(FavoriteEdit::Pin(opt.path.clone()));
-                        }
-                    }
-                    Some(true)
-                }
-                KeyCode::Char('u') => {
-                    if let Some(opt) = self.selected() {
-                        if opt.tier == crate::hosts::DirTier::Pinned {
-                            self.pending_edit = Some(FavoriteEdit::Unpin(opt.path.clone()));
-                        }
-                    }
-                    Some(true)
-                }
-                // Start a reorder.
-                //
-                // Only the pinned block has an order to arrange, so `m` on an
-                // entry outside it pins that entry first and moves the new pin.
-                // Requiring `p` beforehand made `m` do nothing at all on most
-                // rows, with no feedback to say why — "move this" is a clear
-                // enough request to act on.
-                KeyCode::Char('m') => {
-                    match self.selected() {
-                        Some(opt) if opt.tier == crate::hosts::DirTier::Pinned => {
-                            let path = opt.path.clone();
-                            self.begin_move(path);
-                        }
-                        // A built-in location has nothing saved to pin; `a` adds
-                        // it first. Everything else can be pinned in place.
-                        Some(opt) if opt.is_favorite => {
-                            let path = opt.path.clone();
-                            self.pending_edit = Some(FavoriteEdit::PinAndMove(path));
-                        }
-                        _ => {}
-                    }
-                    Some(true)
-                }
-                // Save / forget, matching the dialing directory's a and d.
-                // Only bound while the list has focus, so typing a path that
-                // contains either letter is unaffected.
-                KeyCode::Char('a') => {
-                    self.pending_edit = Some(FavoriteEdit::PromptAdd);
-                    Some(true)
-                }
-                KeyCode::Char('d') => {
-                    if let Some(opt) = self.selected() {
-                        match &opt.host {
-                            // Removing a host is destructive enough to confirm,
-                            // which the app does; a directory entry is only a
-                            // shortcut, so it goes immediately.
-                            Some(h) => {
-                                self.pending_edit =
-                                    Some(FavoriteEdit::DeleteHost(h.label.clone()))
-                            }
-                            None if opt.is_favorite => {
-                                self.pending_edit = Some(FavoriteEdit::Remove(opt.path.clone()))
-                            }
-                            None => {}
-                        }
-                    }
-                    Some(true)
-                }
-                // Anything else printable is the start of a path, so move the
-                // keyboard to the field and take the character with it. Typing a
-                // path is the picker's whole purpose; making that a no-op until
-                // the user finds Tab would be its own bug.
-                KeyCode::Char(c) => {
-                    self.focus = PickerFocus::Field;
-                    self.input_char(c);
-                    Some(true)
-                }
-                KeyCode::Backspace => {
-                    // Clearing a suggestion is discarding text the user never
-                    // typed, so it is not the start of an edit and the keyboard
-                    // stays with the list. Backspacing over something they *did*
-                    // type is an edit, and hands the field back.
-                    if !self.input_is_suggestion {
-                        self.focus = PickerFocus::Field;
-                    }
-                    self.input_backspace();
-                    Some(true)
+                // Enter on a search narrowed to exactly one row opens it: having
+                // typed enough to leave a single candidate, being made to press
+                // Enter again is ceremony. Otherwise it falls through to the
+                // app's Confirm, which opens the highlighted row.
+                KeyCode::Enter if self.searching && self.visible.len() == 1 => {
+                    self.searching = false;
+                    self.cursor = 0;
+                    None
                 }
                 // Enter and Esc are the app's (confirm / go back).
                 _ => None,
@@ -1144,12 +1270,13 @@ impl super::ScreenState for DirPickerState {
         true
     }
 
+
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         let vertical = Layout::vertical([Constraint::Length(3), Constraint::Length(3), Constraint::Min(1)]).split(area);
 
         // Title.
         let title = Paragraph::new(Span::styled(
-            "Go to (Tab switches field/list, Esc to go back)",
+            "Go to (Tab cycles path/list/actions, Esc to go back)",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(title, vertical[0]);
@@ -1164,7 +1291,9 @@ impl super::ScreenState for DirPickerState {
                 Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        "Tab or type to enter a path...",
+                        // No longer "or type": typing drives the list's search
+                        // now, and Tab is the only way back to the field.
+                        "Tab here to enter a path...",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])
@@ -1278,9 +1407,10 @@ impl super::ScreenState for DirPickerState {
             let text = format!("{}{}{}", mark, detail, count);
 
             rendered.push(if row == self.cursor {
-                // Reversed only while the list is driving, so the highlight marks
-                // "the keys move this" rather than just "last touched".
-                let style = if field_focused {
+                // Reversed while the list drives *or* while the actions panel
+                // does: the panel acts on this row, so it has to stay visibly
+                // the subject even though the keys have moved on to the panel.
+                let style = if self.focus == PickerFocus::Field {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
@@ -1322,31 +1452,96 @@ impl super::ScreenState for DirPickerState {
         }
         let lines: Text = Text::from(rendered);
 
+        // The list and its actions sit side by side: the panel acts on whatever
+        // the list highlights, so the two have to be readable at once. The panel
+        // is given a fixed share rather than a percentage so its labels do not
+        // wrap on a narrow terminal, and the list keeps the rest.
+        let columns =
+            Layout::horizontal([Constraint::Min(20), Constraint::Length(24)]).split(vertical[2]);
+
+        let list_focused = self.focus == PickerFocus::List;
         let list = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(if field_focused {
-                    unfocused_border
-                } else {
+                .border_style(Style::default().fg(if list_focused {
                     focused_border
+                } else {
+                    unfocused_border
                 }))
-                // Only claim j/k when they actually work. The title said "j/k to
-                // navigate" unconditionally while the path field was swallowing
-                // both keys.
                 .title(if self.moving.is_some() {
                     " Moving — j/k reposition · Enter confirm · Esc cancel ".to_string()
                 } else if self.searching {
-                    format!(" Search: {}_  ({} shown, Esc clears) ", self.query, self.visible.len())
+                    format!(
+                        " Search: {}_  ({} shown, Esc clears) ",
+                        self.query,
+                        self.visible.len()
+                    )
                 } else if !self.query.is_empty() {
-                    format!(" Filtered: {}  ({} shown, / to change) ", self.query, self.visible.len())
-                } else if field_focused {
-                    " Destinations (↑/↓, or Tab for j/k) ".to_string()
+                    format!(
+                        " Filtered: {}  ({} shown, Esc clears) ",
+                        self.query,
+                        self.visible.len()
+                    )
+                } else if list_focused {
+                    // Says what typing does, since that is the change: letters
+                    // no longer fire commands here, they search.
+                    " Destinations (type to search) ".to_string()
                 } else {
-                    " a save · d forget · e edit · p pin · m move · S shallow · / search ".to_string()
+                    " Destinations (↑/↓, or Tab) ".to_string()
                 }),
         );
-        frame.render_widget(list, vertical[2]);
+        frame.render_widget(list, columns[0]);
+
+        // The actions panel: what Enter would do to the highlighted entry.
+        let actions_focused = self.focus == PickerFocus::Actions;
+        let selected_opt = self.selected().cloned();
+        let actions = self.actions();
+        let action_cursor = self.action_cursor();
+        let action_lines: Vec<Line> = actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let label = a.label(selected_opt.as_ref());
+                if actions_focused && i == action_cursor {
+                    Line::from(Span::styled(
+                        format!("> {}", label),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::REVERSED),
+                    ))
+                } else if actions_focused {
+                    Line::from(Span::styled(
+                        format!("  {}", label),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                } else {
+                    // Dimmed while another pane drives: the panel is showing
+                    // what is *available*, not what is about to happen.
+                    Line::from(Span::styled(
+                        format!("  {}", label),
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                }
+            })
+            .collect();
+
+        let actions_panel = Paragraph::new(Text::from(action_lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(if actions_focused {
+                    focused_border
+                } else {
+                    unfocused_border
+                }))
+                .title(if actions_focused {
+                    " Actions (Enter runs) ".to_string()
+                } else {
+                    " Actions ".to_string()
+                }),
+        );
+        frame.render_widget(actions_panel, columns[1]);
     }
 }
 

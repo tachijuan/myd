@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.32.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.33.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -95,16 +95,18 @@ labelled sections \(em both answer "where do you want to go", and keeping two
 near-identical screens meant two places to fix every bug. \fBEnter\fR opens a
 directory or connects to a host, whichever the highlighted row is.
 .IP
-It has two halves: a path field and the list.
-\fBTab\fR moves the keyboard between them, and the focused one is outlined in
-cyan. With the field focused, type a path (\fB~\fR is expanded) and press
-\fBEnter\fR. With the list focused, \fBj\fR/\fBk\fR move through the
-entries. The arrow keys reach the list from the field too: the first press
-selects the entry already highlighted rather than stepping past it, and further
-presses move. \fBHome\fR, \fBEnd\fR and the left/right arrows hand the
-keyboard back to the field.
+It has three panes: a path field, the list below it, and a panel of actions to
+the right of the list. \fBTab\fR cycles them in that order \(em you pick what to
+act on, then what to do to it \(em and the focused one is outlined in cyan.
 .IP
-Selecting an entry offers its path in the field, and typing then replaces that
+With the field focused, type a path (\fB~\fR is expanded) and press \fBEnter\fR.
+With the list focused, the \fBarrow keys\fR move through the entries. The arrows
+reach the list from the field too: the first press selects the entry already
+highlighted rather than stepping past it, and further presses move.
+\fBLeft\fR/\fBRight\fR hand the keyboard back to the field, as do \fBHome\fR and
+\fBEnd\fR when no search is running.
+.IP
+Selecting an entry offers its path in the field, and typing there replaces that
 offer \(em press \fBEnd\fR first to extend it instead, which is how you append
 a subdirectory to a listed path.
 .IP
@@ -113,18 +115,36 @@ chosen from the list, so a path typed once is a keystroke away afterwards.
 Directories reached by browsing the tree are not: the list is for destinations
 you chose, and recording every directory drilled into would bury them.
 .IP
-With the list focused, \fBa\fR prompts for a
-destination to keep \(em a path, or a \fBlabel = sftp://…\fR line to save a
-host \(em and \fBd\fR forgets the highlighted one. \fBe\fR edits the highlighted
-entry \(em a directory's path, or a host's details \(em in a popup, keeping its
-visit history and its place in the pinned block rather than making a correction
-mean deleting and re-adding. \fBS\fR turns measuring on or off for the
-highlighted directory without opening it \(em marking somewhere known to be slow
-should not require paying for the walk first \(em and the row shows
-\fB(shallow)\fR when it is off. \fB/\fR searches the whole list (\fBEsc\fR
-clears it).
-\fB/\fR only starts a search when the path field is empty, since that is also
-how most absolute paths begin.
+With the list focused, every printable key searches it: typing narrows the list
+as you go, with no \fB/\fR to press first and no letters held back for commands.
+\fBBackspace\fR unwinds the search a character at a time, and past the start
+hands the keyboard back to the path field. \fBEsc\fR clears the filter; a second
+\fBEsc\fR, with nothing left to clear, closes the picker. While a search is
+running, \fBHome\fR and \fBEnd\fR jump to the ends of the narrowed list, and a
+search that leaves a single row opens it on \fBEnter\fR. Searching does not
+disturb the path field, which stays empty so \fBEnter\fR acts on the row you
+narrowed to.
+.IP
+The actions panel offers what can be done to the highlighted entry: go or
+connect, save a directory, edit, forget, pin or unpin, move, and turn measuring
+on or off. Only the operations that apply to that row are listed \(em a saved
+host has no pin or measuring toggle, and a row that is not saved has nothing to
+forget \(em so the panel never shows a choice that would do nothing. \fBj\fR /
+\fBk\fR or the \fBarrow keys\fR walk it and \fBEnter\fR runs the highlighted
+action.
+.IP
+These operations were single letters bound on the list until version 0.33, which
+is what made the list unsearchable: \fBd\fR in "downloads" forgot an entry
+rather than filtering. Moving them into their own pane freed every printable key
+for the search.
+.IP
+Saving prompts for a destination to keep \(em a path, or a \fBlabel = sftp://…\fR
+line to save a host. Editing opens the highlighted entry \(em a directory's path,
+or a host's details \(em in a popup, keeping its visit history and its place in
+the pinned block rather than making a correction mean deleting and re-adding.
+The measuring toggle applies to the highlighted directory without opening it
+\(em marking somewhere known to be slow should not require paying for the walk
+first \(em and the row shows \fB(shallow)\fR when measuring is off.
 .IP
 The path field's title names the traversal the destination will get \(em
 \fBshallow\fR or \fBfull\fR \(em resolved exactly as opening it will resolve it:
@@ -147,19 +167,20 @@ file that already lists directories is left alone, and a file that does not
 parse is never written over. Within the last two groups the order is most-recently-visited first,
 so the places you actually use rise to the top.
 .IP
-\fBp\fR pins the highlighted entry to the \fIbottom\fR of the pinned block \(em
-the block is an order you arranged, so a new pin does not barge into the middle
-of it \(em and \fBu\fR takes it out again, keeping the entry. \fBm\fR starts a
-reorder: \fBj\fR/\fBk\fR (or the arrows) reposition the entry, \fBEnter\fR
-confirms and \fBEsc\fR puts it back where it started. \fBm\fR on an entry that
-is not yet pinned pins it first, so positioning something never needs two keys.
+\fBPin\fR puts the highlighted entry at the \fIbottom\fR of the pinned block
+\(em the block is an order you arranged, so a new pin does not barge into the
+middle of it \(em and \fBUnpin\fR takes it out again, keeping the entry.
+\fBMove\fR starts a reorder, handing the keyboard back to the list:
+\fBj\fR/\fBk\fR (or the arrows) reposition the entry, \fBEnter\fR confirms and
+\fBEsc\fR puts it back where it started. \fBMove\fR on an entry that is not yet
+pinned pins it first, so positioning something never needs two steps.
 .IP
 Sliding an entry one step past the bottom of the block takes it out: the row's
 marker changes as it leaves, so what \fBEnter\fR will do is visible before it
 is committed, and \fBk\fR brings it back in.
 .IP
 Automatically remembered directories are trimmed to the most recent twenty.
-Anything saved with \fBa\fR or pinned with \fBp\fR is never trimmed.
+Anything explicitly saved or pinned is never trimmed.
 .TP
 .B 0
 Collapse all expanded directories.
@@ -371,7 +392,8 @@ never mistaken for a broken one.
 Turning measuring back on asks first, since that is the walk you avoided. The
 choice is remembered per directory in \fB~/.config/myd/hosts.toml\fR, so
 somewhere you have decided not to measure opens that way next time. It can also
-be set from the picker with \fBS\fR, without opening the directory at all.
+be set from the \fBgd\fR picker's actions panel, without opening the directory
+at all.
 .TP
 .B Ctrl+r
 Rescan the file tree.
@@ -380,17 +402,26 @@ Rescan the file tree.
 Toggle the info panel sidebar.
 .TP
 .B gd
-Open the picker: your saved directories and remote hosts in one list, with a
-path field above it. \fBTab\fR switches between the two halves and the focused
-one is outlined in cyan. In the list, \fBj\fR / \fBk\fR / \fBg\fR / \fBG\fR
-navigate, \fBEnter\fR opens a directory or connects to a host depending on which
-kind the cursor is on, \fBa\fR saves a destination, \fBe\fR edits one, \fBd\fR
-forgets one, \fBp\fR / \fBu\fR pin and unpin, \fBm\fR reorders, \fBS\fR toggles
-measuring and \fBEsc\fR closes.
+Open the picker: a path field, your saved directories and remote hosts in one
+list below it, and a panel of actions to the right of that list. \fBTab\fR
+cycles the three in that order and the focused one is outlined in cyan.
 .IP
-\fB/\fR searches everything on screen. If the search narrows the list to a
-single row, \fBEnter\fR opens it straight away; with more than one match
-\fBEnter\fR keeps the narrowed list so you can pick from it.
+In the list, the \fBarrow keys\fR navigate and \fBEnter\fR opens a directory or
+connects to a host depending on which kind the cursor is on. Every other
+printable key searches: typing narrows the list as you go, with no \fB/\fR to
+press first. \fBBackspace\fR unwinds the search a character at a time and
+\fBEsc\fR clears it \(em a second \fBEsc\fR, with nothing left to clear, closes
+the picker. While a search is running, \fBHome\fR and \fBEnd\fR jump to the ends
+of the narrowed list. If the search leaves a single row, \fBEnter\fR opens it
+straight away.
+.IP
+The actions panel lists what can be done to the highlighted entry \(em go or
+connect, save a directory, edit, forget, pin or unpin, move, and toggle
+measuring \(em showing only those that apply to that row, so a saved host offers
+no pin and a built-in location offers no forget. \fBj\fR / \fBk\fR or the
+\fBarrow keys\fR walk the panel and \fBEnter\fR runs the highlighted action.
+These operations used to be single letters bound on the list itself, which is
+what made the list unsearchable by name.
 .IP
 The path field takes a local path or a remote
 \fBsftp://[user@]host[:port][/path]\fR URL, so an address you have not saved
