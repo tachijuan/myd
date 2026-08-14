@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -749,8 +749,15 @@ impl FileBrowser {
         self.last_frame = full;
 
         // Carve the transfer sidebar off the right edge before the panels divide
-        // what's left, so it spans full height and is independent of
-        // single/dual mode. It yields entirely on a narrow terminal.
+        // what's left, so it is independent of single/dual mode. It yields
+        // entirely on a narrow terminal.
+        //
+        // Only over the rows above the footer. Each panel reserves its own
+        // bottom row for the footer *inside* the area it is handed, so a sidebar
+        // spanning the full height sat beside that row and clipped it — the
+        // keybindings lost their tail ("?:help q:quit") to the sidebar's width
+        // whenever the queue was on screen. The footer is one line describing
+        // the whole window, so it gets the whole width.
         let (area, transfer_area) = match show_transfers
             .then(|| transfer_panel::desired_width(full.width))
             .flatten()
@@ -758,10 +765,23 @@ impl FileBrowser {
             Some(w) => {
                 let cols =
                     Layout::horizontal([Constraint::Min(1), Constraint::Length(w)]).split(full);
-                (cols[0], Some(cols[1]))
+                // The sidebar stops one row short of the bottom, leaving that
+                // row clear right across the frame for the footer. The panels
+                // still get the left column — tree and all — and are told
+                // separately (via `footer_width`) that their bottom row may run
+                // the full width.
+                let sidebar = Rect {
+                    height: cols[1].height.saturating_sub(1),
+                    ..cols[1]
+                };
+                (cols[0], Some(sidebar))
             }
             None => (full, None),
         };
+        // How wide the footer row may be drawn, which is the whole terminal
+        // whenever the sidebar has stepped out of that row. `None` leaves each
+        // panel's footer at its own width, which is what a split wants.
+        let footer_width = transfer_area.map(|_| full.width);
 
         // Draw the sidebar first: it borrows the queue, while the panel loop
         // below needs `self.panels` mutably.
@@ -831,6 +851,14 @@ impl FileBrowser {
                     } else {
                         FooterMode::Own
                     };
+                    // Only the right-hand panel abuts the sidebar, so only its
+                    // footer has the reclaimed columns to grow into. Widening
+                    // both would draw the left one straight over the right.
+                    state.footer_width = if i + 1 == panel_count {
+                        footer_width.map(|w| w.saturating_sub(cols[i].x))
+                    } else {
+                        None
+                    };
                 }
                 panel.current_screen_mut().render(f, cols[i]);
             }
@@ -847,6 +875,7 @@ impl FileBrowser {
                 } else {
                     FooterMode::Own
                 };
+                state.footer_width = footer_width;
             }
             self.panels[0].current_screen_mut().render(f, area);
         }
