@@ -206,8 +206,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
             items: &[
                 ("Ctrl+T", "Show / hide the transfer panel"),
                 ("Tab", "Reached after the panels, then wraps around"),
-                ("j / K", "Move between transfers"),
-                ("k / Del", "Cancel the selected transfer (asks first)"),
+                ("j / k", "Move between transfers"),
+                ("K / Del", "Cancel the selected transfer (asks first)"),
                 ("C", "Clear finished ones; live transfers stay"),
                 ("Esc / q", "Back to the file tree"),
                 ("dbl-click", "Cancel the transfer under the pointer"),

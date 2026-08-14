@@ -1105,7 +1105,7 @@ impl MainScreenState {
         // the tree/treemap/preview split within the panel and says nothing about
         // whether the panel has the keyboard at all.
         if self.transfer_focused {
-            const KEYS: &str = " j/K:move  k:cancel  C:clear done  Esc:back  ?:help  q:quit ";
+            const KEYS: &str = " j/k:move  K/Del:cancel  C:clear done  Esc:back  ?:help  q:quit ";
             let prefix = if (area.width as usize) < 46 {
                 " [XFER] "
             } else {
