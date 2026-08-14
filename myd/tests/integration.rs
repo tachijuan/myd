@@ -6035,6 +6035,122 @@ async fn the_arrows_move_the_transfer_cursor_like_j_and_k() {
 }
 
 #[tokio::test]
+async fn backspace_cancels_a_transfer_like_delete() {
+    // Which code a terminal sends for the key labelled "delete" varies, and on
+    // a Mac keyboard the obvious key sends Backspace. Both mean the same thing
+    // in this pane, and neither does anything else here.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let src = dir.path().join("file_a.txt");
+    for name in ["one.txt", "two.txt"] {
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(&src),
+            myd::vfs::VPath::local(dir.path().join(name)),
+        );
+    }
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test());
+
+    // Backspace asks, exactly as Delete and K do.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Backspace));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "Backspace should offer to cancel the selection"
+    );
+
+    // Declining leaves it alone, so the key is as recoverable as the others.
+    app.handle_key_for_test(char_key('n'));
+    assert_eq!(app.modal_kind_for_test(), "none");
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        2,
+        "declining must not have cancelled anything"
+    );
+
+    // Accepting goes through.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Backspace));
+    app.handle_key_for_test(char_key('y'));
+    assert_eq!(app.modal_kind_for_test(), "none");
+}
+
+#[tokio::test]
+async fn only_the_focused_panes_keys_are_shown_in_dual_mode() {
+    // With two panels open, the footer swap was gated on `i == active`, so the
+    // *other* panel went on drawing "[TREE] j/k:move …" beside the sidebar's
+    // line. Two sets of keys claimed to be live and only one of them was.
+    // Both panels get an explicit path: the bare `dual` flag roots the second
+    // one at the working directory, whose scan does not settle in a test.
+    let left = create_test_structure();
+    let right = create_test_structure();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+    assert_eq!(app.panel_count(), 2, "this test needs two panels");
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(left.path().join("file_a.txt")),
+        myd::vfs::VPath::local(left.path().join("copy.txt")),
+    );
+
+    // Wide enough that both panels draw a full footer of their own.
+    let before = app_screen_text(&mut app, 170, 24);
+    assert_eq!(
+        before.matches("[TREE]").count(),
+        2,
+        "both panels should show the tree's keys while a panel has focus: {}",
+        before
+    );
+
+    // Tab round to the sidebar.
+    let mut hops = 0;
+    while !app.transfer_focused_for_test() && hops < 5 {
+        app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+        let _ = app_screen_text(&mut app, 170, 24);
+        hops += 1;
+    }
+    assert!(app.transfer_focused_for_test(), "Tab should reach the sidebar");
+
+    let text = app_screen_text(&mut app, 170, 24);
+    assert_eq!(
+        text.matches("[TREE]").count(),
+        0,
+        "no panel may still advertise the tree's keys: {}",
+        text
+    );
+    assert_eq!(
+        text.matches("[TRANSFERS]").count(),
+        1,
+        "and the sidebar's line must appear exactly once: {}",
+        text
+    );
+
+    // Back to a panel: both footers return, and the sidebar's goes.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Esc));
+    let after = app_screen_text(&mut app, 170, 24);
+    assert_eq!(
+        after.matches("[TRANSFERS]").count(),
+        0,
+        "leaving the sidebar must take its footer with it: {}",
+        after
+    );
+    assert_eq!(
+        after.matches("[TREE]").count(),
+        2,
+        "and restore the panels': {}",
+        after
+    );
+}
+
+#[tokio::test]
 async fn the_footer_describes_the_transfer_panel_while_it_has_focus() {
     // The footer is drawn inside the browser panel, so it went on advertising
     // the tree's keys after Tab moved focus to the sidebar — `t:tag` and
@@ -6070,7 +6186,7 @@ async fn the_footer_describes_the_transfer_panel_while_it_has_focus() {
         xfer_footer
     );
     // The keys that actually work there.
-    for key in ["j/k:move", "K/Del:cancel", "C:clear done", "Esc:back"] {
+    for key in ["j/k:move", "K/Del/⌫:cancel", "C:clear done", "Esc:back"] {
         assert!(
             xfer_footer.contains(key),
             "the sidebar's footer should offer {}: {}",
@@ -14770,6 +14886,8 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
+
 
 
 

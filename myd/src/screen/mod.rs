@@ -10,7 +10,7 @@ pub use dir_picker::{
     PickerOption, PickerSection,
 };
 pub use loading::LoadingState;
-pub use main_screen::MainScreenState;
+pub use main_screen::{FooterMode, MainScreenState};
 
 use crate::widget::file_tree::FileTree;
 

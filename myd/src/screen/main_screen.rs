@@ -69,15 +69,33 @@ pub struct MainScreenState {
     /// state — the app would look like it had ignored the key and then behave
     /// oddly on the next one. Showing it makes the wait explainable.
     pub pending_chord: Option<char>,
-    /// Whether the transfer sidebar currently owns the keyboard, set by the app
-    /// each frame like `active`.
+    /// What this panel's footer should show, set by the app each frame like
+    /// `active`.
     ///
     /// The footer is drawn inside the panel, but it describes whatever has
-    /// focus — and Tab can move that to the sidebar, which is not a panel and
-    /// has its own keys. Without this the footer went on advertising `t:tag`
-    /// and `f:filter` while none of them did anything, and the sidebar's own
-    /// keys (`k` to cancel, and now `C` to clear) were undiscoverable.
-    pub transfer_focused: bool,
+    /// focus — and Tab can move that to the transfer sidebar, which is not a
+    /// panel and has its own keys. Without this the footer went on advertising
+    /// `t:tag` and `f:filter` while none of them did anything, and the
+    /// sidebar's own keys were undiscoverable.
+    pub footer: FooterMode,
+}
+
+/// Which keys a panel's footer describes.
+///
+/// Every panel has a footer of its own, but there is only one keyboard — so
+/// when focus is somewhere that is not a panel, exactly one panel shows those
+/// keys and the rest show nothing. Two panels each drawing a line is how both
+/// halves of this went wrong in turn: first the inactive one kept advertising
+/// the tree's keys next to the sidebar's, then both drew the sidebar's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FooterMode {
+    /// This panel has (or would have) the keyboard: show its own keys.
+    #[default]
+    Own,
+    /// The transfer sidebar has the keyboard; this panel speaks for it.
+    Transfers,
+    /// Something else is speaking, so this panel stays quiet.
+    Hidden,
 }
 
 /// A user-facing explanation of why a regex would not compile.
@@ -122,7 +140,7 @@ impl MainScreenState {
             tree_viewport: 0,
             sort_area: None,
             pending_chord: None,
-            transfer_focused: false,
+            footer: FooterMode::Own,
         }
     }
 
@@ -145,7 +163,7 @@ impl MainScreenState {
             tree_viewport: 0,
             sort_area: None,
             pending_chord: None,
-            transfer_focused: false,
+            footer: FooterMode::Own,
         }
     }
 
@@ -1099,13 +1117,20 @@ impl MainScreenState {
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let bg = Color::Rgb(20, 20, 30);
 
-        // The sidebar is not a panel, so it has no footer of its own — this one
-        // is the only line on screen, and while Tab has moved focus there it has
-        // to describe *those* keys. Checked before `self.focus`, which tracks
-        // the tree/treemap/preview split within the panel and says nothing about
-        // whether the panel has the keyboard at all.
-        if self.transfer_focused {
-            const KEYS: &str = " j/k:move  K/Del:cancel  C:clear done  Esc:back  ?:help  q:quit ";
+        // The sidebar is not a panel, so it has no footer of its own — this
+        // one speaks for it while Tab has moved focus there. Checked before
+        // `self.focus`, which tracks the tree/treemap/preview split within the
+        // panel and says nothing about whether the panel has the keyboard.
+        if self.footer == FooterMode::Hidden {
+            // Another panel is speaking for the focused pane; two lines saying
+            // it would be one too many.
+            return;
+        }
+        if self.footer == FooterMode::Transfers {
+            // `Del/⌫` rather than spelling both out: the pair is two glyphs
+            // wider than "Del" alone, and this line already runs close to the
+            // width of an 80-column terminal.
+            const KEYS: &str = " j/k:move  K/Del/⌫:cancel  C:clear done  Esc:back  ?:help  q:quit ";
             let prefix = if (area.width as usize) < 46 {
                 " [XFER] "
             } else {
