@@ -69,6 +69,15 @@ pub struct MainScreenState {
     /// state — the app would look like it had ignored the key and then behave
     /// oddly on the next one. Showing it makes the wait explainable.
     pub pending_chord: Option<char>,
+    /// Whether the transfer sidebar currently owns the keyboard, set by the app
+    /// each frame like `active`.
+    ///
+    /// The footer is drawn inside the panel, but it describes whatever has
+    /// focus — and Tab can move that to the sidebar, which is not a panel and
+    /// has its own keys. Without this the footer went on advertising `t:tag`
+    /// and `f:filter` while none of them did anything, and the sidebar's own
+    /// keys (`k` to cancel, and now `C` to clear) were undiscoverable.
+    pub transfer_focused: bool,
 }
 
 /// A user-facing explanation of why a regex would not compile.
@@ -113,6 +122,7 @@ impl MainScreenState {
             tree_viewport: 0,
             sort_area: None,
             pending_chord: None,
+            transfer_focused: false,
         }
     }
 
@@ -135,6 +145,7 @@ impl MainScreenState {
             tree_viewport: 0,
             sort_area: None,
             pending_chord: None,
+            transfer_focused: false,
         }
     }
 
@@ -1087,6 +1098,41 @@ impl MainScreenState {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let bg = Color::Rgb(20, 20, 30);
+
+        // The sidebar is not a panel, so it has no footer of its own — this one
+        // is the only line on screen, and while Tab has moved focus there it has
+        // to describe *those* keys. Checked before `self.focus`, which tracks
+        // the tree/treemap/preview split within the panel and says nothing about
+        // whether the panel has the keyboard at all.
+        if self.transfer_focused {
+            const KEYS: &str = " j/K:move  k:cancel  C:clear done  Esc:back  ?:help  q:quit ";
+            let prefix = if (area.width as usize) < 46 {
+                " [XFER] "
+            } else {
+                " [TRANSFERS] "
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        prefix,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        KEYS,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                area,
+            );
+            return;
+        }
+
         match self.focus {
             // In the treemap the tile colors need explaining, and the legend is
             // more useful there than a second copy of the keybindings.
