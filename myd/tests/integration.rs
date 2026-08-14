@@ -5910,13 +5910,128 @@ async fn the_transfer_panel_is_focusable_and_cancellable() {
     app.handle_key_for_test(char_key('j'));
     assert_ne!(app.transfer_cursor_for_test(), first, "j should move");
 
-    // k asks before cancelling rather than doing it outright.
+    // Lowercase k moves, like j — it must not be the destructive one.
     app.handle_key_for_test(char_key('k'));
+    assert_eq!(
+        app.transfer_cursor_for_test(),
+        first,
+        "k should move back, not cancel"
+    );
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "and must not have prompted to cancel"
+    );
+
+    // K asks before cancelling rather than doing it outright.
+    app.handle_key_for_test(char_key('K'));
     assert_eq!(app.modal_kind_for_test(), "confirm");
 
     // Declining leaves the transfer alone.
     app.handle_key_for_test(char_key('n'));
     assert_eq!(app.modal_kind_for_test(), "none");
+}
+
+#[tokio::test]
+async fn lowercase_k_moves_in_the_transfer_panel_and_never_cancels() {
+    // `k` used to cancel while `K` moved up — the reverse of every other list
+    // in the app, so the key a vi user presses without thinking was the
+    // destructive one. Movement is now plain j/k and cancelling is shifted.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let src = dir.path().join("file_a.txt");
+    for name in ["one.txt", "two.txt", "three.txt"] {
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(&src),
+            myd::vfs::VPath::local(dir.path().join(name)),
+        );
+    }
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test());
+
+    let top = app.transfer_cursor_for_test();
+    assert!(top.is_some(), "focusing selects a transfer");
+
+    // Down and back up with plain j/k, prompting nothing along the way.
+    app.handle_key_for_test(char_key('j'));
+    let moved = app.transfer_cursor_for_test();
+    assert_ne!(moved, top, "j moves down");
+    app.handle_key_for_test(char_key('j'));
+    assert_ne!(app.transfer_cursor_for_test(), moved, "and again");
+
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(app.transfer_cursor_for_test(), moved, "k moves back up");
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(app.transfer_cursor_for_test(), top, "and again");
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "no amount of j/k may prompt to cancel anything"
+    );
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        3,
+        "and nothing may have been cancelled"
+    );
+
+    // The shifted key is the one that asks.
+    app.handle_key_for_test(char_key('K'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "K cancels the selection, after asking"
+    );
+    app.handle_key_for_test(char_key('n'));
+
+    // Delete does the same, for anyone who does not think in vi.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Delete));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "Delete cancels too"
+    );
+    app.handle_key_for_test(char_key('n'));
+}
+
+#[tokio::test]
+async fn the_arrows_move_the_transfer_cursor_like_j_and_k() {
+    // The arrows have to keep pace with the vi keys now that `k` changed
+    // meaning — Up was already movement, and must not have been dragged along
+    // into cancelling.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let src = dir.path().join("file_a.txt");
+    for name in ["one.txt", "two.txt"] {
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(&src),
+            myd::vfs::VPath::local(dir.path().join(name)),
+        );
+    }
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+
+    let top = app.transfer_cursor_for_test();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Down));
+    assert_ne!(app.transfer_cursor_for_test(), top, "Down moves");
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Up));
+    assert_eq!(app.transfer_cursor_for_test(), top, "Up moves back");
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "neither arrow may prompt to cancel"
+    );
 }
 
 #[tokio::test]
@@ -5955,7 +6070,7 @@ async fn the_footer_describes_the_transfer_panel_while_it_has_focus() {
         xfer_footer
     );
     // The keys that actually work there.
-    for key in ["k:cancel", "C:clear done", "Esc:back"] {
+    for key in ["j/k:move", "K/Del:cancel", "C:clear done", "Esc:back"] {
         assert!(
             xfer_footer.contains(key),
             "the sidebar's footer should offer {}: {}",
@@ -6130,8 +6245,8 @@ async fn clearing_drops_a_cursor_that_pointed_at_a_removed_row() {
         "the cursor must not survive the row it pointed at"
     );
 
-    // And `k` on that empty selection is inert rather than prompting.
-    app.handle_key_for_test(char_key('k'));
+    // And `K` on that empty selection is inert rather than prompting.
+    app.handle_key_for_test(char_key('K'));
     assert_eq!(
         app.modal_kind_for_test(),
         "none",
@@ -14655,6 +14770,7 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
 
 
 

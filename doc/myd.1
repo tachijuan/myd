@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.35.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.35.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -453,16 +453,21 @@ Rotates through every visible pane in turn \(em each browser panel from left to
 right, then the transfer panel \(em and wraps back to the first. Only one pane
 shows the bright focus border at a time, and the footer switches to describe
 whichever pane that is. While the transfer
-panel has focus, \fBj\fR / \fBK\fR move between transfers, \fBk\fR or
+panel has focus, \fBj\fR / \fBk\fR move between transfers, \fBK\fR or
 \fBDelete\fR cancels the selected one (after a confirmation), \fBC\fR clears the
 finished ones, and \fBEsc\fR returns to the tree. A double-click on a transfer
 also cancels it.
+.IP
+Movement is plain \fBj\fR / \fBk\fR, as everywhere else in the app, and both
+keys that destroy something are shifted. Until version 0.35.1 this was reversed
+\(em \fBk\fR cancelled and \fBK\fR moved up \(em which put the one key a vi user
+presses without thinking on the destructive action.
 .IP
 \fBC\fR drops only entries that have stopped \(em completed, failed and
 cancelled \(em and never touches anything queued or in flight, so it cannot
 abandon work in progress. It asks for no confirmation, unlike cancelling:
 what it discards is a record of work already done, not the work itself. The
-selection is dropped along with the row it was on, so the next \fBk\fR cannot
+selection is dropped along with the row it was on, so the next \fBK\fR cannot
 land on a transfer that merely slid up into that slot.
 .TP
 .B gx

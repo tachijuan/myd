@@ -92,11 +92,10 @@ pub fn render(
     // ratatui clips a title at the border and half a hint is worse than none.
     let title = if focused {
         // Longest first: the fuller hint when there is room, then a shorter one,
-        // then none. The old single hint read "j/k move, k cancels", which is
-        // self-contradictory and wrong besides — `K` moves up, `k` cancels.
+        // then none.
         let fitted = [
-            " — j/K move, k cancels, C clears ",
-            " — k cancels, C clears ",
+            " — j/k move, K cancels, C clears ",
+            " — K cancels, C clears ",
             " — C clears ",
         ]
         .into_iter()

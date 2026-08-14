@@ -2301,25 +2301,26 @@ impl FileBrowser {
             return None;
         }
         match key.code {
+            // Plain vi motion, as everywhere else in the app. `k` used to
+            // cancel and `K` to move, which read as a trap: the one key a vi
+            // user presses without thinking was the destructive one.
             KeyCode::Char('j') | KeyCode::Down => {
                 self.transfer_cursor_step(true);
                 Some(true)
             }
-            KeyCode::Char('K') | KeyCode::Up => {
+            KeyCode::Char('k') | KeyCode::Up => {
                 self.transfer_cursor_step(false);
                 Some(true)
             }
-            // Lowercase k cancels; K moves up. Vi users expect k to move, so this
-            // is a deliberate departure — it is what was asked for, and the
-            // confirmation dialog makes a mistaken press recoverable.
-            KeyCode::Char('k') | KeyCode::Delete => {
+            // Cancelling is shifted, keeping the destructive keys (`K`, `C`)
+            // apart from the ones you hold down to navigate.
+            KeyCode::Char('K') | KeyCode::Delete => {
                 self.prompt_cancel_selected_transfer();
                 Some(true)
             }
             // Drop the finished entries, keeping anything still queued or
-            // running. Uppercase so it cannot be hit while reaching for `k`:
-            // the two sit next to each other in the same panel, and one of them
-            // is destructive.
+            // running. Shifted like `K`, so neither key that destroys something
+            // can be hit while navigating with `j`/`k`.
             //
             // No confirmation, unlike cancelling — clearing discards a record of
             // work that has already happened, not the work itself. There is
@@ -2328,7 +2329,7 @@ impl FileBrowser {
                 self.transfers.clear_finished();
                 // The cursor may have been sitting on a row that just went away.
                 // Leaving it dangling would point at whatever slid up into that
-                // slot, so `k` would then cancel a transfer the user never
+                // slot, so `K` would then cancel a transfer the user never
                 // selected.
                 self.reconcile_transfer_cursor();
                 Some(true)
