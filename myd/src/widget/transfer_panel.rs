@@ -221,14 +221,39 @@ fn build_lines_tracked(
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
+        // Every terminal transfer lands in this one section, so the heading has
+        // to name what is actually in it. "Done (3)" over a list that included
+        // a cancelled transfer claimed it had completed — the row's own ⨯ said
+        // otherwise, but the heading is what gets read first.
         let failed = finished
             .iter()
             .filter(|t| matches!(t.state, TransferState::Failed(_)))
             .count();
-        let header = if failed > 0 {
-            format!("Done ({}, {} failed)", finished.len(), failed)
-        } else {
-            format!("Done ({})", finished.len())
+        let killed = finished
+            .iter()
+            .filter(|t| matches!(t.state, TransferState::Cancelled))
+            .count();
+        let completed = finished.len() - failed - killed;
+
+        // Named by what happened, in the order the counts matter: what worked,
+        // what broke, what was called off. A section holding only one kind says
+        // just that kind rather than a total that needs decomposing.
+        let mut parts: Vec<String> = Vec::new();
+        if completed > 0 {
+            parts.push(format!("{} done", completed));
+        }
+        if failed > 0 {
+            parts.push(format!("{} failed", failed));
+        }
+        if killed > 0 {
+            parts.push(format!("{} aborted", killed));
+        }
+        let header = match parts.len() {
+            // Unreachable while `finished` is non-empty, but a total is a
+            // better fallback than an empty heading if that ever changes.
+            0 => format!("Finished ({})", finished.len()),
+            1 => format!("Finished — {}", parts[0]),
+            _ => format!("Finished — {}", parts.join(", ")),
         };
         lines.push(section_header(header, Color::DarkGray));
 
@@ -239,7 +264,17 @@ fn build_lines_tracked(
                     lines.push(status_line("✓", &t.name, width, Color::Green));
                 }
                 TransferState::Cancelled => {
-                    lines.push(status_line("⨯", &t.name, width, Color::DarkGray));
+                    // Says "aborted" outright rather than relying on the glyph
+                    // and the colour: ⨯ against a dark-grey name is easy to read
+                    // as "finished, nothing to report", which is the opposite of
+                    // what happened. Yellow separates it from both the green of
+                    // a completed row and the red of a failure — it was neither
+                    // a success nor a fault, it was called off.
+                    lines.push(status_line("⨯", &t.name, width, Color::Yellow));
+                    lines.push(Line::from(Span::styled(
+                        "  aborted".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )));
                 }
                 TransferState::Failed(msg) => {
                     lines.push(status_line("!", &t.name, width, Color::Red));
@@ -483,6 +518,89 @@ mod tests {
 
         assert!(text.contains("1 failed"));
         assert!(text.contains("permission denied"));
+    }
+
+    /// Render `q` to plain text at `width`.
+    fn text_of(q: &TransferQueue, width: usize) -> String {
+        build_lines(q, width)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_cancelled_transfer_is_not_reported_as_done() {
+        // The reported bug: every terminal transfer lands in one section, and
+        // that section was headed "Done (n)" — so a transfer the user had just
+        // killed was counted among the completions. The row carried a ⨯, but
+        // the heading is what gets read first, and it said the opposite.
+        let mut q = TransferQueue::default();
+        q.enqueue(VPath::local("/a/gone.bin"), VPath::local("/b/gone.bin"), 10);
+        q.transfers_mut()[0].state = TransferState::Cancelled;
+
+        let text = text_of(&q, 34);
+        assert!(
+            text.contains("aborted"),
+            "a cancelled transfer must say so: {}",
+            text
+        );
+        assert!(
+            !text.contains("1 done"),
+            "and must not be counted as a completion: {}",
+            text
+        );
+        assert!(
+            !text.contains("Done ("),
+            "the old heading claimed completion for everything terminal: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn the_finished_header_names_each_outcome_separately() {
+        // One section, three possible outcomes. The heading has to decompose
+        // them or it is lying about at least one.
+        let mut q = TransferQueue::default();
+        for name in ["ok.bin", "bad.bin", "killed.bin"] {
+            q.enqueue(
+                VPath::local(format!("/a/{}", name)),
+                VPath::local(format!("/b/{}", name)),
+                10,
+            );
+        }
+        {
+            let t = q.transfers_mut();
+            t[0].state = TransferState::Done;
+            t[1].state = TransferState::Failed("nope".into());
+            t[2].state = TransferState::Cancelled;
+        }
+
+        let text = text_of(&q, 40);
+        assert!(text.contains("1 done"), "completions counted: {}", text);
+        assert!(text.contains("1 failed"), "failures counted: {}", text);
+        assert!(text.contains("1 aborted"), "cancellations counted: {}", text);
+    }
+
+    #[test]
+    fn a_section_of_one_kind_says_only_that_kind() {
+        // Three completions should not read "3 done, 0 failed, 0 aborted" —
+        // the absent outcomes are noise, and the common case is all-success.
+        let mut q = TransferQueue::default();
+        for name in ["a.bin", "b.bin"] {
+            q.enqueue(
+                VPath::local(format!("/a/{}", name)),
+                VPath::local(format!("/b/{}", name)),
+                10,
+            );
+        }
+        for t in q.transfers_mut() {
+            t.state = TransferState::Done;
+        }
+
+        let text = text_of(&q, 34);
+        assert!(text.contains("2 done"), "{}", text);
+        assert!(!text.contains("failed"), "no failures to mention: {}", text);
+        assert!(!text.contains("aborted"), "none aborted either: {}", text);
     }
 
     #[test]

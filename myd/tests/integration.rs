@@ -6035,6 +6035,66 @@ async fn the_arrows_move_the_transfer_cursor_like_j_and_k() {
 }
 
 #[tokio::test]
+async fn a_killed_transfer_is_shown_as_aborted_not_done() {
+    // End to end through the real kill path, since the panel's own tests set
+    // the state directly: press K, confirm, and check what the panel then says
+    // about it. It used to be filed under "Done (n)" alongside the completions.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let src = dir.path().join("file_a.txt");
+    for name in ["one.txt", "two.txt"] {
+        app.enqueue_transfer_for_test(
+            myd::vfs::VPath::local(&src),
+            myd::vfs::VPath::local(dir.path().join(name)),
+        );
+    }
+
+    let backend = ratatui::backend::TestBackend::new(120, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+
+    // Kill the selected transfer and let the queue settle.
+    app.handle_key_for_test(char_key('K'));
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+    app.handle_key_for_test(char_key('y'));
+    for _ in 0..500 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let cancelled = app
+        .transfer_queue()
+        .transfers()
+        .iter()
+        .filter(|t| matches!(t.state, myd::transfer::TransferState::Cancelled))
+        .count();
+    assert_eq!(cancelled, 1, "one transfer should have been killed");
+
+    let text = app_screen_text(&mut app, 120, 24);
+    assert!(
+        text.contains("aborted"),
+        "the panel must say the transfer was aborted: {}",
+        text
+    );
+    assert!(
+        !text.contains("2 done"),
+        "and must not count the killed one as a completion: {}",
+        text
+    );
+    assert!(
+        !text.contains("Done ("),
+        "the old heading filed everything terminal under Done: {}",
+        text
+    );
+}
+
+#[tokio::test]
 async fn backspace_cancels_a_transfer_like_delete() {
     // Which code a terminal sends for the key labelled "delete" varies, and on
     // a Mac keyboard the obvious key sends Backspace. Both mean the same thing
@@ -14886,6 +14946,7 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
 
 
 

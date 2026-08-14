@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.35.2" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.35.3" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -462,6 +462,13 @@ tree. A double-click on a transfer also cancels it.
 terminal sends for the key labelled "delete" depends on the terminal and its
 configuration \(em on a Mac keyboard the obvious key sends \fBBackspace\fR.
 Neither does anything else in this pane.
+.IP
+Transfers that have stopped are collected under one \fBFinished\fR heading that
+names each outcome it contains \(em "1 done, 2 aborted", say. A completed
+transfer is marked \fB\[u2713]\fR in green, a failure \fB!\fR in red with its
+error beneath it, and one you cancelled \fB\[u2A2F]\fR in yellow, labelled
+\fBaborted\fR. Until version 0.35.3 the heading read "Done", which counted a
+transfer you had just killed among the completions.
 .IP
 The footer describes whichever pane holds the keyboard, and only that one. In a
 split, the panel the sidebar was reached from shows the sidebar's keys while
