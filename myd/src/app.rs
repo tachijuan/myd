@@ -768,8 +768,7 @@ impl FileBrowser {
                 // The sidebar stops one row short of the bottom, leaving that
                 // row clear right across the frame for the footer. The panels
                 // still get the left column — tree and all — and are told
-                // separately (via `footer_width`) that their bottom row may run
-                // the full width.
+                // separately (via `footer_rect`) where their footer row goes.
                 let sidebar = Rect {
                     height: cols[1].height.saturating_sub(1),
                     ..cols[1]
@@ -778,10 +777,16 @@ impl FileBrowser {
             }
             None => (full, None),
         };
-        // How wide the footer row may be drawn, which is the whole terminal
-        // whenever the sidebar has stepped out of that row. `None` leaves each
-        // panel's footer at its own width, which is what a split wants.
-        let footer_width = transfer_area.map(|_| full.width);
+        // The footer row: the frame's last line, spanning its full width. Only
+        // the focused pane's keys go here, so whichever panel is speaking gets
+        // this rect and the rest draw nothing. `None` when there is no sidebar
+        // and one panel, where the panel's own bottom row already is this row.
+        let footer_rect = Rect {
+            x: full.x,
+            y: full.y + full.height.saturating_sub(1),
+            width: full.width,
+            height: 1,
+        };
 
         // Draw the sidebar first: it borrows the queue, while the panel loop
         // below needs `self.panels` mutably.
@@ -835,30 +840,34 @@ impl FileBrowser {
                     state.active = panel_has_focus && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                     state.pending_chord = pending_chord;
-                    // There is one keyboard, so exactly one set of keys may be
-                    // on screen. Each panel owns a footer, so with the sidebar
-                    // focused the active panel draws its keys and the others
-                    // draw nothing at all — gating on `i == active` alone left
-                    // the other panel still advertising the tree's keys beside
-                    // the sidebar's line, and dropping the gate had both panels
-                    // draw the sidebar's line twice.
-                    state.footer = if transfer_focused {
-                        if i == active {
+                    // There is one keyboard, so exactly one set of keys is on
+                    // screen: the focused pane's. Every other panel stays
+                    // quiet.
+                    //
+                    // The footer says what the keys *do*, and the keys do one
+                    // thing. Two panels each describing themselves put
+                    // "[TREE] … [TREEMAP] …" side by side, which reads as two
+                    // live keymaps when only one of them is — and the two
+                    // disagree, since j/k and hjkl mean different things in the
+                    // tree and the treemap.
+                    //
+                    // The active panel speaks for the sidebar when focus is
+                    // there, since the sidebar has no footer of its own.
+                    state.footer = if i == active {
+                        if transfer_focused {
                             FooterMode::Transfers
                         } else {
-                            FooterMode::Hidden
+                            FooterMode::Own
                         }
                     } else {
-                        FooterMode::Own
+                        FooterMode::Hidden
                     };
-                    // Only the right-hand panel abuts the sidebar, so only its
-                    // footer has the reclaimed columns to grow into. Widening
-                    // both would draw the left one straight over the right.
-                    state.footer_width = if i + 1 == panel_count {
-                        footer_width.map(|w| w.saturating_sub(cols[i].x))
-                    } else {
-                        None
-                    };
+                    // The one panel that draws a footer draws it across the
+                    // whole frame, starting at the left edge rather than at
+                    // this panel's — the row is nobody else's now, and a
+                    // keymap for the whole window reads oddly indented to
+                    // wherever the active column happens to begin.
+                    state.footer_rect = (i == active).then_some(footer_rect);
                 }
                 panel.current_screen_mut().render(f, cols[i]);
             }
@@ -875,7 +884,7 @@ impl FileBrowser {
                 } else {
                     FooterMode::Own
                 };
-                state.footer_width = footer_width;
+                state.footer_rect = Some(footer_rect);
             }
             self.panels[0].current_screen_mut().render(f, area);
         }

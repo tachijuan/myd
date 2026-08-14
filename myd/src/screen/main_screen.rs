@@ -78,16 +78,17 @@ pub struct MainScreenState {
     /// `t:tag` and `f:filter` while none of them did anything, and the
     /// sidebar's own keys were undiscoverable.
     pub footer: FooterMode,
-    /// Width the footer row may use, when it differs from the panel's own.
+    /// Where to draw the footer, when that is not simply the bottom of this
+    /// panel. Set by the app each frame like `active`.
     ///
-    /// Set by the app each frame like `active`. The transfer sidebar occupies a
-    /// column beside the panel but stops above the footer row, so the footer can
-    /// span the whole terminal; without this it was clipped at the sidebar's
-    /// left edge and the keybindings lost their tail.
+    /// Exactly one pane's keys are ever on screen, so in a split only the
+    /// focused panel draws a footer — and it draws it across the whole frame
+    /// rather than its own half, since the keys describe the window. The
+    /// transfer sidebar stops above this row to leave it clear.
     ///
-    /// `None` means "use the panel's width", which is what a split's two panels
-    /// do — there, each footer describing its own half is the point.
-    pub footer_width: Option<u16>,
+    /// `None` means "the bottom row of my own area", which is what a lone panel
+    /// with no sidebar wants.
+    pub footer_rect: Option<Rect>,
 }
 
 /// Which keys a panel's footer describes.
@@ -151,7 +152,7 @@ impl MainScreenState {
             sort_area: None,
             pending_chord: None,
             footer: FooterMode::Own,
-            footer_width: None,
+            footer_rect: None,
         }
     }
 
@@ -175,7 +176,7 @@ impl MainScreenState {
             sort_area: None,
             pending_chord: None,
             footer: FooterMode::Own,
-            footer_width: None,
+            footer_rect: None,
         }
     }
 
@@ -879,17 +880,10 @@ impl ScreenState for MainScreenState {
         let chunks =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         let content_area = chunks[0];
-        // The footer may run wider than the panel's content. The transfer
-        // sidebar sits beside the *content* and stops above this row, so the
-        // keybindings get the full terminal width rather than being clipped at
-        // the sidebar's edge — they describe the window, not the column.
-        let footer_area = match self.footer_width {
-            Some(w) => Rect {
-                width: w.max(chunks[1].width),
-                ..chunks[1]
-            },
-            None => chunks[1],
-        };
+        // The footer describes the window, not this column, so the app may
+        // place it across the whole frame — the transfer sidebar stops above
+        // that row to leave it clear. Falls back to the bottom of this panel.
+        let footer_area = self.footer_rect.unwrap_or(chunks[1]);
 
         match self.focus {
             FocusTarget::Tree => {

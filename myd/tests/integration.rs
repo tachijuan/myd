@@ -6035,6 +6035,105 @@ async fn the_arrows_move_the_transfer_cursor_like_j_and_k() {
 }
 
 #[tokio::test]
+async fn panels_in_different_view_modes_show_only_the_focused_ones_keys() {
+    // The reported case: panel 1 in tree mode, panel 2 in treemap, sidebar
+    // open. The footer read "[TREE] … [TREEMAP] …" — two keymaps side by side,
+    // and contradictory ones, since j/k and hjkl mean different things in the
+    // two views. Only the pane holding the keyboard may speak.
+    let left = create_test_structure();
+    let right = create_test_structure();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(left.path().join("file_a.txt")),
+        myd::vfs::VPath::local(left.path().join("copy.txt")),
+    );
+    let _ = app_screen_text(&mut app, 170, 24);
+
+    // Focus panel 2 and put it in treemap mode.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    let _ = app_screen_text(&mut app, 170, 24);
+    assert_eq!(app.active_panel_index(), 1, "Tab should reach panel 2");
+    app.handle_key_for_test(char_key('v'));
+
+    let text = app_screen_text(&mut app, 170, 24);
+    assert_eq!(
+        text.matches("[TREEMAP]").count(),
+        1,
+        "the focused panel's keys, once: {}",
+        text
+    );
+    assert_eq!(
+        text.matches("[TREE]").count(),
+        0,
+        "and the other panel's not at all — it is not taking keys: {}",
+        text
+    );
+
+    // Back to panel 1, still in tree mode: the footer follows the focus.
+    while app.active_panel_index() != 0 || app.transfer_focused_for_test() {
+        app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+        let _ = app_screen_text(&mut app, 170, 24);
+    }
+    let text = app_screen_text(&mut app, 170, 24);
+    assert_eq!(
+        text.matches("[TREE]").count(),
+        1,
+        "now the tree panel speaks, once: {}",
+        text
+    );
+    assert_eq!(
+        text.matches("[TREEMAP]").count(),
+        0,
+        "and the treemap panel falls silent: {}",
+        text
+    );
+}
+
+#[tokio::test]
+async fn the_footer_starts_at_the_left_edge_whichever_panel_is_focused() {
+    // The footer describes the window, so it is drawn across the frame rather
+    // than inside the active column — otherwise focusing the right-hand panel
+    // indented the whole keymap to the middle of the screen.
+    let left = create_test_structure();
+    let right = create_test_structure();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+
+    let footer_of = |app: &mut FileBrowser| {
+        let t = app_screen_text(app, 170, 24);
+        t.lines().last().unwrap().to_string()
+    };
+
+    let from_left = footer_of(&mut app);
+    assert!(
+        from_left.starts_with(" [TREE]"),
+        "the left panel's footer starts at the edge: {:?}",
+        from_left
+    );
+
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    let _ = app_screen_text(&mut app, 170, 24);
+    assert_eq!(app.active_panel_index(), 1);
+
+    let from_right = footer_of(&mut app);
+    assert!(
+        from_right.starts_with(" [TREE]"),
+        "and so does the right panel's, rather than being indented to its \
+         column: {:?}",
+        from_right
+    );
+}
+
+#[tokio::test]
 async fn the_sidebar_does_not_clip_the_footer() {
     // The sidebar was carved from the full frame height, but each panel
     // reserves its own bottom row for the footer *inside* the area it is
@@ -6277,12 +6376,15 @@ async fn only_the_focused_panes_keys_are_shown_in_dual_mode() {
         myd::vfs::VPath::local(left.path().join("copy.txt")),
     );
 
-    // Wide enough that both panels draw a full footer of their own.
+    // Exactly one footer, always: the focused panel's. This used to assert
+    // *two*, which is the bug — two panels each describing themselves put
+    // "[TREE] … [TREEMAP] …" side by side, reading as two live keymaps when
+    // only one of them is.
     let before = app_screen_text(&mut app, 170, 24);
     assert_eq!(
         before.matches("[TREE]").count(),
-        2,
-        "both panels should show the tree's keys while a panel has focus: {}",
+        1,
+        "only the focused panel may show its keys: {}",
         before
     );
 
@@ -6320,8 +6422,8 @@ async fn only_the_focused_panes_keys_are_shown_in_dual_mode() {
     );
     assert_eq!(
         after.matches("[TREE]").count(),
-        2,
-        "and restore the panels': {}",
+        1,
+        "and restore the focused panel's — just the one: {}",
         after
     );
 }
@@ -15062,6 +15164,7 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
 
 
 
