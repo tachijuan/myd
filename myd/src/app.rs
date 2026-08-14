@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::hosts::{HostCatalog, SavedHost};
 use crate::keybinding::{Action, KeyBindingHandler};
 use crate::panel::Panel;
-use crate::screen::{Screen, SortMode};
+use crate::screen::{FooterMode, Screen, SortMode};
 use crate::transfer::TransferQueue;
 use crate::utils::sizes::CancelToken;
 use crate::vfs::{BackendRegistry, VPath};
@@ -815,10 +815,22 @@ impl FileBrowser {
                     state.active = panel_has_focus && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                     state.pending_chord = pending_chord;
-                    // Only the panel the keyboard would otherwise be in swaps
-                    // its footer for the sidebar's keys. Both panels doing so
-                    // would say the sidebar has focus twice.
-                    state.transfer_focused = transfer_focused && i == active;
+                    // There is one keyboard, so exactly one set of keys may be
+                    // on screen. Each panel owns a footer, so with the sidebar
+                    // focused the active panel draws its keys and the others
+                    // draw nothing at all — gating on `i == active` alone left
+                    // the other panel still advertising the tree's keys beside
+                    // the sidebar's line, and dropping the gate had both panels
+                    // draw the sidebar's line twice.
+                    state.footer = if transfer_focused {
+                        if i == active {
+                            FooterMode::Transfers
+                        } else {
+                            FooterMode::Hidden
+                        }
+                    } else {
+                        FooterMode::Own
+                    };
                 }
                 panel.current_screen_mut().render(f, cols[i]);
             }
@@ -829,7 +841,12 @@ impl FileBrowser {
                 state.active = panel_has_focus;
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                 state.pending_chord = pending_chord;
-                state.transfer_focused = transfer_focused;
+                // The sole panel, so it is the one that speaks for the sidebar.
+                state.footer = if transfer_focused {
+                    FooterMode::Transfers
+                } else {
+                    FooterMode::Own
+                };
             }
             self.panels[0].current_screen_mut().render(f, area);
         }
@@ -2314,7 +2331,13 @@ impl FileBrowser {
             }
             // Cancelling is shifted, keeping the destructive keys (`K`, `C`)
             // apart from the ones you hold down to navigate.
-            KeyCode::Char('K') | KeyCode::Delete => {
+            //
+            // Backspace alongside Delete: which of the two a terminal sends for
+            // the key labelled "delete" depends on the terminal and its
+            // configuration, and on a Mac keyboard the obvious key sends
+            // Backspace. Both mean "get rid of this" here, and neither does
+            // anything else in this pane.
+            KeyCode::Char('K') | KeyCode::Delete | KeyCode::Backspace => {
                 self.prompt_cancel_selected_transfer();
                 Some(true)
             }

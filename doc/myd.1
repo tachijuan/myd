@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.35.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.35.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -453,10 +453,20 @@ Rotates through every visible pane in turn \(em each browser panel from left to
 right, then the transfer panel \(em and wraps back to the first. Only one pane
 shows the bright focus border at a time, and the footer switches to describe
 whichever pane that is. While the transfer
-panel has focus, \fBj\fR / \fBk\fR move between transfers, \fBK\fR or
-\fBDelete\fR cancels the selected one (after a confirmation), \fBC\fR clears the
-finished ones, and \fBEsc\fR returns to the tree. A double-click on a transfer
-also cancels it.
+panel has focus, \fBj\fR / \fBk\fR move between transfers, \fBK\fR,
+\fBDelete\fR or \fBBackspace\fR cancels the selected one (after a
+confirmation), \fBC\fR clears the finished ones, and \fBEsc\fR returns to the
+tree. A double-click on a transfer also cancels it.
+.IP
+\fBDelete\fR and \fBBackspace\fR both cancel because which of the two a
+terminal sends for the key labelled "delete" depends on the terminal and its
+configuration \(em on a Mac keyboard the obvious key sends \fBBackspace\fR.
+Neither does anything else in this pane.
+.IP
+The footer describes whichever pane holds the keyboard, and only that one. In a
+split, the panel the sidebar was reached from shows the sidebar's keys while
+the other shows nothing \(em there is one keyboard, so exactly one set of keys
+is ever on screen.
 .IP
 Movement is plain \fBj\fR / \fBk\fR, as everywhere else in the app, and both
 keys that destroy something are shifted. Until version 0.35.1 this was reversed
