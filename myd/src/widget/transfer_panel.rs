@@ -91,14 +91,19 @@ pub fn render(
     // the user isn't driving. Dropped entirely when it wouldn't fit, since
     // ratatui clips a title at the border and half a hint is worse than none.
     let title = if focused {
-        let hint = " — j/k move, k cancels ";
-        let with_hint = format!("{}{}", base.trim_end(), hint);
+        // Longest first: the fuller hint when there is room, then a shorter one,
+        // then none. The old single hint read "j/k move, k cancels", which is
+        // self-contradictory and wrong besides — `K` moves up, `k` cancels.
+        let fitted = [
+            " — j/K move, k cancels, C clears ",
+            " — k cancels, C clears ",
+            " — C clears ",
+        ]
+        .into_iter()
         // Two border corners plus a column of slack.
-        if with_hint.chars().count() + 3 <= area.width as usize {
-            with_hint
-        } else {
-            base
-        }
+        .map(|hint| format!("{}{}", base.trim_end(), hint))
+        .find(|with_hint| with_hint.chars().count() + 3 <= area.width as usize);
+        fitted.unwrap_or(base)
     } else {
         base
     };

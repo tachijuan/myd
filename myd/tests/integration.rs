@@ -5919,6 +5919,226 @@ async fn the_transfer_panel_is_focusable_and_cancellable() {
     assert_eq!(app.modal_kind_for_test(), "none");
 }
 
+#[tokio::test]
+async fn the_footer_describes_the_transfer_panel_while_it_has_focus() {
+    // The footer is drawn inside the browser panel, so it went on advertising
+    // the tree's keys after Tab moved focus to the sidebar — `t:tag` and
+    // `f:filter` do nothing there, and the sidebar's own keys were nowhere on
+    // screen.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let tree_footer = app_screen_text(&mut app, 120, 30);
+    assert!(
+        tree_footer.contains("[TREE]"),
+        "the tree's footer should be up first: {}",
+        tree_footer
+    );
+
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test(), "Tab should reach the sidebar");
+
+    let xfer_footer = app_screen_text(&mut app, 120, 30);
+    assert!(
+        xfer_footer.contains("[TRANSFERS]"),
+        "the footer must switch to the sidebar's: {}",
+        xfer_footer
+    );
+    assert!(
+        !xfer_footer.contains("[TREE]"),
+        "and must not still claim the tree has focus: {}",
+        xfer_footer
+    );
+    // The keys that actually work there.
+    for key in ["k:cancel", "C:clear done", "Esc:back"] {
+        assert!(
+            xfer_footer.contains(key),
+            "the sidebar's footer should offer {}: {}",
+            key,
+            xfer_footer
+        );
+    }
+    // And not the ones that don't.
+    for key in ["t:tag", "f:filter", "l/h:expand"] {
+        assert!(
+            !xfer_footer.contains(key),
+            "{} does nothing in the sidebar and must not be advertised: {}",
+            key,
+            xfer_footer
+        );
+    }
+
+    // Esc hands the keyboard back, and the footer follows it.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Esc));
+    let back = app_screen_text(&mut app, 120, 30);
+    assert!(
+        back.contains("[TREE]") && !back.contains("[TRANSFERS]"),
+        "leaving the sidebar must restore the tree's footer: {}",
+        back
+    );
+}
+
+#[tokio::test]
+async fn capital_c_clears_finished_transfers_and_keeps_live_ones() {
+    // `clear_finished` existed on the queue but nothing ever called it, so a
+    // completed transfer sat in the panel until the app exited.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 2048]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dir.path().join("out/done.bin")),
+    );
+
+    // Run it to completion, so there is a terminal entry to clear.
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        app.transfer_queue().finished_count(),
+        1,
+        "the transfer should have finished"
+    );
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test());
+
+    app.handle_key_for_test(char_key('C'));
+
+    assert_eq!(
+        app.transfer_queue().finished_count(),
+        0,
+        "C should have dropped the finished entry"
+    );
+    assert!(
+        app.transfer_queue().is_empty(),
+        "and it was the only one, so the queue is empty"
+    );
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "clearing discards a record, not work — no confirmation needed"
+    );
+}
+
+#[tokio::test]
+async fn clearing_leaves_queued_and_active_transfers_alone() {
+    // The destructive misread of "clear": it must drop only what has already
+    // stopped, never cancel work still in flight.
+    let dir = tempfile::tempdir().unwrap();
+    let small = dir.path().join("small.bin");
+    std::fs::write(&small, vec![0u8; 512]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // One that will finish.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&small),
+        myd::vfs::VPath::local(dir.path().join("out/first.bin")),
+    );
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert_eq!(app.transfer_queue().finished_count(), 1);
+
+    // And one that has not been ticked, so it is still queued.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&small),
+        myd::vfs::VPath::local(dir.path().join("out/second.bin")),
+    );
+    let live_before = app.transfer_queue().transfers().len() - 1;
+    assert_eq!(live_before, 1, "one finished, one not");
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(char_key('C'));
+
+    assert_eq!(
+        app.transfer_queue().finished_count(),
+        0,
+        "the finished one went"
+    );
+    assert_eq!(
+        app.transfer_queue().transfers().len(),
+        1,
+        "and exactly one entry survived"
+    );
+    assert!(
+        !app.transfer_queue().transfers()[0].state.is_terminal(),
+        "the survivor is the one that had not finished"
+    );
+}
+
+#[tokio::test]
+async fn clearing_drops_a_cursor_that_pointed_at_a_removed_row() {
+    // The cursor names a transfer by id. If clearing removes the row it was on
+    // and the cursor is left dangling, the next `k` prompts to cancel whatever
+    // slid into that slot — a transfer the user never selected.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, vec![0u8; 512]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(&src),
+        myd::vfs::VPath::local(dir.path().join("out/only.bin")),
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(
+        app.transfer_cursor_for_test().is_some(),
+        "focusing selects the queued transfer"
+    );
+
+    // Let it finish, which makes the selected row a terminal one.
+    for _ in 0..2000 {
+        app.tick_transfers_for_test();
+        if !app.transfer_queue().has_work() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    app.handle_key_for_test(char_key('C'));
+    assert!(
+        app.transfer_cursor_for_test().is_none(),
+        "the cursor must not survive the row it pointed at"
+    );
+
+    // And `k` on that empty selection is inert rather than prompting.
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "there is nothing selected to cancel"
+    );
+}
+
 /// Esc returns focus to the file tree.
 #[tokio::test]
 async fn esc_leaves_the_transfer_panel() {
@@ -14435,5 +14655,6 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
 
 

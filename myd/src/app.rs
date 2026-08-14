@@ -797,6 +797,9 @@ impl FileBrowser {
         // being true once the sidebar became focusable — both it and the last
         // panel drew a cyan border at once.
         let panel_has_focus = !self.transfer_focused;
+        // Read once here for the same reason `pending_chord` is: the panels are
+        // borrowed mutably below, so `self` cannot be consulted inside the loop.
+        let transfer_focused = self.transfer_focused;
 
         if panel_count == 2 {
             let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -812,6 +815,10 @@ impl FileBrowser {
                     state.active = panel_has_focus && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                     state.pending_chord = pending_chord;
+                    // Only the panel the keyboard would otherwise be in swaps
+                    // its footer for the sidebar's keys. Both panels doing so
+                    // would say the sidebar has focus twice.
+                    state.transfer_focused = transfer_focused && i == active;
                 }
                 panel.current_screen_mut().render(f, cols[i]);
             }
@@ -822,6 +829,7 @@ impl FileBrowser {
                 state.active = panel_has_focus;
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                 state.pending_chord = pending_chord;
+                state.transfer_focused = transfer_focused;
             }
             self.panels[0].current_screen_mut().render(f, area);
         }
@@ -2308,12 +2316,47 @@ impl FileBrowser {
                 self.prompt_cancel_selected_transfer();
                 Some(true)
             }
+            // Drop the finished entries, keeping anything still queued or
+            // running. Uppercase so it cannot be hit while reaching for `k`:
+            // the two sit next to each other in the same panel, and one of them
+            // is destructive.
+            //
+            // No confirmation, unlike cancelling — clearing discards a record of
+            // work that has already happened, not the work itself. There is
+            // nothing to lose beyond the list, so a prompt would be ceremony.
+            KeyCode::Char('C') => {
+                self.transfers.clear_finished();
+                // The cursor may have been sitting on a row that just went away.
+                // Leaving it dangling would point at whatever slid up into that
+                // slot, so `k` would then cancel a transfer the user never
+                // selected.
+                self.reconcile_transfer_cursor();
+                Some(true)
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.transfer_focused = false;
                 self.transfer_cursor = None;
                 Some(true)
             }
             _ => None,
+        }
+    }
+
+    /// Drop a transfer cursor that no longer names a live row.
+    ///
+    /// The panel only gives cursor stops to cancellable (queued or active)
+    /// transfers, so anything else the cursor points at is stale.
+    fn reconcile_transfer_cursor(&mut self) {
+        let Some(id) = self.transfer_cursor else {
+            return;
+        };
+        let still_there = self
+            .transfers
+            .transfers()
+            .iter()
+            .any(|t| t.id == id && !t.state.is_terminal());
+        if !still_there {
+            self.transfer_cursor = None;
         }
     }
 
