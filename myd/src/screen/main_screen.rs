@@ -78,6 +78,16 @@ pub struct MainScreenState {
     /// `t:tag` and `f:filter` while none of them did anything, and the
     /// sidebar's own keys were undiscoverable.
     pub footer: FooterMode,
+    /// Width the footer row may use, when it differs from the panel's own.
+    ///
+    /// Set by the app each frame like `active`. The transfer sidebar occupies a
+    /// column beside the panel but stops above the footer row, so the footer can
+    /// span the whole terminal; without this it was clipped at the sidebar's
+    /// left edge and the keybindings lost their tail.
+    ///
+    /// `None` means "use the panel's width", which is what a split's two panels
+    /// do — there, each footer describing its own half is the point.
+    pub footer_width: Option<u16>,
 }
 
 /// Which keys a panel's footer describes.
@@ -141,6 +151,7 @@ impl MainScreenState {
             sort_area: None,
             pending_chord: None,
             footer: FooterMode::Own,
+            footer_width: None,
         }
     }
 
@@ -164,6 +175,7 @@ impl MainScreenState {
             sort_area: None,
             pending_chord: None,
             footer: FooterMode::Own,
+            footer_width: None,
         }
     }
 
@@ -867,7 +879,17 @@ impl ScreenState for MainScreenState {
         let chunks =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         let content_area = chunks[0];
-        let footer_area = chunks[1];
+        // The footer may run wider than the panel's content. The transfer
+        // sidebar sits beside the *content* and stops above this row, so the
+        // keybindings get the full terminal width rather than being clipped at
+        // the sidebar's edge — they describe the window, not the column.
+        let footer_area = match self.footer_width {
+            Some(w) => Rect {
+                width: w.max(chunks[1].width),
+                ..chunks[1]
+            },
+            None => chunks[1],
+        };
 
         match self.focus {
             FocusTarget::Tree => {

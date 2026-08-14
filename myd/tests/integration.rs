@@ -6035,6 +6035,122 @@ async fn the_arrows_move_the_transfer_cursor_like_j_and_k() {
 }
 
 #[tokio::test]
+async fn the_sidebar_does_not_clip_the_footer() {
+    // The sidebar was carved from the full frame height, but each panel
+    // reserves its own bottom row for the footer *inside* the area it is
+    // handed. So the sidebar sat beside that row and cut the keybindings off at
+    // its left edge — "?:help q:quit" simply vanished whenever the queue was on
+    // screen. The footer describes the window, so it gets the window's width.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // The footer as it reads with no sidebar in the way.
+    let bare = app_screen_text(&mut app, 120, 16);
+    let bare_footer = bare
+        .lines()
+        .last()
+        .expect("a rendered frame has a last row")
+        .trim_end()
+        .to_string();
+    assert!(
+        bare_footer.contains("?:help") && bare_footer.contains("q:quit"),
+        "the untouched footer should run to the end: {}",
+        bare_footer
+    );
+
+    // Open the sidebar; the footer must be untouched by it.
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+    assert!(app.is_transfer_panel_visible(), "the sidebar should be up");
+
+    let with_sidebar = app_screen_text(&mut app, 120, 16);
+    let footer = with_sidebar
+        .lines()
+        .last()
+        .expect("a rendered frame has a last row")
+        .trim_end()
+        .to_string();
+    assert_eq!(
+        footer, bare_footer,
+        "the sidebar must not change the footer at all"
+    );
+    assert!(
+        footer.contains("q:quit"),
+        "and the tail must survive: {}",
+        footer
+    );
+}
+
+#[tokio::test]
+async fn the_sidebar_leaves_the_footer_row_clear_while_focused() {
+    // Same clipping, on the sidebar's own footer: it is drawn in the panel and
+    // was cut at the same column.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let _ = app_screen_text(&mut app, 120, 16);
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    assert!(app.transfer_focused_for_test());
+
+    let text = app_screen_text(&mut app, 120, 16);
+    let lines: Vec<&str> = text.lines().collect();
+    let footer = lines[lines.len() - 1];
+    assert!(
+        footer.contains("[TRANSFERS]") && footer.trim_end().ends_with("q:quit"),
+        "the sidebar's own footer must run to the end too: {}",
+        footer
+    );
+    // The sidebar's keys happen to be short enough to fit even in the clipped
+    // width, so the text alone proves nothing — what matters is that the row is
+    // the footer's alone, with no sidebar border sharing it.
+    assert!(
+        !footer.contains('│') && !footer.contains('┘'),
+        "the footer row must be clear of the sidebar: {}",
+        footer
+    );
+}
+
+#[tokio::test]
+async fn the_sidebar_ends_above_the_footer_row() {
+    // The mechanism, asserted directly: with the sidebar open its bottom border
+    // sits one row higher than the frame's last line, which is what leaves that
+    // line clear for the footer. Checking only the text would pass again if the
+    // footer were merely re-clipped somewhere else.
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.enqueue_transfer_for_test(
+        myd::vfs::VPath::local(dir.path().join("file_a.txt")),
+        myd::vfs::VPath::local(dir.path().join("copy.txt")),
+    );
+
+    let text = app_screen_text(&mut app, 120, 16);
+    let lines: Vec<&str> = text.lines().collect();
+    let last = lines.len() - 1;
+
+    // The footer row carries no box-drawing from the sidebar.
+    assert!(
+        !lines[last].contains('│') && !lines[last].contains('┘'),
+        "the sidebar must not reach the footer row: {}",
+        lines[last]
+    );
+    // And the row above it closes the sidebar's box.
+    assert!(
+        lines[last - 1].contains('┘'),
+        "the sidebar should close on the row above the footer: {}",
+        lines[last - 1]
+    );
+}
+
+#[tokio::test]
 async fn a_killed_transfer_is_shown_as_aborted_not_done() {
     // End to end through the real kill path, since the panel's own tests set
     // the state directly: press K, confirm, and check what the panel then says
@@ -14946,6 +15062,7 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
 
 
 
