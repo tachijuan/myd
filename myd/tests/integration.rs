@@ -6034,6 +6034,147 @@ async fn the_arrows_move_the_transfer_cursor_like_j_and_k() {
     );
 }
 
+/// A panel showing a treemap, for the border tests. Returns the app with panel
+/// 2 in treemap mode and focused.
+async fn treemap_split() -> (tempfile::TempDir, tempfile::TempDir, FileBrowser) {
+    let left = create_test_structure();
+    let right = tempfile::tempdir().unwrap();
+    for (name, size) in [("a.bin", 8000usize), ("b.bin", 4000), ("c.bin", 2000)] {
+        std::fs::write(right.path().join(name), vec![0u8; size]).unwrap();
+    }
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        false,
+    );
+    settle_all(&mut app).await;
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    let _ = app_screen_text(&mut app, 140, 18);
+    assert_eq!(app.active_panel_index(), 1, "Tab should reach panel 2");
+    app.handle_key_for_test(char_key('v'));
+    let _ = app_screen_text(&mut app, 140, 18);
+    (left, right, app)
+}
+
+#[tokio::test]
+async fn the_treemap_panel_has_a_border_like_every_other_pane() {
+    // The treemap drew its tiles straight into the panel's area with no frame
+    // of its own, so in a split it was the one pane on screen with no border —
+    // no edge between it and the panel beside it, and no cyan outline to say
+    // whether it held the keyboard.
+    let (_l, _r, mut app) = treemap_split().await;
+
+    let backend = ratatui::backend::TestBackend::new(140, 18);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // The treemap panel starts in the right half, so its top-left corner is a
+    // box-drawing corner somewhere past the middle of the first row.
+    let corner = {
+        let buf = term.backend().buffer();
+        (0..buf.area.width)
+            .find(|&x| buf[(x, 0)].symbol() == "┌" && x > 60)
+            .expect("the treemap panel should draw a top-left corner")
+    };
+
+    // Focused: the same cyan every other active pane uses.
+    {
+        let buf = term.backend().buffer();
+        assert_eq!(
+            buf[(corner, 0)].style().fg,
+            Some(ratatui::style::Color::Cyan),
+            "a focused treemap panel should carry the active border colour"
+        );
+    }
+
+    // Unfocused: it dims, exactly as the tree panel does.
+    app.handle_key_for_test(special_key(crossterm::event::KeyCode::Tab));
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    {
+        let buf = term.backend().buffer();
+        assert_eq!(
+            buf[(corner, 0)].style().fg,
+            Some(ratatui::style::Color::DarkGray),
+            "and dim when the keyboard is elsewhere"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_treemap_panel_is_titled() {
+    // The border needs a title like the tree's, or the pane is an anonymous box
+    // — and the title is where "v goes back" belongs, since the treemap's keys
+    // are the ones a user arrives at without having asked for them.
+    let (_l, _r, mut app) = treemap_split().await;
+    let text = app_screen_text(&mut app, 140, 18);
+    assert!(
+        text.contains("Treemap"),
+        "the panel should name the view it is showing: {}",
+        text
+    );
+    assert!(
+        text.contains("v for the tree"),
+        "and say how to get back: {}",
+        text
+    );
+}
+
+#[tokio::test]
+async fn clicking_a_treemap_tile_still_selects_it_through_the_border() {
+    // The tiles are laid out inside the border now, so their rects moved. Hit
+    // testing reads those same rects, but this is the assertion that keeps the
+    // two in step — an inset applied to only one of them would put every click
+    // one cell out.
+    let (_l, _r, mut app) = treemap_split().await;
+
+    let backend = ratatui::backend::TestBackend::new(140, 18);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // Locate b.bin's label in the very buffer that was just drawn — measuring
+    // it from a separately-rendered string would index a different frame.
+    // Scan cell by cell rather than searching a joined string: box-drawing
+    // symbols are multi-byte, so a byte offset from `str::find` is not a column
+    // — it ran past the right edge of a 140-wide buffer.
+    let (target_col, target_row) = {
+        let buf = term.backend().buffer();
+        let mut found = None;
+        'rows: for y in 0..buf.area.height {
+            for x in 0..buf.area.width.saturating_sub(5) {
+                let at: String = (0..5)
+                    .map(|d| buf[(x + d, y)].symbol().to_string())
+                    .collect();
+                if at == "b.bin" {
+                    found = Some((x, y));
+                    break 'rows;
+                }
+            }
+        }
+        found.expect("b.bin should have a labelled tile")
+    };
+
+    let selected_name = |app: &FileBrowser| match app.current_screen() {
+        myd::screen::Screen::Main(s) => s
+            .selected_path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string()),
+        _ => panic!("expected the main screen"),
+    };
+    assert_ne!(
+        selected_name(&app).as_deref(),
+        Some("b.bin"),
+        "b.bin must not already be selected for this to test anything"
+    );
+
+    click_at(&mut app, target_col, target_row);
+
+    assert_eq!(
+        selected_name(&app).as_deref(),
+        Some("b.bin"),
+        "the click should land on the tile that was drawn there"
+    );
+}
+
 #[tokio::test]
 async fn panels_in_different_view_modes_show_only_the_focused_ones_keys() {
     // The reported case: panel 1 in tree mode, panel 2 in treemap, sidebar
@@ -15164,6 +15305,10 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
     // Third: nothing left to back out of.
     assert!(!app.handle_key_for_test(char_key('q')), "the third quits");
 }
+
+
+
+
 
 
 

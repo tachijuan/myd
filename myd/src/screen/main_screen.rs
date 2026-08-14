@@ -1056,8 +1056,38 @@ impl MainScreenState {
         // lives on the tree and the treemap is about to be borrowed mutably.
         let tagged = self.tree.tagged.clone();
 
+        // The same bordered box the tree and the info panel draw, in the same
+        // focus colour. Without it the treemap was the one pane on screen with
+        // no frame — in a split that left no edge between the two panels and no
+        // way to tell which of them had the keyboard, since the cyan border is
+        // how every other pane says so.
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(self.border_color()))
+            .title(self.treemap_title());
+        // Cells are laid out inside the frame, not over it: `compute_layout`
+        // fills whatever rect it is handed, so passing the outer area would draw
+        // tiles on top of the border it had just been given.
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
         self.treemap
-            .render(frame, area, cursor, highlighted_path.as_deref(), &tagged);
+            .render(frame, inner, cursor, highlighted_path.as_deref(), &tagged);
+    }
+
+    /// The treemap box's title: what is being shown, and how to leave it.
+    ///
+    /// Mirrors the tree's, which names the directory and the sort order — the
+    /// treemap has no sort to report, so it names the view instead, which is
+    /// also the answer to "why do my usual keys not work here".
+    fn treemap_title(&self) -> String {
+        let name = self
+            .root_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.root_path.to_string_lossy().to_string());
+        format!(" Treemap ({}) — v for the tree ", name)
     }
 
     fn render_info(&mut self, frame: &mut Frame, area: Rect) {

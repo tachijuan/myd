@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.35.5" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.35.6" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -271,6 +271,11 @@ cached and reused as you navigate, so this is how to pick up on-disk changes.
 Toggle between the tree view and the treemap view, carrying the selection over
 so the entry you were looking at in one is the one highlighted in the other. The
 chosen view persists as you navigate between directories.
+.IP
+Either view fills the panel and carries the panel's border \(em bright cyan
+when it holds the keyboard, grey otherwise \(em so a split reads the same
+whichever view each side is showing. The treemap's box is titled with the
+directory it covers and how to get back to the tree.
 .IP
 \fBEnter\fR opens the selected directory in either view. Treemap tiles for
 directories end in a slash, as in
