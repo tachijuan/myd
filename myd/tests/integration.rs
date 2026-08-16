@@ -17435,3 +17435,59 @@ async fn the_left_panels_permissions_can_be_edited_in_a_split() {
         "editing from the left panel's info panel did not reach the disk"
     );
 }
+
+/// The inline preview asks for a real image when it would be the only one on
+/// the terminal, and falls back to block characters when a split would put two
+/// on screen at once.
+///
+/// It used to force cells unconditionally, so the same image at the same size
+/// looked markedly worse here than in the full pane.
+#[tokio::test]
+async fn the_inline_preview_asks_for_graphics_only_when_it_is_the_only_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x\n").unwrap();
+
+    // One panel showing one info panel: nothing to conflict with.
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    assert!(
+        app.info_preview_may_use_graphics_for_test(),
+        "a lone info panel should be allowed a real image"
+    );
+    // And the request actually issued asks for one, not just the predicate.
+    cursor_onto(&mut app, "a.txt");
+    settle_subpanel(&mut app).await;
+    assert_eq!(
+        app.info_preview_wants_graphics_for_test(),
+        Some(true),
+        "the request should have asked for a graphics payload"
+    );
+
+    // Two info panels would share the one slot the app tracks, and on kitty
+    // erasing either removes both.
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+    let _ = screen_text(&mut app, 170, 40);
+    assert!(
+        !app.info_preview_may_use_graphics_for_test(),
+        "two info panels must fall back to cells"
+    );
+    assert_eq!(
+        app.info_preview_wants_graphics_for_test(),
+        Some(false),
+        "a split's requests should have asked for cells"
+    );
+
+    // Hiding one of them makes the other the only surface again.
+    while app.info_focused_for_test() {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+        let _ = screen_text(&mut app, 170, 40);
+    }
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 170, 40);
+    assert!(
+        app.info_preview_may_use_graphics_for_test(),
+        "with one info panel left, a real image is allowed again"
+    );
+}

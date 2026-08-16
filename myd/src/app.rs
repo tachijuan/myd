@@ -319,6 +319,9 @@ pub struct FileBrowser {
     /// way out — so a session that never touched a preference never writes the
     /// file at all.
     prefs_dirty: bool,
+    /// What the most recent inline-preview request asked for, so a test can
+    /// assert on the request rather than on the predicate that shapes it.
+    info_preview_last_cells_only: Option<bool>,
     /// The compact preview at the foot of each panel's info panel, one slot per
     /// panel and indexed the same way [`Self::panels`] is.
     ///
@@ -576,6 +579,7 @@ impl FileBrowser {
             preview_task: None,
             info_focused: false,
             prefs_dirty: false,
+            info_preview_last_cells_only: None,
             info_previews: Vec::new(),
             preview_graphics_shown: None,
             force_repaint: false,
@@ -1041,7 +1045,7 @@ impl FileBrowser {
                     crate::widget::preview::render_compact(
                         f,
                         *rect,
-                        &self.info_previews[i].state,
+                        &mut self.info_previews[i].state,
                     );
                 }
             }
@@ -1510,6 +1514,17 @@ impl FileBrowser {
                 _ => true,
             })
             .collect()
+    }
+
+    /// Whether an inline preview may use a graphics protocol, for tests.
+    pub fn info_preview_may_use_graphics_for_test(&self) -> bool {
+        self.info_preview_may_use_graphics()
+    }
+
+    /// Whether the active panel's inline preview asked for a graphics payload,
+    /// taken from the request actually issued rather than from the predicate.
+    pub fn info_preview_wants_graphics_for_test(&self) -> Option<bool> {
+        self.info_preview_last_cells_only.map(|cells| !cells)
     }
 
     /// Index of the active panel, for tests.
@@ -2282,10 +2297,21 @@ impl FileBrowser {
     fn flush_preview_graphics(&mut self) {
         // Taken by value: erasing the old image needs `&mut self`, which cannot
         // coexist with a payload borrowed out of `self.preview`.
+        // The full pane first: it covers the panels, so while it is open it is
+        // the only thing that can own the terminal's one image. The inline
+        // preview takes over when the pane is closed — it only ever produces a
+        // payload when it is the single surface (see
+        // `info_preview_may_use_graphics`), so the two can share this slot.
         let wanted = match (&self.preview.graphics_area, self.preview.graphics()) {
             (Some(area), Some(payload)) if self.preview_open => {
                 Some((*area, payload.to_string()))
             }
+            _ if !self.preview_open => self.info_previews.iter().find_map(|slot| {
+                match (&slot.state.graphics_area, slot.state.graphics()) {
+                    (Some(area), Some(payload)) => Some((*area, payload.to_string())),
+                    _ => None,
+                }
+            }),
             _ => None,
         };
 
@@ -2443,6 +2469,26 @@ impl FileBrowser {
         }
     }
 
+    /// Whether an inline preview may render through a graphics protocol.
+    ///
+    /// Only when it would be the single image on the terminal. Two sub-panels
+    /// drawn at once — a split with both info panels shown — would share the
+    /// one slot the app tracks, and on kitty erasing either removes both, so
+    /// those fall back to block characters rather than flickering against each
+    /// other.
+    fn info_preview_may_use_graphics(&self) -> bool {
+        self.panels
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.current_screen(),
+                    Screen::Main(state) if !state.info_panel_hidden
+                )
+            })
+            .count()
+            == 1
+    }
+
     /// The body of [`Self::request_info_previews`] for one panel.
     fn request_info_preview_for(&mut self, i: usize) {
         let Some((cols, rows)) = self.info_previews[i].cells else {
@@ -2522,6 +2568,11 @@ impl FileBrowser {
             .unwrap_or_else(|| path.display().to_string());
         self.info_previews[i].state.begin_load(label);
 
+        // A graphics payload where this is the only surface that would carry
+        // one, and block characters otherwise — see the field's own comment.
+        let cells_only = !self.info_preview_may_use_graphics();
+        self.info_preview_last_cells_only = Some(cells_only);
+
         let fs = self.backends.get(backend);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2531,9 +2582,18 @@ impl FileBrowser {
             cols,
             rows,
             page: 0,
-            // Cells, never a graphics payload: the app tracks exactly one
-            // graphics surface and this is not it.
-            cells_only: true,
+            // A graphics payload where this is the only surface that would
+            // carry one, and block characters otherwise.
+            //
+            // The app tracks exactly one image on the terminal, and on kitty
+            // the delete escape removes *every* placement at once — so two
+            // surfaces cannot be told apart. But the full pane covers the
+            // panels (nothing is loaded here while it is open), and a split
+            // only has two sub-panels when both info panels are shown. Outside
+            // that one case there is no second surface to conflict with, and
+            // forcing cells cost real resolution: the same image at the same
+            // size looked far worse here than in the full pane.
+            cells_only,
             // Names only: this box is a fraction of a panel wide.
             compact_listing: true,
             // A handful of rows has no use for a megabyte, and on a remote panel

@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.41.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.41.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -827,10 +827,15 @@ a server \(em waits for the cursor to settle before it starts.
 .PP
 In a split, each panel previews its own cursor's file and keeps doing so
 whether or not it has focus \(em moving between panels changes which one is
-outlined and nothing else. Images render as cells here
-rather than through a graphics protocol, so they never disturb the full pane's
-image. Below roughly 20 columns or 16 rows the preview yields and the metadata
-takes the whole panel; \fB>\fR is the answer when it does not fit.
+outlined and nothing else.
+.PP
+An image here is drawn with the terminal's graphics protocol, at the same
+resolution the full pane would give it, whenever this is the only such image on
+screen. A split showing two info panels falls back to block characters for
+both: the terminal is told about one image at a time, and on kitty removing
+either would remove the other. Below roughly 20 columns or 16 rows the preview
+yields and the metadata takes the whole panel; \fB<\fR is the answer when it
+does not fit.
 .PP
 Hide or show the panel with \fBCtrl+p\fR.
 .SH FILE PREVIEW
