@@ -546,15 +546,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut PreviewState, focused: 
 ///   them again is wasted work on every frame.
 /// - No footer. The full pane's says "Tab to focus, q to close", and neither is
 ///   true here — this box cannot take focus at all.
-/// - No scroll or search state is written, which is why it takes `&PreviewState`
-///   rather than `&mut`. A box that cannot be focused has nothing to scroll,
-///   and the type says so. It also means `graphics_area` is never set from
-///   here, so the single graphics surface the app tracks stays the full pane's.
+/// - No scroll or search state is written: a box that cannot be focused has
+///   nothing to scroll. The one field it does record is `graphics_area`, which
+///   is where the terminal must place a real image — geometry only the layout
+///   knows, read back after the frame by the code that writes the escape.
 /// - Content is sliced to the visible rows rather than handed whole to
 ///   `Paragraph`. The full pane clones its lines once when the user opens it;
 ///   this one draws on every tick the info panel is up, and cloning a
 ///   million-line file ten times a second is not the same trade.
-pub fn render_compact(frame: &mut Frame, area: Rect, state: &PreviewState) {
+pub fn render_compact(frame: &mut Frame, area: Rect, state: &mut PreviewState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -610,13 +610,18 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &PreviewState) {
             frame.render_widget(Paragraph::new(shown), centred);
         }
         Some(PreviewContent::Graphics { .. }) => {
-            // Unreachable by construction — the sub-panel's loads set
-            // `cells_only`, so a graphics payload is never produced for it. Said
-            // rather than left blank, because the alternative to this arm is an
-            // empty hole that looks like a bug.
-            frame.render_widget(Paragraph::new("[image]").style(dim), inner);
+            // Deliberately nothing: the terminal draws the image itself, into
+            // the gap this leaves. Writing cells here would be overwritten by
+            // the image, or would overwrite it.
         }
     }
+
+    // Where a real image goes, for the code that writes the escape after the
+    // frame. Only set for graphics, and cleared otherwise, so a stale rect can
+    // never leave an image painted over text — the same contract the full
+    // pane's render follows.
+    state.graphics_area =
+        matches!(state.content(), Some(PreviewContent::Graphics { .. })).then_some(inner);
 }
 
 /// Title: the filename, plus the scroll position when there is more than fits.
@@ -1107,7 +1112,7 @@ mod tests {
     }
 
     /// Render the compact variant and return the screen as text.
-    fn draw_compact(s: &PreviewState, w: u16, h: u16) -> String {
+    fn draw_compact(s: &mut PreviewState, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render_compact(f, f.area(), s)).unwrap();
         let buf = t.backend().buffer().clone();
@@ -1125,7 +1130,7 @@ mod tests {
     fn the_compact_render_shows_the_content() {
         let mut s = PreviewState::new();
         s.set_content(key(), text(10));
-        let screen = draw_compact(&s, 30, 8);
+        let screen = draw_compact(&mut s, 30, 8);
         assert!(screen.contains("line 0"), "no content: {screen}");
     }
 
@@ -1136,14 +1141,14 @@ mod tests {
     fn the_compact_render_has_no_footer() {
         let mut s = PreviewState::new();
         s.set_content(key(), text(10));
-        let screen = draw_compact(&s, 40, 8);
+        let screen = draw_compact(&mut s, 40, 8);
         assert!(!screen.contains("Tab"), "compact drew a footer: {screen}");
         assert!(!screen.contains("close"), "compact drew a footer: {screen}");
     }
 
     /// It must not write scroll state: an unfocusable box has nothing to
-    /// scroll, and `graphics_area` in particular is read by the code that
-    /// flushes the one image the app tracks.
+    /// scroll. `graphics_area` is the deliberate exception — only the layout
+    /// knows where an image goes, so the compact render records that too.
     #[test]
     fn the_compact_render_leaves_the_state_alone() {
         let mut s = PreviewState::new();
@@ -1151,13 +1156,13 @@ mod tests {
         // Give it geometry from a full render first, so there is state to
         // disturb.
         draw(&mut s, 40, 14);
-        let before = (s.viewport, s.max_scroll, s.content_area, s.graphics_area);
+        let before = (s.viewport, s.max_scroll, s.content_area);
 
-        let _ = draw_compact(&s, 20, 6);
+        let _ = draw_compact(&mut s, 20, 6);
         assert_eq!(
-            (s.viewport, s.max_scroll, s.content_area, s.graphics_area),
+            (s.viewport, s.max_scroll, s.content_area),
             before,
-            "the compact render wrote state the full pane owns"
+            "the compact render wrote scroll state it does not own"
         );
     }
 
@@ -1167,7 +1172,7 @@ mod tests {
         let mut s = PreviewState::new();
         s.set_content(key(), text(50));
         for (w, h) in [(1, 1), (2, 1), (1, 3), (5, 2), (20, 1)] {
-            let _ = draw_compact(&s, w, h);
+            let _ = draw_compact(&mut s, w, h);
         }
     }
 
@@ -1177,14 +1182,14 @@ mod tests {
     fn the_compact_render_says_when_it_is_loading() {
         let mut s = PreviewState::new();
         s.begin_load("x.txt".to_string());
-        assert!(draw_compact(&s, 30, 6).contains("Loading"));
+        assert!(draw_compact(&mut s, 30, 6).contains("Loading"));
     }
 
-    /// Graphics can never reach here (the sub-panel's loads set `cells_only`),
-    /// but if one did it must say so rather than leave a hole that reads as a
-    /// bug.
+    /// A real image leaves a hole for the terminal to draw into, and records
+    /// where — the same contract the full pane follows. Writing cells there
+    /// would be overwritten by the image, or would overwrite it.
     #[test]
-    fn the_compact_render_names_a_graphics_payload_rather_than_leaving_a_hole() {
+    fn the_compact_render_leaves_a_hole_for_a_graphics_payload() {
         let mut s = PreviewState::new();
         s.set_content(
             key(),
@@ -1196,6 +1201,39 @@ mod tests {
                 pages: None,
             },
         );
-        assert!(draw_compact(&s, 30, 8).contains("[image]"));
+        let screen = draw_compact(&mut s, 30, 8);
+        // Nothing but the separator: no placeholder text under the image.
+        assert!(
+            !screen.contains("[image]"),
+            "cells were drawn where the image goes: {screen}"
+        );
+        let area = s.graphics_area.expect("the image's rect must be recorded");
+        assert!(area.width > 0 && area.height > 0);
+    }
+
+    /// A stale rect would leave an image painted over text, so it is cleared
+    /// whenever the content is not graphics.
+    #[test]
+    fn the_compact_render_clears_the_graphics_rect_for_other_content() {
+        let mut s = PreviewState::new();
+        s.set_content(
+            key(),
+            PreviewContent::Graphics {
+                payload: "\x1b_Gf=100;AAAA\x1b\\".to_string(),
+                rows: 4,
+                backend: "timg",
+                page: 0,
+                pages: None,
+            },
+        );
+        let _ = draw_compact(&mut s, 30, 8);
+        assert!(s.graphics_area.is_some());
+
+        s.set_content(key(), text(5));
+        let _ = draw_compact(&mut s, 30, 8);
+        assert!(
+            s.graphics_area.is_none(),
+            "a stale rect would paint the old image over this text"
+        );
     }
 }
