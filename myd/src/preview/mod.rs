@@ -32,12 +32,18 @@ const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 /// Bytes sampled to decide whether a file is text at all.
 const SNIFF_BYTES: usize = 8192;
 
-/// Largest file that gets syntax highlighting.
+/// How much of a file gets syntax highlighting.
 ///
 /// syntect's cost is linear in the text it is given and not cheap: ~264ms for a
-/// 4300-line Rust file, against 6.5ms for the first 200 lines of it. Past this
-/// size the pane shows plain text immediately rather than making the user wait,
-/// since the content is the point and the colours are a bonus.
+/// 4300-line Rust file, against 6.5ms for the first 200 lines of it. So this is
+/// a budget spent from the top of the file — the head is coloured and the rest
+/// is shown plain, which bounds the work without making the colours depend on
+/// how long the file happens to be.
+///
+/// It was once a ceiling on the *whole* file, which had a subtler cost than it
+/// looked: the two previews read different amounts (16KB inline, 1MB in the
+/// pane), so a 600KB source file came out coloured in one and grey in the
+/// other. What is on screen should not change with how much was read behind it.
 ///
 /// 64KB is roughly 1500 lines of source — comfortably more than anyone reads in
 /// a preview, and about 90ms in the worst grammar measured. Markdown does not go
@@ -140,6 +146,32 @@ pub struct PreviewRequest {
     /// Which page of a multi-page document to render, zero-based. Ignored for
     /// everything else.
     pub page: usize,
+    /// Render into cells rather than a graphics protocol, whatever the terminal
+    /// supports.
+    ///
+    /// The info panel's inline preview sets this. kitty and iTerm2 images are
+    /// escape payloads the terminal owns, and the app tracks exactly one such
+    /// surface — a second would erase the first on every frame. On kitty it is
+    /// worse than that: the delete escape removes every placement at once, so
+    /// two surfaces cannot be told apart even in principle without per-image
+    /// ids, which nothing here assigns.
+    pub cells_only: bool,
+    /// Show an archive's members by name alone, without the permission, size
+    /// and timestamp columns.
+    ///
+    /// Set by the info panel's inline preview. Those columns are laid out
+    /// *before* the name, so in a box a fraction of a panel wide they are the
+    /// only part that survives truncation — the listing ends up showing
+    /// everything except what it was opened to show.
+    pub compact_listing: bool,
+    /// Cap on the text read, overriding [`MAX_TEXT_BYTES`]. `None` for the
+    /// default.
+    ///
+    /// A preview that shows a handful of rows has no use for a megabyte: the
+    /// read, the UTF-8 conversion and the syntax highlighting are all paid in
+    /// full and then thrown away, and on a remote panel the megabyte crosses
+    /// the wire on every cursor move.
+    pub max_text_bytes: Option<u64>,
 }
 
 /// Load a preview. Blocking on the calling task; run it on a worker.
@@ -193,7 +225,12 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
             Some(by_content) if by_content != by_name => by_content,
             _ => by_name,
         };
-        return crate::vfs::archive::listing::preview(fs, path, format, &name).await;
+        let detail = if req.compact_listing {
+            crate::vfs::archive::listing::Detail::NamesOnly
+        } else {
+            crate::vfs::archive::listing::Detail::Full
+        };
+        return crate::vfs::archive::listing::preview(fs, path, format, &name, detail).await;
     }
 
     let meta = fs.stat(path).await?;
@@ -209,7 +246,7 @@ async fn load_inner(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<Pr
         });
     }
 
-    let want = meta.len.min(MAX_TEXT_BYTES);
+    let want = meta.len.min(req.max_text_bytes.unwrap_or(MAX_TEXT_BYTES));
 
     // Sniff before committing to the full read. Only the first `SNIFF_BYTES`
     // decide whether this is text at all, so reading a megabyte first is a
@@ -332,6 +369,15 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
     let caps = image::capabilities();
     let label = req.label.as_path();
 
+    // Asked for once and used for every decision below, so a request that wants
+    // cells cannot take a graphics path by one branch reading the global and
+    // another reading the request.
+    let protocol = if req.cells_only {
+        graphics::Protocol::Blocks
+    } else {
+        graphics::protocol()
+    };
+
     // iTerm2 decodes the file itself, so for a format it understands the file's
     // own bytes go straight over and the renderer is skipped entirely.
     //
@@ -344,9 +390,7 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
     // Only when the file is small enough to survive the trip: inside a
     // multiplexer an oversized inline image is silently not drawn, and the
     // renderer can shrink where sending the original cannot.
-    if graphics::protocol() == graphics::Protocol::Iterm2
-        && graphics::iterm_decodes_natively(label)
-    {
+    if protocol == graphics::Protocol::Iterm2 && graphics::iterm_decodes_natively(label) {
         if let Some(content) = native_iterm_image(fs.clone(), req).await? {
             return Ok(content);
         }
@@ -358,12 +402,19 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
         });
     };
 
-    // The renderers take a path. A remote file has to come down first.
+    // The renderers take a path, so anything that is not already a file on this
+    // machine has to be written out to one first. That includes an archive
+    // member, which is local but lives inside a container the renderer cannot
+    // open — it is staged, but none of the *network* costs below apply to it.
     let staged = if req.path.is_local() {
         None
     } else {
+        let over_network = fs.is_remote();
         let meta = fs.stat(&req.path).await?;
-        if meta.len > MAX_REMOTE_IMAGE_BYTES {
+        // Only a real download is worth refusing. Extracting an 80MB PDF from an
+        // archive is a local read, and capping it reported "too large to fetch"
+        // about a file there was nothing to fetch.
+        if over_network && meta.len > MAX_REMOTE_IMAGE_BYTES {
             return Ok(PreviewContent::Note {
                 message: format!(
                     "Remote image is {} — too large to fetch for a preview.",
@@ -398,7 +449,6 @@ async fn render_image(fs: Arc<dyn Vfs>, req: &PreviewRequest) -> anyhow::Result<
     // Only a paged format is asked for a page count; an ordinary image reports
     // `None`, which is what tells the pane to scroll rather than page.
     let paged = filetype::is_pdf(label);
-    let protocol = graphics::protocol();
     let (rendered, pages) = tokio::task::spawn_blocking(move || {
         (
             image::render(backend, &render_path, cols, rows, page, protocol),
@@ -509,8 +559,8 @@ fn highlight(path: &Path, text: &str) -> Vec<Line<'static>> {
             })
     };
 
-    // No syntax, or too much text to highlight responsively.
-    let Some(syntax) = syntax.filter(|_| text.len() <= MAX_HIGHLIGHT_BYTES) else {
+    // No syntax at all — nothing to colour with.
+    let Some(syntax) = syntax else {
         return plain_lines(text);
     };
 
@@ -530,7 +580,26 @@ fn highlight(path: &Path, text: &str) -> Vec<Line<'static>> {
     } else {
         text
     };
+    // Highlight the head and leave the rest plain, rather than dropping colour
+    // for the whole file once it passes the cap.
+    //
+    // syntect's cost is linear, so a megabyte of source cannot be highlighted
+    // responsively — but the reason to cap it is the *time*, and time is only
+    // spent on the lines actually processed. Colouring the first 64KB of a
+    // 600KB file costs ~2ms and gives a reader the part they are looking at;
+    // refusing outright gave them a wall of grey and, worse, made a file's
+    // appearance depend on its total size rather than on anything visible.
+    // (That is how this was found: `integration.rs` was coloured in the info
+    // panel's 16KB preview and plain in the full pane's 1MB one.)
+    let mut budget = MAX_HIGHLIGHT_BYTES;
     for line in LinesWithEndings::from(text) {
+        if budget == 0 {
+            // One line in, one line out — `plain_lines` would allocate a `Vec`
+            // per line, and past the budget there may be tens of thousands.
+            out.push(Line::from(Span::raw(expand_tabs(strip_eol(line)))));
+            continue;
+        }
+        budget = budget.saturating_sub(line.len());
         let Ok(ranges) = h.highlight_line(line, syntaxes) else {
             // Give up on highlighting from here rather than losing the file.
             out.extend(plain_lines(line));
@@ -654,25 +723,68 @@ mod tests {
         }
     }
 
-    /// A large source file must show up as plain text rather than making the user
-    /// wait on syntect, whose cost is linear in the text it is handed.
+    /// A large source file is highlighted as far as the budget goes and shown
+    /// plain after that — syntect's cost is linear, so a megabyte cannot be
+    /// coloured responsively, but the part someone is reading can be.
+    ///
+    /// It used to refuse outright, which made a file's appearance depend on its
+    /// total size rather than on anything on screen: `integration.rs` came out
+    /// coloured in the info panel's 16KB preview and grey in the full pane's
+    /// 1MB one.
     #[test]
-    fn a_large_file_skips_highlighting() {
+    fn a_large_file_is_highlighted_up_to_the_budget() {
         let big = "fn f() { let x = 1; }\n".repeat(20_000);
         assert!(big.len() > MAX_HIGHLIGHT_BYTES);
 
         let t = std::time::Instant::now();
         let lines = highlight(Path::new("big.rs"), &big);
-        let elapsed = t.elapsed();
+        let big_elapsed = t.elapsed();
 
         assert_eq!(lines.len(), 20_000, "every line must still be shown");
-        // Plain text: no colour anywhere.
-        assert!(lines[0].spans.iter().all(|s| s.style.fg.is_none()));
-        // Generous, since this also runs in debug — highlighting this much text
-        // takes seconds.
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "skipping highlighting should be fast, took {elapsed:?}"
+            lines[0].spans.iter().any(|s| s.style.fg.is_some()),
+            "the head of a large file should still be coloured"
+        );
+        // Past the budget it goes plain, which is what keeps this bounded.
+        assert!(
+            lines[19_999].spans.iter().all(|s| s.style.fg.is_none()),
+            "the tail should be plain once the budget is spent"
+        );
+
+        // The cost is bounded by the *budget*, not by the file, so a file ten
+        // times longer must not take ten times as long. Compared against a
+        // budget-sized input rather than a wall-clock limit: syntect is about a
+        // thousand times slower in debug than in release, so any absolute
+        // number is either meaningless in one profile or flaky in the other.
+        let budgeted: String = big.chars().take(MAX_HIGHLIGHT_BYTES).collect();
+        let t = std::time::Instant::now();
+        let _ = highlight(Path::new("small.rs"), &budgeted);
+        let budget_elapsed = t.elapsed();
+
+        assert!(
+            big_elapsed < budget_elapsed * 3 + std::time::Duration::from_millis(200),
+            "a 20x larger file cost {big_elapsed:?} against {budget_elapsed:?} for one \
+             budget's worth — the budget is not bounding the work"
+        );
+    }
+
+    /// The same file must look the same however much of it was read. The two
+    /// previews read different amounts (16KB inline, 1MB in the pane), and a
+    /// cap on the *whole* file meant the smaller read was coloured and the
+    /// larger one was not.
+    #[test]
+    fn a_head_and_a_fuller_read_of_one_file_agree() {
+        let src = "fn f() { let x = 1; }\n".repeat(20_000);
+        let head: String = src.chars().take(16 * 1024).collect();
+
+        let from_head = highlight(Path::new("big.rs"), &head);
+        let from_full = highlight(Path::new("big.rs"), &src);
+
+        let coloured = |l: &Line| l.spans.iter().any(|s| s.style.fg.is_some());
+        assert!(coloured(&from_head[0]), "the short read lost its colour");
+        assert!(
+            coloured(&from_full[0]),
+            "the same first line is plain when more of the file is read"
         );
     }
 
@@ -802,5 +914,79 @@ mod tests {
             pages: None,
         };
         assert!(c.search_text().is_empty());
+    }
+
+    /// A request for a text file, at whatever read cap.
+    fn text_request(path: &Path, max_text_bytes: Option<u64>) -> PreviewRequest {
+        PreviewRequest {
+            path: crate::vfs::VPath::local(path.to_path_buf()),
+            label: path.to_path_buf(),
+            cols: 40,
+            rows: 10,
+            page: 0,
+            cells_only: false,
+            compact_listing: false,
+            max_text_bytes,
+        }
+    }
+
+    /// The cap has to bound the read, not just the display: the inline preview
+    /// sets it so that following the cursor does not read a megabyte per file.
+    #[tokio::test]
+    async fn max_text_bytes_limits_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // 2000 numbered lines, so which ones arrived is visible in the content.
+        let body: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let reg = crate::vfs::BackendRegistry::new();
+        let capped = load(reg.local(), text_request(&path, Some(200))).await;
+        let full = load(reg.local(), text_request(&path, None)).await;
+
+        let (capped_lines, full_lines) = match (&capped, &full) {
+            (
+                PreviewContent::Text { lines: a, .. },
+                PreviewContent::Text { lines: b, .. },
+            ) => (a.len(), b.len()),
+            _ => panic!("expected both to load as text"),
+        };
+
+        // 200 bytes is ~25 of these lines; the uncapped read gets all 2000.
+        assert!(
+            capped_lines < 40,
+            "the cap was ignored: {capped_lines} lines from a 200-byte read"
+        );
+        assert_eq!(full_lines, 2000, "the uncapped read lost lines");
+
+        // A capped read is a partial one, and must say so — the pane draws a
+        // marker from this, and claiming a truncated file is complete is worse
+        // than showing less of it.
+        assert!(
+            matches!(capped, PreviewContent::Text { truncated: true, .. }),
+            "a capped read must report itself truncated"
+        );
+        assert!(
+            matches!(full, PreviewContent::Text { truncated: false, .. }),
+            "a complete read must not report itself truncated"
+        );
+    }
+
+    /// `cells_only` must not disturb text, which has no protocol to choose.
+    #[tokio::test]
+    async fn cells_only_leaves_text_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+
+        let reg = crate::vfs::BackendRegistry::new();
+        let mut req = text_request(&path, None);
+        req.cells_only = true;
+        let content = load(reg.local(), req).await;
+
+        match content {
+            PreviewContent::Text { lines, .. } => assert_eq!(lines.len(), 2),
+            _ => panic!("expected text"),
+        }
     }
 }

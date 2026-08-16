@@ -176,6 +176,28 @@ pub trait Vfs: Send + Sync {
     async fn remove_dir(&self, path: &VPath) -> Result<()>;
     async fn rename(&self, from: &VPath, to: &VPath) -> Result<()>;
 
+    /// Set `path`'s permission bits.
+    ///
+    /// Defaults to refusing, so a backend that cannot do this says so rather
+    /// than reporting a success it did not perform — the same reasoning as
+    /// [`is_read_only`](Self::is_read_only), where a silent no-op reads as the
+    /// change having been made.
+    async fn set_mode(&self, path: &VPath, mode: u32) -> Result<()> {
+        let _ = (path, mode);
+        anyhow::bail!("this backend cannot change permissions")
+    }
+
+    /// Set `path`'s owner, group, or both. `None` leaves that one unchanged.
+    ///
+    /// Both are one call because the underlying operation is one call on every
+    /// backend — `chown(2)` and SFTP's SETSTAT each take the pair — and doing
+    /// them separately would make a half-applied change possible where the
+    /// system offers an all-or-nothing one.
+    async fn set_owner(&self, path: &VPath, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        let _ = (path, uid, gid);
+        anyhow::bail!("this backend cannot change ownership")
+    }
+
     async fn open_read(&self, path: &VPath) -> Result<Box<dyn VRead>>;
     /// Open for writing, creating and truncating. `len_hint` lets a backend
     /// preallocate or size its write pipeline.
@@ -239,6 +261,23 @@ pub trait Vfs: Send + Sync {
     /// Whether `dir_size` reports a true recursive total. The treemap uses this
     /// to explain why remote directory tiles are uniformly small.
     fn has_recursive_sizes(&self) -> bool {
+        false
+    }
+
+    /// Whether reading from this backend crosses a network.
+    ///
+    /// Distinct from `!BackendId::is_local()`, which asks "is this backend 0"
+    /// — an archive is a *registered* backend and so answers no to that, but
+    /// its members are read from a file on this machine. The costs that need
+    /// guarding (round trips, staging a download before an external renderer
+    /// can open it) apply to a server and not to an archive, so anything
+    /// pricing those must ask this instead.
+    ///
+    /// Getting the two confused is a recurring bug: it has variously stopped
+    /// the info panel previewing images inside archives, and made a PDF in an
+    /// archive report itself as "too large to fetch" when there was nothing to
+    /// fetch.
+    fn is_remote(&self) -> bool {
         false
     }
 

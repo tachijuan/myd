@@ -22,6 +22,30 @@ pub struct MainScreenState {
     /// Which view has focus: file tree or treemap.
     pub focus: FocusTarget,
     pub info_panel_hidden: bool,
+    /// Info panel width, as a percentage of this panel. Carried on
+    /// [`crate::panel::ViewPrefs`] and applied to every new screen.
+    pub info_panel_pct: u16,
+    /// Which editable field the info panel's cursor is on.
+    ///
+    /// Only drawn, and only meaningful, while the panel has focus.
+    pub info_field: crate::widget::file_info::InfoField,
+    /// Render hint: whether this panel's info panel holds the keyboard. Set by
+    /// the app before drawing, like `active`, since focus is app-level state.
+    pub info_active: bool,
+    /// Rows added to (or taken from) the metadata's share of the info panel,
+    /// set by `+` and `-`.
+    ///
+    /// A bias rather than an absolute height so it means the same thing at
+    /// every terminal size: the split is derived from [`META_ROWS`], and this
+    /// nudges it. Carried on [`crate::panel::ViewPrefs`] like the width.
+    pub info_meta_bias: i16,
+    /// The rect the info panel reserved for its preview sub-panel, or `None`
+    /// when it did not fit.
+    ///
+    /// Recorded during render and filled in by the app afterwards: the preview
+    /// content and the backend registry both live there, and `render_info` runs
+    /// inside `terminal.draw`, where starting I/O would be wrong.
+    pub info_preview_area: Option<Rect>,
     /// Render hint: whether this screen belongs to the active panel. In
     /// single-panel mode it is always the active one; in dual mode the app sets
     /// it before drawing each panel so the active panel's border stands out.
@@ -35,7 +59,11 @@ pub struct MainScreenState {
     /// in different directories can share a basename — keying on the name alone
     /// let one view's panel show the other's stale text. The focus is part of
     /// the key so switching views always re-reads the newly focused cursor.
-    cached_info_key: Option<(PathBuf, FocusTarget)>,
+    cached_info_key: Option<(
+        PathBuf,
+        FocusTarget,
+        Option<crate::widget::file_info::InfoField>,
+    )>,
     /// The most recent search regex, so `n` / `p` can repeat it to the next /
     /// previous match without re-prompting.
     last_search: Option<regex::Regex>,
@@ -131,6 +159,31 @@ fn bad_pattern_message(pattern: &str, err: &regex::Error) -> String {
 /// before they were taught to measure the terminal.
 const DEFAULT_VIEWPORT: usize = 20;
 
+/// Rows the preview sub-panel needs before it is worth drawing: a separator and
+/// enough content to be more than a tease.
+const MIN_PREVIEW_ROWS: u16 = 6;
+
+/// Columns below which a preview is unreadable — narrower than this and even a
+/// single token of source is truncated.
+const MIN_PREVIEW_COLS: u16 = 20;
+
+/// Rows the metadata gets when the panel is tall enough to have a preview.
+///
+/// The dense layout is a fixed size — name, type, size, the three editable
+/// fields, three timestamps and the path, plus a row for a directory's item
+/// count — so this is all of it with one row to spare. Everything above it goes
+/// to the preview, which is the part that can actually use more room.
+///
+/// `+` and `-` shift it by [`MainScreenState::info_meta_bias`], which is
+/// bounded by [`crate::prefs::MAX_META_BIAS`].
+const META_ROWS: u16 = 11;
+
+/// Rows the metadata keeps for itself before any preview is offered at all.
+///
+/// Below this the fields that matter — name, type, size — are already going, so
+/// the preview yields instead.
+const MIN_META_ROWS: u16 = 10;
+
 impl MainScreenState {
     pub fn new(root_path: PathBuf) -> Self {
         let tree = FileTree::new(root_path.clone(), SortMode::Largest, true, true);
@@ -141,6 +194,11 @@ impl MainScreenState {
             treemap,
             focus: FocusTarget::Tree,
             info_panel_hidden: true,
+            info_panel_pct: crate::prefs::DEFAULT_INFO_PCT,
+            info_field: crate::widget::file_info::InfoField::default(),
+            info_active: false,
+            info_meta_bias: 0,
+            info_preview_area: None,
             active: true,
             cached_info_text: Text::default(),
             cached_info_key: None,
@@ -165,6 +223,11 @@ impl MainScreenState {
             treemap,
             focus: FocusTarget::Tree,
             info_panel_hidden: true,
+            info_panel_pct: crate::prefs::DEFAULT_INFO_PCT,
+            info_field: crate::widget::file_info::InfoField::default(),
+            info_active: false,
+            info_meta_bias: 0,
+            info_preview_area: None,
             active: true,
             cached_info_text: Text::default(),
             cached_info_key: None,
@@ -201,6 +264,8 @@ impl MainScreenState {
     /// by construction rather than by every call site remembering.
     pub fn apply_view_prefs(&mut self, prefs: crate::panel::ViewPrefs) {
         self.info_panel_hidden = prefs.info_panel_hidden;
+        self.info_panel_pct = prefs.info_panel_pct;
+        self.info_meta_bias = prefs.info_meta_bias;
         self.focus = prefs.focus;
         self.tree.show_perms = prefs.show_perms;
         self.tree.show_times = prefs.show_times;
@@ -254,6 +319,17 @@ impl MainScreenState {
     /// several round trips, paid on every press of `s`.
     fn rebuild_treemap_and_info(&mut self) {
         self.rebuild_treemap();
+        self.cached_info_key = None;
+    }
+
+    /// Drop the cached info text so the next frame rebuilds it.
+    ///
+    /// For a change that alters what the panel *says* about an entry without
+    /// altering the listing — a new mode or owner. `refresh()` would also do
+    /// this, but it rebuilds the tree from disk and resets the cursor to the
+    /// root, which leaves the panel describing a different file than the one
+    /// just edited.
+    pub fn invalidate_info_cache(&mut self) {
         self.cached_info_key = None;
     }
 
@@ -885,29 +961,39 @@ impl ScreenState for MainScreenState {
         // that row to leave it clear. Falls back to the bottom of this panel.
         let footer_area = self.footer_rect.unwrap_or(chunks[1]);
 
+        // One split for both views: the width is a preference now, and two
+        // copies of the constraint would let the tree and the treemap drift to
+        // different widths for the same panel.
+        let (main_area, info_area) = if self.info_panel_hidden {
+            (content_area, None)
+        } else {
+            let pct = self
+                .info_panel_pct
+                .clamp(crate::prefs::MIN_INFO_PCT, crate::prefs::MAX_INFO_PCT);
+            let inner = Layout::horizontal([
+                Constraint::Percentage(100 - pct),
+                Constraint::Percentage(pct),
+            ])
+            .split(content_area);
+            (inner[0], Some(inner[1]))
+        };
+
         match self.focus {
-            FocusTarget::Tree => {
-                if self.info_panel_hidden {
-                    self.render_tree(frame, content_area);
-                } else {
-                    let inner =
-                        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
-                            .split(content_area);
-                    self.render_tree(frame, inner[0]);
-                    self.render_info(frame, inner[1]);
-                }
-            }
-            FocusTarget::Treemap => {
-                if self.info_panel_hidden {
-                    self.render_treemap(frame, content_area);
-                } else {
-                    let inner =
-                        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
-                            .split(content_area);
-                    self.render_treemap(frame, inner[0]);
-                    self.render_info(frame, inner[1]);
-                }
-            }
+            FocusTarget::Tree => self.render_tree(frame, main_area),
+            FocusTarget::Treemap => self.render_treemap(frame, main_area),
+        }
+        // Clear the sub-panel's rect whenever the info panel is not drawn.
+        //
+        // `render_info` is what records it, so hiding the panel leaves the rect
+        // from the last frame it *was* visible — and the app draws the preview
+        // into that rect afterwards, from outside this screen. The result was a
+        // stripe of file content floating over the tree with no panel around
+        // it, since the border had gone and the content had not.
+        if info_area.is_none() {
+            self.info_preview_area = None;
+        }
+        if let Some(area) = info_area {
+            self.render_info(frame, area);
         }
 
         self.render_footer(frame, footer_area);
@@ -1106,8 +1192,12 @@ impl MainScreenState {
                 .unwrap_or_else(|| (PathBuf::from("."), PathBuf::from("."))),
         };
 
-        // Recompute when the focused view changes or points somewhere new.
-        let key = (resolved, self.focus);
+        // Recompute when the focused view changes or points somewhere new, or
+        // when the field cursor moves — the cursor is drawn into the cached
+        // text, so a stale entry would pin it to whichever row it was on when
+        // the entry was built.
+        let field = self.info_active.then_some(self.info_field);
+        let key = (resolved, self.focus, field);
         if self.cached_info_key.as_ref() != Some(&key) {
             // A remote entry is described from the directory listing the tree
             // already holds. Inspecting it with `std::fs` would read the local
@@ -1124,11 +1214,13 @@ impl MainScreenState {
                     line.map(|l| l.is_dir).unwrap_or(false),
                     line.map(|l| l.is_symlink).unwrap_or(false),
                     size,
+                    line.and_then(|l| l.mode),
                     line.and_then(|l| l.mtime),
                     line.and_then(|l| l.atime),
+                    field,
                 )
             } else {
-                file_info::render_info_owned(&path, &self.tree.size_cache)
+                file_info::render_info_owned(&path, &self.tree.size_cache, field)
             };
             self.cached_info_key = Some(key);
             if let Some(started) = info_started {
@@ -1139,14 +1231,64 @@ impl MainScreenState {
             }
         }
 
-        let paragraph = Paragraph::new(self.cached_info_text.clone()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(self.border_color()))
-                .title(" Info "),
-        );
-        frame.render_widget(paragraph, area);
+        // The panel says so when it holds the keyboard, the way every other
+        // focusable pane does — and names the keys that only work from here,
+        // since nothing else on screen advertises them.
+        let (border, title) = if self.info_active {
+            (
+                Color::Cyan,
+                " Info — Enter edits, < > + - resize ".to_string(),
+            )
+        } else {
+            (self.border_color(), " Info ".to_string())
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(border))
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // The metadata is this panel's job; the preview is a bonus, so it only
+        // appears once the metadata has the room it needs. Below either
+        // threshold the metadata takes the whole panel, exactly as it did
+        // before the sub-panel existed — and `>` is the answer when it does not
+        // fit.
+        let (meta_area, preview_area) = if inner.width >= MIN_PREVIEW_COLS
+            && inner.height >= MIN_META_ROWS + MIN_PREVIEW_ROWS
+        {
+            // The metadata is a fixed handful of rows — nine for a local file,
+            // ten for a directory — so anything past that is space it cannot
+            // use. Give it what it needs and hand the rest to the preview,
+            // which can always show more.
+            //
+            // This used to cap the preview at a third of the panel, which meant
+            // a tall terminal grew the *metadata*: at sixty rows the fields
+            // took forty of them to say the same nine things, and the preview
+            // was left with the smaller share of a much larger panel.
+            let meta_rows = (META_ROWS as i16 + self.info_meta_bias).clamp(
+                MIN_META_ROWS as i16,
+                inner.height.saturating_sub(MIN_PREVIEW_ROWS).max(MIN_META_ROWS) as i16,
+            ) as u16;
+            let rows = Layout::vertical([
+                Constraint::Length(meta_rows),
+                Constraint::Min(MIN_PREVIEW_ROWS),
+            ])
+            .split(inner);
+            (rows[0], Some(rows[1]))
+        } else {
+            (inner, None)
+        };
+
+        frame.render_widget(Paragraph::new(self.cached_info_text.clone()), meta_area);
+
+        // Recorded, not drawn: the content lives on the app (which owns the one
+        // loader and the backend registry), so the app fills this rect after the
+        // panels have rendered. Recorded here for the same reason `sort_area`
+        // is — it is derived from the area handed in, and cannot be recovered
+        // from state alone.
+        self.info_preview_area = preview_area;
     }
 
     /// Border color for this screen's panels — bright cyan when active, dim gray

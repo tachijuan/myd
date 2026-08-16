@@ -21,6 +21,19 @@ pub struct ViewPrefs {
     /// Sort order, carried across screens so drilling into a directory keeps
     /// whatever order the user chose rather than snapping back to the default.
     pub sort_mode: crate::screen::SortMode,
+    /// Info panel width, as a percentage of the panel it sits in.
+    ///
+    /// Lives here rather than on the screen for the same reason the rest do —
+    /// a new screen per directory would otherwise snap it back on every `cd`.
+    /// Seeded from [`crate::prefs::Prefs`] at startup and written back when
+    /// changed, so it also survives a restart.
+    pub info_panel_pct: u16,
+    /// Rows added to the info panel's metadata share, set by `+` and `-`.
+    ///
+    /// Signed so it means "shift the split", which reads the same whatever the
+    /// terminal height — an absolute row count would mean something different
+    /// on every screen.
+    pub info_meta_bias: i16,
 }
 
 impl Default for ViewPrefs {
@@ -35,6 +48,8 @@ impl Default for ViewPrefs {
             show_perms: false,
             show_times: false,
             sort_mode: crate::screen::SortMode::default(),
+            info_panel_pct: crate::prefs::startup().info_panel_pct,
+            info_meta_bias: crate::prefs::startup().info_meta_bias,
         }
     }
 }

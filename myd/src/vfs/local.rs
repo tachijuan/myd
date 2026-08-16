@@ -181,6 +181,64 @@ impl Vfs for LocalFs {
         .await?
     }
 
+    async fn set_mode(&self, path: &VPath, mode: u32) -> Result<()> {
+        let p = path.path.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Only the permission bits are ours to set: `mode` comes from a
+                // dialog that parsed `644` or `rw-r--r--`, neither of which can
+                // express the file type, and passing the whole word through
+                // would clear the setuid and sticky bits a directory may rely
+                // on. Masked to 0o7777 so setuid/setgid/sticky survive when the
+                // user does type them.
+                let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+                std::fs::set_permissions(&p, perms)
+                    .with_context(|| format!("failed to set permissions on {}", p.display()))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (p, mode);
+                anyhow::bail!("permissions can only be changed on unix")
+            }
+        })
+        .await?
+    }
+
+    async fn set_owner(&self, path: &VPath, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        let p = path.path.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                // `chown` takes -1 for "leave this one alone", which is what
+                // lets owner and group be set independently in one call.
+                let uid = uid.unwrap_or(u32::MAX);
+                let gid = gid.unwrap_or(u32::MAX);
+                let c_path = std::ffi::CString::new(p.as_os_str().as_bytes())
+                    .with_context(|| format!("{} is not a valid path", p.display()))?;
+                // `lchown`, not `chown`: following a symlink here would change
+                // the owner of whatever it points at, which may be outside the
+                // tree entirely — the same reasoning that makes the recursive
+                // walk use `symlink_stat`.
+                let rc = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(anyhow::Error::new(err)
+                        .context(format!("failed to change owner of {}", p.display())));
+                }
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (p, uid, gid);
+                anyhow::bail!("ownership can only be changed on unix")
+            }
+        })
+        .await?
+    }
+
     async fn open_read(&self, path: &VPath) -> Result<Box<dyn VRead>> {
         let file = tokio::fs::File::open(&path.path)
             .await

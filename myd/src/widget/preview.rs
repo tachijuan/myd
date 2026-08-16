@@ -105,13 +105,35 @@ impl PreviewState {
         }
     }
 
-    /// What the pane is currently showing, if anything.
+    /// The loaded content, or `None` while a load is in flight.
+    ///
+    /// For [`render_compact`], which draws without the scroll and search
+    /// bookkeeping the full pane's render performs.
+    pub fn content(&self) -> Option<&PreviewContent> {
+        self.content.as_ref()
+    }
+
+    /// The file being previewed, known before the load finishes.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     pub fn key(&self) -> Option<&PreviewKey> {
         self.key.as_ref()
     }
 
     pub fn has_content(&self) -> bool {
         self.content.is_some()
+    }
+
+    /// Whether a load has been started and has not yet landed.
+    ///
+    /// Distinct from "no content": a pane that was never asked for anything has
+    /// nothing to show and nothing coming, and drawing "Loading…" for it would
+    /// promise content that never arrives. [`Self::begin_load`] names the file
+    /// it is fetching, so a title with no content is exactly a load in flight.
+    pub fn is_loading(&self) -> bool {
+        self.content.is_none() && !self.title.is_empty()
     }
 
     /// Note that a load is starting: clears the old content so a stale file is
@@ -513,6 +535,88 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut PreviewState, focused: 
         Paragraph::new(build_footer(state, focused)).style(Style::default().fg(Color::DarkGray)),
         footer_area,
     );
+}
+
+/// Draw a compact, non-interactive preview into `area`.
+///
+/// A cut-down [`render`] for the info panel's sub-panel. Deliberately not the
+/// same function:
+///
+/// - No [`Clear`]: the parent block already owns these cells, and clearing
+///   them again is wasted work on every frame.
+/// - No footer. The full pane's says "Tab to focus, q to close", and neither is
+///   true here — this box cannot take focus at all.
+/// - No scroll or search state is written, which is why it takes `&PreviewState`
+///   rather than `&mut`. A box that cannot be focused has nothing to scroll,
+///   and the type says so. It also means `graphics_area` is never set from
+///   here, so the single graphics surface the app tracks stays the full pane's.
+/// - Content is sliced to the visible rows rather than handed whole to
+///   `Paragraph`. The full pane clones its lines once when the user opens it;
+///   this one draws on every tick the info panel is up, and cloning a
+///   million-line file ten times a second is not the same trade.
+pub fn render_compact(frame: &mut Frame, area: Rect, state: &PreviewState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // A separator rather than a full border: a box inside a box would spend two
+    // of the six or so rows this gets on lines, and the panel already has an
+    // edge of its own.
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let rows = inner.height as usize;
+
+    match state.content() {
+        None if !state.is_loading() => {
+            // Nothing was asked for — a directory, or something the sub-panel
+            // declined. Draw an empty box rather than "Loading…", which would
+            // promise content that is never coming.
+        }
+        None => {
+            frame.render_widget(Paragraph::new("Loading…").style(dim), inner);
+        }
+        Some(PreviewContent::Note { message }) => {
+            frame.render_widget(
+                Paragraph::new(message.clone())
+                    .style(dim)
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                inner,
+            );
+        }
+        Some(PreviewContent::Text { lines, .. }) => {
+            let shown: Vec<Line> = lines.iter().take(rows).cloned().collect();
+            frame.render_widget(Paragraph::new(shown), inner);
+        }
+        Some(PreviewContent::Image { lines, .. }) => {
+            // Centred like the full pane's, since the renderers preserve aspect
+            // ratio and the result is usually narrower than the box.
+            let w = crate::widget::ansi::block_width(lines) as u16;
+            let pad = inner.width.saturating_sub(w.min(inner.width)) / 2;
+            let centred = Rect {
+                x: inner.x + pad,
+                y: inner.y,
+                width: inner.width.saturating_sub(pad),
+                height: inner.height,
+            };
+            let shown: Vec<Line> = lines.iter().take(rows).cloned().collect();
+            frame.render_widget(Paragraph::new(shown), centred);
+        }
+        Some(PreviewContent::Graphics { .. }) => {
+            // Unreachable by construction — the sub-panel's loads set
+            // `cells_only`, so a graphics payload is never produced for it. Said
+            // rather than left blank, because the alternative to this arm is an
+            // empty hole that looks like a bug.
+            frame.render_widget(Paragraph::new("[image]").style(dim), inner);
+        }
+    }
 }
 
 /// Title: the filename, plus the scroll position when there is more than fits.
@@ -1000,5 +1104,98 @@ mod tests {
         draw(&mut s, 40, 14);
         let area = s.content_area.expect("recorded");
         assert!(area.height > 0 && area.width > 0);
+    }
+
+    /// Render the compact variant and return the screen as text.
+    fn draw_compact(s: &PreviewState, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render_compact(f, f.area(), s)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_compact_render_shows_the_content() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), text(10));
+        let screen = draw_compact(&s, 30, 8);
+        assert!(screen.contains("line 0"), "no content: {screen}");
+    }
+
+    /// The compact box has no footer — the full pane's advertises `Tab to
+    /// focus` and `q to close`, and neither is true of something that cannot
+    /// take focus.
+    #[test]
+    fn the_compact_render_has_no_footer() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), text(10));
+        let screen = draw_compact(&s, 40, 8);
+        assert!(!screen.contains("Tab"), "compact drew a footer: {screen}");
+        assert!(!screen.contains("close"), "compact drew a footer: {screen}");
+    }
+
+    /// It must not write scroll state: an unfocusable box has nothing to
+    /// scroll, and `graphics_area` in particular is read by the code that
+    /// flushes the one image the app tracks.
+    #[test]
+    fn the_compact_render_leaves_the_state_alone() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), text(100));
+        // Give it geometry from a full render first, so there is state to
+        // disturb.
+        draw(&mut s, 40, 14);
+        let before = (s.viewport, s.max_scroll, s.content_area, s.graphics_area);
+
+        let _ = draw_compact(&s, 20, 6);
+        assert_eq!(
+            (s.viewport, s.max_scroll, s.content_area, s.graphics_area),
+            before,
+            "the compact render wrote state the full pane owns"
+        );
+    }
+
+    /// A tiny box must clamp rather than index outside the buffer.
+    #[test]
+    fn the_compact_render_survives_a_tiny_area() {
+        let mut s = PreviewState::new();
+        s.set_content(key(), text(50));
+        for (w, h) in [(1, 1), (2, 1), (1, 3), (5, 2), (20, 1)] {
+            let _ = draw_compact(&s, w, h);
+        }
+    }
+
+    /// A load that has not landed says so rather than drawing an empty box that
+    /// looks like an empty file.
+    #[test]
+    fn the_compact_render_says_when_it_is_loading() {
+        let mut s = PreviewState::new();
+        s.begin_load("x.txt".to_string());
+        assert!(draw_compact(&s, 30, 6).contains("Loading"));
+    }
+
+    /// Graphics can never reach here (the sub-panel's loads set `cells_only`),
+    /// but if one did it must say so rather than leave a hole that reads as a
+    /// bug.
+    #[test]
+    fn the_compact_render_names_a_graphics_payload_rather_than_leaving_a_hole() {
+        let mut s = PreviewState::new();
+        s.set_content(
+            key(),
+            PreviewContent::Graphics {
+                payload: "\x1b_Gf=100;AAAA\x1b\\".to_string(),
+                rows: 4,
+                backend: "timg",
+                page: 0,
+                pages: None,
+            },
+        );
+        assert!(draw_compact(&s, 30, 8).contains("[image]"));
     }
 }

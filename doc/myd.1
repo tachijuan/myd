@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.40.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.41.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -283,7 +283,11 @@ directories end in a slash, as in
 so a tile says whether there is anything to open.
 .TP
 .B Ctrl+p
-Toggle the info panel sidebar. Hidden by default.
+Toggle the info panel sidebar. Hidden by default. \fBTab\fR moves focus into
+it, where \fBj\fR/\fBk\fR walk the editable fields, \fBEnter\fR edits one, and
+\fB<\fR/\fB>\fR resize the panel. See
+.B INFO PANEL
+below.
 .TP
 .B Ctrl+l
 Redraw the whole screen, as in a shell or
@@ -484,9 +488,11 @@ Show or hide the transfer panel.
 .TP
 .B Tab
 Rotates through every visible pane in turn \(em each browser panel from left to
-right, then the transfer panel \(em and wraps back to the first. Only one pane
-shows the bright focus border at a time, and the footer switches to describe
-whichever pane that is. While the transfer
+right, each followed immediately by its own info panel when that is shown, then
+the transfer panel \(em and wraps back to the first. Only one pane shows the
+bright focus border at a time, and the footer switches to describe whichever
+pane that is. Focusing an info panel makes the panel it belongs to the active
+one, since the fields it edits are that panel's selection. While the transfer
 panel has focus, \fBj\fR / \fBk\fR move between transfers, \fBK\fR,
 \fBDelete\fR or \fBBackspace\fR cancels the selected one (after a
 confirmation), \fBC\fR clears the finished ones, and \fBEsc\fR returns to the
@@ -653,6 +659,14 @@ Besides the transfer tunables above, myd reads:
 .B PATH
 Searched to resolve the program named in the \fBO\fR dialog, when that program
 is given as a bare name rather than a path.
+.TP
+.B MYD_PREFS
+Names the preferences file outright, ahead of the usual lookup. Preferences
+otherwise live in \fB$XDG_CONFIG_HOME/myd/prefs.toml\fR, falling back to
+\fB~/.config/myd/prefs.toml\fR. The file is written only on exit, and only when
+a preference has actually changed; a missing or malformed one costs the
+settings rather than the session, and is left alone so it can be repaired by
+hand.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes, or type the mode's
 number (\fB1\fR\-\fB8\fR, as listed in the \fBg s\fR menu) to go straight to it:
@@ -729,31 +743,94 @@ span of consecutive rows and the treemap has no such order, so it applies in the
 tree view only and says so if pressed here.
 .SH INFO PANEL
 The right-hand sidebar (hidden by default; toggle with \fBCtrl+p\fR)
-displays detailed metadata for the currently selected item:
+describes the selected item, one field per row:
 .TP
 .B Name
 The file or directory name.
 .TP
 .B Type
-Whether the item is a file or directory.
+File, Directory, or Symlink.
 .TP
 .B Size
 Human-readable file size (e.g., "245 MB").
 .TP
-.B Contents
+.B Items
 For directories: the count of files and subdirectories.
 .TP
-.B Permissions
+.B Perms
 Standard Unix permission string (e.g., \fBdrwxr-xr-x\fR).
 .TP
 .B Owner / Group
 The owning user and group.
 .TP
-.B Timestamps
+.B Made / Mod / Acc
 Creation, modification, and last access times.
 .TP
 .B Path
 The absolute path to the item.
+.SS Editing permissions and ownership
+Press \fBTab\fR to move the keyboard into the panel; its border turns cyan and
+a marker picks out the field the cursor is on. \fBj\fR and \fBk\fR walk the three
+editable fields \(em permissions, owner, and group \(em and \fBEnter\fR opens a
+dialog for the one under the cursor. \fBEsc\fR hands focus back to the tree
+without hiding the panel.
+.PP
+Permissions are typed either octal (\fB644\fR, \fB0644\fR) or symbolic
+(\fBrw\-r\-\-r\-\-\fR, with or without the leading type character, so what the
+panel displays can be typed straight back). Owner and group take a name or a
+numeric id. A value that cannot be read is refused before anything is changed,
+rather than being guessed at.
+.PP
+The change applies to the tagged files, or to the file under the cursor when
+nothing is tagged \(em the same rule \fBD\fR, \fBc\fR and \fBm\fR follow. When
+exactly one directory is selected the dialog offers
+.BR "Apply to everything inside" ,
+which walks the subtree. The walk changes symlinks but never follows them, so
+it cannot leave the tree; and it applies to a directory only after its
+contents, so removing the \fBx\fR bit cannot cut off the rest of the walk.
+.PP
+This works on local and SFTP panels. Archives are read-only and refuse with a
+notice.
+.SS Width and height
+\fB<\fR and \fB>\fR move the divider left and right in steps of five percent \(em
+so \fB<\fR widens the panel and \fB>\fR narrows it \(em between
+15% and 60% of the pane.
+.PP
+\fB+\fR and \fB\-\fR move the split between the metadata and the preview beneath
+it, a row at a time: \fB+\fR grows the preview, \fB\-\fR gives the rows back.
+Neither can squeeze the other out \(em the metadata keeps enough rows for the
+fields that matter, and the preview keeps enough to be worth drawing.
+.PP
+The metadata is a fixed size, so by default everything past it goes to the
+preview: a taller terminal makes the preview taller rather than spacing out the
+same dozen fields. Both settings are remembered across directories and, on exit,
+written to
+.IR ~/.config/myd/prefs.toml .
+.SS Preview
+When the panel is wide and tall enough, the lower part of it shows the start of
+the selected file, using the same reader as the full preview: highlighted text,
+a rendered image, or a note saying why neither applies. It follows the cursor
+and cannot be focused \(em it is a glance, and \fBspace\fR opens the full pane
+for anything more.
+.PP
+An archive previews as its table of contents \(em member names alone here,
+without the permission, size and timestamp columns the full pane shows, since
+those are laid out before the name and in a box this narrow would be all that
+fits. A file inside an archive previews like any other: members are read from a
+file on this machine, so none of the remote handling applies to them. A
+directory shows nothing, since there is nothing to read.
+.PP
+It declines the work that is too expensive to repeat on every cursor move:
+remote images are not fetched, only the first few kilobytes of a text file are
+read, and anything slow to open \(em an image, a PDF, an archive, or a file on
+a server \(em waits for the cursor to settle before it starts.
+.PP
+In a split, each panel previews its own cursor's file and keeps doing so
+whether or not it has focus \(em moving between panels changes which one is
+outlined and nothing else. Images render as cells here
+rather than through a graphics protocol, so they never disturb the full pane's
+image. Below roughly 20 columns or 16 rows the preview yields and the metadata
+takes the whole panel; \fB>\fR is the answer when it does not fit.
 .PP
 Hide or show the panel with \fBCtrl+p\fR.
 .SH FILE PREVIEW
@@ -763,11 +840,13 @@ hand focus back to the tree with \fBEsc\fR or \fBq\fR and moving the cursor
 re-reads the preview, so a directory can be walked and its contents watched.
 .PP
 Text is syntax highlighted, using the file's extension or its \fB#!\fR line when
-it has none. Source files over 64 KB are shown as plain text instead:
-highlighting is linear in the text and a 4300-line file costs about a quarter of
-a second, which is not worth the colours. Only the first megabyte of a large file
-is read; the footer reads \fBtruncated\fR when that happened. A binary file is
-reported with its size rather than written out as control characters.
+it has none. Highlighting is linear in the text and a 4300-line file costs about
+a quarter of a second, so it is budgeted: the first 64 KB of a file is coloured
+and the rest is shown plain. A long file therefore looks the same at the top
+however long it is, rather than losing its colours entirely once it crosses a
+threshold. Only the first megabyte of a large file is read; the footer reads
+\fBtruncated\fR when that happened. A binary file is reported with its size
+rather than written out as control characters.
 .PP
 Markdown has its own highlighter rather than going through the general grammar,
 which makes it roughly four thousand times faster (37 microseconds against 170
