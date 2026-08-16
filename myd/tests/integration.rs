@@ -7032,6 +7032,11 @@ async fn help_scroll_keys_move_and_clamp() {
     );
 }
 
+/// Tall enough for the whole help list. It grows as bindings are added, so this
+/// is deliberately generous rather than exact — the point of the test below is
+/// that a terminal with room to spare says nothing about scrolling.
+const HELP_TALL_ENOUGH: u16 = 160;
+
 /// A tall terminal shows everything, so no scroll indicator is needed.
 #[tokio::test]
 async fn help_without_overflow_shows_no_scroll_hint() {
@@ -7042,7 +7047,7 @@ async fn help_without_overflow_shows_no_scroll_hint() {
     app.handle_key_for_test(char_key('?'));
     // Tall enough for the whole list, which grows as categories are added — the
     // preview pane's keys took it past 100 rows.
-    let text = help_text(&mut app, 80, 130);
+    let text = help_text(&mut app, 80, HELP_TALL_ENOUGH);
     assert!(
         !text.contains("to scroll"),
         "a terminal tall enough for the whole list should not advertise scrolling"
@@ -15318,3 +15323,350 @@ async fn a_filter_inside_an_archive_unwinds_one_step_at_a_time() {
 
 
 
+
+// --- Open with (`O`) -------------------------------------------------------
+
+/// A directory with two plain files, for driving the open dialog.
+fn open_with_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("beta.txt"), b"b").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn capital_o_opens_the_open_with_dialog() {
+    use myd::app::FileBrowser;
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    assert_eq!(app.modal_kind_for_test(), "none");
+    app.handle_key_for_test(char_key('O'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "open",
+        "O should open the run-a-program dialog"
+    );
+}
+
+#[tokio::test]
+async fn lowercase_o_still_goes_to_the_default_app() {
+    use myd::app::FileBrowser;
+
+    // The new binding must not have displaced the old one.
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('o'));
+    assert_ne!(
+        app.modal_kind_for_test(),
+        "open",
+        "lowercase o must not open the dialog"
+    );
+}
+
+#[tokio::test]
+async fn esc_closes_the_open_dialog_without_running_anything() {
+    use crossterm::event::KeyCode;
+    use myd::app::FileBrowser;
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    // Assert the dialog is actually up before closing it: without this the
+    // test passes when `O` does nothing at all, which is not what it checks.
+    assert_eq!(app.modal_kind_for_test(), "open");
+    app.handle_key_for_test(char_key('v'));
+    app.handle_key_for_test(key(KeyCode::Esc));
+    assert_eq!(app.modal_kind_for_test(), "none", "Esc closes the dialog");
+    assert_eq!(
+        app.last_open_command_for_test(),
+        None,
+        "cancelling must not record a command"
+    );
+}
+
+#[tokio::test]
+async fn the_open_dialog_takes_its_letters_as_text_not_commands() {
+    use myd::app::FileBrowser;
+
+    // `q` would quit and `j` would move a cursor if the dialog did not own its
+    // keys. It is a form; every printable character belongs to the field.
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    for c in "qjk".chars() {
+        assert!(
+            app.handle_key_for_test(char_key(c)),
+            "{} must not quit while the dialog is up",
+            c
+        );
+    }
+    let dialog = app.open_dialog_for_test().expect("the dialog is still up");
+    assert_eq!(dialog.command(), "qjk");
+}
+
+#[tokio::test]
+async fn the_open_dialog_acts_on_the_tagged_files() {
+    use myd::app::FileBrowser;
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag both files. The cursor starts on the root directory row, so step onto
+    // the first file before tagging anything.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+
+    app.handle_key_for_test(char_key('O'));
+    let dialog = app.open_dialog_for_test().expect("the dialog is up");
+    assert_eq!(dialog.targets().len(), 2, "both tagged files are targets");
+    let names: Vec<String> = dialog
+        .targets()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.contains(&"alpha.txt".to_string()) && names.contains(&"beta.txt".to_string()),
+        "both tagged files should be targets, got {:?}",
+        names
+    );
+}
+
+#[tokio::test]
+async fn the_untagged_cursor_line_is_the_target() {
+    use myd::app::FileBrowser;
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('O'));
+    let dialog = app.open_dialog_for_test().expect("the dialog is up");
+    assert_eq!(dialog.targets().len(), 1, "the cursor's file is the target");
+    assert_eq!(
+        dialog.targets()[0].file_name().unwrap(),
+        "alpha.txt",
+        "with nothing tagged, O acts on the highlighted row"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_program_is_reported_rather_than_run() {
+    use crossterm::event::KeyCode;
+    use myd::app::FileBrowser;
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    for c in "myd-no-such-program-anywhere".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a program that cannot be found should say so"
+    );
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("myd-no-such-program-anywhere"),
+        "the message should name the program: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn a_successful_run_is_remembered_and_leaves_no_modal() {
+    use crossterm::event::KeyCode;
+    use myd::app::FileBrowser;
+
+    // `true` ignores its arguments and exits 0, so this exercises the whole
+    // suspend/run/restore path without needing a terminal.
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    for c in "true".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "a clean exit needs no report"
+    );
+    assert_eq!(
+        app.last_open_command_for_test(),
+        Some("true"),
+        "the command is offered back next time"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_program_reports_its_exit_status() {
+    use crossterm::event::KeyCode;
+    use myd::app::FileBrowser;
+
+    // Once the screen comes back there is nothing left to see, so a non-zero
+    // exit has to be said out loud.
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    for c in "false".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(KeyCode::Enter));
+
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("exit status 1"),
+        "the exit status should be reported: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn the_last_command_comes_back_as_the_default() {
+    use crossterm::event::KeyCode;
+    use myd::app::FileBrowser;
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    for c in "true".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(KeyCode::Enter));
+
+    app.handle_key_for_test(char_key('O'));
+    let dialog = app.open_dialog_for_test().expect("the dialog is up");
+    assert_eq!(
+        dialog.command(),
+        "true",
+        "running one program over a series of files should not mean retyping it"
+    );
+}
+
+#[tokio::test]
+async fn the_open_dialog_renders_over_the_tree() {
+    use myd::app::FileBrowser;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|f| app.render_for_test(f)).unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..24u16 {
+        for x in 0..90u16 {
+            text.push_str(buf[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    assert!(text.contains("Open with"), "the dialog should be titled");
+    assert!(text.contains("Command"), "the command field should be labelled");
+    assert!(text.contains("[ OK ]"), "OK should be drawn");
+    assert!(text.contains("[ Cancel ]"), "Cancel should be drawn");
+    assert!(
+        !text.contains("[ Terminal ]"),
+        "the Terminal button was removed and must not come back"
+    );
+    assert!(text.contains("alpha.txt"), "the summary should name the file");
+}
+
+#[tokio::test]
+async fn the_open_dialog_survives_a_tiny_terminal() {
+    use myd::app::FileBrowser;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('O'));
+    assert_eq!(app.modal_kind_for_test(), "open", "the dialog must be up");
+
+    for (w, h) in [(1u16, 1u16), (2, 3), (10, 4), (40, 2), (90, 24)] {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| app.render_for_test(f))
+            .unwrap_or_else(|e| panic!("open dialog panicked at {}x{}: {}", w, h, e));
+    }
+}
+
+#[tokio::test]
+async fn opening_with_a_program_is_refused_inside_an_archive() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(
+        !app.panel_backend_for_test(0).is_local(),
+        "the panel should be inside the archive"
+    );
+
+    app.handle_key_for_test(char_key('O'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "an archive entry has no path to hand a program"
+    );
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("archive"),
+        "the message should say why: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn a_directory_can_be_the_target() {
+    use myd::app::FileBrowser;
+
+    // `O` on the root row targets the directory itself rather than refusing.
+    // Plenty of programs take a directory — `du`, `ls`, an editor opening a
+    // project — so this is a real selection, not a degenerate one.
+    let dir = open_with_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('O'));
+    let dialog = app.open_dialog_for_test().expect("the dialog is up");
+    assert_eq!(dialog.targets().len(), 1);
+    assert!(
+        dialog.targets()[0].is_dir(),
+        "the cursor starts on the root directory row"
+    );
+}

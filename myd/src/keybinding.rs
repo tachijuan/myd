@@ -79,6 +79,8 @@ pub enum Action {
     ToggleMouse,
     /// Hand the selected entry to the desktop's default application.
     OpenWithDefaultApp,
+    /// Ask which program to run, then run it over the selection.
+    OpenWith,
     /// Browse without measuring directory sizes, and back again.
     ToggleShallow,
     /// Show or hide the tree's `ls -l` permissions column.
@@ -253,6 +255,7 @@ impl KeyBindingHandler {
             KeyCode::Char('H') => Some(Action::ToggleHidden),
             KeyCode::Char('B') => Some(Action::ToggleBar),
             KeyCode::Char('o') => Some(Action::OpenWithDefaultApp),
+            KeyCode::Char('O') => Some(Action::OpenWith),
             KeyCode::Char('S') => Some(Action::ToggleShallow),
             KeyCode::Char('P') => Some(Action::TogglePerms),
             KeyCode::Char('T') => Some(Action::ToggleTimes),

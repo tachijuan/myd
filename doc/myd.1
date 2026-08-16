@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.35.6" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.40.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -395,6 +395,35 @@ Remote entries are refused: those launchers only understand local paths, and a
 remote path either fails or opens an unrelated local file that happens to share
 it. Copy the file across first with \fBc\fR.
 .TP
+.B O
+Open with a program you name. A dialog asks for a command line; the selection is
+appended to it and the result is run.
+.IP
+The command is split on whitespace, honouring single and double quotes so a
+program under a path with a space in it can still be named. It is
+.I not
+passed to a shell, so there is no expansion, no globbing and no \fB$VAR\fR \(em
+a filename can never be read as syntax. A bare name is looked up on \fBPATH\fR;
+anything containing a
+.B /
+is used as written.
+.IP
+The files come after your own arguments, as absolute paths: with two files
+tagged, \fBvim \-v\fR runs \fBvim \-v /abs/one /abs/two\fR. As everywhere else,
+the tagged files are the target when there are any, and the selected one
+otherwise.
+.IP
+myd leaves the alternate screen while the program runs and takes it back when it
+exits, so a full\-screen editor or pager behaves exactly as it would from the
+shell. A non\-zero exit status is reported, since it would otherwise vanish with
+the screen.
+.IP
+The dialog's buttons are \fBOK\fR and \fBCancel\fR. \fBTab\fR reaches them and
+never presses one; \fBEnter\fR in the command field is the same as \fBOK\fR.
+.IP
+Refused inside an archive and on remote panels, for the same reason \fBo\fR is:
+there is no path on this machine to give the program.
+.TP
 .B S
 Browse without measuring directory sizes, and back again.
 .IP
@@ -618,6 +647,12 @@ Concurrent transfers, and files per directory level (default 16).
 .B MYD_GLOBAL_CONCURRENCY
 Ceiling on concurrent operations during a recursive copy (default 192). Without
 it the per-level windows multiply.
+.SH ENVIRONMENT
+Besides the transfer tunables above, myd reads:
+.TP
+.B PATH
+Searched to resolve the program named in the \fBO\fR dialog, when that program
+is given as a bare name rather than a path.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes, or type the mode's
 number (\fB1\fR\-\fB8\fR, as listed in the \fBg s\fR menu) to go straight to it:

@@ -16,10 +16,65 @@ use crate::vfs::{BackendRegistry, VPath};
 use crate::widget::confirm_dialog::ConfirmDialog;
 use crate::widget::help::{render_help, HelpState};
 use crate::widget::input_dialog::InputDialog;
+use crate::widget::open_dialog::{OpenDialog, OpenDialogOutcome};
 use crate::widget::sort_menu::{SortMenu, SortMenuOutcome};
 use crate::widget::progress::{OpProgress, ProgressOverlay};
 use crate::widget::transfer_panel;
 use crate::widget::treemap::FocusTarget;
+
+/// Take the terminal: raw mode, alternate screen, mouse capture, hidden cursor.
+///
+/// Paired with [`leave_tui`]. Both exist as free functions because there are now
+/// three callers between them — the guard, [`FileBrowser::run`], and the suspend
+/// around an external program — and a second copy of either would eventually
+/// enable something the other did not undo.
+fn enter_tui() -> std::io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::Hide,
+    )
+}
+
+/// Give the terminal back: cooked mode, main screen, visible cursor.
+///
+/// Every step is best-effort. This runs on the way out — including from a panic,
+/// via [`TerminalGuard`] — and stopping at the first error would leave the
+/// terminal in a worse state than finishing the rest.
+fn leave_tui() {
+    let mut stdout = std::io::stdout();
+    // Remove any image still on screen before handing the terminal back.
+    //
+    // A kitty image is an object the terminal re-composites and is not part of
+    // the alternate screen's cells, so leaving that screen does not take it
+    // with us — it needs its own delete. iTerm2 and sixel images belong to
+    // cells, which *should* go with the alternate screen, but erasing them
+    // first is cheap and does not depend on that being true of every build.
+    let protocol = crate::preview::graphics::protocol();
+    if let Some(seq) = crate::preview::graphics::clear_sequence(protocol) {
+        let _ = stdout.write_all(seq.as_bytes());
+    } else if crate::preview::graphics::needs_region_erase(protocol) {
+        // Erase the whole alternate screen rather than tracking where the
+        // image was: this runs once, on the way out.
+        let _ = stdout.write_all(b"\x1b[2J");
+    }
+    // Flush any pending output before cleanup.
+    let _ = stdout.flush();
+    // Disable raw mode (restores cooked mode for normal terminal I/O).
+    let _ = crossterm::terminal::disable_raw_mode();
+    // Leave alternate screen, disable mouse capture, show cursor.
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::cursor::Show,
+    );
+    // Flush again to ensure all control sequences are sent.
+    let _ = stdout.flush();
+}
 
 /// Drop guard that restores terminal state even if the app panics or is interrupted.
 /// Disables raw mode, leaves alternate screen, shows cursor, and flushes output.
@@ -27,35 +82,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let mut stdout = std::io::stdout();
-        // Remove any image still on screen before handing the terminal back.
-        //
-        // A kitty image is an object the terminal re-composites and is not part of
-        // the alternate screen's cells, so leaving that screen does not take it
-        // with us — it needs its own delete. iTerm2 and sixel images belong to
-        // cells, which *should* go with the alternate screen, but erasing them
-        // first is cheap and does not depend on that being true of every build.
-        let protocol = crate::preview::graphics::protocol();
-        if let Some(seq) = crate::preview::graphics::clear_sequence(protocol) {
-            let _ = stdout.write_all(seq.as_bytes());
-        } else if crate::preview::graphics::needs_region_erase(protocol) {
-            // Erase the whole alternate screen rather than tracking where the
-            // image was: this runs once, on the way out.
-            let _ = stdout.write_all(b"\x1b[2J");
-        }
-        // Flush any pending output before cleanup.
-        let _ = stdout.flush();
-        // Disable raw mode (restores cooked mode for normal terminal I/O).
-        let _ = crossterm::terminal::disable_raw_mode();
-        // Leave alternate screen, disable mouse capture, show cursor.
-        let _ = crossterm::execute!(
-            stdout,
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
-            crossterm::cursor::Show,
-        );
-        // Flush again to ensure all control sequences are sent.
-        let _ = stdout.flush();
+        leave_tui();
     }
 }
 
@@ -76,6 +103,8 @@ pub enum Modal {
     SortMenu(SortMenu),
     /// Regex rename over the tagged files, opened by `gr`.
     Rename(crate::widget::rename_dialog::RenameDialog),
+    /// Run a program of the user's choosing over the selection, opened by `O`.
+    Open(crate::widget::open_dialog::OpenDialog),
 }
 
 /// Context for modal operations.
@@ -304,6 +333,13 @@ pub struct FileBrowser {
     /// guard on an irreversible operation should be a thing you opt into while
     /// you are doing it, not a setting you can leave on and forget about.
     skip_delete_confirm: bool,
+    /// The last command `O` ran, offered back as the next dialog's default.
+    ///
+    /// In memory only, like `skip_delete_confirm` above but for a different
+    /// reason: this one is a convenience rather than a guard, and a command line
+    /// remembered across runs would be a surprising thing to press Enter on
+    /// weeks later without reading.
+    last_open_command: Option<String>,
     /// How many times the terminal bell has been rung. Tests cannot hear it, so
     /// they count it instead.
     bells_rung: usize,
@@ -496,6 +532,7 @@ impl FileBrowser {
             force_repaint: false,
             shallow_default: false,
             skip_delete_confirm: false,
+            last_open_command: None,
             bells_rung: 0,
         }
     }
@@ -572,14 +609,7 @@ impl FileBrowser {
         // user had typed it. Cached, so this is the only time it costs anything.
         let _ = crate::preview::graphics::protocol();
 
-        crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::Hide,
-        )?;
+        enter_tui()?;
         self.mouse_captured = true;
 
         // Insert guard FIRST so any early return still cleans up.
@@ -920,6 +950,7 @@ impl FileBrowser {
             Modal::Input(d) => d.render(f, full),
             Modal::SortMenu(m) => m.render(f, full, sort_anchor),
             Modal::Rename(d) => d.render(f, full),
+            Modal::Open(d) => d.render(f, full),
             Modal::Operation { verb } => {
                 let overlay = match &op_progress {
                     Some(p) => ProgressOverlay::for_operation(verb, p),
@@ -1463,7 +1494,21 @@ impl FileBrowser {
             Modal::Help(_) => "help",
             Modal::SortMenu(_) => "sort_menu",
             Modal::Rename(_) => "rename",
+            Modal::Open(_) => "open",
         }
+    }
+
+    /// The open dialog, for tests that check what it is offering.
+    pub fn open_dialog_for_test(&self) -> Option<&OpenDialog> {
+        match &self.modal {
+            Modal::Open(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The command `O` would offer back next time, for tests.
+    pub fn last_open_command_for_test(&self) -> Option<&str> {
+        self.last_open_command.as_deref()
     }
 
 
@@ -1681,6 +1726,20 @@ impl FileBrowser {
                 };
                 let outcome = dialog.click_at(x, y);
                 return self.apply_rename_dialog_outcome(outcome);
+            }
+            return true;
+        }
+
+        // Same contract for the open dialog: a click on a button presses it, and
+        // anything else is swallowed rather than dismissing — this one launches
+        // a program, so a stray click is the last thing that should decide it.
+        if matches!(self.modal, Modal::Open(_)) {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Modal::Open(dialog) = &mut self.modal else {
+                    return true;
+                };
+                let outcome = dialog.click_at(x, y);
+                return self.apply_open_dialog_outcome(outcome);
             }
             return true;
         }
@@ -2736,6 +2795,142 @@ impl FileBrowser {
         }
     }
 
+    /// Refuse `O` when the selection is not a set of paths on this machine.
+    ///
+    /// Returns true when it refused, having put the reason on screen. The two
+    /// cases share "there is nothing here to hand to a local program", but the
+    /// way out differs enough to be worth saying which one applies — the same
+    /// split [`Self::open_selection_externally`] makes.
+    fn refuse_open_with_if_not_local(&mut self) -> bool {
+        let panel = self.active_panel();
+        if self.backends.get(panel.backend).is_read_only() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot run a program on a file inside an archive. \
+                 Copy it out first (c), then open the copy.",
+            ));
+            return true;
+        }
+        if !panel.backend.is_local() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot run a local program on remote files. Copy them across first (c).",
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// Open the "run a program over the selection" dialog.
+    fn open_with_program(&mut self) {
+        if self.refuse_open_with_if_not_local() {
+            return;
+        }
+        let targets = self.selection_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let mut dialog = OpenDialog::new(targets);
+        // Offer the last command back. Re-running one program over a series of
+        // files is the common case, and retyping it every time is the friction
+        // this is meant to remove.
+        if let Some(last) = &self.last_open_command {
+            dialog = dialog.with_command(last.clone());
+        }
+        self.modal = Modal::Open(dialog);
+    }
+
+    /// Act on what the open dialog decided. Returns false only to quit, which it
+    /// never does — the signature matches the other modal handlers.
+    fn apply_open_dialog_outcome(&mut self, outcome: OpenDialogOutcome) -> bool {
+        match outcome {
+            OpenDialogOutcome::Continue => true,
+            OpenDialogOutcome::Cancelled => {
+                self.modal = Modal::None;
+                true
+            }
+            OpenDialogOutcome::Run { command } => {
+                // Take the targets from the dialog rather than re-reading the
+                // selection: the dialog said what it was going to act on, and
+                // that promise should hold even if something moved underneath.
+                let targets = match &self.modal {
+                    Modal::Open(d) => d.targets().to_vec(),
+                    _ => Vec::new(),
+                };
+                self.modal = Modal::None;
+                self.last_open_command = Some(command.clone());
+                self.run_open_command(&command, &targets);
+                true
+            }
+        }
+    }
+
+    /// Parse `command`, resolve it, and run it over `targets`.
+    fn run_open_command(&mut self, command: &str, targets: &[PathBuf]) {
+        let Some((program, args)) = crate::utils::opener::split_command(command) else {
+            return;
+        };
+        let program = match crate::utils::opener::resolve_program(&program) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(command = %command, error = %e, "could not resolve program");
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!("{}", e)));
+                return;
+            }
+        };
+        match self.run_program_suspended(&program, &args, targets) {
+            Ok(status) if !status.success() => {
+                // A non-zero exit is the program's own business, not an error in
+                // myd — but it is invisible once the screen comes back, so say
+                // it happened rather than let the user wonder.
+                let code = status
+                    .code()
+                    .map(|c| format!("exit status {}", c))
+                    .unwrap_or_else(|| "killed by a signal".to_string());
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                    "{} finished with {}.",
+                    program.display(),
+                    code
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(program = %program.display(), error = %e, "could not run program");
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!("{}", e)));
+            }
+        }
+        // The directory may look different now — the program may well have
+        // written to it, which is often the entire point of running it.
+        self.active_panel_mut().current_screen_mut().refresh();
+    }
+
+    /// Hand the terminal to `program`, wait for it to finish, and take it back.
+    ///
+    /// The child inherits this process's streams so that an editor or a pager
+    /// gets the real terminal and behaves exactly as it would from a shell.
+    ///
+    /// The restore is unconditional: if the spawn fails, myd would otherwise
+    /// carry on drawing an alternate screen it had already left, which looks
+    /// like a hang and is not recoverable from inside the app.
+    fn run_program_suspended(
+        &mut self,
+        program: &Path,
+        args: &[String],
+        files: &[PathBuf],
+    ) -> Result<std::process::ExitStatus> {
+        leave_tui();
+        let result = crate::utils::opener::run_foreground(program, args, files);
+        let restored = enter_tui();
+        // `enter_tui` re-enables mouse capture, so the flag has to agree with it
+        // — otherwise `toggle_mouse_capture` inverts the wrong way afterwards.
+        self.mouse_captured = true;
+        // The child owned the screen and ratatui's buffer no longer describes
+        // what is on it. `force_repaint` clears before the next draw.
+        self.force_repaint = true;
+        if let Err(e) = restored {
+            tracing::error!(error = %e, "could not restore the terminal");
+        }
+        result
+    }
+
     /// Scroll the view under the pointer by `delta` rows.
     ///
     /// The wheel moves the *cursor*, not the viewport, so it stays consistent
@@ -3175,6 +3370,10 @@ impl FileBrowser {
                 self.open_selection_externally();
                 true
             }
+            Action::OpenWith => {
+                self.open_with_program();
+                true
+            }
             Action::ToggleShallow => {
                 self.toggle_shallow();
                 true
@@ -3536,6 +3735,7 @@ impl FileBrowser {
                     | Action::CancelTransfers
                     | Action::ToggleMouse
                     | Action::OpenWithDefaultApp
+                    | Action::OpenWith
                     | Action::TogglePreview
                     | Action::Redraw
                     | Action::ToggleShallow
@@ -3564,6 +3764,14 @@ impl FileBrowser {
         if let Modal::SortMenu(menu) = &mut self.modal {
             let outcome = menu.handle_key(key);
             return self.apply_sort_menu_outcome(outcome);
+        }
+
+        // The open dialog owns its keys for the same reason the rename dialog
+        // does: it is a form, and its field has to take every printable
+        // character rather than have `q` quit underneath it.
+        if let Modal::Open(dialog) = &mut self.modal {
+            let outcome = dialog.handle_key(key);
+            return self.apply_open_dialog_outcome(outcome);
         }
 
         match &mut self.modal {
@@ -3821,7 +4029,7 @@ impl FileBrowser {
             }
             // Handled by the early returns at the top of this function, which
             // need `&mut self` for the whole call and so can't sit in this match.
-            Modal::SortMenu(_) | Modal::Rename(_) => true,
+            Modal::SortMenu(_) | Modal::Rename(_) | Modal::Open(_) => true,
             Modal::None => true,
         }
     }
@@ -3991,12 +4199,13 @@ impl FileBrowser {
         self.key_handler.pending_chord()
     }
 
-    /// The files a patterned rename would act on: the tagged set, or the
-    /// cursor's file when nothing is tagged.
+    /// The files an operation acts on: the tagged set, or the cursor's file when
+    /// nothing is tagged, in the order they appear on screen.
     ///
     /// Mirrors how `D` chooses its targets, so "what does this act on" has one
-    /// answer across the app rather than one per operation.
-    fn rename_targets(&self) -> Vec<PathBuf> {
+    /// answer across the app rather than one per operation. Shared by the
+    /// patterned rename and by `O`.
+    fn selection_targets(&self) -> Vec<PathBuf> {
         let mut targets = self.active_panel().current_screen().tagged_paths();
         if targets.is_empty() {
             if let Screen::Main(state) = self.active_panel().current_screen() {
@@ -4040,7 +4249,7 @@ impl FileBrowser {
         if self.refuse_if_read_only("rename files") {
             return;
         }
-        let targets = self.rename_targets();
+        let targets = self.selection_targets();
         if targets.is_empty() {
             return;
         }
@@ -4066,7 +4275,7 @@ impl FileBrowser {
     fn apply_pattern_rename(&mut self, pattern: &str, replacement: &str) -> Option<String> {
         use crate::widget::rename_dialog::apply_pattern;
 
-        let targets = self.rename_targets();
+        let targets = self.selection_targets();
         let mut renamed = 0usize;
         let mut skipped = 0usize;
         let mut failures: Vec<String> = Vec::new();
