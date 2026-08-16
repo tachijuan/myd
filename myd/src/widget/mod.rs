@@ -4,6 +4,7 @@ pub mod file_info;
 pub mod file_tree;
 pub mod help;
 pub mod input_dialog;
+pub mod open_dialog;
 pub mod preview;
 pub mod progress;
 pub mod rename_dialog;
