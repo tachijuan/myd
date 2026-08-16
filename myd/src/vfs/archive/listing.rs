@@ -55,9 +55,12 @@ pub async fn preview(
     path: &VPath,
     format: ArchiveFormat,
     label: &str,
+    detail: Detail,
 ) -> Result<PreviewContent> {
-    // The bsdtar-backed formats hand the file to a child process, so they need
-    // a real path on this machine — which a file on a remote panel is not.
+    // The bsdtar-backed formats hand the file to a child process, so they need a
+    // real path a separate process can open. `is_local` is the right question
+    // here and not `is_remote`: an archive nested inside another archive is on
+    // this machine but has no path of its own, so bsdtar cannot reach it either.
     if format.needs_bsdtar() && !path.is_local() {
         return Ok(PreviewContent::Note {
             message: format!(
@@ -80,7 +83,12 @@ pub async fn preview(
     // A remote container has to come across the wire before it can be parsed,
     // and a large one is a download nobody asked for. A local one is mapped
     // below and has no such cost, so no limit applies to it.
-    if !path.is_local() && !format.needs_bsdtar() && meta.len > MAX_REMOTE_LISTING_BYTES {
+    //
+    // `is_remote`, not `!is_local`: a nested archive is read from a container on
+    // this machine, so it is read into memory rather than mapped but never
+    // crosses a network — refusing it would report a download that is not
+    // happening.
+    if fs.is_remote() && !format.needs_bsdtar() && meta.len > MAX_REMOTE_LISTING_BYTES {
         return Ok(PreviewContent::Note {
             message: format!(
                 "This archive is {} and is on a remote panel — listing it would download \
@@ -108,11 +116,26 @@ pub async fn preview(
     let container_path = path.as_path().to_path_buf();
     let content = tokio::task::spawn_blocking(move || {
         let index = super::read_index(&container, &container_path, format, MAX_PREVIEW_MEMBERS)?;
-        Ok::<_, anyhow::Error>(render(&index, &label, format))
+        Ok::<_, anyhow::Error>(render_with_detail(&index, &label, format, detail))
     })
     .await??;
 
     Ok(content)
+}
+
+/// How much of each member to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// Permissions, size, ratio, timestamp, then the name — for the full pane,
+    /// which has the width for all of it.
+    Full,
+    /// The name alone.
+    ///
+    /// For the info panel's sub-panel, which is a fraction of a panel wide. The
+    /// columns are laid out before the name, so in a narrow box they are the
+    /// only thing that survives truncation and the listing shows everything
+    /// *except* what someone opened it to see.
+    NamesOnly,
 }
 
 /// Turn an index into pane lines.
@@ -120,6 +143,16 @@ pub async fn preview(
 /// Pure, so it is testable without an archive on disk, and so the cost of
 /// rendering is separable from the cost of parsing.
 pub fn render(index: &ArchiveIndex, label: &str, format: ArchiveFormat) -> PreviewContent {
+    render_with_detail(index, label, format, Detail::Full)
+}
+
+/// As [`render`], showing as much of each member as `detail` asks for.
+pub fn render_with_detail(
+    index: &ArchiveIndex,
+    label: &str,
+    format: ArchiveFormat,
+    detail: Detail,
+) -> PreviewContent {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let total = index.total_len();
@@ -139,13 +172,24 @@ pub fn render(index: &ArchiveIndex, label: &str, format: ArchiveFormat) -> Previ
     } else {
         String::new()
     };
-    lines.push(Line::from(Span::styled(
-        format!(
+    // The narrow box gets a header it can actually fit: the full one runs to
+    // sixty-odd columns and would be truncated mid-word, taking the member
+    // count with it.
+    let header = match detail {
+        Detail::Full => format!(
             "{label} — {}, {n} member{}, {} uncompressed{stored}",
             format.label(),
             if n == 1 { "" } else { "s" },
             format_size(total),
         ),
+        Detail::NamesOnly => format!(
+            "{n} member{}, {}",
+            if n == 1 { "" } else { "s" },
+            format_size(total),
+        ),
+    };
+    lines.push(Line::from(Span::styled(
+        header,
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
@@ -208,30 +252,32 @@ pub fn render(index: &ArchiveIndex, label: &str, format: ArchiveFormat) -> Previ
             node.stored_path.clone()
         });
 
-        lines.push(Line::from(vec![
-            Span::styled(
-                format_mode(node.mode, node.is_dir, node.is_symlink),
-                Style::default().fg(MODE_COLOUR),
-            ),
-            Span::raw("  "),
-            Span::styled(size, Style::default().fg(QUIET)),
-            Span::raw(" "),
-            Span::styled(ratio, Style::default().fg(QUIET)),
-            Span::raw("  "),
-            Span::styled(
-                crate::widget::file_info::format_time_fixed(node.mtime),
-                Style::default().fg(QUIET),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                name,
-                if node.is_dir {
-                    Style::default().fg(DIR_COLOUR).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
-        ]));
+        let name_style = if node.is_dir {
+            Style::default().fg(DIR_COLOUR).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        lines.push(match detail {
+            Detail::NamesOnly => Line::from(Span::styled(name, name_style)),
+            Detail::Full => Line::from(vec![
+                Span::styled(
+                    format_mode(node.mode, node.is_dir, node.is_symlink),
+                    Style::default().fg(MODE_COLOUR),
+                ),
+                Span::raw("  "),
+                Span::styled(size, Style::default().fg(QUIET)),
+                Span::raw(" "),
+                Span::styled(ratio, Style::default().fg(QUIET)),
+                Span::raw("  "),
+                Span::styled(
+                    crate::widget::file_info::format_time_fixed(node.mtime),
+                    Style::default().fg(QUIET),
+                ),
+                Span::raw("  "),
+                Span::styled(name, name_style),
+            ]),
+        });
     }
 
     PreviewContent::Text {

@@ -4,6 +4,7 @@ pub mod config;
 pub mod hosts;
 pub mod keybinding;
 pub mod panel;
+pub mod prefs;
 pub mod preview;
 pub mod screen;
 pub mod trace;

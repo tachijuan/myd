@@ -105,6 +105,8 @@ pub enum Modal {
     Rename(crate::widget::rename_dialog::RenameDialog),
     /// Run a program of the user's choosing over the selection, opened by `O`.
     Open(crate::widget::open_dialog::OpenDialog),
+    /// Change one attribute of the selection, opened by Enter in the info panel.
+    Attr(crate::widget::attr_dialog::AttrDialog),
 }
 
 /// Context for modal operations.
@@ -305,6 +307,33 @@ pub struct FileBrowser {
     /// Moving the cursor supersedes a load rather than queueing behind it, or a
     /// held-down `j` would replay every file it passed over.
     preview_task: Option<PreviewTask>,
+    /// Whether the info panel has keyboard focus instead of a panel, the
+    /// sidebar or the preview.
+    ///
+    /// Kept exclusive with the other two by [`Self::focus_info`] and the Tab
+    /// rotation, for the same reason they are exclusive with each other.
+    info_focused: bool,
+    /// Whether a preference has changed and not yet been written to disk.
+    ///
+    /// Set by the resize keys, cleared by [`Self::save_prefs_if_dirty`] on the
+    /// way out — so a session that never touched a preference never writes the
+    /// file at all.
+    prefs_dirty: bool,
+    /// The compact preview at the foot of each panel's info panel, one slot per
+    /// panel and indexed the same way [`Self::panels`] is.
+    ///
+    /// Per panel rather than one shared slot because a panel's preview belongs
+    /// to *its* cursor: with a split showing two info panels, following only
+    /// the focused one meant the other went blank as soon as focus moved, and
+    /// filling both from one loader captioned one panel's file with the other's
+    /// metadata. Each panel keeps its own, so switching focus changes nothing
+    /// about what is already on screen.
+    ///
+    /// Separate from `self.preview` (the full pane) for different reasons: the
+    /// two are shown at once, they load at different geometries — geometry is
+    /// part of `PreviewKey` — and these render into cells while the full pane
+    /// may use a graphics protocol.
+    info_previews: Vec<InfoPreview>,
     /// What high-resolution image is currently on the terminal: where it was put,
     /// how big its payload was, and which page it was.
     ///
@@ -351,6 +380,23 @@ struct PreviewTask {
     rx: tokio::sync::oneshot::Receiver<crate::preview::PreviewContent>,
     /// Dropped when a newer load starts; the task checks it before doing work.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One panel's inline preview: its content, its in-flight load, and the
+/// geometry that load was sized for.
+///
+/// Grouped in a struct rather than as parallel `Vec`s so a panel added or
+/// removed by the split can never leave the three out of step.
+#[derive(Default)]
+struct InfoPreview {
+    state: crate::widget::preview::PreviewState,
+    task: Option<PreviewTask>,
+    /// Cell size the sub-panel was last drawn at, read back after that panel
+    /// rendered. `None` when it did not fit, which is also what stops the load.
+    cells: Option<(u16, u16)>,
+    /// When this panel's target last changed, so an expensive load waits for
+    /// the cursor to settle.
+    settle: Option<(crate::widget::preview::PreviewKey, std::time::Instant)>,
 }
 
 /// A connection attempt running in the background, with a channel for its result.
@@ -528,6 +574,9 @@ impl FileBrowser {
             preview_open: false,
             preview_focused: false,
             preview_task: None,
+            info_focused: false,
+            prefs_dirty: false,
+            info_previews: Vec::new(),
             preview_graphics_shown: None,
             force_repaint: false,
             shallow_default: false,
@@ -731,6 +780,10 @@ impl FileBrowser {
             // onto a different file.
             self.resolve_preview();
             self.request_preview();
+            // The info panel's inline preview follows the cursor the same way,
+            // and declines the loads too expensive to run per keystroke.
+            self.resolve_info_previews();
+            self.request_info_previews();
 
             let after_resolve = trace_started_now(tick_started);
             // Erasing an image writes over cells ratatui still believes it drew,
@@ -760,6 +813,10 @@ impl FileBrowser {
                 }
             }
         }
+
+        // Preferences are written once, here, rather than on every keystroke
+        // that changes one — see `save_prefs_if_dirty`.
+        self.save_prefs_if_dirty();
 
         // Guard's Drop will handle cleanup, but explicitly clear the flag so
         // the guard doesn't double-restore if called before drop.
@@ -852,9 +909,17 @@ impl FileBrowser {
         // being true once the sidebar became focusable — both it and the last
         // panel drew a cyan border at once.
         let panel_has_focus = !self.transfer_focused;
+        // Focus must never rest on something that is not drawn. The info panel
+        // can be hidden by `Ctrl+P` from anywhere, including while it holds the
+        // keyboard, so the flag is reconciled here rather than at every place
+        // that could hide it.
+        if !self.info_panel_visible() {
+            self.info_focused = false;
+        }
         // Read once here for the same reason `pending_chord` is: the panels are
         // borrowed mutably below, so `self` cannot be consulted inside the loop.
         let transfer_focused = self.transfer_focused;
+        let info_focused = self.info_focused;
 
         if panel_count == 2 {
             let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -868,6 +933,9 @@ impl FileBrowser {
                 // border can stand out.
                 if let Screen::Main(state) = panel.current_screen_mut() {
                     state.active = panel_has_focus && i == active;
+                    // Only the active panel's info panel can hold the keyboard,
+                    // so the inactive one draws no field cursor.
+                    state.info_active = info_focused && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                     state.pending_chord = pending_chord;
                     // There is one keyboard, so exactly one set of keys is on
@@ -906,6 +974,7 @@ impl FileBrowser {
             let backend = self.panels[0].backend;
             if let Screen::Main(state) = self.panels[0].current_screen_mut() {
                 state.active = panel_has_focus;
+                state.info_active = info_focused;
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                 state.pending_chord = pending_chord;
                 // The sole panel, so it is the one that speaks for the sidebar.
@@ -940,6 +1009,44 @@ impl FileBrowser {
             _ => None,
         };
 
+        // The info panel's preview sub-panel: each panel reserved a rect and
+        // left it blank, because the content and the loaders live here. Read
+        // after the panels render, since that is when the rects are recorded.
+        //
+        // Every panel draws its own slot, so what is on screen depends on that
+        // panel's cursor and not on which panel has focus — moving focus
+        // changes nothing about a preview already drawn.
+        self.info_previews
+            .resize_with(self.panels.len(), Default::default);
+        let rects: Vec<Option<Rect>> = self
+            .panels
+            .iter()
+            .map(|p| match p.current_screen() {
+                Screen::Main(s) => s.info_preview_area,
+                _ => None,
+            })
+            .collect();
+        for (i, rect) in rects.iter().enumerate() {
+            self.info_previews[i].cells = rect.map(|a| {
+                (
+                    a.width,
+                    // One row goes to the separator the compact renderer draws.
+                    a.height.saturating_sub(1).max(1),
+                )
+            });
+        }
+        if !self.preview_open {
+            for (i, rect) in rects.iter().enumerate() {
+                if let Some(rect) = rect {
+                    crate::widget::preview::render_compact(
+                        f,
+                        *rect,
+                        &self.info_previews[i].state,
+                    );
+                }
+            }
+        }
+
         // Modals center on the whole terminal, not the tree column, so toggling
         // the sidebar doesn't shift a dialog under the cursor.
         // Taken by value so the picker can render with `&mut self` (it keeps a
@@ -951,6 +1058,7 @@ impl FileBrowser {
             Modal::SortMenu(m) => m.render(f, full, sort_anchor),
             Modal::Rename(d) => d.render(f, full),
             Modal::Open(d) => d.render(f, full),
+            Modal::Attr(d) => d.render(f, full),
             Modal::Operation { verb } => {
                 let overlay = match &op_progress {
                     Some(p) => ProgressOverlay::for_operation(verb, p),
@@ -1360,6 +1468,8 @@ impl FileBrowser {
         self.advance_transfers();
         self.resolve_preview();
         self.request_preview();
+        self.resolve_info_previews();
+        self.request_info_previews();
     }
 
     /// Whether a copy destination is still being listed in the background.
@@ -1389,6 +1499,64 @@ impl FileBrowser {
 
     pub fn preview_focused_for_test(&self) -> bool {
         self.preview_focused
+    }
+
+    /// Each panel's `info_panel_hidden`, for tests.
+    pub fn info_hidden_flags_for_test(&self) -> Vec<bool> {
+        self.panels
+            .iter()
+            .map(|p| match p.current_screen() {
+                Screen::Main(s) => s.info_panel_hidden,
+                _ => true,
+            })
+            .collect()
+    }
+
+    /// Index of the active panel, for tests.
+    pub fn active_panel_for_test(&self) -> usize {
+        self.active
+    }
+
+    /// Whether the info panel holds the keyboard (for tests).
+    pub fn info_focused_for_test(&self) -> bool {
+        self.info_focused
+    }
+
+    /// The info panel's field cursor, or `None` when it has no focus.
+    pub fn info_field_for_test(&self) -> Option<crate::widget::file_info::InfoField> {
+        match self.active_panel().current_screen() {
+            Screen::Main(s) => self.info_focused.then_some(s.info_field),
+            _ => None,
+        }
+    }
+
+    /// The active panel's info panel width, as a percentage.
+    pub fn info_panel_pct_for_test(&self) -> u16 {
+        self.active_panel().view_prefs.info_panel_pct
+    }
+
+    /// The info panel's metadata/preview split bias, for tests.
+    pub fn info_meta_bias_for_test(&self) -> i16 {
+        self.active_panel().view_prefs.info_meta_bias
+    }
+
+    /// Whether a preference is waiting to be written on exit.
+    pub fn prefs_dirty_for_test(&self) -> bool {
+        self.prefs_dirty
+    }
+
+    /// Run the exit-time preference flush, which `run` does on the way out.
+    ///
+    /// Refuses unless `$MYD_PREFS` points somewhere, so a test can never write
+    /// the config of whoever is running the suite. Tests share one process and
+    /// its environment, so a guard held by one of them is not protection for
+    /// the rest — and the flush is the one call here that writes to disk.
+    pub fn save_prefs_for_test(&mut self) {
+        assert!(
+            std::env::var_os("MYD_PREFS").is_some(),
+            "set $MYD_PREFS (see PrefsGuard) before flushing preferences in a test"
+        );
+        self.save_prefs_if_dirty();
     }
 
     /// The preview's scroll offset, for asserting that motions move it.
@@ -1495,6 +1663,7 @@ impl FileBrowser {
             Modal::SortMenu(_) => "sort_menu",
             Modal::Rename(_) => "rename",
             Modal::Open(_) => "open",
+            Modal::Attr(_) => "attr",
         }
     }
 
@@ -1744,6 +1913,19 @@ impl FileBrowser {
             return true;
         }
 
+        // Same again for the attribute dialog, which has a clickable checkbox
+        // as well as its buttons.
+        if matches!(self.modal, Modal::Attr(_)) {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Modal::Attr(dialog) = &mut self.modal else {
+                    return true;
+                };
+                let outcome = dialog.click_at(x, y);
+                return self.apply_attr_dialog_outcome(outcome);
+            }
+            return true;
+        }
+
         if matches!(self.modal, Modal::SortMenu(_)) {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let Modal::SortMenu(menu) = &mut self.modal else {
@@ -1913,6 +2095,7 @@ impl FileBrowser {
         // Two focused panes would draw two active borders and both would answer
         // to `j`.
         self.preview_focused = false;
+        self.info_focused = false;
         if self.transfer_cursor.is_none() {
             self.transfer_cursor = self.transfer_rows.ids().first().copied();
         }
@@ -1925,7 +2108,34 @@ impl FileBrowser {
         }
         self.preview_focused = true;
         self.transfer_focused = false;
+        self.info_focused = false;
         self.transfer_cursor = None;
+    }
+
+    /// Give the active panel's info panel keyboard focus.
+    ///
+    /// A no-op when the panel is not on screen, so focus can never rest on
+    /// something that is not drawn — the same guard the other two setters use.
+    fn focus_info(&mut self) {
+        if !self.info_panel_visible() {
+            return;
+        }
+        self.info_focused = true;
+        self.preview_focused = false;
+        self.transfer_focused = false;
+        self.transfer_cursor = None;
+    }
+
+    /// Whether the active panel is currently showing its info panel.
+    ///
+    /// Read from the panel's own preference rather than from last frame's
+    /// geometry: unlike the transfer sidebar, the info panel has no width
+    /// threshold below which it yields, so the preference is the whole answer.
+    fn info_panel_visible(&self) -> bool {
+        matches!(
+            self.active_panel().current_screen(),
+            Screen::Main(state) if !state.info_panel_hidden
+        )
     }
 
     /// Open or close the preview pane (space).
@@ -2036,6 +2246,12 @@ impl FileBrowser {
             cols,
             rows,
             page: key.page,
+            // The full pane is the one graphics surface, and it is opened
+            // deliberately on one file, so it takes the terminal's best
+            // protocol and the full read budget.
+            cells_only: false,
+            compact_listing: false,
+            max_text_bytes: None,
         };
         let flag = cancel.clone();
         tokio::spawn(async move {
@@ -2161,6 +2377,208 @@ impl FileBrowser {
 
         let mut out = std::io::stdout();
         out.write_all(body.as_bytes()).is_ok() && out.flush().is_ok()
+    }
+
+    /// Whether a file is worth loading an inline preview for.
+    ///
+    /// The full pane is opened deliberately, on one file, so it may take its
+    /// time on anything. The sub-panel follows the cursor, so a run of `j` down
+    /// a directory of archives would start and cancel a load per keystroke —
+    /// each of which may be a process, a round trip, or a decompression.
+    ///
+    /// Judged from what the tree already holds, so the gate itself costs no I/O.
+    fn worth_inline_preview(path: &std::path::Path, is_dir: bool, over_network: bool) -> bool {
+        if is_dir {
+            // The loader would stat it only to return "This is a directory."
+            return false;
+        }
+        if over_network
+            && (crate::utils::filetype::is_image_like(path) || crate::utils::filetype::is_pdf(path))
+        {
+            // A remote image is downloaded to a temp file before it can be
+            // rendered. Per cursor move, that is a transfer per keystroke.
+            //
+            // Only over a *network*: an archive is a non-local backend too, but
+            // its members are read from a file on this machine, so an image
+            // inside one costs no round trips and previews like any other.
+            return false;
+        }
+        // An archive previews as its table of contents, exactly as the full
+        // pane does. Indexing the container is real work, but it is the one
+        // thing anyone wants to know about an archive, and the settle delay
+        // below keeps a fast scroll past a shelf of them from paying for it.
+        true
+    }
+
+    /// Whether this backend is reached over a network.
+    ///
+    /// Defers to [`crate::vfs::Vfs::is_remote`], which is where this question is
+    /// answered for the whole app — see its documentation for why it is not the
+    /// same as `!BackendId::is_local`.
+    fn backend_is_remote(&self, backend: crate::vfs::BackendId) -> bool {
+        self.backends.get(backend).is_remote()
+    }
+
+    /// Start each panel's inline preview, for any that is on screen and is not
+    /// already showing (or fetching) what its cursor points at.
+    ///
+    /// Mirrors [`Self::request_preview`], with three differences: it is gated on
+    /// that panel's sub-panel having been drawn rather than on the pane being
+    /// open, it asks for cells rather than a graphics protocol, and it declines
+    /// the loads that are too expensive to run per cursor move.
+    ///
+    /// Runs for every panel, not just the focused one — a panel's preview
+    /// belongs to its own cursor, and following only the focused panel is what
+    /// made the other half of a split go blank the moment focus moved.
+    fn request_info_previews(&mut self) {
+        // The full pane covers the panels, so no sub-panel is visible while it
+        // is open — and loading for something nobody can see is waste. This also
+        // removes any chance of two graphics surfaces at once.
+        if self.preview_open {
+            return;
+        }
+        self.info_previews.resize_with(self.panels.len(), Default::default);
+        for i in 0..self.panels.len() {
+            self.request_info_preview_for(i);
+        }
+    }
+
+    /// The body of [`Self::request_info_previews`] for one panel.
+    fn request_info_preview_for(&mut self, i: usize) {
+        let Some((cols, rows)) = self.info_previews[i].cells else {
+            return;
+        };
+        let Some(path) = self.panels[i].selected_resolved_path() else {
+            return;
+        };
+        let backend = self.panels[i].backend;
+
+        let is_dir = match self.panels[i].current_screen() {
+            Screen::Main(state) => state.tree.selected_line().map(|l| l.is_dir).unwrap_or(false),
+            _ => false,
+        };
+        let over_network = self.backend_is_remote(backend);
+        if !Self::worth_inline_preview(&path, is_dir, over_network) {
+            // Clear whatever the last file left behind rather than leaving it
+            // under the new selection, which would read as this entry's content.
+            // A fresh state has no title, so the box draws empty rather than
+            // claiming to be loading something it will never fetch.
+            self.cancel_info_preview_task(i);
+            self.info_previews[i].state = crate::widget::preview::PreviewState::new();
+            self.info_previews[i].settle = None;
+            return;
+        }
+
+        let key = crate::widget::preview::PreviewKey {
+            path: path.clone(),
+            backend,
+            cols,
+            rows,
+            // The sub-panel has no paging keys, so it always shows the first.
+            page: 0,
+        };
+
+        // Already showing it, or already fetching it.
+        if self.info_previews[i].state.key() == Some(&key) {
+            return;
+        }
+        if self.info_previews[i].task.as_ref().is_some_and(|t| t.key == key) {
+            return;
+        }
+
+        // An image render is an external process, and the cancel flag cannot
+        // kill one that has already started — so those wait for the cursor to
+        // settle. Text on a local disk loads in microseconds and must stay
+        // instant, which is most of what anyone scrolls past.
+        // Indexing an archive belongs here too: it is the most expensive thing
+        // the sub-panel will now attempt, and scrolling past a directory of
+        // them must not index every one on the way through.
+        let slow = crate::utils::filetype::is_image_like(&path)
+            || crate::utils::filetype::is_pdf(&path)
+            || crate::vfs::archive::archive_format(&path).is_some()
+            || over_network;
+        if slow {
+            const SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+            match &self.info_previews[i].settle {
+                Some((k, since)) if *k == key => {
+                    if since.elapsed() < SETTLE {
+                        return;
+                    }
+                }
+                _ => {
+                    self.info_previews[i].settle =
+                        Some((key.clone(), std::time::Instant::now()));
+                    return;
+                }
+            }
+        }
+        self.info_previews[i].settle = None;
+
+        self.cancel_info_preview_task(i);
+
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.info_previews[i].state.begin_load(label);
+
+        let fs = self.backends.get(backend);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = crate::preview::PreviewRequest {
+            path: crate::vfs::VPath::new(backend, path.clone()),
+            label: path,
+            cols,
+            rows,
+            page: 0,
+            // Cells, never a graphics payload: the app tracks exactly one
+            // graphics surface and this is not it.
+            cells_only: true,
+            // Names only: this box is a fraction of a panel wide.
+            compact_listing: true,
+            // A handful of rows has no use for a megabyte, and on a remote panel
+            // that megabyte would cross the wire on every cursor move.
+            max_text_bytes: Some(16 * 1024),
+        };
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let content = crate::preview::load(fs, req).await;
+            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = tx.send(content);
+            }
+        });
+        self.info_previews[i].task = Some(PreviewTask { key, rx, cancel });
+    }
+
+    /// Supersede panel `i`'s in-flight sub-panel load, if there is one.
+    fn cancel_info_preview_task(&mut self, i: usize) {
+        if let Some(task) = self.info_previews[i].task.take() {
+            task.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Install any finished sub-panel loads. Called once per tick.
+    fn resolve_info_previews(&mut self) {
+        for slot in self.info_previews.iter_mut() {
+            let Some(task) = slot.task.as_mut() else {
+                continue;
+            };
+            match task.rx.try_recv() {
+                Ok(content) => {
+                    let key = task.key.clone();
+                    slot.task = None;
+                    slot.state.set_content(key, content);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    slot.task = None;
+                }
+            }
+        }
     }
 
     /// Install a finished preview load. Called once per tick.
@@ -2463,7 +2881,384 @@ impl FileBrowser {
         }
     }
 
-    /// Drop a transfer cursor that no longer names a live row.
+    /// The info panel's own keys, while it has focus.
+    ///
+    /// Returns `None` for anything it does not own, so the global table still
+    /// sees `q`, `?` and the rest — the same contract the preview pane and the
+    /// transfer sidebar follow.
+    ///
+    /// `Tab` is deliberately absent: it belongs to the global rotation, and a
+    /// pane that swallowed it would be one you could enter but not leave.
+    fn handle_info_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if !self.info_focused {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.step_info_field(true);
+                Some(true)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.step_info_field(false);
+                Some(true)
+            }
+            // Width is adjusted from here rather than globally because this is
+            // the one place the panel is the thing you are looking at, and `<`
+            // and `>` are ordinary characters everywhere else.
+            //
+            // The keys move the *divider*, not the panel's size: the info panel
+            // is the right-hand column, so `<` pushes the split left and makes
+            // it wider. Reading them as "smaller" and "bigger" instead means
+            // the arrow points away from the edge that actually moves.
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                self.resize_info_panel(5);
+                Some(true)
+            }
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                self.resize_info_panel(-5);
+                Some(true)
+            }
+            // The vertical counterpart: `+` grows the preview beneath the
+            // metadata, `-` gives the rows back. Shifted and unshifted spellings
+            // both, since `+` needs Shift on most layouts and `=` is the key it
+            // shares.
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.resize_info_preview(1);
+                Some(true)
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                self.resize_info_preview(-1);
+                Some(true)
+            }
+            KeyCode::Enter => {
+                self.open_attr_dialog();
+                Some(true)
+            }
+            // Esc hands focus back without hiding the panel, mirroring the
+            // preview pane — the panel stays up and keeps following the cursor.
+            KeyCode::Esc => {
+                self.info_focused = false;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// Open the edit dialog for the field the info panel's cursor is on.
+    ///
+    /// Refused inside an archive, which is read-only. Remote panels are allowed:
+    /// SFTP can set both a mode and an owner, so the guard is
+    /// `refuse_if_read_only` — the one `D`, `R` and `m` use — rather than the
+    /// stricter local-only guard `O` needs for running a local program.
+    fn open_attr_dialog(&mut self) {
+        use crate::widget::attr_dialog::AttrDialog;
+
+        let field = match self.active_panel().current_screen() {
+            Screen::Main(state) => state.info_field,
+            _ => return,
+        };
+        if self.refuse_if_read_only(match field {
+            crate::widget::file_info::InfoField::Perms => "change permissions",
+            _ => "change ownership",
+        }) {
+            return;
+        }
+
+        let targets = self.selection_targets();
+        if targets.is_empty() {
+            return;
+        }
+
+        // Recursion is only offered for a single directory: "apply to
+        // everything inside" has no obvious meaning over a mixed selection, and
+        // guessing at one would be a lot of files changed by accident.
+        let allow_recursive = targets.len() == 1
+            && matches!(
+                self.active_panel().current_screen(),
+                Screen::Main(state)
+                    if state.tree.selected_line().map(|l| l.is_dir).unwrap_or(false)
+            );
+
+        // Pre-fill with what the panel is showing, so an edit is a correction
+        // rather than a retype — and so the accepted spellings are discoverable
+        // from the value already in the box.
+        let current = self.current_attr_value(field, targets.first());
+        let mut dialog = AttrDialog::new(field, targets, allow_recursive);
+        if let Some(value) = current {
+            dialog = dialog.with_value(value);
+        }
+        self.modal = Modal::Attr(dialog);
+    }
+
+    /// What `field` currently reads as for `path`, for pre-filling the dialog.
+    ///
+    /// `None` when it cannot be determined — a remote entry has no local
+    /// metadata to stat, and an empty field is more honest than a local file's
+    /// mode presented as the server's.
+    fn current_attr_value(
+        &self,
+        field: crate::widget::file_info::InfoField,
+        path: Option<&PathBuf>,
+    ) -> Option<String> {
+        use crate::widget::file_info::InfoField;
+
+        let path = path?;
+        if !self.active_panel().backend.is_local() {
+            // The listing carries the mode, so that one can still be offered.
+            if field == InfoField::Perms {
+                if let Screen::Main(state) = self.active_panel().current_screen() {
+                    let line = state.tree.selected_line()?;
+                    return line.mode.map(|m| format!("{:o}", m & 0o7777));
+                }
+            }
+            return None;
+        }
+
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        match field {
+            InfoField::Perms => {
+                use std::os::unix::fs::PermissionsExt;
+                Some(format!("{:o}", meta.permissions().mode() & 0o7777))
+            }
+            InfoField::Owner => {
+                use std::os::unix::fs::MetadataExt;
+                Some(
+                    crate::widget::file_info::uid_to_name(meta.uid())
+                        .unwrap_or_else(|| meta.uid().to_string()),
+                )
+            }
+            InfoField::Group => {
+                use std::os::unix::fs::MetadataExt;
+                Some(
+                    crate::widget::file_info::gid_to_name(meta.gid())
+                        .unwrap_or_else(|| meta.gid().to_string()),
+                )
+            }
+        }
+    }
+
+    /// Act on what the attribute dialog decided. Returns false only to quit,
+    /// which it never does — the signature matches the other modal handlers.
+    fn apply_attr_dialog_outcome(
+        &mut self,
+        outcome: crate::widget::attr_dialog::AttrDialogOutcome,
+    ) -> bool {
+        use crate::widget::attr_dialog::AttrDialogOutcome;
+
+        match outcome {
+            AttrDialogOutcome::Continue => true,
+            AttrDialogOutcome::Cancelled => {
+                self.modal = Modal::None;
+                true
+            }
+            AttrDialogOutcome::Apply { value, recursive } => {
+                // Take the targets and the field from the dialog rather than
+                // re-reading the selection: the dialog said what it was going
+                // to act on, and that promise holds even if the cursor moved.
+                let (field, targets) = match &self.modal {
+                    Modal::Attr(d) => (d.field(), d.targets().to_vec()),
+                    _ => return true,
+                };
+                self.modal = Modal::None;
+                self.apply_attr_change(field, &value, &targets, recursive);
+                true
+            }
+        }
+    }
+
+    /// Parse `value` and apply it to every target, then report what happened.
+    fn apply_attr_change(
+        &mut self,
+        field: crate::widget::file_info::InfoField,
+        value: &str,
+        targets: &[PathBuf],
+        recursive: bool,
+    ) {
+        use crate::vfs::ops::AttrChange;
+        use crate::widget::file_info::{self, InfoField};
+
+        // Parse before touching anything. A half-applied batch because the
+        // value turned out to be nonsense partway through is the one outcome
+        // worth ruling out entirely.
+        let change = match field {
+            InfoField::Perms => match file_info::parse_mode(value) {
+                Some(mode) => AttrChange::Mode(mode),
+                None => {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                        "'{value}' is not a permission. Use octal (644) or \
+                         symbolic (rw-r--r--)."
+                    )));
+                    return;
+                }
+            },
+            InfoField::Owner => match file_info::name_to_uid(value) {
+                Some(uid) => AttrChange::Owner {
+                    uid: Some(uid),
+                    gid: None,
+                },
+                None => {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                        "There is no user '{value}' on this system."
+                    )));
+                    return;
+                }
+            },
+            InfoField::Group => match file_info::name_to_gid(value) {
+                Some(gid) => AttrChange::Owner {
+                    uid: None,
+                    gid: Some(gid),
+                },
+                None => {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                        "There is no group '{value}' on this system."
+                    )));
+                    return;
+                }
+            },
+        };
+
+        let backend = self.active_panel().backend;
+        let fs = self.backends.get(backend);
+        let paths: Vec<crate::vfs::VPath> = targets
+            .iter()
+            .map(|p| crate::vfs::VPath::new(backend, p.clone()))
+            .collect();
+        let cancel = crate::utils::sizes::CancelToken::new();
+
+        // Blocking on the event loop, deliberately: a chmod is one syscall per
+        // entry and returns immediately, unlike a delete or a transfer. The
+        // recursive case over a deep tree is the exception — see below.
+        let failures: Vec<String> = futures::executor::block_on(async {
+            let mut failures = Vec::new();
+            for path in &paths {
+                if recursive {
+                    failures.extend(
+                        crate::vfs::ops::set_attr_recursive(&fs, path, change, None, &cancel).await,
+                    );
+                } else if let Err(e) = match change {
+                    AttrChange::Mode(mode) => fs.set_mode(path, mode).await,
+                    AttrChange::Owner { uid, gid } => fs.set_owner(path, uid, gid).await,
+                } {
+                    failures.push(format!("{}: {}", path.path.display(), e));
+                }
+            }
+            failures
+        });
+
+        let changed = targets.len() - failures.len().min(targets.len());
+        if !failures.is_empty() {
+            // The first few, then a count: the whole list of a failed recursive
+            // change could be thousands of lines, and the dialog would be
+            // unreadable long before it was complete.
+            let shown: Vec<&String> = failures.iter().take(3).collect();
+            let mut detail = shown
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if failures.len() > shown.len() {
+                detail.push_str(&format!(" (and {} more)", failures.len() - shown.len()));
+            }
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                "Changed {changed}, failed {}: {detail}",
+                failures.len()
+            )));
+        }
+
+        // The panel caches its text, so without this it would go on showing the
+        // old mode until the cursor moved off the row and back.
+        //
+        // Deliberately not `refresh()`, which rebuilds the tree from disk and
+        // resets the cursor to the root — leaving the panel describing the
+        // wrong entry immediately after an edit. Nothing about a mode or an
+        // owner changes the listing, so invalidating the cached text is the
+        // whole of what is needed.
+        if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+            state.invalidate_info_cache();
+        }
+        // And draw that rebuilt text now. The event loop redraws when something
+        // has happened, and applying a change from a dialog that has just
+        // closed is not something it counts — so without this the panel keeps
+        // showing the old mode until the next keystroke, which reads as the
+        // change not having worked. Found in a real terminal; a test that draws
+        // unconditionally cannot see it.
+        self.force_repaint = true;
+    }
+
+    /// Move the info panel's field cursor.
+    fn step_info_field(&mut self, down: bool) {
+        if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+            state.info_field = if down {
+                state.info_field.next()
+            } else {
+                state.info_field.prev()
+            };
+        }
+    }
+
+    /// Widen or narrow the info panel, and remember the new width.
+    ///
+    /// Written to the panel's own prefs so it holds across navigation, and to
+    /// disk so it holds across restarts. A failed write costs the persistence,
+    /// not the resize — the panel still moves.
+    fn resize_info_panel(&mut self, delta: i16) {
+        let current = self.active_panel().view_prefs.info_panel_pct;
+        let next = (current as i16 + delta).clamp(
+            crate::prefs::MIN_INFO_PCT as i16,
+            crate::prefs::MAX_INFO_PCT as i16,
+        ) as u16;
+        if next == current {
+            return;
+        }
+        self.active_panel_mut().view_prefs.info_panel_pct = next;
+        if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+            state.info_panel_pct = next;
+        }
+        // Marked dirty rather than written: `<` and `>` are held down, and a
+        // file write per keystroke would put a create-write-rename cycle on the
+        // event loop for every repeat. Flushed once on the way out.
+        self.prefs_dirty = true;
+    }
+
+    /// Grow or shrink the preview beneath the metadata.
+    ///
+    /// `delta` is rows given to the preview, so a positive value takes them
+    /// from the metadata — the sign follows the key (`+` means "more preview"),
+    /// not the field it is stored in.
+    fn resize_info_preview(&mut self, delta: i16) {
+        let current = self.active_panel().view_prefs.info_meta_bias;
+        let next = (current - delta).clamp(
+            -crate::prefs::MAX_META_BIAS,
+            crate::prefs::MAX_META_BIAS,
+        );
+        if next == current {
+            return;
+        }
+        self.active_panel_mut().view_prefs.info_meta_bias = next;
+        if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
+            state.info_meta_bias = next;
+        }
+        self.prefs_dirty = true;
+    }
+
+    /// Write any changed preferences to disk.
+    ///
+    /// Called on the way out. A failure is logged and nothing more — losing a
+    /// panel width is not worth failing an exit over, and by this point there
+    /// is no screen left to report it on.
+    fn save_prefs_if_dirty(&mut self) {
+        if !self.prefs_dirty {
+            return;
+        }
+        self.prefs_dirty = false;
+        let prefs = crate::prefs::Prefs {
+            info_panel_pct: self.active_panel().view_prefs.info_panel_pct,
+            info_meta_bias: self.active_panel().view_prefs.info_meta_bias,
+        };
+        if let Err(e) = prefs.save() {
+            tracing::warn!(error = %e, "could not save preferences");
+        }
+    }
     ///
     /// The panel only gives cursor stops to cancellable (queued or active)
     /// transfers, so anything else the cursor points at is stale.
@@ -2982,6 +3777,12 @@ impl FileBrowser {
             return result;
         }
 
+        // Same contract for the info panel: the keys it owns while focused, and
+        // nothing else, so `q`, `?` and the rest still work from inside it.
+        if let Some(result) = self.handle_info_key(key) {
+            return result;
+        }
+
         // Let the current screen handle raw keys first (e.g., dir picker input).
         if let Some(result) = self
             .active_panel_mut()
@@ -3099,43 +3900,76 @@ impl FileBrowser {
                 false
             }
             Action::SwitchPanel => {
-                // Tab rotates through every focusable pane in layout order — each
-                // browser panel left to right, then the transfer sidebar — and
-                // wraps around. Everything focusable is reachable from one key
-                // rather than the sidebar needing its own.
+                // Tab rotates through every focusable pane in layout order and
+                // wraps around, so everything focusable is reachable from one
+                // key rather than each pane needing its own.
                 //
-                // This has to be a rotation over the whole set, not a pair of
-                // special cases: leaving the sidebar used to clear its focus
-                // without moving `active`, so focus fell back to whichever panel
-                // it came from. With two panels open that alternated between the
-                // second panel and the sidebar forever, and the first panel was
-                // unreachable by Tab.
-                let panels = self.panels.len();
-                let sidebar = self.transfer_area.is_some();
-                // Position in the rotation: 0..panels are the browser panels,
-                // then the sidebar when it is on screen, then the preview when it
-                // is open.
-                let sidebar_stop = panels;
-                let preview_stop = panels + usize::from(sidebar);
-                let current = if self.preview_focused {
-                    preview_stop
+                // Built as an explicit list rather than arithmetic over counts.
+                // A panel's info panel is a stop *immediately after that panel*,
+                // which is the order they sit in on screen — and with the stops
+                // computed as offsets there was only ever one info-panel stop at
+                // the end of the rotation, always targeting the active panel. In
+                // a split with both info panels open, the left one could not be
+                // reached at all, so its permissions and ownership could not be
+                // edited.
+                //
+                // Only what is actually drawn gets a stop, which is what makes
+                // an invisible pane unreachable rather than a dead stop.
+                #[derive(PartialEq)]
+                enum Stop {
+                    Panel(usize),
+                    Info(usize),
+                    Sidebar,
+                    Preview,
+                }
+
+                let mut stops: Vec<Stop> = Vec::new();
+                for (i, panel) in self.panels.iter().enumerate() {
+                    stops.push(Stop::Panel(i));
+                    let shows_info = matches!(
+                        panel.current_screen(),
+                        Screen::Main(state) if !state.info_panel_hidden
+                    );
+                    if shows_info {
+                        stops.push(Stop::Info(i));
+                    }
+                }
+                if self.transfer_area.is_some() {
+                    stops.push(Stop::Sidebar);
+                }
+                if self.preview_open {
+                    stops.push(Stop::Preview);
+                }
+
+                let current = if self.info_focused {
+                    Stop::Info(self.active)
+                } else if self.preview_focused {
+                    Stop::Preview
                 } else if self.transfer_focused {
-                    sidebar_stop
+                    Stop::Sidebar
                 } else {
-                    self.active.min(panels.saturating_sub(1))
+                    Stop::Panel(self.active)
                 };
-                let stops = preview_stop + usize::from(self.preview_open);
-                if stops > 1 {
-                    let next = (current + 1) % stops;
-                    if sidebar && next == sidebar_stop {
-                        self.focus_transfers();
-                    } else if self.preview_open && next == preview_stop {
-                        self.focus_preview();
-                    } else {
-                        self.transfer_focused = false;
-                        self.preview_focused = false;
-                        self.transfer_cursor = None;
-                        self.active = next;
+
+                if stops.len() > 1 {
+                    let at = stops.iter().position(|s| *s == current).unwrap_or(0);
+                    match &stops[(at + 1) % stops.len()] {
+                        Stop::Sidebar => self.focus_transfers(),
+                        Stop::Preview => self.focus_preview(),
+                        Stop::Info(i) => {
+                            // The info panel belongs to its panel, so focusing
+                            // it makes that panel active — the fields it edits
+                            // are that panel's selection.
+                            self.active = *i;
+                            self.focus_info();
+                        }
+                        Stop::Panel(i) => {
+                            self.transfer_focused = false;
+                            self.preview_focused = false;
+                            self.info_focused = false;
+                            self.transfer_cursor = None;
+                            self.active = *i;
+                        }
                     }
                 }
                 true
@@ -3774,6 +4608,14 @@ impl FileBrowser {
             return self.apply_open_dialog_outcome(outcome);
         }
 
+        // And the attribute dialog, for the same reason: its field has to take
+        // every printable character, including the `r`, `w` and `x` of a
+        // symbolic mode.
+        if let Modal::Attr(dialog) = &mut self.modal {
+            let outcome = dialog.handle_key(key);
+            return self.apply_attr_dialog_outcome(outcome);
+        }
+
         match &mut self.modal {
             Modal::Confirm(dialog) => {
                 use crate::widget::confirm_dialog::Answer;
@@ -4029,7 +4871,7 @@ impl FileBrowser {
             }
             // Handled by the early returns at the top of this function, which
             // need `&mut self` for the whole call and so can't sit in this match.
-            Modal::SortMenu(_) | Modal::Rename(_) | Modal::Open(_) => true,
+            Modal::SortMenu(_) | Modal::Rename(_) | Modal::Open(_) | Modal::Attr(_) => true,
             Modal::None => true,
         }
     }

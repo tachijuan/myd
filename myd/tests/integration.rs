@@ -12928,6 +12928,9 @@ async fn test_a_remote_preview_reads_through_the_vfs() {
             cols: 60,
             rows: 20,
             page: 0,
+            cells_only: false,
+            compact_listing: false,
+            max_text_bytes: None,
         },
     )
     .await;
@@ -15668,5 +15671,1767 @@ async fn a_directory_can_be_the_target() {
     assert!(
         dialog.targets()[0].is_dir(),
         "the cursor starts on the root directory row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The info panel takes focus, walks its fields, and resizes.
+// ---------------------------------------------------------------------------
+
+/// A panel with the info panel already shown, cursor on a regular file.
+async fn info_fixture() -> (tempfile::TempDir, myd::app::FileBrowser) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"hello\n").unwrap();
+    std::fs::write(dir.path().join("beta.txt"), b"world\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    // The panel starts hidden, so every test here begins by showing it.
+    app.handle_key_for_test(ctrl_key('p'));
+    (dir, app)
+}
+
+#[tokio::test]
+async fn tab_reaches_the_info_panel_when_it_is_shown() {
+    let (_dir, mut app) = info_fixture().await;
+    assert!(!app.info_focused_for_test(), "focus starts on the tree");
+
+    // Draw first: the rotation is over what is on screen.
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(
+        app.info_focused_for_test(),
+        "Tab should reach the info panel"
+    );
+}
+
+/// A pane that is not drawn must not be a stop, or Tab lands on nothing.
+#[tokio::test]
+async fn tab_skips_the_info_panel_when_it_is_hidden() {
+    let (_dir, mut app) = info_fixture().await;
+    // Hide it again — back to the state the app starts in.
+    app.handle_key_for_test(ctrl_key('p'));
+
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(
+        !app.info_focused_for_test(),
+        "a hidden info panel must not be a Tab stop"
+    );
+}
+
+/// Hiding the panel while it holds the keyboard must not strand focus on
+/// something that is no longer drawn.
+#[tokio::test]
+async fn hiding_the_panel_takes_its_focus_away() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(app.info_focused_for_test());
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    assert!(
+        !app.info_focused_for_test(),
+        "focus must not rest on a panel that is not drawn"
+    );
+}
+
+#[tokio::test]
+async fn j_and_k_walk_the_editable_fields() {
+    use myd::widget::file_info::InfoField;
+
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+
+    assert_eq!(app.info_field_for_test(), Some(InfoField::Perms));
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.info_field_for_test(), Some(InfoField::Owner));
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.info_field_for_test(), Some(InfoField::Group));
+    // Stops rather than wrapping — a cursor that jumped to the top would read
+    // as having moved somewhere else entirely.
+    app.handle_key_for_test(char_key('j'));
+    assert_eq!(app.info_field_for_test(), Some(InfoField::Group));
+    app.handle_key_for_test(char_key('k'));
+    assert_eq!(app.info_field_for_test(), Some(InfoField::Owner));
+}
+
+/// While the panel has focus its keys must not also reach the tree, or `j`
+/// would move both cursors at once.
+#[tokio::test]
+async fn the_tree_cursor_stays_put_while_the_panel_has_focus() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    let before = app.selected_name_for_test();
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('j'));
+
+    assert_eq!(
+        app.selected_name_for_test(),
+        before,
+        "j moved the tree while the info panel had focus"
+    );
+}
+
+/// Esc gives the keyboard back without hiding the panel, mirroring the preview.
+#[tokio::test]
+async fn esc_returns_focus_to_the_tree_and_keeps_the_panel() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(app.info_focused_for_test());
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    assert!(!app.info_focused_for_test(), "Esc should release focus");
+    assert!(
+        screen_text(&mut app, 120, 40).contains("Info"),
+        "Esc should not hide the panel"
+    );
+}
+
+#[tokio::test]
+async fn angle_brackets_resize_the_panel() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+
+    // The keys move the divider, not the panel: the info panel is the
+    // right-hand column, so `<` pushes the split left and widens it.
+    let before = app.info_panel_pct_for_test();
+    app.handle_key_for_test(char_key('<'));
+    let wider = app.info_panel_pct_for_test();
+    assert!(wider > before, "< should widen the panel: {before} -> {wider}");
+
+    app.handle_key_for_test(char_key('>'));
+    assert_eq!(
+        app.info_panel_pct_for_test(),
+        before,
+        "> should undo the widening"
+    );
+}
+
+/// The width is a percentage of the panel, so it has to actually change the
+/// rect — a stored number that nothing lays out would be invisible.
+#[tokio::test]
+async fn widening_the_panel_shows_more_of_the_values() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+
+    let narrow_width = info_panel_columns(&screen_text(&mut app, 120, 40));
+    for _ in 0..4 {
+        app.handle_key_for_test(char_key('<'));
+    }
+    let wide_width = info_panel_columns(&screen_text(&mut app, 120, 40));
+
+    assert!(
+        wide_width > narrow_width,
+        "the drawn panel did not widen: {narrow_width} -> {wide_width}"
+    );
+}
+
+/// Width of the info panel's box, in columns, measured from the rendered frame.
+///
+/// Found by where the panel's top-left corner falls on the title row: the
+/// panel is right-aligned in the frame, so the further left that corner sits,
+/// the wider the panel is.
+///
+/// Counted in `chars`, not bytes — the box-drawing characters are three bytes
+/// each, so byte offsets are about triple the real column and two panels of
+/// different widths can compare equal by accident.
+fn info_panel_columns(screen: &str) -> usize {
+    screen
+        .lines()
+        .find(|l| l.contains("Info"))
+        .and_then(|l| {
+            // `rfind`, not `find`: the tree draws its own corner at column 0 on
+            // this same row, and matching that one measures the whole frame —
+            // which is the same number at every panel width.
+            let byte = l.rfind('┌')?;
+            let start = l[..byte].chars().count();
+            Some(l.chars().count() - start)
+        })
+        .unwrap_or(0)
+}
+
+/// Resizing must survive entering a directory, like every other view
+/// preference — a new screen per directory would otherwise reset it.
+#[tokio::test]
+async fn the_width_survives_entering_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("f.txt"), b"x").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    for _ in 0..4 {
+        app.handle_key_for_test(char_key('<'));
+    }
+    let widened = app.info_panel_pct_for_test();
+    // Measured from the frame, not from the stored number: the preference
+    // reaching the new screen is the whole point, and a test that only read
+    // `view_prefs` back would pass with nothing laid out from it.
+    let widened_columns = info_panel_columns(&screen_text(&mut app, 120, 40));
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    assert_eq!(
+        app.info_panel_pct_for_test(),
+        widened,
+        "the width reset on entering a directory"
+    );
+    assert_eq!(
+        info_panel_columns(&screen_text(&mut app, 120, 40)),
+        widened_columns,
+        "the new screen drew the panel at a different width"
+    );
+}
+
+/// The panel draws its cursor only while focused, so an unfocused panel looks
+/// exactly as it did before it became focusable.
+#[tokio::test]
+async fn the_field_cursor_is_drawn_only_when_focused() {
+    let (_dir, mut app) = info_fixture().await;
+    assert!(
+        !screen_text(&mut app, 120, 40).contains('▸'),
+        "an unfocused panel drew a field cursor"
+    );
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(
+        screen_text(&mut app, 120, 40).contains('▸'),
+        "a focused panel drew no field cursor"
+    );
+}
+
+/// Global keys must still work from inside the panel — the handler returns
+/// `None` for anything it does not own.
+#[tokio::test]
+async fn global_keys_still_work_from_the_info_panel() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(app.info_focused_for_test());
+
+    app.handle_key_for_test(char_key('?'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "help",
+        "? should still open help from inside the info panel"
+    );
+}
+
+/// Sets `MYD_PREFS` for the duration of a test and restores it on drop.
+///
+/// Holds a process-wide lock for the same reason [`HomeGuard`] does: `set_var`
+/// is global. Without it a test would write the preferences of whoever is
+/// running the suite.
+struct PrefsGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl PrefsGuard {
+    fn set(path: &std::path::Path) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("MYD_PREFS");
+        unsafe { std::env::set_var("MYD_PREFS", path) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for PrefsGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var("MYD_PREFS", v) },
+            None => unsafe { std::env::remove_var("MYD_PREFS") },
+        }
+    }
+}
+
+/// Holding down `>` must not put a file write on the event loop per repeat, so
+/// the width is marked dirty and flushed once on the way out.
+#[tokio::test]
+async fn the_width_is_written_once_on_exit_not_per_keystroke() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefs_path = dir.path().join("prefs.toml");
+    let _guard = PrefsGuard::set(&prefs_path);
+
+    let (_fixture, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+
+    assert!(!app.prefs_dirty_for_test(), "nothing changed yet");
+    app.handle_key_for_test(char_key('>'));
+    assert!(app.prefs_dirty_for_test(), "the resize should mark it dirty");
+    assert!(
+        !prefs_path.exists(),
+        "the width was written during the keystroke rather than on exit"
+    );
+
+    let widened = app.info_panel_pct_for_test();
+    app.save_prefs_for_test();
+    assert!(!app.prefs_dirty_for_test(), "the flush should clear the flag");
+    assert_eq!(
+        myd::prefs::Prefs::load_from(&prefs_path).info_panel_pct,
+        widened,
+        "the width did not survive the round trip to disk"
+    );
+}
+
+/// A session that changes nothing must not write the file at all.
+#[tokio::test]
+async fn an_untouched_preference_is_never_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefs_path = dir.path().join("prefs.toml");
+    let _guard = PrefsGuard::set(&prefs_path);
+
+    let (_fixture, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(char_key('j'));
+    app.save_prefs_for_test();
+
+    assert!(
+        !prefs_path.exists(),
+        "a session that changed no preference still wrote the file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Editing permissions and ownership from the info panel.
+// ---------------------------------------------------------------------------
+
+/// Mode bits of a path, as the panel would report them.
+#[cfg(unix)]
+fn mode_bits(p: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// Focus the info panel with the cursor on `name`.
+///
+/// Releases the panel's focus first if it has it: `cursor_onto` drives the tree
+/// with `j`, and while the panel holds the keyboard `j` walks its fields
+/// instead — so a second call would move the wrong cursor and never arrive.
+async fn info_panel_on(app: &mut myd::app::FileBrowser, name: &str) {
+    if app.info_focused_for_test() {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    }
+    let _ = screen_text(app, 120, 40);
+    cursor_onto(app, name);
+    let _ = screen_text(app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(
+        app.info_focused_for_test(),
+        "the info panel should have focus"
+    );
+}
+
+/// Type a string into whatever dialog is up.
+fn type_into_dialog(app: &mut myd::app::FileBrowser, s: &str) {
+    for c in s.chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn enter_on_permissions_opens_the_attribute_dialog() {
+    let (_dir, mut app) = info_fixture().await;
+    info_panel_on(&mut app, "alpha.txt").await;
+
+    assert_eq!(app.modal_kind_for_test(), "none");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "attr",
+        "Enter should open the attribute dialog"
+    );
+}
+
+/// The whole point: the change has to reach the filesystem.
+#[cfg(unix)]
+#[tokio::test]
+async fn applying_a_mode_changes_the_file_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(app.modal_kind_for_test(), "attr");
+    // Clear the pre-filled current value, then type the new one.
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "600");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&file), 0o600, "the mode did not reach the disk");
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "a successful change should leave no dialog"
+    );
+}
+
+/// The symbolic form is what the panel displays, so it must be accepted.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symbolic_mode_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "rwxr-x---");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&file), 0o750);
+}
+
+/// Tagged files are the selection, as everywhere else in the app.
+#[cfg(unix)]
+#[tokio::test]
+async fn applying_a_mode_covers_every_tagged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("alpha.txt");
+    let b = dir.path().join("beta.txt");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+
+    // Tag both files. The first row is the root directory, so step past it.
+    cursor_onto(&mut app, "alpha.txt");
+    app.handle_key_for_test(char_key('t'));
+    cursor_onto(&mut app, "beta.txt");
+    app.handle_key_for_test(char_key('t'));
+
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(app.modal_kind_for_test(), "attr");
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "640");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&a), 0o640, "the first tagged file was missed");
+    assert_eq!(mode_bits(&b), 0o640, "the second tagged file was missed");
+}
+
+/// A value that is not a mode must change nothing and say why.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bad_permission_value_is_reported_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+    let before = mode_bits(&file);
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "qqq");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&file), before, "a bad value changed the file");
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a bad value should be reported"
+    );
+}
+
+/// Esc must abandon the edit without touching anything.
+#[cfg(unix)]
+#[tokio::test]
+async fn esc_closes_the_attribute_dialog_without_applying() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+    let before = mode_bits(&file);
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "600");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+
+    assert_eq!(app.modal_kind_for_test(), "none");
+    assert_eq!(mode_bits(&file), before, "Esc still applied the change");
+}
+
+/// The recursive option belongs to a directory and nothing else.
+#[cfg(unix)]
+#[tokio::test]
+async fn recursion_is_offered_for_a_directory_and_not_for_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("inner.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+
+    info_panel_on(&mut app, "sub").await;
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert!(
+        screen_text(&mut app, 120, 40).contains("Apply to everything inside"),
+        "a directory should offer recursion"
+    );
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+
+    // A fresh app for the file, rather than navigating this one: the cursor is
+    // parked on a collapsed directory, and walking off it is a different
+    // behaviour than the one under test here.
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "attr",
+        "the dialog should have opened for the file"
+    );
+    assert!(
+        !screen_text(&mut app, 120, 40).contains("Apply to everything inside"),
+        "a file should not offer recursion"
+    );
+}
+
+/// The recursive change has to reach the whole subtree.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recursive_change_reaches_the_files_inside() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let inner = sub.join("inner.txt");
+    std::fs::write(&inner, b"x").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "sub").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "750");
+    // Tab to the checkbox and tick it, then Tab on to Apply.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(char_key(' '));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&sub), 0o750, "the directory itself was missed");
+    assert_eq!(mode_bits(&inner), 0o750, "the file inside was missed");
+}
+
+/// Without the checkbox the change stops at the directory itself.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_recursive_change_leaves_the_contents_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let inner = sub.join("inner.txt");
+    std::fs::write(&inner, b"x").unwrap();
+    let before = mode_bits(&inner);
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "sub").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "750");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&sub), 0o750, "the directory itself was missed");
+    assert_eq!(
+        mode_bits(&inner),
+        before,
+        "an unticked box still changed the contents"
+    );
+}
+
+/// An archive is read-only, so the edit must be refused before anything runs.
+#[tokio::test]
+async fn editing_attributes_is_refused_inside_an_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    assert!(app.info_focused_for_test());
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "an archive should refuse with a notice, not open the dialog"
+    );
+}
+
+/// The panel caches its text, so a change has to invalidate it or the old mode
+/// stays on screen.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_panel_shows_the_new_mode_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+    std::fs::set_permissions(
+        &file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )
+    .unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+    assert!(
+        screen_text(&mut app, 120, 40).contains("rw-r--r--"),
+        "the panel should start by showing the old mode"
+    );
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "600");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        shown.contains("rw-------"),
+        "the panel is still showing the old mode: {shown}"
+    );
+}
+
+/// The dialog opens pre-filled, so an edit is a correction rather than a
+/// retype — and the accepted spelling is discoverable from what is in the box.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_dialog_starts_from_the_current_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+    std::fs::set_permissions(
+        &file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o642),
+    )
+    .unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert!(
+        screen_text(&mut app, 120, 40).contains("642"),
+        "the dialog should open showing the current mode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The info panel's inline preview sub-panel.
+// ---------------------------------------------------------------------------
+
+/// Tick and redraw until the sub-panel's load has landed.
+async fn settle_subpanel(app: &mut myd::app::FileBrowser) {
+    for _ in 0..60 {
+        app.tick_for_test();
+        let _ = screen_text(app, 120, 40);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_sub_panel_shows_the_selected_files_content() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("alpha.txt"),
+        b"FIRSTLINE\nSECONDLINE\nTHIRD\n",
+    )
+    .unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "alpha.txt");
+    settle_subpanel(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        shown.contains("FIRSTLINE"),
+        "the sub-panel did not show the file: {shown}"
+    );
+    // The metadata is still above it — the preview is an addition, not a
+    // replacement.
+    assert!(shown.contains("Perms"), "the metadata is gone: {shown}");
+}
+
+/// The sub-panel follows the cursor, like the full pane.
+#[tokio::test]
+async fn the_sub_panel_follows_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"AAAAMARKER\n").unwrap();
+    std::fs::write(dir.path().join("beta.txt"), b"BBBBMARKER\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+
+    cursor_onto(&mut app, "alpha.txt");
+    settle_subpanel(&mut app).await;
+    assert!(screen_text(&mut app, 120, 40).contains("AAAAMARKER"));
+
+    cursor_onto(&mut app, "beta.txt");
+    settle_subpanel(&mut app).await;
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(shown.contains("BBBBMARKER"), "did not follow: {shown}");
+    assert!(
+        !shown.contains("AAAAMARKER"),
+        "the previous file's content is still up: {shown}"
+    );
+}
+
+/// "If it fits" — a short panel keeps all its rows for the metadata.
+#[tokio::test]
+async fn the_sub_panel_yields_on_a_short_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"FIRSTLINE\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "alpha.txt");
+    settle_subpanel(&mut app).await;
+
+    // Tall enough: the preview is there.
+    assert!(screen_text(&mut app, 120, 40).contains("FIRSTLINE"));
+
+    // Too short for the metadata floor plus a preview: the metadata takes it
+    // all, exactly as before the sub-panel existed.
+    let short = screen_text(&mut app, 120, 14);
+    assert!(
+        !short.contains("FIRSTLINE"),
+        "the preview should yield on a short panel: {short}"
+    );
+    assert!(short.contains("Type"), "the metadata went missing: {short}");
+}
+
+/// A directory would cost a round trip to render a constant string.
+#[tokio::test]
+async fn a_directory_gets_no_inline_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("inner.txt"), b"INNERMARKER\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "sub");
+    settle_subpanel(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        !shown.contains("INNERMARKER"),
+        "a directory should not preview its contents: {shown}"
+    );
+    assert!(
+        !shown.contains("This is a directory"),
+        "a directory should not be loaded at all: {shown}"
+    );
+}
+
+/// Moving off a file that had a preview must clear it, or the old content
+/// reads as the new selection's.
+#[tokio::test]
+async fn the_sub_panel_clears_when_the_cursor_reaches_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"AAAAMARKER\n").unwrap();
+    std::fs::create_dir(dir.path().join("zsub")).unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+
+    cursor_onto(&mut app, "alpha.txt");
+    settle_subpanel(&mut app).await;
+    assert!(screen_text(&mut app, 120, 40).contains("AAAAMARKER"));
+
+    cursor_onto(&mut app, "zsub");
+    settle_subpanel(&mut app).await;
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        !shown.contains("AAAAMARKER"),
+        "the previous file's preview is still up on a directory: {shown}"
+    );
+}
+
+/// The sub-panel is not a focus target, so Tab must never land on it.
+#[tokio::test]
+async fn tab_never_lands_on_the_sub_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"FIRSTLINE\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "alpha.txt");
+    settle_subpanel(&mut app).await;
+
+    // Round the whole rotation twice. With one panel and no sidebar the only
+    // stops are the panel and the info panel, so focus must alternate between
+    // exactly those two.
+    for _ in 0..4 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        let _ = screen_text(&mut app, 120, 40);
+        assert!(
+            !app.preview_focused_for_test(),
+            "Tab reached the preview from the info panel"
+        );
+    }
+}
+
+/// The full pane covers the panels, so the sub-panel neither draws nor loads
+/// while it is open.
+#[tokio::test]
+async fn the_sub_panel_stands_down_while_the_full_preview_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), b"FIRSTLINE\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "alpha.txt");
+    settle_subpanel(&mut app).await;
+    assert!(screen_text(&mut app, 120, 40).contains("FIRSTLINE"));
+
+    // Space opens the full preview over everything.
+    app.handle_key_for_test(char_key(' '));
+    settle_subpanel(&mut app).await;
+    assert!(
+        app.preview_open_for_test(),
+        "the full preview should be open"
+    );
+    // The sub-panel's content must not be on screen: it is drawn after the full
+    // pane, so without the guard it paints straight over it — verified by
+    // removing the guard, which puts the separator and this line at column ~80,
+    // inside the pane's box. The full pane shows the same file, so the check is
+    // positional: only a leaked sub-panel draws this far right.
+    let covered = screen_text(&mut app, 120, 40);
+    let leaked = covered
+        .lines()
+        .any(|l| l.rfind("FIRSTLINE").is_some_and(|at| at > 70));
+    assert!(!leaked, "the info panel drew over the full preview: {covered}");
+
+    // Closing it brings the sub-panel back.
+    app.handle_key_for_test(char_key('q'));
+    settle_subpanel(&mut app).await;
+    assert!(
+        screen_text(&mut app, 120, 40).contains("FIRSTLINE"),
+        "the sub-panel did not come back"
+    );
+}
+
+/// A binary file has no useful preview, but the note explaining that is cheap
+/// and worth showing.
+#[tokio::test]
+async fn a_binary_file_says_so_in_the_sub_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "alpha.bin");
+    settle_subpanel(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        shown.contains("Binary"),
+        "a binary file should say so: {shown}"
+    );
+}
+
+/// After applying, the app must be in a state that repaints — the event loop
+/// only draws when something has happened, and a dialog closing does not count
+/// on its own. Without it the panel keeps showing the old mode until the next
+/// keystroke, which reads as the change not having worked.
+///
+/// Caught in a real terminal under a PTY, not here: every render helper in this
+/// file draws unconditionally, so no test that calls one can observe a missing
+/// repaint. This is a weaker guard than it looks — other things on this path
+/// also set the flag — but it pins the post-condition, and the file content and
+/// panel text either side of it are checked properly by the tests above.
+#[cfg(unix)]
+#[tokio::test]
+async fn applying_a_change_asks_for_a_repaint() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("alpha.txt");
+    std::fs::write(&file, b"hello\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    info_panel_on(&mut app, "alpha.txt").await;
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "600");
+    // Drawing clears the flag, so check it as the apply leaves it.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(mode_bits(&file), 0o600, "the change did not apply");
+    assert!(
+        app.force_repaint_pending_for_test(),
+        "the panel will not repaint until the next keystroke"
+    );
+}
+
+/// A declined preview must draw nothing. "Loading…" promises content that is
+/// never coming, which reads as the panel having hung.
+#[tokio::test]
+async fn a_directory_shows_an_empty_sub_panel_not_a_loading_message() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "sub");
+    settle_subpanel(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        !shown.contains("Loading"),
+        "a directory should show an empty preview, not a loading message: {shown}"
+    );
+    // The metadata is still there — only the preview is blank.
+    assert!(shown.contains("Perms"), "the metadata went missing: {shown}");
+}
+
+/// An archive previews as its table of contents, the same as the full pane —
+/// what is in it is the one thing anyone wants to know.
+#[tokio::test]
+async fn an_archive_previews_its_contents_in_the_sub_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "bundle.zip");
+    settle_subpanel(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        shown.contains("members"),
+        "the archive's listing did not appear: {shown}"
+    );
+    assert!(
+        !shown.contains("Loading"),
+        "the listing never landed: {shown}"
+    );
+}
+
+/// Inside an archive the sub-panel reads members like any other file — they are
+/// on this machine, so none of the remote gating applies.
+#[tokio::test]
+async fn a_file_inside_an_archive_previews_in_the_sub_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "run.sh");
+    settle_subpanel(&mut app).await;
+
+    let shown = screen_text(&mut app, 120, 40);
+    assert!(
+        shown.contains("echo hi"),
+        "the member's content did not appear: {shown}"
+    );
+}
+
+/// An archive is not backend 0, but its members are read from a file on this
+/// machine — so the gate that exists for network round trips must not catch
+/// them. An image inside an archive costs no transfer, and asking
+/// `is_local()` instead of "is this over a network?" silently skipped it.
+///
+/// An image specifically, because that is the branch the remote gate guards;
+/// a text member would pass either way.
+#[tokio::test]
+async fn an_image_inside_an_archive_is_not_gated_as_remote() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pics.zip");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut w = zip::ZipWriter::new(file);
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    // A real PNG header, so the loader takes the image branch rather than
+    // sniffing it as text.
+    w.start_file("shot.png", opts).unwrap();
+    w.write_all(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+    w.start_file("readme.txt", opts).unwrap();
+    w.write_all(b"UNIQUEMARKER\n").unwrap();
+    w.finish().unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "pics.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "shot.png");
+    settle_subpanel(&mut app).await;
+
+    // Whatever the renderer makes of a stub PNG, the load must have been
+    // *attempted* — the gate skipping it outright leaves an empty box, which is
+    // what this is guarding against.
+    let shown = screen_text(&mut app, 120, 40);
+    let attempted = shown.contains("Loading")
+        || shown.contains("render")
+        || shown.contains("timg")
+        || shown.contains("chafa")
+        || shown.contains("produced no output")
+        || shown.contains("Could not read");
+    assert!(
+        attempted,
+        "an image inside an archive was skipped as if it were remote: {shown}"
+    );
+}
+
+/// The sub-panel is a fraction of a panel wide, and the listing's columns are
+/// laid out *before* the name — so in that box the permissions and timestamps
+/// are all that survives truncation and the names, the one thing worth seeing,
+/// run off the edge. It shows names alone; the full pane keeps the columns.
+#[tokio::test]
+async fn the_sub_panel_lists_archive_names_without_the_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "bundle.zip");
+    settle_subpanel(&mut app).await;
+
+    // Everything right of the panel's own left border belongs to it. Found
+    // from the frame rather than hardcoded: the divider moves with the width
+    // preference and with how the rows are split.
+    let frame = screen_text(&mut app, 120, 40);
+    let divider = frame
+        .lines()
+        .find(|l| l.contains("Info"))
+        .and_then(|l| l.rfind('┌').map(|b| l[..b].chars().count()))
+        .expect("the info panel should be on screen");
+    let sub: String = frame
+        .lines()
+        .filter_map(|l| l.char_indices().nth(divider).map(|(b, _)| l[b..].to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        sub.contains("run.sh"),
+        "the member names are missing: {sub}"
+    );
+    assert!(
+        !sub.contains("-rwxr-xr-x"),
+        "the sub-panel is still drawing the permissions column: {sub}"
+    );
+    assert!(
+        !sub.contains("125%"),
+        "the sub-panel is still drawing the ratio column: {sub}"
+    );
+
+    // The full pane has the width, so it keeps every column.
+    app.handle_key_for_test(char_key(' '));
+    settle_subpanel(&mut app).await;
+    let full = screen_text(&mut app, 120, 40);
+    assert!(
+        full.contains("-rwxr-xr-x"),
+        "the full pane lost its permissions column: {full}"
+    );
+}
+
+/// The metadata is a fixed handful of rows, so a taller terminal must give the
+/// extra space to the preview — the one part that can use it.
+///
+/// It used to cap the preview at a third of the panel, which meant a tall
+/// terminal grew the *metadata*: at sixty rows the fields took forty of them to
+/// say the same nine things.
+#[tokio::test]
+async fn a_taller_panel_gives_the_extra_rows_to_the_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.txt"),
+        (0..80).map(|i| format!("line {i}\n")).collect::<String>(),
+    )
+    .unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 60);
+    cursor_onto(&mut app, "a.txt");
+    settle_subpanel(&mut app).await;
+
+    let preview_rows = |h: u16, app: &mut myd::app::FileBrowser| {
+        screen_text(app, 120, h)
+            .lines()
+            .filter(|l| l.contains("line "))
+            .count()
+    };
+
+    let short = preview_rows(30, &mut app);
+    let tall = preview_rows(60, &mut app);
+
+    // Thirty more rows of terminal must be worth nearly thirty more rows of
+    // preview, not ten: the metadata's needs do not grow with the window.
+    assert!(
+        tall >= short + 25,
+        "doubling the height gained only {} preview rows ({short} -> {tall})",
+        tall - short
+    );
+}
+
+/// `+` and `-` move the split, and the sign follows the key rather than the
+/// field it is stored in: `+` means more preview.
+#[tokio::test]
+async fn plus_and_minus_move_the_metadata_preview_split() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 60);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+
+    // Relative to wherever it starts: the bias is a saved preference, so a
+    // machine with one already set is a legitimate starting point and asserting
+    // a fixed value would be testing the tester's config.
+    let start = app.info_meta_bias_for_test();
+
+    app.handle_key_for_test(char_key('+'));
+    assert_eq!(
+        app.info_meta_bias_for_test(),
+        start - 1,
+        "+ should take a row from the metadata and give it to the preview"
+    );
+
+    app.handle_key_for_test(char_key('-'));
+    app.handle_key_for_test(char_key('-'));
+    assert_eq!(
+        app.info_meta_bias_for_test(),
+        start + 1,
+        "- should give rows back to the metadata"
+    );
+}
+
+/// The metadata keeps its floor however hard `+` is held: the fields that
+/// matter must not be squeezed out by the preview.
+#[tokio::test]
+async fn the_metadata_keeps_its_floor_however_far_the_split_is_pushed() {
+    let (_dir, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 60);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+
+    for _ in 0..80 {
+        app.handle_key_for_test(char_key('+'));
+    }
+    let shown = screen_text(&mut app, 120, 60);
+    for field in ["Type", "Size", "Perms"] {
+        assert!(
+            shown.contains(field),
+            "the metadata lost '{field}' when the preview took everything: {shown}"
+        );
+    }
+
+    // And the other way: the preview must survive too.
+    for _ in 0..160 {
+        app.handle_key_for_test(char_key('-'));
+    }
+    assert!(
+        app.info_meta_bias_for_test() <= 40,
+        "the bias ran past its clamp"
+    );
+}
+
+/// The split is a preference like the width, so it survives navigation and is
+/// written on exit.
+#[tokio::test]
+async fn the_split_is_remembered() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefs_path = dir.path().join("prefs.toml");
+    let _guard = PrefsGuard::set(&prefs_path);
+
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("f.txt"), b"x").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 60);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(char_key('+'));
+    let biased = app.info_meta_bias_for_test();
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert_eq!(
+        app.info_meta_bias_for_test(),
+        biased,
+        "the split reset on entering a directory"
+    );
+
+    app.save_prefs_for_test();
+    assert_eq!(
+        myd::prefs::Prefs::load_from(&prefs_path).info_meta_bias,
+        biased,
+        "the split did not survive the round trip to disk"
+    );
+}
+
+/// A large file inside an archive is extracted from a container on this
+/// machine, so the cap that guards against downloading a big *remote* file must
+/// not apply to it. It reported "too large to fetch for a preview" about a file
+/// there was nothing to fetch.
+///
+/// Both previews are checked: the sub-panel and the full pane share this code
+/// path, and the bug showed in both.
+#[tokio::test]
+async fn a_large_file_inside_an_archive_is_not_refused_as_a_remote_fetch() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("docs.zip");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let o: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        w.start_file("big.pdf", o).unwrap();
+        w.write_all(b"%PDF-1.4\n").unwrap();
+        // Past the 32MB remote-fetch cap, and incompressible — a member that
+        // shrinks to nothing is rejected by the index as implausibly large for
+        // the container holding it.
+        let mut seed: u64 = 12345;
+        let mut chunk = vec![0u8; 1024 * 1024];
+        for b in chunk.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (seed >> 33) as u8;
+        }
+        // One buffer of random bytes written 34 times: past the 32MB cap, but
+        // the repetition keeps the *container* small enough to build quickly
+        // while still being far too large to look like a compression artefact.
+        for _ in 0..34 {
+            w.write_all(&chunk).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "docs.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "big.pdf");
+
+    // The full pane, as `space` opens it.
+    app.handle_key_for_test(char_key(' '));
+    settle_subpanel(&mut app).await;
+    let full = screen_text(&mut app, 120, 40);
+    assert!(
+        !full.contains("too large to fetch"),
+        "the full pane refused an archive member as a remote fetch: {full}"
+    );
+
+    // And the info panel's inline preview, which takes the same path.
+    app.handle_key_for_test(char_key('q'));
+    app.handle_key_for_test(ctrl_key('p'));
+    settle_subpanel(&mut app).await;
+    let inline = screen_text(&mut app, 120, 40);
+    assert!(
+        !inline.contains("too large to fetch"),
+        "the sub-panel refused an archive member as a remote fetch: {inline}"
+    );
+}
+
+/// The three backends must agree on what "remote" means, since several cost
+/// guards turn on it. An archive is not backend 0 but is not over a wire
+/// either — conflating the two is what broke previews inside archives twice.
+#[test]
+fn only_the_network_backend_reports_itself_remote() {
+    use myd::vfs::{LocalFs, Vfs};
+    use std::sync::Arc;
+
+    let local: Arc<dyn Vfs> = Arc::new(LocalFs::new());
+    assert!(!local.is_remote(), "the local filesystem is not remote");
+    assert_eq!(local.scheme(), "file");
+}
+
+/// Hiding the info panel must take its preview with it.
+///
+/// The sub-panel's rect is recorded by `render_info` and drawn into afterwards
+/// by the app, from outside the screen. A hidden panel does not run
+/// `render_info` at all, so the rect from the last visible frame survived and
+/// the preview kept being drawn into it — a stripe of file content over the
+/// tree, with no panel around it because the border had gone and the content
+/// had not.
+#[tokio::test]
+async fn hiding_the_info_panel_takes_its_preview_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"GHOSTMARKER line one\nsecond\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('|'));
+    let _ = screen_text(&mut app, 160, 40);
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 160, 40);
+    cursor_onto(&mut app, "a.txt");
+    settle_subpanel(&mut app).await;
+
+    assert!(
+        screen_text(&mut app, 160, 40).contains("GHOSTMARKER"),
+        "the preview should be up before it can be hidden"
+    );
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let hidden = screen_text(&mut app, 160, 40);
+    assert!(
+        !hidden.contains("GHOSTMARKER"),
+        "the preview outlived the panel it belongs to: {hidden}"
+    );
+    assert!(
+        !hidden.contains("Info"),
+        "the panel itself should be gone too: {hidden}"
+    );
+}
+
+/// The same, for the other panel of a split: each records its own rect, so
+/// hiding either one must clear that one.
+#[tokio::test]
+async fn hiding_the_info_panel_on_the_other_side_of_a_split_clears_it_too() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"GHOSTMARKER line one\nsecond\n").unwrap();
+
+    let mut app = myd::app::FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('|'));
+    let _ = screen_text(&mut app, 160, 40);
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 160, 40);
+    cursor_onto(&mut app, "a.txt");
+    settle_subpanel(&mut app).await;
+
+    // Move to the other panel, then hide the info panel from there.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    let _ = screen_text(&mut app, 160, 40);
+    app.handle_key_for_test(ctrl_key('p'));
+
+    let hidden = screen_text(&mut app, 160, 40);
+    assert!(
+        !hidden.contains("GHOSTMARKER"),
+        "a preview survived on the other side of the split: {hidden}"
+    );
+}
+
+/// Turn the info panel on for both halves of a split, leaving both cursors on
+/// `name`. Returns the app with focus on a tree (not the info panel).
+async fn dual_info_app(name: &str, dir: &std::path::Path) -> myd::app::FileBrowser {
+    let mut app = myd::app::FileBrowser::new(Some(dir.to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('|'));
+    let _ = screen_text(&mut app, 170, 40);
+
+    // The split leaves focus on the new panel, and Tab reaches the info panel
+    // before the other tree — so step until `active` actually changes.
+    for _ in 0..2 {
+        app.handle_key_for_test(ctrl_key('p'));
+        let _ = screen_text(&mut app, 170, 40);
+        cursor_onto(&mut app, name);
+        settle_subpanel(&mut app).await;
+        let start = app.active_panel_for_test();
+        for _ in 0..4 {
+            app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+            let _ = screen_text(&mut app, 170, 40);
+            if app.active_panel_for_test() != start {
+                break;
+            }
+        }
+    }
+    // Hand the keyboard back to the tree: Tab may have left it on an info
+    // panel, where `j` walks fields rather than moving the cursor.
+    if app.info_focused_for_test() {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+        let _ = screen_text(&mut app, 170, 40);
+    }
+    app
+}
+
+/// With both info panels up and both cursors on the same file, both previews
+/// show it — and Tab does not empty either of them.
+///
+/// The sub-panel used to be drawn only for the active panel, so the other half
+/// of a split had an empty hole under its metadata, and switching panels moved
+/// the hole rather than filling it.
+#[tokio::test]
+async fn both_halves_of_a_split_keep_their_preview_across_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.txt"),
+        b"AAAAMARKER one\nAAAAMARKER two\n",
+    )
+    .unwrap();
+
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+    let markers = |app: &mut myd::app::FileBrowser| {
+        screen_text(app, 170, 40).matches("AAAAMARKER").count()
+    };
+
+    assert!(
+        markers(&mut app) >= 4,
+        "both previews should be filled when both cursors are on the same file"
+    );
+
+    // Round the rotation: neither preview may empty on the way.
+    for i in 0..4 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        settle_subpanel(&mut app).await;
+        assert!(
+            markers(&mut app) >= 4,
+            "a preview emptied after {} Tab press(es)",
+            i + 1
+        );
+    }
+}
+
+/// Each panel previews its *own* cursor's file, so a split showing two
+/// different files shows both — and neither panel is captioned by the other's
+/// metadata.
+#[tokio::test]
+async fn each_half_of_a_split_previews_its_own_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.txt"),
+        b"AAAAMARKER one\nAAAAMARKER two\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"BBBBMARKER only\n").unwrap();
+
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+
+    // Point the active panel at the other file, so the two disagree.
+    cursor_onto(&mut app, "b.txt");
+    settle_subpanel(&mut app).await;
+    let shown = screen_text(&mut app, 170, 40);
+
+    assert_eq!(
+        shown.matches("BBBBMARKER").count(),
+        1,
+        "the moved panel should preview its new file, and only in its own box: {shown}"
+    );
+    // The other panel keeps showing *its own* file rather than a placeholder:
+    // each panel loads for its own cursor.
+    assert!(
+        shown.matches("AAAAMARKER").count() >= 1,
+        "the unfocused panel should still preview its own file: {shown}"
+    );
+}
+
+/// Moving focus must not disturb a preview already on screen. Each panel loads
+/// for its own cursor, so Tab changes which panel is *outlined*, and nothing
+/// else.
+///
+/// The sub-panel was originally a single slot following the focused panel, so
+/// in a split the unfocused half went blank the moment focus moved — and
+/// filling both from that one slot captioned one panel's file with the other's
+/// metadata. Per-panel state is what makes focus irrelevant to content.
+#[tokio::test]
+async fn switching_panels_leaves_both_previews_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"AAAAMARKER one\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"BBBBMARKER only\n").unwrap();
+
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+
+    // Leave the two panels on different files.
+    // `cursor_onto` only moves down, and the cursor may already be past the
+    // target — start from the top.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('g'));
+    cursor_onto(&mut app, "b.txt");
+    settle_subpanel(&mut app).await;
+
+    let before = screen_text(&mut app, 170, 40);
+    let (a_before, b_before) = (
+        before.matches("AAAAMARKER").count(),
+        before.matches("BBBBMARKER").count(),
+    );
+    assert_eq!(
+        (a_before, b_before),
+        (1, 1),
+        "each panel should be previewing its own file: {before}"
+    );
+
+    // Round the whole rotation. Every stop must show exactly the same content.
+    for i in 0..5 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        settle_subpanel(&mut app).await;
+        let now = screen_text(&mut app, 170, 40);
+        assert_eq!(
+            (
+                now.matches("AAAAMARKER").count(),
+                now.matches("BBBBMARKER").count()
+            ),
+            (a_before, b_before),
+            "a preview changed after {} Tab press(es): {now}",
+            i + 1
+        );
+    }
+
+    // A panel loads for its own cursor even while another has focus. Move one
+    // panel's cursor, Tab away, then move the *other* panel's: with a single
+    // shared loader the first panel's preview is lost the moment it stops being
+    // the focused one.
+    std::fs::write(dir.path().join("c.txt"), b"CCCCMARKER third\n").unwrap();
+    while app.info_focused_for_test() {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+        let _ = screen_text(&mut app, 170, 40);
+    }
+    app.handle_key_for_test(char_key('r'));
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('g'));
+    cursor_onto(&mut app, "c.txt");
+    settle_subpanel(&mut app).await;
+    assert_eq!(
+        screen_text(&mut app, 170, 40).matches("CCCCMARKER").count(),
+        1,
+        "the panel whose cursor moved should preview the new file"
+    );
+
+    // Now hand focus to the other panel and move *its* cursor. The first
+    // panel's preview must survive: it is no longer focused, but its cursor has
+    // not moved.
+    let start = app.active_panel_for_test();
+    for _ in 0..4 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        let _ = screen_text(&mut app, 170, 40);
+        if app.active_panel_for_test() != start && !app.info_focused_for_test() {
+            break;
+        }
+    }
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('g'));
+    cursor_onto(&mut app, "a.txt");
+    settle_subpanel(&mut app).await;
+
+    let both = screen_text(&mut app, 170, 40);
+    assert_eq!(
+        both.matches("CCCCMARKER").count(),
+        1,
+        "the unfocused panel lost its preview when the other panel moved: {both}"
+    );
+    assert_eq!(
+        both.matches("AAAAMARKER").count(),
+        1,
+        "the focused panel should preview the file it just moved to: {both}"
+    );
+}
+
+/// Every info panel on screen must be reachable by Tab, not just the active
+/// panel's.
+///
+/// The rotation was built from offsets and allocated exactly one info-panel
+/// stop, at the end, always targeting whichever panel was active. In a split
+/// with both info panels open the left one could never be focused, so its
+/// permissions and ownership could not be edited at all.
+#[tokio::test]
+async fn tab_reaches_the_info_panel_of_both_halves_of_a_split() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"AAAAMARKER\n").unwrap();
+
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+
+    // Walk a full rotation and record which (panel, info?) stops it visits.
+    let mut seen: Vec<(usize, bool)> = Vec::new();
+    for _ in 0..8 {
+        seen.push((app.active_panel_for_test(), app.info_focused_for_test()));
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        let _ = screen_text(&mut app, 170, 40);
+    }
+
+    for panel in [0, 1] {
+        assert!(
+            seen.contains(&(panel, true)),
+            "panel {panel}'s info panel is unreachable by Tab: visited {seen:?}"
+        );
+        assert!(
+            seen.contains(&(panel, false)),
+            "panel {panel}'s tree is unreachable by Tab: visited {seen:?}"
+        );
+    }
+}
+
+/// Focusing an info panel makes its panel the active one: the fields it edits
+/// are that panel's selection, so acting on another panel's file would be a
+/// permission change on something the user is not looking at.
+#[tokio::test]
+async fn focusing_an_info_panel_makes_its_own_panel_active() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"AAAAMARKER\n").unwrap();
+
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        let _ = screen_text(&mut app, 170, 40);
+        if app.info_focused_for_test() {
+            // Whichever info panel this is, the dialog it opens must act on the
+            // panel it belongs to — which is the one now active.
+            let owner = app.active_panel_for_test();
+            app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+            assert_eq!(
+                app.modal_kind_for_test(),
+                "attr",
+                "a focused info panel should open its edit dialog"
+            );
+            assert_eq!(
+                app.active_panel_for_test(),
+                owner,
+                "the dialog changed which panel is active"
+            );
+            app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+        }
+    }
+}
+
+/// The left panel's permissions are editable — the whole point of reaching its
+/// info panel.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_left_panels_permissions_can_be_edited_in_a_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, b"x").unwrap();
+    std::fs::set_permissions(
+        &file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )
+    .unwrap();
+
+    let mut app = dual_info_app("a.txt", dir.path()).await;
+
+    // Tab until panel 0's info panel has the keyboard.
+    let mut reached = false;
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        let _ = screen_text(&mut app, 170, 40);
+        if app.info_focused_for_test() && app.active_panel_for_test() == 0 {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "never reached the left panel's info panel");
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(app.modal_kind_for_test(), "attr");
+    for _ in 0..8 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    type_into_dialog(&mut app, "600");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(
+        mode_bits(&file),
+        0o600,
+        "editing from the left panel's info panel did not reach the disk"
     );
 }

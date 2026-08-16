@@ -626,6 +626,11 @@ impl Vfs for SftpFs {
         "sftp"
     }
 
+    /// The one backend that is genuinely over a wire.
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     fn display_name(&self) -> String {
         self.label.clone()
     }
@@ -787,6 +792,54 @@ impl Vfs for SftpFs {
                 to.path.display()
             )
         })?;
+        Ok(())
+    }
+
+    async fn set_mode(&self, path: &VPath, mode: u32) -> Result<()> {
+        let mut fs = self.sftp.fs();
+        // Masked to the permission bits, as locally: the mode came from a
+        // dialog that parsed `644` or `rw-r--r--`, and the file-type bits are
+        // not the user's to set. (`Permissions::from` masks too; doing it here
+        // as well keeps the two backends visibly identical.)
+        let perms = openssh_sftp_client::metadata::Permissions::from((mode & 0o7777) as u16);
+        fs.set_permissions(&path.path, perms)
+            .await
+            .with_context(|| {
+                format!("could not set permissions on {}", path.path.display())
+            })?;
+        Ok(())
+    }
+
+    async fn set_owner(&self, path: &VPath, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        // SFTP's SETSTAT carries uid and gid as a pair with no "leave this one"
+        // sentinel, unlike `chown`'s -1. So a request to change only one of
+        // them has to supply the other's current value, which costs a stat.
+        let (uid, gid) = match (uid, gid) {
+            (Some(u), Some(g)) => (u, g),
+            _ => {
+                let meta = self.stat(path).await.with_context(|| {
+                    format!(
+                        "could not read the current owner of {}",
+                        path.path.display()
+                    )
+                })?;
+                let current_uid = meta.uid.with_context(|| {
+                    format!("{} does not report an owner", path.path.display())
+                })?;
+                let current_gid = meta.gid.with_context(|| {
+                    format!("{} does not report a group", path.path.display())
+                })?;
+                (uid.unwrap_or(current_uid), gid.unwrap_or(current_gid))
+            }
+        };
+
+        let mut fs = self.sftp.fs();
+        let meta = openssh_sftp_client::metadata::MetaDataBuilder::new()
+            .id((uid, gid))
+            .create();
+        fs.set_metadata(&path.path, meta)
+            .await
+            .with_context(|| format!("could not change owner of {}", path.path.display()))?;
         Ok(())
     }
 

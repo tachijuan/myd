@@ -30,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
             cols,
             rows,
             page: 0,
+            cells_only: false,
+            compact_listing: false,
+            max_text_bytes: None,
         },
     )
     .await;
