@@ -132,34 +132,49 @@ impl InputDialog {
 
         // Input display with cursor indicator. A masked field shows dots so a
         // passphrase or password never appears on screen.
-        let display = if self.value.is_empty() && !self.placeholder.is_empty() {
-            format!("\x1b[4m{}\x1b[0m", self.placeholder) // Underlined placeholder (visual hint).
+        //
+        // The placeholder is styled through ratatui rather than with in-band
+        // escapes. A literal "\x1b[4m…\x1b[0m" is not interpreted — the buffer
+        // stores it as cells — so it drew as visible "[4m" text *and* ate eight
+        // columns of the line's width, leaving that much of the row beyond it
+        // unpainted and the tree underneath showing through.
+        let showing_placeholder = self.value.is_empty() && !self.placeholder.is_empty();
+        let display = if showing_placeholder {
+            self.placeholder.clone()
         } else if self.masked {
             "•".repeat(self.value.chars().count())
         } else {
             self.value.clone()
+        };
+        // Underlined and dim, so it still reads as a hint rather than as text
+        // that has been typed.
+        let text_style = if showing_placeholder {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
         };
 
         // The value can be longer than the box, so the input line is a window
         // onto it that scrolls to keep the cursor visible — otherwise a long
         // path just ran past the border and the user typed blind.
         //
-        // The placeholder is decorated with escapes and is only shown when the
-        // value is empty, so scrolling applies to real input only.
+        // The placeholder stands in for an empty value, so scrolling applies to
+        // real input only.
         let chars: Vec<char> = display.chars().collect();
-        let showing_placeholder = self.value.is_empty() && !self.placeholder.is_empty();
         // One column is reserved for the cursor block.
         let window = inner_width.saturating_sub(1).max(1);
         let cursor = self.cursor.min(chars.len());
         let input_line = if showing_placeholder || chars.len() <= window {
-            let cut: String = chars[..cursor.min(chars.len())].iter().collect();
-            let rest: String = chars[cursor.min(chars.len())..].iter().collect();
+            // The cursor sits at the start of a placeholder: nothing is typed
+            // yet, so it must not appear to sit after the hint text.
+            let split = if showing_placeholder { 0 } else { cursor };
+            let cut: String = chars[..split].iter().collect();
+            let rest: String = chars[split..].iter().collect();
             Line::from(vec![
-                Span::styled(
-                    format!("{}{}", cut, "█"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(rest, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}{}", cut, "█"), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(rest, text_style),
             ])
         } else {
             // Scroll so the cursor sits inside the window, keeping as much text
@@ -188,10 +203,7 @@ impl InputDialog {
                 format!("{}{}", before, "█"),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(
-                after,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(after, text_style));
             if end < chars.len() {
                 spans.push(Span::styled("›", Style::default().fg(Color::DarkGray)));
             }

@@ -17781,3 +17781,71 @@ async fn pressing_g_shows_the_chord_keys_in_the_footer() {
         done
     );
 }
+
+/// The filter dialog must not leak the tree underneath, or leave debris behind.
+///
+/// The placeholder was drawn with in-band ANSI escapes ("\x1b[4m…"). Ratatui
+/// stores span content as cells rather than interpreting it, so the escapes
+/// showed as literal "[4m" text *and* consumed eight columns of the input
+/// line's width — leaving that much of the row unpainted, with the tree showing
+/// through, and stray characters left over once the dialog closed.
+#[tokio::test]
+async fn the_filter_dialog_covers_the_tree_and_leaves_nothing_behind() {
+    use crossterm::event::{KeyCode, KeyEvent};
+    let dir = tempfile::tempdir().unwrap();
+    // Long names, so the rows under the dialog are wide enough to show through.
+    for i in 0..12 {
+        std::fs::write(
+            dir.path().join(format!("ZZZZ-distinctive-row-{:02}-aaaaaaaaaaaaaaaaaaaa.txt", i)),
+            b"x",
+        )
+        .unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Open the filter dialog.
+    app.handle_key_for_test(char_key('f'));
+    let open = screen_text(&mut app, 100, 24);
+
+    // No un-interpreted escape debris anywhere on screen.
+    for junk in ["[4m", "[0m", "\u{1b}"] {
+        assert!(
+            !open.contains(junk),
+            "raw escape {:?} was drawn as text: {}",
+            junk,
+            open
+        );
+    }
+
+    // Inside the dialog's border, no row leaks the tree behind it.
+    for line in open.lines() {
+        if let (Some(l), Some(r)) = (line.find('│'), line.rfind('│')) {
+            if r > l {
+                let inner = &line[l + '│'.len_utf8()..r];
+                assert!(
+                    !inner.contains("ZZZZ"),
+                    "the tree showed through the dialog: {:?}",
+                    line
+                );
+            }
+        }
+    }
+
+    // Apply a filter that matches nothing, then confirm no debris survives.
+    for c in "row-03".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(KeyEvent::from(KeyCode::Enter));
+    settle(&mut app).await;
+
+    let after = screen_text(&mut app, 100, 24);
+    for junk in ["[4m", "[0m", "\u{1b}", "/pattern/"] {
+        assert!(
+            !after.contains(junk),
+            "{:?} was left on screen after the filter was applied: {}",
+            junk,
+            after
+        );
+    }
+}
