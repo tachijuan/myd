@@ -1118,3 +1118,89 @@ sftp_test!(a_colon_path_lands_under_home, env, {
 
     std::fs::remove_dir_all(&under_home).ok();
 });
+
+// Connecting to a relative path must not trap the panel in that directory.
+//
+// `sftp://host:c` roots the panel at ~/c with an empty screen stack, so `h`
+// had nothing to pop and no way to re-root: the starting directory was a hard
+// ceiling and the only way out was retyping a URL in the picker.
+sftp_test!(h_climbs_out_of_a_remote_start_directory, env, {
+    // A directory under the login directory, reached by the colon form.
+    let server_home = {
+        let bare = SftpTarget {
+            host: env.host.clone(),
+            user: Some(whoami()),
+            port: Some(env.port),
+            path: None,
+        };
+        match SftpFs::connect(&bare, &Credentials::default(), true)
+            .await
+            .expect("connect with no path failed")
+        {
+            ConnectOutcome::Connected(fs) => fs.home().to_path_buf(),
+            ConnectOutcome::NeedsCredential(need) => panic!("unexpected prompt: {:?}", need),
+        }
+    };
+    let name = "myd-updir-probe";
+    let under_home = server_home.join(name);
+    std::fs::create_dir_all(under_home.join("inner")).expect("create probe dir");
+
+    let local = tempfile::tempdir().unwrap();
+    let mut app = myd::app::FileBrowser::new(Some(local.path().to_path_buf()), None, false);
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    // Connect with the scp-style relative path.
+    let target = format!(
+        "sftp://{}@{}:{}:{}",
+        whoami(),
+        env.host,
+        env.port,
+        name
+    );
+    app.connect_on_start(&target);
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        if app.panel_current_dir(0) == Some(under_home.clone()) {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        opened,
+        "did not land in {} (got {:?})",
+        under_home.display(),
+        app.panel_current_dir(0)
+    );
+
+    // `h` at the root climbs out into the login directory, over the same
+    // connection — one press, no picker.
+    app.handle_key_for_test(crossterm::event::KeyEvent::from(
+        crossterm::event::KeyCode::Char('h'),
+    ));
+    let mut climbed = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0) == Some(server_home.clone()) {
+            climbed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        climbed,
+        "h did not re-root to {} (got {:?})",
+        server_home.display(),
+        app.panel_current_dir(0)
+    );
+
+    std::fs::remove_dir_all(&under_home).ok();
+});
