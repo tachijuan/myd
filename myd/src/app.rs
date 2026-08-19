@@ -1716,6 +1716,12 @@ impl FileBrowser {
         self.is_connecting()
     }
 
+    /// The saved-directory catalog, for tests that need a preference recorded
+    /// the way an earlier session would have left it.
+    pub fn hosts_mut_for_test(&mut self) -> &mut crate::hosts::HostCatalog {
+        &mut self.hosts
+    }
+
     /// How deep the active panel's screen stack is (for tests).
     ///
     /// Distinguishes navigation that pushes history from navigation that
@@ -4279,16 +4285,25 @@ impl FileBrowser {
                             sort_mode,
                         ));
                     } else {
-                        // Honour whatever was decided for this directory last
-                        // time: somewhere not worth walking stays that way
-                        // instead of measuring again on every arrival. With
-                        // nothing recorded, the session's mode carries in — a
+                        // A pane that is *currently* shallow stays shallow when
+                        // you walk into a subdirectory. What is on screen wins
+                        // over what was recorded for the destination: climbing
+                        // out of a shallow tree with `h` and stepping back into
+                        // a directory recorded as measured would otherwise
+                        // launch the full walk the pane was visibly avoiding,
+                        // with the footer still reading "shallow".
+                        //
+                        // Otherwise honour whatever was decided for this
+                        // directory last time — somewhere not worth walking
+                        // stays that way instead of measuring again on every
+                        // arrival — and failing that the session's mode, since a
                         // subdirectory entered under `-s` is not a reason to
                         // start measuring.
-                        let shallow = self
-                            .hosts
-                            .dir_shallow_pref(&path.to_string_lossy())
-                            .unwrap_or(self.shallow_default);
+                        let shallow = source.is_shallow()
+                            || self
+                                .hosts
+                                .dir_shallow_pref(&path.to_string_lossy())
+                                .unwrap_or(self.shallow_default);
                         let panel = self.active_panel_mut();
                         if shallow {
                             panel.screen_stack.push(Screen::loading_with_source_sorted(

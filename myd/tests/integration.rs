@@ -11902,34 +11902,87 @@ async fn toggling_the_mode_changes_it_for_later_directories() {
     );
 }
 
-/// A directory explicitly recorded as measured stays measured under `-s`.
+/// A recorded preference applies on arrival from a measured pane.
+///
+/// It no longer outranks a pane that is *currently* shallow — see
+/// `a_shallow_pane_stays_shallow_when_entering_a_directory_recorded_as_measured`
+/// for why. What is on screen wins there; this covers the case where nothing on
+/// screen contradicts the recording.
 #[tokio::test]
-async fn a_recorded_preference_outranks_the_session_mode() {
+async fn a_recorded_preference_applies_when_arriving_from_a_measured_pane() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    // The session mode is only the fallback. Somewhere the user decided to
-    // measure is a decision about that directory, and opening the app with `-s`
-    // does not overrule it.
     let cfg = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("sub")).unwrap();
     std::fs::write(root.path().join("sub/f.bin"), vec![0u8; 4_000]).unwrap();
 
+    // The destination is recorded as *not* worth measuring, while the pane and
+    // the session are both measuring — so the recording is what decides.
     let mut hosts = myd::hosts::HostCatalog::load_from_unseeded(&cfg.path().join("hosts.toml"));
-    hosts.set_dir_shallow(&root.path().join("sub").to_string_lossy(), false);
+    hosts.set_dir_shallow(&root.path().join("sub").to_string_lossy(), true);
 
-    let mut app =
-        FileBrowser::new_shallow(Some(root.path().to_path_buf()), None, false, true);
+    let mut app = FileBrowser::new(Some(root.path().to_path_buf()), None, false);
     app.set_hosts_for_test(hosts);
     settle(&mut app).await;
-    assert!(tree_is_shallow(&app), "the root follows the flag");
+    assert!(!tree_is_shallow(&app), "the root measures by default");
 
     app.handle_key_for_test(char_key('j'));
     app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     settle_into(&mut app, &root.path().join("sub")).await;
     assert!(
-        !tree_is_shallow(&app),
-        "a directory recorded as measured keeps measuring"
+        tree_is_shallow(&app),
+        "a directory recorded as unmeasured is not walked, even from a measured pane"
+    );
+}
+
+/// A shallow pane stays shallow on the way in, whatever the destination says.
+///
+/// Reported: browsing `~/juan/code` shallow, climbing out with `h` to `/home`,
+/// then pressing Enter on `juan` started a full traversal — while the pane
+/// still displayed shallow mode. `juan` carried a recorded "measured"
+/// preference from an earlier session, which used to outrank the pane.
+///
+/// The pane's own mode wins now: it is what the user can see, and a walk the
+/// pane was visibly avoiding must not start behind a footer that says
+/// otherwise. `S` is still there to measure a directory on purpose.
+#[tokio::test]
+async fn a_shallow_pane_stays_shallow_when_entering_a_directory_recorded_as_measured() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let cfg = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let juan = root.path().join("juan");
+    std::fs::create_dir_all(juan.join("code/sub")).unwrap();
+    std::fs::write(juan.join("code/sub/f.bin"), vec![0u8; 4_000]).unwrap();
+
+    // As an earlier full browse of a home directory would have left it.
+    let mut hosts = myd::hosts::HostCatalog::load_from_unseeded(&cfg.path().join("hosts.toml"));
+    hosts.set_dir_shallow(&juan.to_string_lossy(), false);
+
+    let mut app = FileBrowser::new(Some(juan.join("code")), None, false);
+    app.set_hosts_for_test(hosts);
+    settle(&mut app).await;
+
+    // Go shallow, then climb out with `h` — the re-rooting keeps the mode.
+    app.handle_key_for_test(char_key('S'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "S turns measuring off");
+
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "climbing out stays shallow");
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "and stays shallow another level up");
+
+    // Back down into `juan`, which is recorded as measured.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    settle_into(&mut app, &juan).await;
+    assert!(
+        tree_is_shallow(&app),
+        "a shallow pane must not start a full walk on the way back in"
     );
 }
 
