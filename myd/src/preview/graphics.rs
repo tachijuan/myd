@@ -679,44 +679,82 @@ pub fn iterm_escape_for_file(bytes: &[u8], cols: u16, rows: u16) -> String {
         ),
         None => format!("width={cols};height={rows}"),
     };
-    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 128);
+    // Encoded straight into this buffer rather than into a String that is then
+    // copied in. The body is the whole image — ~9.8MB of base64 for a 7MB photo —
+    // so the intermediate cost a second allocation of that size and a full copy
+    // of it, on every render.
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4 + 128);
     let _ = write!(
         out,
         "\x1b]1337;File=size={};{};preserveAspectRatio=1;inline=1:",
         bytes.len(),
         size
     );
-    out.push_str(&base64_encode(bytes));
+    base64_encode_into(bytes, &mut out);
     out.push('\x07');
     out
 }
 
 /// Standard base64, which is what the escape expects.
+/// Kept for the RFC 4648 vectors, which are about the encoding rather than about
+/// how it is appended. The escape builder calls [`base64_encode_into`] directly.
+#[cfg(test)]
 fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    base64_encode_into(bytes, &mut out);
+    out
+}
+
+/// Append the base64 of `bytes` to `out`.
+///
+/// Appending rather than returning is what keeps a large image cheap: the escape
+/// is assembled around a body of megabytes, and building that body separately
+/// meant allocating it twice and copying it once, per render.
+///
+/// Encoded as bytes rather than by pushing `char`s. The output is pure ASCII, so
+/// every push was a UTF-8 encode and a capacity check for a single byte — around
+/// ten million of them for a 7MB photograph.
+fn base64_encode_into(bytes: &[u8], out: &mut String) {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
+
+    // SAFETY: only ASCII from `ALPHABET` and `=` is written, so the buffer stays
+    // valid UTF-8. Taken as bytes to avoid re-validating megabytes that were
+    // never in question — `String::from_utf8` on a fresh buffer would, and this
+    // appends to a string whose existing contents are already known good.
+    let out = unsafe { out.as_mut_vec() };
+    let start = out.len();
+    out.resize(start + bytes.len().div_ceil(3) * 4, 0);
+    let dst = &mut out[start..];
+
+    // The bulk: whole 3-byte groups, each producing exactly 4 output bytes with
+    // no padding decision inside the loop.
+    let full = bytes.len() / 3;
+    for i in 0..full {
+        let b = &bytes[i * 3..i * 3 + 3];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
+        let o = &mut dst[i * 4..i * 4 + 4];
+        o[0] = ALPHABET[(n >> 18) as usize & 63];
+        o[1] = ALPHABET[(n >> 12) as usize & 63];
+        o[2] = ALPHABET[(n >> 6) as usize & 63];
+        o[3] = ALPHABET[n as usize & 63];
     }
-    out
+
+    // The 1- or 2-byte remainder, padded with '='.
+    let rest = &bytes[full * 3..];
+    if !rest.is_empty() {
+        let b2 = rest.get(1).copied().unwrap_or(0);
+        let n = (u32::from(rest[0]) << 16) | (u32::from(b2) << 8);
+        let o = &mut dst[full * 4..full * 4 + 4];
+        o[0] = ALPHABET[(n >> 18) as usize & 63];
+        o[1] = ALPHABET[(n >> 12) as usize & 63];
+        o[2] = if rest.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63]
+        } else {
+            b'='
+        };
+        o[3] = b'=';
+    }
 }
 
 /// Pin a graphics payload to an exact size in terminal cells.
@@ -1920,6 +1958,37 @@ mod tests {
         assert!(is_complete(&esc), "must be a complete sequence");
         // The body is the file's bytes, base64'd.
         assert_eq!(esc.split_once(':').unwrap().1.trim_end_matches('\x07'), "Zm9vYmFy");
+    }
+
+    /// Encoding appends rather than replacing, and leaves valid UTF-8.
+    ///
+    /// The escape is assembled by writing the header into a buffer and then
+    /// encoding the image straight after it, so the body must land *after* what
+    /// is already there. Getting this wrong would truncate the header and send
+    /// the terminal a sequence it cannot parse. The buffer is also written
+    /// through `as_mut_vec`, so a bug here could leave a `String` holding
+    /// invalid UTF-8.
+    #[test]
+    fn encoding_appends_to_what_is_already_there() {
+        let mut out = String::from("header:");
+        base64_encode_into(b"foobar", &mut out);
+        assert_eq!(out, "header:Zm9vYmFy");
+
+        // Twice over, to catch an implementation that measures from zero.
+        base64_encode_into(b"f", &mut out);
+        assert_eq!(out, "header:Zm9vYmFyZg==");
+
+        // A non-ASCII prefix must survive: `as_mut_vec` works in bytes, so a
+        // multibyte character before the body is where a length mix-up shows.
+        let mut out = String::from("héllo:");
+        base64_encode_into(b"foo", &mut out);
+        assert_eq!(out, "héllo:Zm9v");
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "left invalid UTF-8");
+
+        // Empty input adds nothing at all.
+        let mut out = String::from("x");
+        base64_encode_into(b"", &mut out);
+        assert_eq!(out, "x");
     }
 
     /// Standard base64, checked against RFC 4648's own vectors — a wrong
