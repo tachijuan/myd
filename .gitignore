@@ -16,6 +16,16 @@ myd/target/
 *.cbt
 *.cb7
 
+# Images kept in the tree for preview testing, for the same reason as the
+# archives above: real files at real sizes, which is what the size-dependent
+# render paths need, and not something to carry in the repository.
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.png
+*.heic
+
 # General
 __pycache__/
 *.py[cod]

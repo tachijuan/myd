@@ -58,9 +58,31 @@ const MAX_REMOTE_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Largest file sent to iTerm2 in its own format rather than re-rendered.
 ///
-/// Past this a re-render at the pane's size is smaller than the original, so
-/// sending the file whole stops being the cheaper option.
-const MAX_NATIVE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// The trade is transfer cost against picture quality. Past some size a
+/// re-render at the pane's size is fewer bytes than the original — but iTerm2
+/// draws a multi-megabyte inline image without complaint, and re-encoding is
+/// the worse picture: timg turns a photograph into PNG, which is that format's
+/// worst case. A 7.3MB JPEG became a 1.7MB PNG that did not draw, where the
+/// original goes over intact.
+///
+/// Only reached outside a multiplexer. Inside one an oversized single escape is
+/// silently dropped, and `native_iterm_image` still refuses there on its own
+/// check — the renderer can shrink where sending the original cannot.
+///
+/// `MYD_PREVIEW_MAX_NATIVE` overrides it, in megabytes, so a slow link or a
+/// terminal with a lower ceiling can be dialled back without a rebuild.
+const MAX_NATIVE_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The native-image cap in force, allowing for an override.
+fn max_native_image_bytes() -> u64 {
+    match std::env::var("MYD_PREVIEW_MAX_NATIVE").ok().as_deref() {
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(mb) => mb.saturating_mul(1024 * 1024),
+            Err(_) => MAX_NATIVE_IMAGE_BYTES,
+        },
+        None => MAX_NATIVE_IMAGE_BYTES,
+    }
+}
 
 /// What the pane should draw.
 pub enum PreviewContent {
@@ -305,9 +327,8 @@ async fn native_iterm_image(
     req: &PreviewRequest,
 ) -> anyhow::Result<Option<PreviewContent>> {
     let meta = fs.stat(&req.path).await?;
-    // Past this the file is no longer smaller than what timg would produce, and
-    // a re-render at the pane's size is the better trade.
-    if meta.len > MAX_NATIVE_IMAGE_BYTES {
+    // Past this the transfer is no longer worth the better picture.
+    if meta.len > max_native_image_bytes() {
         return Ok(None);
     }
     // base64 costs a third on top, and a multiplexer will not carry an
@@ -987,6 +1008,46 @@ mod tests {
         match content {
             PreviewContent::Text { lines, .. } => assert_eq!(lines.len(), 2),
             _ => panic!("expected text"),
+        }
+    }
+
+    /// The native-image cap is overridable, in megabytes.
+    ///
+    /// The default is deliberately high: iTerm2 draws a multi-megabyte inline
+    /// image without complaint, and re-encoding a photograph to PNG is both
+    /// larger and worse-looking. The override exists for a slow link or a
+    /// terminal with a lower ceiling, so it has to actually take effect.
+    #[test]
+    fn the_native_image_cap_honours_its_override() {
+        // Serialised against other env-touching tests by using a distinct var
+        // name; this is the only test that reads it.
+        let restore = std::env::var("MYD_PREVIEW_MAX_NATIVE").ok();
+
+        std::env::remove_var("MYD_PREVIEW_MAX_NATIVE");
+        assert_eq!(
+            super::max_native_image_bytes(),
+            super::MAX_NATIVE_IMAGE_BYTES,
+            "unset should give the built-in default"
+        );
+
+        std::env::set_var("MYD_PREVIEW_MAX_NATIVE", "2");
+        assert_eq!(
+            super::max_native_image_bytes(),
+            2 * 1024 * 1024,
+            "the override is in megabytes"
+        );
+
+        // Rubbish falls back rather than disabling the cap or panicking.
+        std::env::set_var("MYD_PREVIEW_MAX_NATIVE", "not-a-number");
+        assert_eq!(
+            super::max_native_image_bytes(),
+            super::MAX_NATIVE_IMAGE_BYTES,
+            "an unparseable value should fall back to the default"
+        );
+
+        match restore {
+            Some(v) => std::env::set_var("MYD_PREVIEW_MAX_NATIVE", v),
+            None => std::env::remove_var("MYD_PREVIEW_MAX_NATIVE"),
         }
     }
 }
