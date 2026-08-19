@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.41.2" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.41.3" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -6,7 +6,7 @@ myd \- vi-like terminal file browser
 .br
 \fBmyd\fR [\fB\-s\fR] \fB\-d\fR
 .br
-\fBmyd\fR [\fIPATH\fR] \fBsftp://\fR[\fIuser\fR@]\fIhost\fR[:\fIport\fR][/\fIpath\fR]
+\fBmyd\fR [\fIPATH\fR] \fBsftp://\fR[\fIuser\fR@]\fIhost\fR[:\fIport\fR][:\fIpath\fR|/\fIpath\fR]
 .SH DESCRIPTION
 \fBmyd\fR is a terminal user interface (TUI) for browsing and managing the
 filesystem. It provides a directory tree with \fBvi\fR-style key bindings,
@@ -475,9 +475,15 @@ These operations used to be single letters bound on the list itself, which is
 what made the list unsearchable by name.
 .IP
 The path field takes a local path or a remote
-\fBsftp://[user@]host[:port][/path]\fR URL, so an address you have not saved
-needs no separate step \(em type it and press \fBEnter\fR. A connection replaces
-whatever the active panel was showing.
+\fBsftp://[user@]host[:port][:path|/path]\fR URL, so an address you have not
+saved needs no separate step \(em type it and press \fBEnter\fR. A connection
+replaces whatever the active panel was showing.
+.IP
+The starting directory may be given after a \fB/\fR or, as \fBscp\fR writes it,
+after a \fB:\fR. The two differ in what they are relative to: \fBhost:work\fR
+starts in \fIwork\fR under the login directory, while \fBhost:/work\fR and
+\fBhost/work\fR name \fI/work\fR itself. A relative path is resolved by the
+server on connection, so it follows the account's home wherever that is.
 .TP
 .B Ctrl+N
 Release the mouse so the terminal's own text selection works; press again to
@@ -541,6 +547,7 @@ launch with a remote target:
 .nf
 myd sftp://prod
 myd sftp://user@host:2222/var/log
+myd sftp://user@host:work/notes
 myd /tmp sftp://prod
 .fi
 .RE
