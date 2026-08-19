@@ -5001,7 +5001,7 @@ impl FileBrowser {
             Err(e) => {
                 self.modal_target = None;
                 self.modal = Modal::Confirm(ConfirmDialog::new(format!(
-                    "Could not parse '{}': {}\n\nExpected: label = sftp://[user@]host[:port][/path]",
+                    "Could not parse '{}': {}\n\nExpected: label = sftp://[user@]host[:port][:path|/path]",
                     url, e
                 )));
             }

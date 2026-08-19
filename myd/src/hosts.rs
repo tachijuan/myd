@@ -78,10 +78,22 @@ impl SavedHost {
         }
         if let Some(path) = &self.path {
             if !path.is_empty() {
-                if !path.starts_with('/') {
-                    s.push('/');
+                if path.starts_with('/') {
+                    // The root is written '//', since a lone trailing slash
+                    // parses as "no path given" and would move a host pinned to
+                    // the root into the home directory on the next open.
+                    if path == "/" {
+                        s.push('/');
+                    }
+                    s.push_str(path);
+                } else {
+                    // A relative path keeps the scp-style colon: it means "under
+                    // the login directory", and writing it as '/path' made it
+                    // absolute — so a host saved as `host:c` came back as
+                    // `sftp://host/c` and opened /c instead of ~/c.
+                    s.push(':');
+                    s.push_str(path);
                 }
-                s.push_str(path);
             }
         }
         s
@@ -817,15 +829,97 @@ mod tests {
         ]
     }
 
+    /// `sample()` plus an scp-style relative path.
+    ///
+    /// Kept out of `sample()` itself because several tests there assert on its
+    /// length, and a URL round trip is not what those are about.
+    fn sample_with_relative_path() -> Vec<SavedHost> {
+        let mut v = sample();
+        v.push(SavedHost {
+            label: "home-rel".into(),
+            user: Some("juan".into()),
+            host: "rel.example.com".into(),
+            port: None,
+            path: Some("work/notes".into()),
+            uses: 1,
+            last_used: None,
+        });
+        v
+    }
+
     #[test]
     fn url_round_trips_through_the_parser() {
-        for h in sample() {
+        for h in sample_with_relative_path() {
             let url = h.to_url();
             let parsed = SftpTarget::parse(&url)
                 .unwrap_or_else(|e| panic!("{} did not parse: {}", url, e));
             assert_eq!(parsed.host, h.host, "host lost in {}", url);
             assert_eq!(parsed.user, h.user, "user lost in {}", url);
             assert_eq!(parsed.port, h.port, "port lost in {}", url);
+            // The path was omitted here once, which is how a saved relative path
+            // could be rewritten to an absolute one unnoticed.
+            assert_eq!(
+                parsed.path.map(|p| p.to_string_lossy().to_string()),
+                h.path,
+                "path lost in {}",
+                url
+            );
+        }
+    }
+
+    /// A saved relative path must not be rewritten as absolute.
+    ///
+    /// `to_url` wrote every path with a leading '/', so a host saved as
+    /// `host:c` was re-displayed and reopened as `sftp://host/c` — the starting
+    /// directory silently moved from ~/c to /c. This is a second copy of the
+    /// conversion in `SftpTarget::to_url`; fixing that one alone left saved
+    /// hosts, which round-trip through here, still broken.
+    #[test]
+    fn a_relative_path_keeps_its_colon() {
+        for (url, want_path) in [
+            ("sftp://user@remote.com:c", "c"),
+            ("sftp://user@remote.com:work/notes", "work/notes"),
+            ("sftp://user@remote.com:2222:c", "c"),
+        ] {
+            let h = SavedHost::from_url("lab", url).unwrap();
+            assert_eq!(h.path.as_deref(), Some(want_path), "{} stored wrongly", url);
+
+            // Re-emitting it must not turn the path absolute.
+            let out = h.to_url();
+            assert!(
+                !out.contains(&format!("/{}", want_path)),
+                "{} became absolute as {}",
+                url,
+                out
+            );
+
+            // And it must survive a full save/reopen cycle unchanged.
+            let back = SavedHost::from_url("lab", &out).unwrap();
+            assert_eq!(back, h, "{} did not round-trip (via {})", url, out);
+
+            // The connect path reads the same URL, so it must agree.
+            let t = SftpTarget::parse(&out).unwrap();
+            assert_eq!(
+                t.path.map(|p| p.to_string_lossy().to_string()).as_deref(),
+                Some(want_path),
+                "connecting to {} would use the wrong directory",
+                out
+            );
+        }
+    }
+
+    /// An absolute saved path stays absolute, including the root.
+    #[test]
+    fn an_absolute_path_stays_absolute() {
+        for (url, want_path) in [
+            ("sftp://user@remote.com:/abs/c", "/abs/c"),
+            ("sftp://user@remote.com/abs/c", "/abs/c"),
+            ("sftp://h//", "/"),
+        ] {
+            let h = SavedHost::from_url("lab", url).unwrap();
+            assert_eq!(h.path.as_deref(), Some(want_path), "{} stored wrongly", url);
+            let back = SavedHost::from_url("lab", &h.to_url()).unwrap();
+            assert_eq!(back, h, "{} did not round-trip (via {})", url, h.to_url());
         }
     }
 
