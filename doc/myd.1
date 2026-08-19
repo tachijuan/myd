@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.45.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.45.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -258,6 +258,10 @@ between the two fields. The preview shows the first tagged file transformed, so
 the pattern can be checked before it is applied. Files the pattern does not
 match are skipped rather than treated as failures, since tagging a mixed set and
 renaming only part of it is the ordinary case.
+.IP
+Unlike the search and the filter, this pattern is case\-sensitive \(em changing
+a name's case is a common reason to use it. See \fBPATTERNS\fR for the syntax,
+and for when a capture group needs \fB${1}\fR rather than \fB$1\fR.
 .TP
 .B N
 Create a new directory in the current location.
@@ -364,8 +368,8 @@ Entries with no reported time show a dash.
 .TP
 .B /
 Search for a file or directory by name. The pattern is a case-insensitive
-regular expression; \fBn\fR and \fBp\fR step to the next and previous match,
-wrapping at the ends.
+regular expression (see \fBPATTERNS\fR); \fBn\fR and \fBp\fR step to the next
+and previous match, wrapping at the ends.
 .TP
 .B f
 Filter the tree by a case-insensitive regular expression: entries whose names
@@ -387,7 +391,8 @@ more urgent signal, and the title badge still carries the filter.
 .IP
 A pattern that is not valid regular expression syntax is reported. Note that
 \fB*p$\fR is not valid (there is nothing for \fB*\fR to repeat); the pattern
-for "names ending in p" is \fBp$\fR, or \fB.*p$\fR.
+for "names ending in p" is \fBp$\fR, or \fB.*p$\fR. See \fBPATTERNS\fR below for
+the syntax accepted, and the two constructs that are not.
 .TP
 .B ? / F1
 Show or hide the key reference. It is taller than a typical terminal, so
@@ -1164,6 +1169,65 @@ Extraction does not restore the executable bit: a \fBchmod +x\fR script comes ou
 of an archive non\-executable. The mode is held in the index and shown in the
 listing, but passing it through would mean widening the write path for every
 backend.
+.SH PATTERNS
+Every pattern in \fBmyd\fR \(em the tree search (\fB/\fR), the filter (\fBf\fR),
+the preview's own search, and the patterned rename (\fBg r\fR) \(em is a Rust
+\fBregex\fR crate regular expression. That crate's syntax is documented in full
+at:
+.PP
+.RS
+https://docs.rs/regex/latest/regex/#syntax
+.RE
+.PP
+The syntax is close to Perl's for everything most patterns use: character
+classes (\fB[a\-z]\fR, \fB\\d\fR, \fB\\w\fR, \fB\\s\fR), anchors (\fB^\fR,
+\fB$\fR, \fB\\b\fR), repetition (\fB*\fR, \fB+\fR, \fB?\fR, \fB{2,5}\fR),
+alternation (\fBa|b\fR), groups (\fB(…)\fR) and inline flags (\fB(?i)\fR).
+Unicode is supported throughout, so \fB\\w\fR matches accented letters and
+\fB.\fR matches one character rather than one byte.
+.SS What is not supported
+The \fBregex\fR crate guarantees linear-time matching, which rules out two
+constructs a pattern written for \fBgrep \-P\fR, \fBsed\fR or Perl may rely on.
+Both are reported as a syntax error rather than silently misbehaving:
+.TP
+.B Lookaround
+\fB(?=…)\fR, \fB(?!…)\fR, \fB(?<=…)\fR and \fB(?<!…)\fR. A pattern needing "not
+followed by" usually has to be restructured, or the selection narrowed by
+tagging before a rename.
+.TP
+.B Backreferences
+\fB\\1\fR inside the \fIpattern\fR. Note that \fB$1\fR in a rename's
+\fIreplacement\fR is a different thing and does work \(em see below.
+.SS Case
+Search and filter are case\-insensitive: \fBreadme\fR finds \fBREADME.md\fR. The
+patterned rename is case\-\fIsensitive\fR, because a rename that ignored case
+would be unable to change it \(em matching \fBIMG\fR and writing \fBimg\fR is a
+common reason to reach for the operation. Prefix a rename pattern with
+\fB(?i)\fR to make it insensitive too.
+.SS Replacements
+The rename dialog's second field is a replacement, not a pattern. A capture
+group is written \fB$1\fR by number or \fB$name\fR when the group was named with
+\fB(?P<name>…)\fR. A literal dollar is \fB$$\fR.
+.PP
+Braces are needed more often than they look. A group reference runs on until a
+character that cannot be part of a name, so \fB$1_\fR asks for a group called
+\fB1_\fR rather than group one followed by an underscore \(em and a name that
+does not exist expands to nothing, silently dropping that part of the new name.
+Write \fB${1}\fR whenever a letter, digit or underscore follows. For the same
+reason \fB$10\fR is group ten, not group one and a zero.
+.PP
+.RS
+.nf
+pattern            replacement   IMG_1234.JPG becomes
+\fB^IMG_\fR              \fBphoto_\fR        photo_1234.JPG
+\fB(\\d+)\fR              \fBno${1}\fR        IMG_no1234.JPG
+\fB(\\w+)_(\\d+)\fR        \fB${2}_${1}\fR     1234_IMG.JPG
+\fB(\\w+)_(\\d+)\fR        \fB$2_$1\fR         IMG.JPG   \(em wrong, see above
+.fi
+.RE
+.PP
+The rename preview shows the first tagged file transformed, so a pattern can be
+checked against a real name before it is applied to the set.
 .SH EXAMPLES
 .TP
 .B myd
@@ -1224,3 +1288,6 @@ cargo run \-\- ~/Documents
 .BR timg (1),
 .BR chafa (1),
 .BR pdfinfo (1)
+.PP
+Pattern syntax is the Rust \fBregex\fR crate's, documented at
+https://docs.rs/regex/latest/regex/#syntax \(em see \fBPATTERNS\fR above.
