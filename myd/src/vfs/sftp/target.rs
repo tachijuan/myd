@@ -42,8 +42,38 @@ impl SftpTarget {
             _ => (None, rest),
         };
 
-        // Split the path off the host. The first '/' starts the path; a ':'
-        // before it introduces either a port or (scp-style) a path.
+        // Split host, port and path. The host runs up to the first ':' or '/',
+        // whichever comes first — splitting on the last ':' mis-set the host to
+        // "host:2222" for `host:2222:dir`, since the port and an scp-style path
+        // can both be present.
+        let host_end = hostpart.find([':', '/']).unwrap_or(hostpart.len());
+        let host = &hostpart[..host_end];
+        let mut rest = &hostpart[host_end..];
+
+        // An optional ':port'. Only digits count: `host:dir` is scp-style, so a
+        // non-numeric segment here is a path, not a bad port. A numeric one is
+        // unambiguously the port, and any path follows it.
+        let mut port = None;
+        if let Some(after) = rest.strip_prefix(':') {
+            let seg_end = after.find([':', '/']).unwrap_or(after.len());
+            let seg = &after[..seg_end];
+            if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()) {
+                port = Some(
+                    seg.parse::<u16>()
+                        .map_err(|_| anyhow::anyhow!("invalid port '{}'", seg))?,
+                );
+                rest = &after[seg_end..];
+            }
+        }
+
+        // What remains is the path, in one of two notations:
+        //
+        //   ':path'  scp-style, relative to the login directory (`~/path`)
+        //   '/path'  absolute, as given
+        //
+        // A ':' followed by '/' is absolute too — `host:/some/path` names the
+        // real root, matching scp. Relative paths are kept relative here and
+        // resolved server-side against $HOME on connect.
         //
         // A lone trailing '/' is dropped rather than read as the root. Typing
         // `sftp://host/` is how a URL is habitually ended, and taking it as "/"
@@ -51,35 +81,25 @@ impl SftpTarget {
         // address without the slash would have given — a surprise, and a slow
         // one on a large filesystem. `sftp://host//` still asks for the root,
         // which is the only way left to say it explicitly.
-        let (hostport, path) = match hostpart.find('/') {
-            Some(i) => {
-                let raw = &hostpart[i..];
-                // `//` is normalised to `/` rather than passed on literally: it
-                // is a way of spelling the root here, not part of the name, and
-                // the server should be addressed with the path it expects.
-                let path = match raw {
-                    "/" => None,
-                    "//" => Some(PathBuf::from("/")),
-                    other => Some(PathBuf::from(other)),
-                };
-                (&hostpart[..i], path)
+        let path = if let Some(after) = rest.strip_prefix(':') {
+            // Everything after the colon, absolute or relative as written.
+            match after {
+                "" => None,
+                "/" => Some(PathBuf::from("/")),
+                other => Some(PathBuf::from(other)),
             }
-            None => (hostpart, None),
+        } else {
+            // `//` is normalised to `/` rather than passed on literally: it is a
+            // way of spelling the root here, not part of the name, and the
+            // server should be addressed with the path it expects.
+            match rest {
+                "" | "/" => None,
+                "//" => Some(PathBuf::from("/")),
+                other => Some(PathBuf::from(other)),
+            }
         };
 
-        let (host, port, path) = match hostport.rsplit_once(':') {
-            Some((h, tail)) if !tail.is_empty() => {
-                match tail.parse::<u16>() {
-                    Ok(p) => (h.to_string(), Some(p), path),
-                    // `host:/some/path` and `host:path` are scp-style, not a port.
-                    Err(_) if path.is_none() => (h.to_string(), None, Some(PathBuf::from(tail))),
-                    Err(_) => bail!("invalid port '{}'", tail),
-                }
-            }
-            // Trailing ':' with a path already split off, e.g. "host:/tmp".
-            Some((h, _)) => (h.to_string(), None, path),
-            None => (hostport.to_string(), None, path),
-        };
+        let host = host.to_string();
 
         if host.is_empty() {
             bail!("no host in '{}'", input);
@@ -118,18 +138,23 @@ impl SftpTarget {
         }
         if let Some(path) = &self.path {
             let p = path.to_string_lossy();
-            if !p.starts_with('/') {
-                s.push('/');
+            if p.starts_with('/') {
+                // The root has to be written as '//', because a single trailing
+                // slash now parses as "no path given". Saved hosts round-trip
+                // through here, so emitting "sftp://host/" for a host pinned to
+                // the root would quietly move it to the home directory the next
+                // time it was opened.
+                if p == "/" {
+                    s.push('/');
+                }
+                s.push_str(&p);
+            } else {
+                // A relative path keeps the scp-style colon. Writing it as
+                // '/path' made it absolute, so saving `host:dir` as a favourite
+                // and reopening it went to /dir instead of ~/dir.
+                s.push(':');
+                s.push_str(&p);
             }
-            // The root has to be written as '//', because a single trailing
-            // slash now parses as "no path given". Saved hosts round-trip
-            // through here, so emitting "sftp://host/" for a host pinned to the
-            // root would quietly move it to the home directory the next time it
-            // was opened.
-            if p == "/" {
-                s.push('/');
-            }
-            s.push_str(&p);
         }
         s
     }
@@ -202,8 +227,96 @@ mod tests {
 
     #[test]
     fn rejects_a_bad_port() {
+        // Out of range for a port, and all digits, so it cannot be a path either.
         assert!(SftpTarget::parse("sftp://host:99999/x").is_err());
-        assert!(SftpTarget::parse("sftp://host:abc/x").is_err());
+        // `host:abc/x` is not a bad port — it is an scp-style relative path.
+        let t = SftpTarget::parse("sftp://host:abc/x").unwrap();
+        assert_eq!(t.port, None);
+        assert_eq!(t.path, Some(PathBuf::from("abc/x")));
+    }
+
+    /// `host:dir` means `~/dir`; only a leading '/' asks for the real root.
+    ///
+    /// The colon form is how scp addresses a path relative to the login
+    /// directory. A relative path is kept relative here and canonicalized
+    /// server-side against $HOME on connect.
+    #[test]
+    fn a_colon_path_is_relative_to_home_unless_absolute() {
+        // Relative: no leading slash, so it resolves under $HOME.
+        for s in ["sftp://user@remote.com:dir", "user@remote.com:dir"] {
+            let t = SftpTarget::parse(s).unwrap();
+            assert_eq!(t.host, "remote.com");
+            assert_eq!(t.user.as_deref(), Some("user"));
+            assert_eq!(t.port, None);
+            assert_eq!(t.path, Some(PathBuf::from("dir")), "{} should be ~/dir", s);
+            assert!(!t.path.unwrap().is_absolute(), "{} must stay relative", s);
+        }
+
+        // Absolute: the colon introduces a full path, which is used as given.
+        for s in ["sftp://user@remote.com:/some/path", "user@remote.com:/some/path"] {
+            let t = SftpTarget::parse(s).unwrap();
+            assert_eq!(t.host, "remote.com");
+            assert_eq!(
+                t.path,
+                Some(PathBuf::from("/some/path")),
+                "{} should be an absolute path",
+                s
+            );
+        }
+
+        // The slash form is absolute, as in any URL.
+        let t = SftpTarget::parse("sftp://user@remote.com/dir").unwrap();
+        assert_eq!(t.path, Some(PathBuf::from("/dir")));
+    }
+
+    /// A multi-segment relative path is a path, not a malformed port.
+    ///
+    /// The host was split on the *last* ':' and the path on the first '/', so
+    /// `host:dir/sub` left "dir" sitting where the port belonged and was
+    /// rejected outright as "invalid port 'dir'".
+    #[test]
+    fn a_relative_colon_path_may_have_several_segments() {
+        let t = SftpTarget::parse("sftp://user@remote.com:dir/sub").unwrap();
+        assert_eq!(t.host, "remote.com");
+        assert_eq!(t.port, None);
+        assert_eq!(t.path, Some(PathBuf::from("dir/sub")));
+    }
+
+    /// A port and an scp-style relative path can be given together.
+    ///
+    /// `rsplit_once(':')` took the last colon, so the host came back as
+    /// "remote.com:2222" — a host that does not resolve.
+    #[test]
+    fn a_port_and_a_relative_path_coexist() {
+        let t = SftpTarget::parse("sftp://user@remote.com:2222:dir").unwrap();
+        assert_eq!(t.host, "remote.com");
+        assert_eq!(t.port, Some(2222));
+        assert_eq!(t.path, Some(PathBuf::from("dir")));
+    }
+
+    /// A relative path must survive being saved and reopened.
+    ///
+    /// `to_url` wrote every path with a leading '/', so a favourite saved as
+    /// `host:dir` came back as `sftp://host/dir` and opened /dir instead of
+    /// ~/dir — the starting directory silently moved.
+    #[test]
+    fn a_relative_path_round_trips_through_a_url() {
+        for s in [
+            "sftp://user@remote.com:dir",
+            "sftp://user@remote.com:dir/sub",
+            "sftp://user@remote.com:2222:dir",
+        ] {
+            let t = SftpTarget::parse(s).unwrap();
+            let url = t.to_url();
+            let back = SftpTarget::parse(&url).unwrap();
+            assert_eq!(back, t, "{} became {} and re-parsed differently", s, url);
+            assert!(
+                !back.path.as_ref().unwrap().is_absolute(),
+                "{} became absolute as {}",
+                s,
+                url
+            );
+        }
     }
 
     #[test]

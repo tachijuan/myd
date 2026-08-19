@@ -1038,3 +1038,83 @@ sftp_test!(a_single_panel_remote_copy_uses_the_typed_path_verbatim, env, {
     );
     std::fs::remove_file(&landed).ok();
 });
+
+// `host:dir` must land in `~/dir`, and `host:/dir` in `/dir`.
+//
+// The colon form is scp's notation for a path relative to the login directory.
+// Parsing kept it relative, but only a real server proves it actually resolves
+// under $HOME rather than at the root — the two differ only once a server
+// canonicalizes them.
+sftp_test!(a_colon_path_lands_under_home, env, {
+    // The server's login directory, asked of the server itself: $HOME here is
+    // the client-side redirect for known_hosts, which is a different thing.
+    let server_home = {
+        let bare = SftpTarget {
+            host: env.host.clone(),
+            user: Some(whoami()),
+            port: Some(env.port),
+            path: None,
+        };
+        match SftpFs::connect(&bare, &Credentials::default(), true)
+            .await
+            .expect("connect with no path failed")
+        {
+            ConnectOutcome::Connected(fs) => fs.home().to_path_buf(),
+            ConnectOutcome::NeedsCredential(need) => panic!("unexpected prompt: {:?}", need),
+        }
+    };
+
+    // A marker directory in that login directory, reachable only as ~/<name>.
+    let name = "myd-colon-path-probe";
+    let under_home = server_home.join(name);
+    std::fs::create_dir_all(&under_home).expect("create probe dir");
+
+    let user = whoami();
+    let relative = SftpTarget::parse(&format!(
+        "sftp://{}@{}:{}:{}",
+        user, env.host, env.port, name
+    ))
+    .expect("parse relative target");
+    assert_eq!(relative.path, Some(PathBuf::from(name)));
+
+    let fs = match SftpFs::connect(&relative, &Credentials::default(), true)
+        .await
+        .expect("connect with a relative path failed")
+    {
+        ConnectOutcome::Connected(fs) => fs,
+        ConnectOutcome::NeedsCredential(need) => panic!("unexpected prompt: {:?}", need),
+    };
+
+    // The session's starting directory is the marker under $HOME, not /<name>.
+    assert_eq!(
+        fs.home(),
+        under_home.as_path(),
+        "a relative colon path did not resolve under $HOME"
+    );
+
+    // And the absolute form still means exactly what it says.
+    let absolute = SftpTarget::parse(&format!(
+        "sftp://{}@{}:{}:{}",
+        user,
+        env.host,
+        env.port,
+        env.remote_dir.display()
+    ))
+    .expect("parse absolute target");
+    assert_eq!(absolute.path.as_deref(), Some(env.remote_dir.as_path()));
+
+    let fs = match SftpFs::connect(&absolute, &Credentials::default(), true)
+        .await
+        .expect("connect with an absolute path failed")
+    {
+        ConnectOutcome::Connected(fs) => fs,
+        ConnectOutcome::NeedsCredential(need) => panic!("unexpected prompt: {:?}", need),
+    };
+    assert_eq!(
+        fs.home(),
+        env.remote_dir.as_path(),
+        "an absolute colon path was not used as given"
+    );
+
+    std::fs::remove_dir_all(&under_home).ok();
+});
