@@ -17902,3 +17902,35 @@ async fn the_filter_dialog_covers_the_tree_and_leaves_nothing_behind() {
         );
     }
 }
+
+/// An unchanged image is not re-copied on every frame.
+///
+/// `flush_preview_graphics` runs after every draw, and used to clone the whole
+/// payload before checking whether anything had changed. For a photograph handed
+/// to iTerm2 in its own format that is megabytes per frame — ~33ms per 100
+/// frames for a 9.8MB payload, spent ten times a second on an idle loop to
+/// discover there was nothing to redraw. The stamp is now compared against the
+/// payload's length, and the copy happens only when the image is really written.
+///
+/// Only the no-image path is covered here: producing a real graphics payload
+/// needs a terminal that reports a graphics protocol, which a test backend does
+/// not. This pins the early return and the stamp bookkeeping the fast path
+/// depends on; the copy-avoidance itself is structural.
+#[tokio::test]
+async fn an_unchanged_preview_image_is_not_reflushed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // No image open: the stamp stays empty however many frames go by.
+    let before = app.preview_graphics_stamp_for_test();
+    for _ in 0..5 {
+        app.flush_preview_graphics_for_test();
+    }
+    assert_eq!(
+        app.preview_graphics_stamp_for_test(),
+        before,
+        "an idle flush with no image must not record anything"
+    );
+}
