@@ -44,8 +44,17 @@ impl InputDialog {
 
     pub fn with_default(mut self, default: impl Into<String>) -> Self {
         self.value = default.into();
-        self.cursor = self.value.len();
+        self.cursor = self.value.chars().count();
         self
+    }
+
+    /// Byte offset of char index `n` in `value`, for slicing on a boundary.
+    fn byte_at(&self, n: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(n)
+            .map(|(i, _)| i)
+            .unwrap_or(self.value.len())
     }
 
     /// Handle key input. Returns `Some(value)` on submit, `None` if still editing.
@@ -69,9 +78,17 @@ impl InputDialog {
                 None
             }
             KeyCode::Right => {
-                if self.cursor < self.value.len() {
+                if self.cursor < self.value.chars().count() {
                     self.cursor += 1;
                 }
+                None
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.cursor = self.value.chars().count();
                 None
             }
             _ => None,
@@ -79,25 +96,29 @@ impl InputDialog {
     }
 
     fn insert_char(&mut self, c: char) {
-        self.value.insert(self.cursor, c);
-        if self.cursor < self.value.len() {
-            self.cursor += 1;
-        }
+        let at = self.byte_at(self.cursor);
+        self.value.insert(at, c);
+        self.cursor += 1;
     }
 
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            self.value.remove(self.cursor);
+            let at = self.byte_at(self.cursor);
+            self.value.remove(at);
         }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        // Width is capped to the terminal; the message then wraps to however many
-        // lines it needs and the box grows to fit. A fixed height clipped the
-        // trailing lines (the Enter/Esc hint), leaving the user with a prompt but
-        // no visible way to answer it.
-        let width = 60.min(area.width.max(1));
+        // The box grows with the terminal — 80% of the width, between 60 and 120
+        // columns — so a long path gets room on a wide window instead of being
+        // squeezed into a fixed 60. Width is still capped to the terminal; the
+        // message then wraps to however many lines it needs and the box grows to
+        // fit. A fixed height clipped the trailing lines (the Enter/Esc hint),
+        // leaving the user with a prompt but no visible way to answer it.
+        let width = (area.width as u32 * 8 / 10)
+            .clamp(60, 120)
+            .min(area.width.max(1) as u32) as u16;
         let inner_width = width.saturating_sub(2).max(1) as usize;
         let message_lines = wrap_text(&self.message, inner_width);
         // Content rows: title + blank + message(n) + blank + input + blank +
@@ -119,17 +140,63 @@ impl InputDialog {
             self.value.clone()
         };
 
-        // Byte-safe cursor clamp: the mask uses a multibyte glyph, so slice on a
-        // char boundary rather than a raw byte index.
-        let cut = display
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(display.len());
-        let input_line = Line::from(Span::styled(
-            format!("{}{}", &display[..cut], "█"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        // The value can be longer than the box, so the input line is a window
+        // onto it that scrolls to keep the cursor visible — otherwise a long
+        // path just ran past the border and the user typed blind.
+        //
+        // The placeholder is decorated with escapes and is only shown when the
+        // value is empty, so scrolling applies to real input only.
+        let chars: Vec<char> = display.chars().collect();
+        let showing_placeholder = self.value.is_empty() && !self.placeholder.is_empty();
+        // One column is reserved for the cursor block.
+        let window = inner_width.saturating_sub(1).max(1);
+        let cursor = self.cursor.min(chars.len());
+        let input_line = if showing_placeholder || chars.len() <= window {
+            let cut: String = chars[..cursor.min(chars.len())].iter().collect();
+            let rest: String = chars[cursor.min(chars.len())..].iter().collect();
+            Line::from(vec![
+                Span::styled(
+                    format!("{}{}", cut, "█"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest, Style::default().add_modifier(Modifier::BOLD)),
+            ])
+        } else {
+            // Scroll so the cursor sits inside the window, keeping as much text
+            // to its left as fits — typing at the tail of a path then shows the
+            // tail, and moving left brings earlier text back into view.
+            //
+            // Reserve a column for each ellipsis marker so the assembled line
+            // never overflows the box and wraps. Budgeting for both up front
+            // costs at most one column when only one marker ends up drawn,
+            // which is cheaper than a second pass to find a stable width.
+            let budget = window.saturating_sub(2).max(1);
+            let start = cursor
+                .saturating_sub(budget)
+                .min(chars.len().saturating_sub(budget));
+            let end = (start + budget).min(chars.len());
+            let visible = &chars[start..end];
+            let rel = cursor - start;
+            let before: String = visible[..rel.min(visible.len())].iter().collect();
+            let after: String = visible[rel.min(visible.len())..].iter().collect();
+            // Ellipsis marks text scrolled off each side.
+            let mut spans = Vec::new();
+            if start > 0 {
+                spans.push(Span::styled("‹", Style::default().fg(Color::DarkGray)));
+            }
+            spans.push(Span::styled(
+                format!("{}{}", before, "█"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                after,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            if end < chars.len() {
+                spans.push(Span::styled("›", Style::default().fg(Color::DarkGray)));
+            }
+            Line::from(spans)
+        };
 
         let buttons = Line::from(vec![
             Span::styled(" (Enter: OK, Esc: Cancel) ", Style::default().fg(Color::DarkGray)),
