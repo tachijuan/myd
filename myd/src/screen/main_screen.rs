@@ -1050,20 +1050,35 @@ impl MainScreenState {
             Some(name) => format!("{} {}", name, self.root_path.display()),
             None => self.root_path.display().to_string(),
         };
-        let prefix = if self.tree.filter_pattern().is_some() {
+        // The filtered badge is drawn as its own span so it can carry a
+        // background, while the rest of the title keeps whatever tint the source
+        // gives it. Split out rather than formatted in, but the two halves still
+        // add up to exactly the old string — `sort_area` below measures the
+        // prefix in characters to place the click region, so changing its width
+        // would move the "Sort:" hit box off the text.
+        let filtered = self.tree.filter_pattern().is_some();
+        let (badge, prefix) = if filtered {
             // "FILTERED" leads, because ratatui truncates a title at the right
             // border: on a narrow terminal the tail is the first thing lost, and
             // this is the part that must not be.
-            format!(
-                "{} FILTERED | {} ({}) | {} shown | {} dirs | {} files | ",
-                shallow_mark, kind, where_, total, dirs, files,
+            (
+                format!("{} FILTERED ", shallow_mark),
+                format!(
+                    "| {} ({}) | {} shown | {} dirs | {} files | ",
+                    kind, where_, total, dirs, files,
+                ),
             )
         } else {
-            format!(
-                "{} {} ({}) | {} items | {} dirs | {} files | ",
-                shallow_mark, kind, where_, total, dirs, files,
+            (
+                String::new(),
+                format!(
+                    "{} {} ({}) | {} items | {} dirs | {} files | ",
+                    shallow_mark, kind, where_, total, dirs, files,
+                ),
             )
         };
+        // Captured before the badge is moved into the title's spans below.
+        let badge_len = badge.chars().count();
         let sort_text = format!("Sort: {} ▾ ", self.tree.sort_mode.label());
         // Coloured rather than lengthened: the title is the most contested row in
         // the app, and a colour costs no columns. The kind word above carries the
@@ -1079,12 +1094,29 @@ impl MainScreenState {
         } else {
             None
         };
-        let title = match tint {
-            Some(colour) => Line::from(Span::styled(
+        let rest_style = match tint {
+            Some(colour) => Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            None => Style::default(),
+        };
+        let title = if filtered {
+            // Reversed out of the filter colour, the way the footer badge and
+            // the archive marker are: a background is what reads as a label at a
+            // glance, where coloured text reads as more title.
+            Line::from(vec![
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(crate::widget::file_tree::FILTER_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{}{}", prefix, sort_text), rest_style),
+            ])
+        } else {
+            Line::from(Span::styled(
                 format!("{}{}", prefix, sort_text),
-                Style::default().fg(colour).add_modifier(Modifier::BOLD),
-            )),
-            None => Line::from(format!("{}{}", prefix, sort_text)),
+                rest_style,
+            ))
         };
 
         // Remember where "Sort: …" landed so a click on it can open the sort
@@ -1092,7 +1124,11 @@ impl MainScreenState {
         // and ratatui truncates it at the border — a hit region past the edge
         // would match clicks on nothing, so it is clipped to the box.
         self.sort_area = {
-            let start = area.x + 1 + prefix.chars().count() as u16;
+            // Both spans precede "Sort: …", so the badge counts toward the
+            // offset — measuring the prefix alone put the hit box eleven columns
+            // left of the text while a filter was on.
+            let start =
+                area.x + 1 + (badge_len + prefix.chars().count()) as u16;
             let end = (start + sort_text.chars().count() as u16)
                 .min(area.x + area.width.saturating_sub(1));
             (start < end).then(|| Rect::new(start, area.y, end - start, 1))
@@ -1294,11 +1330,25 @@ impl MainScreenState {
     /// Border color for this screen's panels — bright cyan when active, dim gray
     /// when it belongs to the inactive panel. In single-panel mode `active` is
     /// always true, so the appearance is unchanged.
+    /// The pane's border colour.
+    ///
+    /// A filtered pane borders in the filter colour, because rows are missing
+    /// and nothing else about the frame says so — the count in the title reads
+    /// like any other count, and the footer badge is at the far end of the
+    /// screen from where the eye is.
+    ///
+    /// Focus still has to be readable, so the filtered colour is only used on
+    /// the active pane; an unfocused one stays dark gray. Two panes both
+    /// bordered in green with no cyan would say "filtered" twice and "who has
+    /// the keyboard" not at all, and focus is the more urgent of the two.
     fn border_color(&self) -> Color {
-        if self.active {
-            Color::Cyan
+        if !self.active {
+            return Color::DarkGray;
+        }
+        if self.tree.filter_pattern().is_some() {
+            crate::widget::file_tree::FILTER_COLOR
         } else {
-            Color::DarkGray
+            Color::Cyan
         }
     }
 
@@ -1730,6 +1780,116 @@ mod tests {
         assert!(
             screen.contains("read-only"),
             "the footer should carry the read-only badge:\n{screen}"
+        );
+    }
+
+    /// Build a filtered screen and return its buffer for inspection.
+    fn filtered_buffer(active: bool) -> ratatui::buffer::Buffer {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.rs", "b.rs", "c.txt"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let tree = FileTree::with_source_cancellable_progress(
+            Source::Local,
+            dir.path().to_path_buf(),
+            SortMode::default(),
+            true,
+            true,
+            SizeCache::new(),
+            &CancelToken::new(),
+            &OpProgress::new(),
+        )
+        .expect("tree builds");
+        let mut state = MainScreenState::from_tree(dir.path().to_path_buf(), tree);
+        state.active = active;
+        state.tree.set_filter(regex::Regex::new("rs").unwrap());
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| state.render(f, f.area())).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// A filtered pane is obvious from the frame, not just from the footer.
+    ///
+    /// Rows are missing and nothing about the box said so: "FILTERED" sat in the
+    /// title as plain text that read like the rest of it, the border was the
+    /// same cyan as an unfiltered pane, and the only coloured marker was at the
+    /// far end of the screen from where the eye is.
+    #[test]
+    fn a_filtered_pane_colours_its_border_and_badges_its_title() {
+        let buf = filtered_buffer(true);
+
+        // The border carries the filter colour.
+        assert_eq!(
+            buf[(0u16, 0u16)].fg,
+            crate::widget::file_tree::FILTER_COLOR,
+            "a filtered pane should border in the filter colour"
+        );
+
+        // And FILTERED is reversed out of it rather than being plain text.
+        let title: String = (0..buf.area.width)
+            .map(|x| buf[(x, 0u16)].symbol().to_string())
+            .collect();
+        let at = title.find("FILTERED").expect("title should say FILTERED");
+        assert_eq!(
+            buf[(at as u16, 0u16)].bg,
+            crate::widget::file_tree::FILTER_COLOR,
+            "the FILTERED badge should have a filter-coloured background: {}",
+            title
+        );
+    }
+
+    /// Focus outranks the filter colour on an unfocused pane.
+    ///
+    /// Two panes both bordered in green would say "filtered" twice and "who has
+    /// the keyboard" not at all, and in a split that is the more urgent signal.
+    #[test]
+    fn an_unfocused_filtered_pane_keeps_the_inactive_border() {
+        let buf = filtered_buffer(false);
+        assert_eq!(
+            buf[(0u16, 0u16)].fg,
+            Color::DarkGray,
+            "an unfocused pane must stay dark gray even while filtered"
+        );
+    }
+
+    /// The sort click region still lands on "Sort:" while filtering.
+    ///
+    /// The badge is a separate span now, and the hit box is placed by counting
+    /// characters — measuring only the text after the badge put it eleven
+    /// columns left of the words it is meant to cover.
+    #[test]
+    fn the_sort_hit_box_follows_the_filtered_title() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.rs", "b.rs", "c.txt"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let tree = FileTree::with_source_cancellable_progress(
+            Source::Local,
+            dir.path().to_path_buf(),
+            SortMode::default(),
+            true,
+            true,
+            SizeCache::new(),
+            &CancelToken::new(),
+            &OpProgress::new(),
+        )
+        .expect("tree builds");
+        let mut state = MainScreenState::from_tree(dir.path().to_path_buf(), tree);
+        state.active = true;
+        state.tree.set_filter(regex::Regex::new("rs").unwrap());
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| state.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let area = state.sort_area.expect("the sort region should be recorded");
+        let under: String = (area.x..area.x + area.width)
+            .map(|x| buf[(x, 0u16)].symbol().to_string())
+            .collect();
+        assert!(
+            under.starts_with("Sort:"),
+            "the sort hit box does not cover the sort text: {:?}",
+            under
         );
     }
 
