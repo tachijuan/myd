@@ -3793,6 +3793,127 @@ async fn test_input_dialog_wraps_long_prompts_and_keeps_hint() {
     );
 }
 
+/// Render `dialog` on a `w`x`h` terminal and return the screen as text.
+#[cfg(test)]
+fn render_input_dialog(
+    dialog: &myd::widget::input_dialog::InputDialog,
+    w: u16,
+    h: u16,
+) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| dialog.render(f, f.area())).unwrap();
+    let buf = term.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A path longer than the box must scroll so the user can see what they type.
+///
+/// The input line had no horizontal scrolling, so once a path passed the box
+/// width it ran off the border: the tail being typed was invisible and the user
+/// was editing blind.
+#[tokio::test]
+async fn test_input_dialog_scrolls_long_value_to_cursor() {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use myd::widget::input_dialog::InputDialog;
+
+    // Far longer than the 60-column box a small terminal gets.
+    let long = "/home/juan/projects/deeply/nested/directory/tree/that/keeps/going/further/still/final";
+    let mut dialog = InputDialog::new("Edit directory path:", "/path/to/directory")
+        .with_default(long);
+
+    // Cursor lands at the end, so the tail of the path is what's on screen.
+    let text = render_input_dialog(&dialog, 80, 30);
+    assert!(
+        text.contains("final"),
+        "the end of the path (at the cursor) was not visible: {}",
+        text
+    );
+    // The head has scrolled off, and the box says so.
+    assert!(
+        !text.contains("/home/juan/projects/deeply"),
+        "the whole path was drawn, overflowing the box: {}",
+        text
+    );
+    assert!(
+        text.contains('‹'),
+        "no marker showed that text scrolled off the left: {}",
+        text
+    );
+
+    // Home scrolls back to the start, bringing the head into view.
+    dialog.handle_key(KeyEvent::from(KeyCode::Home));
+    let text = render_input_dialog(&dialog, 80, 30);
+    assert!(
+        text.contains("/home/juan/projects/deeply"),
+        "Home did not scroll back to the start of the path: {}",
+        text
+    );
+    assert!(
+        text.contains('›'),
+        "no marker showed that text scrolled off the right: {}",
+        text
+    );
+
+    // No line may exceed the terminal: an overflowing input line would wrap and
+    // push the Enter/Esc hint off the box.
+    for line in text.lines() {
+        assert!(
+            line.chars().count() <= 80,
+            "a rendered line overflowed the terminal: {:?}",
+            line
+        );
+    }
+}
+
+/// A bigger window must give the dialog a bigger box.
+///
+/// The width was hardcoded to 60 columns, so a wide terminal still squeezed long
+/// paths into a narrow box for no reason.
+#[tokio::test]
+async fn test_input_dialog_grows_with_terminal_width() {
+    use myd::widget::input_dialog::InputDialog;
+
+    let dialog = InputDialog::new("Edit directory path:", "/path/to/directory");
+
+    // Measure the drawn box by its widest row of border glyphs.
+    let box_width = |w: u16| -> usize {
+        render_input_dialog(&dialog, w, 30)
+            .lines()
+            .map(|l| l.chars().filter(|c| *c == '─').count())
+            .max()
+            .unwrap_or(0)
+    };
+
+    let narrow = box_width(70);
+    let wide = box_width(200);
+    assert!(
+        wide > narrow,
+        "the dialog did not grow on a wider terminal: {} vs {}",
+        narrow,
+        wide
+    );
+    // Clamped, so it stays a dialog rather than swallowing a huge screen.
+    assert!(wide <= 120, "the dialog grew past its 120-column cap: {}", wide);
+
+    // On a terminal narrower than the minimum it must still fit, not overflow.
+    let text = render_input_dialog(&dialog, 40, 30);
+    for line in text.lines() {
+        assert!(
+            line.chars().count() <= 40,
+            "the dialog overflowed a narrow terminal: {:?}",
+            line
+        );
+    }
+}
+
 /// A rejected password must be re-promptable rather than a dead end.
 ///
 /// A wrong password used to `bail!` into a generic failure dialog, stranding the
