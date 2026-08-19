@@ -17725,3 +17725,59 @@ async fn descending_then_h_pops_rather_than_rerooting() {
     };
     assert_eq!(root, dir.path(), "h should return to where we descended from");
 }
+
+/// Pressing `g` replaces the footer's key list with the chord's own keys.
+///
+/// End to end through the app's key handling and render, not by setting the
+/// pending-chord flag directly: the footer used to keep showing `j/k:move`,
+/// `t:tag` and the rest beside a `g…` badge, which reads as though those keys
+/// were still live. While `g` waits they are not — anything that does not
+/// complete the chord rings the bell.
+#[tokio::test]
+async fn pressing_g_shows_the_chord_keys_in_the_footer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Before: the ordinary tree bindings.
+    let before = screen_text(&mut app, 120, 24);
+    assert!(
+        before.contains("j/k:move"),
+        "expected the normal footer first: {}",
+        before
+    );
+
+    app.handle_key_for_test(char_key('g'));
+    assert_eq!(
+        app.pending_chord_for_test(),
+        Some('g'),
+        "g should leave a chord pending"
+    );
+
+    let after = screen_text(&mut app, 120, 24);
+    assert!(after.contains("g…"), "the pending chord is not shown: {}", after);
+    for c in myd::keybinding::KeyBindingHandler::G_CHORD_KEYS {
+        assert!(
+            after.contains(&format!("{}:", c)),
+            "g{} is bound but not offered while the chord is pending: {}",
+            c,
+            after
+        );
+    }
+    assert!(
+        !after.contains("j/k:move"),
+        "keys that are not live are still offered: {}",
+        after
+    );
+
+    // Completing the chord puts the ordinary footer back.
+    app.handle_key_for_test(char_key('g'));
+    settle(&mut app).await;
+    let done = screen_text(&mut app, 120, 24);
+    assert!(
+        done.contains("j/k:move") && !done.contains("g…"),
+        "the footer did not return to normal after the chord completed: {}",
+        done
+    );
+}

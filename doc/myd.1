@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.42.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.43.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -88,6 +88,14 @@ Move down half a screen.
 .TP
 .B Ctrl+u
 Move up half a screen.
+.TP
+.B g
+Start a two-key chord and wait for the second key, however long that takes \(em
+there is no timeout, so the sequence is decided by what you type rather than how
+fast. While it waits, the footer shows \fBg…\fR followed by the keys that
+complete it (\fBg\fR, \fBu\fR, \fBd\fR, \fBs\fR, \fBr\fR, \fBx\fR) in place of
+the ordinary bindings, which are not live until the chord resolves. \fBEsc\fR
+abandons it; any other key rings the bell rather than acting on its own.
 .TP
 .B g u
 Move cursor to the parent directory.
