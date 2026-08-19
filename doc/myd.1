@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.43.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.43.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -457,6 +457,14 @@ choice is remembered per directory in \fB~/.config/myd/hosts.toml\fR, so
 somewhere you have decided not to measure opens that way next time. It can also
 be set from the \fBgd\fR picker's actions panel, without opening the directory
 at all.
+.IP
+A pane that is already shallow stays shallow as you walk into subdirectories,
+whatever those directories have remembered: what the pane shows is what it does,
+and a walk you can see it avoiding should not start because of a decision made
+in an earlier session. A remembered preference still applies when you arrive
+from a measuring pane, and \fBS\fR measures the directory you are in whenever
+you want it. This matters most after climbing out of a tree with \fBh\fR: the
+directory you step back into may well be one you once browsed in full.
 .TP
 .B Ctrl+r
 Rescan the file tree.
