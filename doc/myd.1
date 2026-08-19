@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.44.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.44.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -962,6 +962,17 @@ images to fit.
 The per-escape limit remains as a backstop. \fBMYD_PREVIEW_MAX_PAYLOAD\fR sets
 it in kilobytes, and \fB0\fR removes it. It is judged per sequence rather than
 per image, which is the point of chunking.
+.PP
+On iTerm2 outside a multiplexer, an image in a format the terminal decodes
+itself \(em JPEG, PNG, GIF, BMP, TIFF, WebP, HEIC \(em is sent as its own bytes
+rather than re-rendered, up to 100 MB. Handing over the original is both fewer
+bytes and a better picture than re-encoding: \fBtimg\fR converts to PNG, which
+is the worst case for a photograph, and a 7.3 MB JPEG became a 1.7 MB PNG that
+did not draw at all. \fBMYD_PREVIEW_MAX_NATIVE\fR sets the ceiling in megabytes
+for a slow link or a terminal that will not take an image that large. Inside a
+multiplexer the original is never sent whole, whatever the ceiling says, because
+a single oversized escape is silently dropped there and only the renderer can
+shrink the picture to fit.
 .PP
 Block output is captured and drawn as part of the interface rather than written to
 the terminal, so it cannot corrupt the display. A graphics image necessarily does
