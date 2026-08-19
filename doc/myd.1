@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.41.4" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.42.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -60,6 +60,12 @@ Move cursor up one line.
 In the tree view, collapse the current directory or move the cursor to the
 parent entry. In the treemap view, move the cursor one tile to the left; when
 already on a left-edge tile, step up to the parent directory.
+.IP
+On the root line, \fBh\fR goes up out of the directory the pane was opened at:
+back to the previous view if you arrived by descending, otherwise re-rooting the
+pane one level higher, up to \fB/\fR. A pane opened deep in a tree \(em a remote
+connected at \fBsftp://host:dir\fR, or a path given on the command line \(em is
+therefore not confined to it. A remote re-roots over the same connection.
 .TP
 .B l
 In the tree view, expand the current directory. In the treemap view, move the

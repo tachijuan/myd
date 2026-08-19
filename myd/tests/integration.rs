@@ -17612,3 +17612,116 @@ async fn the_inline_preview_asks_for_graphics_only_when_it_is_the_only_surface()
         "with one info panel left, a real image is allowed again"
     );
 }
+
+/// At the root with nothing to pop, `h` re-roots one directory up.
+///
+/// The panel's starting directory used to be a hard ceiling: `h` there only
+/// collapsed or moved the cursor, so a panel opened deep in a tree could not
+/// reach its own parent. Most visible on a remote opened at a path
+/// (`sftp://host:c` lands in ~/c with an empty screen stack), but local panels
+/// had the same limit.
+#[tokio::test]
+async fn h_at_the_root_reroots_one_level_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("a/b/c");
+    std::fs::create_dir_all(&deep).unwrap();
+    // A sibling at each level, so the parent listing is visibly different.
+    std::fs::create_dir_all(dir.path().join("a/b/sibling")).unwrap();
+
+    let mut app = FileBrowser::new(Some(deep.clone()), None, false);
+    settle(&mut app).await;
+    let root = |a: &FileBrowser| match a.current_screen() {
+        Screen::Main(s) => s.root_path().clone(),
+        _ => PathBuf::from("<loading>"),
+    };
+    assert_eq!(root(&app), deep);
+
+    // One press per level: the auto-expanded root must not eat the first `h`.
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert_eq!(
+        root(&app),
+        dir.path().join("a/b"),
+        "h at the root should re-root to the parent in a single press"
+    );
+
+    // The new root really is listed, not just relabelled: the sibling that
+    // lives beside the old root is now on screen.
+    let text = screen_text(&mut app, 100, 30);
+    assert!(
+        text.contains("sibling"),
+        "the parent's contents were not listed after re-rooting: {}",
+        text
+    );
+
+    // And it keeps going up.
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert_eq!(root(&app), dir.path().join("a"));
+}
+
+/// Re-rooting replaces the screen rather than pushing one.
+///
+/// Going up is not descending somewhere new. If it pushed, the next `q` would
+/// return to the child just left instead of to wherever the panel was opened
+/// from, and repeated `h` would bury the real history.
+#[tokio::test]
+async fn rerooting_upward_does_not_grow_the_screen_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("a/b");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let mut app = FileBrowser::new(Some(deep.clone()), None, false);
+    settle(&mut app).await;
+    let depth = app.screen_stack_len_for_test();
+
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert_eq!(
+        app.screen_stack_len_for_test(),
+        depth,
+        "re-rooting up should replace the screen, not push a new one"
+    );
+}
+
+/// Descending and coming back up must still use the history, not a re-root.
+///
+/// The pop path is what preserves the parent's cursor position and expansion
+/// state; re-rooting rebuilds from scratch. Whichever runs, `h` has to land on
+/// the same directory — but entering a directory and pressing `h` should return
+/// to the view that was left, so the stack has to be preferred.
+#[tokio::test]
+async fn descending_then_h_pops_rather_than_rerooting() {
+    use crossterm::event::{KeyCode, KeyEvent};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("child/grandchild")).unwrap();
+    std::fs::write(dir.path().join("marker.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    let start_depth = app.screen_stack_len_for_test();
+
+    // Enter "child". It sorts after the file, so step down twice.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(KeyEvent::from(KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(
+        app.screen_stack_len_for_test() > start_depth,
+        "entering a directory should push a screen"
+    );
+
+    // `h` comes back by popping, so the stack returns to its original depth.
+    app.handle_key_for_test(char_key('h'));
+    settle(&mut app).await;
+    assert_eq!(
+        app.screen_stack_len_for_test(),
+        start_depth,
+        "h after descending should pop the pushed screen"
+    );
+    let root = match app.current_screen() {
+        Screen::Main(s) => s.root_path().clone(),
+        _ => PathBuf::from("<loading>"),
+    };
+    assert_eq!(root, dir.path(), "h should return to where we descended from");
+}

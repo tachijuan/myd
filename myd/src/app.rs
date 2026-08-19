@@ -1716,6 +1716,14 @@ impl FileBrowser {
         self.is_connecting()
     }
 
+    /// How deep the active panel's screen stack is (for tests).
+    ///
+    /// Distinguishes navigation that pushes history from navigation that
+    /// replaces the current view, which look identical from the root path alone.
+    pub fn screen_stack_len_for_test(&self) -> usize {
+        self.active_panel().screen_stack.len()
+    }
+
     /// The screen currently on top of the active panel's stack.
     pub fn current_screen(&self) -> &Screen {
         self.active_panel().current_screen()
@@ -3570,6 +3578,50 @@ impl FileBrowser {
         self.set_shallow(true);
     }
 
+    /// Re-root the active panel one directory up, keeping its backend.
+    ///
+    /// Returns `false` when there is nowhere to go — already at `/`, or on a
+    /// screen that has no root — so the caller can fall back to moving the
+    /// cursor.
+    ///
+    /// The screen is *replaced* rather than pushed, as in [`set_shallow`]: going
+    /// up is not descending into somewhere new, and pushing would make the next
+    /// `q` return to the child that was just left rather than to wherever the
+    /// panel was opened from.
+    fn reroot_to_parent(&mut self) -> bool {
+        let Screen::Main(state) = self.active_panel().current_screen() else {
+            return false;
+        };
+        let root = state.root_path().clone();
+        let Some(parent) = root.parent().map(|p| p.to_path_buf()) else {
+            // Already at the filesystem root (or the server's).
+            return false;
+        };
+        // `Path::parent` of "/" is None, but of "/x" it is "" on some inputs —
+        // treat an empty parent as the root so the last step up still lands
+        // somewhere listable rather than on a path the server will reject.
+        let parent = if parent.as_os_str().is_empty() {
+            PathBuf::from("/")
+        } else {
+            parent
+        };
+
+        let source = state.tree.source.clone();
+        let sort_mode = state.tree.sort_mode;
+        // The size cache is keyed by path and stays valid across a re-root: the
+        // child we came from is one of the parent's entries, so its measured
+        // total is exactly what the new listing needs.
+        let cache = if source.is_shallow() {
+            None
+        } else {
+            Some(state.tree.size_cache.clone())
+        };
+
+        *self.active_panel_mut().current_screen_mut() =
+            Screen::loading_with_source_sorted(source, parent, cache, sort_mode);
+        true
+    }
+
     /// Rebuild the active panel's tree with measuring on or off, and remember
     /// the choice for this directory.
     fn set_shallow(&mut self, shallow: bool) {
@@ -4406,15 +4458,20 @@ impl FileBrowser {
                     // in-place collapse here would eat the first `h` after
                     // entering a directory — the user expects `h` at the root to
                     // step back up. So when the cursor is on the root (depth 0)
-                    // and there's a screen to return to, fall through to the pop
-                    // below instead of collapsing the root.
+                    // and there is any way up at all, fall through to the pop or
+                    // re-root below instead of collapsing the root.
                     let at_root_line = state
                         .tree
                         .selected_line()
                         .map(|l| l.depth == 0)
                         .unwrap_or(false);
                     let can_pop = stack_len > 1 && !dir_picker_below;
-                    if !(at_root_line && can_pop) {
+                    // Re-rooting is a way up too, so it must suppress the
+                    // collapse exactly as a poppable stack does — otherwise the
+                    // first `h` of every level is spent collapsing the root and
+                    // going up costs two presses instead of one.
+                    let can_reroot = state.root_path().parent().is_some();
+                    if !(at_root_line && (can_pop || can_reroot)) {
                         // Otherwise: on an expanded directory, collapse in place.
                         let is_expanded = state.tree.is_cursor_expanded();
                         let is_dir = state
@@ -4433,6 +4490,15 @@ impl FileBrowser {
 
                 if at_root && stack_len > 1 && !dir_picker_below {
                     self.pop_screen();
+                    return true;
+                }
+
+                // At the root with no screen to pop: re-root one level up rather
+                // than doing nothing. The panel's starting directory was
+                // otherwise a hard ceiling, which is most obvious on a remote
+                // opened at a path — `sftp://host:c` landed in ~/c with an empty
+                // stack, so there was no way up short of retyping a URL in `g d`.
+                if at_root && self.reroot_to_parent() {
                     return true;
                 }
 
