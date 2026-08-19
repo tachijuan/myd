@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.43.2" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.44.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -373,6 +373,12 @@ many entries are \fIshown\fR rather than how many exist, and the footer carries
 the pattern \(em a masked view is never mistaken for the directory's real
 contents. On a narrow terminal the footer badge drops its hint, then the
 pattern, but never the fact that filtering is on.
+.IP
+The frame itself says so too: the pane's border turns green and \fBFILTERED\fR
+is reversed out of the same colour, so a view with rows missing is obvious at a
+glance rather than only on reading the counts. The border reverts to cyan for
+focus on an unfocused pane \(em in a split, which pane has the keyboard is the
+more urgent signal, and the title badge still carries the filter.
 .IP
 A pattern that is not valid regular expression syntax is reported. Note that
 \fB*p$\fR is not valid (there is nothing for \fB*\fR to repeat); the pattern
