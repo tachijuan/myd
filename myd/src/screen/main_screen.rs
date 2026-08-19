@@ -1314,6 +1314,34 @@ impl MainScreenState {
             // it would be one too many.
             return;
         }
+        // A pending chord takes the whole line. The keys listed to the right are
+        // the ones that are live *now*, and while `g` waits none of them are —
+        // leaving them up said `j` would move the cursor when it would in fact
+        // ring the bell. So the line becomes the chord and what completes it.
+        if let Some(c) = self.pending_chord {
+            let (prefix, keys) = chord_footer(c, area.width as usize);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        prefix,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Rgb(120, 220, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        keys,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                area,
+            );
+            return;
+        }
+
         if self.footer == FooterMode::Transfers {
             // `Del/⌫` rather than spelling both out: the pair is two glyphs
             // wider than "Del" alone, and this line already runs close to the
@@ -1494,18 +1522,9 @@ impl MainScreenState {
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
-                // A chord waiting for its second key, shown the way vim shows a
-                // pending operator. Without a timeout this is the only sign the
-                // app is mid-sequence rather than ignoring keys.
-                if let Some(c) = self.pending_chord {
-                    spans.push(Span::styled(
-                        format!(" {}… ", c),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(120, 220, 255))
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
+                // A pending chord is handled by the early return above, which
+                // takes the whole line — the keys here are not live while `g`
+                // waits, so showing them alongside it was the confusing part.
                 let footer = " [TREE]  j/k:move  l/h:expand/collapse  t:tag  V:visual  U:untag  f:filter  c:copy  ?:help  q:quit ";
                 spans.push(Span::styled(
                     footer,
@@ -1520,6 +1539,45 @@ impl MainScreenState {
     }
 }
 
+/// The footer for a chord waiting on its second key: the prefix, and what can
+/// complete it.
+///
+/// The pairs must match `KeyBindingHandler::resolve_chord`, which is the only
+/// place that decides what a chord does — a hint listing a key that resolves to
+/// nothing would send the user to the bell. `chord_hint_matches_bindings` in
+/// the keybinding tests holds the two together.
+///
+/// Abbreviates on a narrow terminal rather than overflowing, the way the other
+/// footers do: the labels go first, then the prefix.
+fn chord_footer(c: char, width: usize) -> (String, String) {
+    let prefix = format!(" {}… ", c);
+    if c != 'g' {
+        // No other chord prefix exists today; if one is added without a hint
+        // here, say that a key is expected rather than claiming to know which.
+        return (prefix, " waiting for the next key…  Esc:cancel ".to_string());
+    }
+    // Widest first: the full labels, then shorter ones, then just the letters —
+    // which still says which keys are live, and at least the prefix badge
+    // survives to show the app is mid-sequence.
+    const FULL: &str =
+        " g:top  u:parent  d:go to…  s:sort  r:rename tagged  x:cancel transfers  Esc:cancel ";
+    const MEDIUM: &str =
+        " g:top  u:parent  d:go to…  s:sort  r:rename  x:cancel  Esc:back ";
+    const SHORT: &str = " g:top  u:parent  d:go to  s:sort  r:rename  x:cancel ";
+    const TERSE: &str = " g u d s r x ";
+    let budget = width.saturating_sub(prefix.chars().count());
+    let keys = if budget >= FULL.chars().count() {
+        FULL
+    } else if budget >= MEDIUM.chars().count() {
+        MEDIUM
+    } else if budget >= SHORT.chars().count() {
+        SHORT
+    } else {
+        TERSE
+    };
+    (prefix, keys.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,6 +1587,94 @@ mod tests {
     use crate::widget::progress::OpProgress;
     use crate::widget::source::{RemoteSource, Source};
     use std::sync::Arc;
+
+    /// Render a screen with a chord pending, at `width`, and return the footer.
+    fn chord_footer_line(width: u16) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let tree = FileTree::with_source_cancellable_progress(
+            Source::Local,
+            dir.path().to_path_buf(),
+            SortMode::default(),
+            true,
+            true,
+            SizeCache::new(),
+            &CancelToken::new(),
+            &OpProgress::new(),
+        )
+        .expect("tree builds");
+        let mut state = MainScreenState::from_tree(dir.path().to_path_buf(), tree);
+        state.pending_chord = Some('g');
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20)).unwrap();
+        term.draw(|f| state.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+    }
+
+    /// A pending `g` replaces the key list with what completes the chord.
+    ///
+    /// The footer used to add a `g…` badge and leave the normal bindings beside
+    /// it, which read as though `j`, `t` and the rest were still live — they are
+    /// not: while `g` waits, anything that is not a chord key rings the bell.
+    #[test]
+    fn a_pending_chord_lists_what_completes_it() {
+        let line = chord_footer_line(120);
+        assert!(line.contains("g…"), "the pending chord is not shown: {}", line);
+
+        // Every key that completes the chord is offered.
+        for c in crate::keybinding::KeyBindingHandler::G_CHORD_KEYS {
+            assert!(
+                line.contains(&format!("{}:", c)),
+                "g{} is bound but not offered in the footer: {}",
+                c,
+                line
+            );
+        }
+
+        // And the keys that are *not* live are gone, so the line cannot be read
+        // as "these still work".
+        for stale in ["j/k:move", "t:tag", "V:visual", "f:filter", "[TREE]"] {
+            assert!(
+                !line.contains(stale),
+                "{} is still offered while a chord is pending: {}",
+                stale,
+                line
+            );
+        }
+    }
+
+    /// The chord footer abbreviates rather than overflowing a narrow terminal.
+    #[test]
+    fn a_pending_chord_footer_fits_the_terminal() {
+        for width in [40u16, 60, 80, 120] {
+            let line = chord_footer_line(width);
+            assert_eq!(
+                line.chars().count(),
+                width as usize,
+                "footer at width {} was not exactly one line",
+                width
+            );
+            // The prefix survives at every width: it is the part that says the
+            // app is mid-sequence rather than ignoring keys.
+            assert!(
+                line.contains("g…"),
+                "the chord prefix was dropped at width {}: {}",
+                width,
+                line
+            );
+            // Nothing spilled past the edge into a wrapped second line.
+            assert!(
+                !line.trim_end().is_empty(),
+                "footer was blank at width {}",
+                width
+            );
+        }
+    }
 
     /// Render a screen over `source` and return the whole buffer as text.
     fn rendered(source: Source, path: &std::path::Path) -> String {

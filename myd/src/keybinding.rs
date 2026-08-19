@@ -190,6 +190,13 @@ impl KeyBindingHandler {
         self.resolve_single(key)
     }
 
+    /// Every second key that completes a `g` chord.
+    ///
+    /// The footer's pending-chord hint is built from this, so a chord added to
+    /// `resolve_chord` without a hint is a test failure rather than a key the
+    /// user has no way to discover.
+    pub const G_CHORD_KEYS: &'static [char] = &['g', 'u', 'd', 's', 'r', 'x'];
+
     /// Resolve a chord (two-character sequence, only g-prefix).
     fn resolve_chord(&self, combined: &str) -> Option<Action> {
         match combined {
@@ -301,6 +308,42 @@ impl KeyBindingHandler {
             KeyCode::PageDown => Some(Action::PageDown),
             KeyCode::PageUp => Some(Action::PageUp),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `G_CHORD_KEYS` must list exactly the keys that complete a `g` chord.
+    ///
+    /// The footer hint is built from it, so a chord added to `resolve_chord`
+    /// without updating the list would be undiscoverable, and a key listed but
+    /// unbound would send the user to the bell.
+    #[test]
+    fn g_chord_keys_match_the_resolver() {
+        let h = KeyBindingHandler::new();
+        // Every advertised key resolves.
+        for c in KeyBindingHandler::G_CHORD_KEYS {
+            assert!(
+                h.resolve_chord(&format!("g{}", c)).is_some(),
+                "g{} is advertised in the footer but resolves to nothing",
+                c
+            );
+        }
+        // And nothing else does: sweep the printable ASCII range so a new chord
+        // cannot be added without appearing here.
+        for c in (b' '..=b'~').map(char::from) {
+            let bound = h.resolve_chord(&format!("g{}", c)).is_some();
+            let advertised = KeyBindingHandler::G_CHORD_KEYS.contains(&c);
+            assert_eq!(
+                bound, advertised,
+                "g{} is {} but {} in G_CHORD_KEYS",
+                c,
+                if bound { "bound" } else { "unbound" },
+                if advertised { "listed" } else { "missing" },
+            );
         }
     }
 }
