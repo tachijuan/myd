@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.44.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.45.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -18,6 +18,11 @@ Built with \fBratatui\fR and \fBcrossterm\fR.
 If \fIPATH\fR is provided, the browser starts at that directory; otherwise it
 starts in the current directory. The picker is reached with \fBg d\fR, or at
 start-up with \fB\-\-directory\fR.
+.PP
+A \fIPATH\fR that cannot be opened is reported and nothing starts, naming which
+of the three it was \(em no such directory, not a directory, or a directory that
+cannot be read. Earlier versions silently showed the picker instead, which was
+indistinguishable from the argument having been ignored.
 .SH OPTIONS
 .TP
 .B \-2, \-\-dual

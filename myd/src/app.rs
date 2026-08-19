@@ -1722,6 +1722,21 @@ impl FileBrowser {
         &mut self.hosts
     }
 
+    /// What the graphics flush believes is on screen (for tests).
+    ///
+    /// `(area, payload length, page)`. The length is what makes the flush cheap:
+    /// comparing it needs no copy of the image.
+    pub fn preview_graphics_stamp_for_test(
+        &self,
+    ) -> Option<(ratatui::layout::Rect, usize, usize)> {
+        self.preview_graphics_shown
+    }
+
+    /// Run one graphics flush, as the event loop does after each frame.
+    pub fn flush_preview_graphics_for_test(&mut self) {
+        self.flush_preview_graphics();
+    }
+
     /// How deep the active panel's screen stack is (for tests).
     ///
     /// Distinguishes navigation that pushes history from navigation that
@@ -2306,43 +2321,77 @@ impl FileBrowser {
     /// on purpose (see [`crate::widget::preview`]).
     ///
     /// Only emitted when something changed. The event loop runs at 10Hz even when
-    /// idle, and re-sending a few hundred kilobytes of base64 every tick would
-    /// flood the terminal and make the image flicker.
+    /// idle, and re-sending megabytes of base64 every tick would flood the
+    /// terminal and make the image flicker. Deciding that costs no copy of the
+    /// payload either — see the stamp below.
     fn flush_preview_graphics(&mut self) {
-        // Taken by value: erasing the old image needs `&mut self`, which cannot
-        // coexist with a payload borrowed out of `self.preview`.
-        // The full pane first: it covers the panels, so while it is open it is
-        // the only thing that can own the terminal's one image. The inline
-        // preview takes over when the pane is closed — it only ever produces a
-        // payload when it is the single surface (see
-        // `info_preview_may_use_graphics`), so the two can share this slot.
-        let wanted = match (&self.preview.graphics_area, self.preview.graphics()) {
-            (Some(area), Some(payload)) if self.preview_open => {
-                Some((*area, payload.to_string()))
-            }
-            _ if !self.preview_open => self.info_previews.iter().find_map(|slot| {
-                match (&slot.state.graphics_area, slot.state.graphics()) {
-                    (Some(area), Some(payload)) => Some((*area, payload.to_string())),
-                    _ => None,
+        // Which surface owns the terminal's one image, located without copying
+        // it. The full pane comes first: it covers the panels, so while it is
+        // open it is the only thing that can own the image. The inline preview
+        // takes over when the pane is closed — it only ever produces a payload
+        // when it is the single surface (see `info_preview_may_use_graphics`),
+        // so the two can share this slot.
+        //
+        // The payload is the whole picture — for a photograph handed to iTerm2 in
+        // its own format, megabytes of it — and this runs after every frame. The
+        // copy used to be made up front, so an idle loop spent it ten times a
+        // second only to reach the stamp check below and find nothing to redraw.
+        //
+        // `None` = the full pane, `Some(i)` = that inline slot.
+        let source: Option<usize> = if self.preview_open {
+            match (&self.preview.graphics_area, self.preview.graphics()) {
+                (Some(_), Some(_)) => None,
+                _ => {
+                    self.clear_shown_graphics();
+                    return;
                 }
-            }),
-            _ => None,
+            }
+        } else {
+            match self.info_previews.iter().position(|slot| {
+                slot.state.graphics_area.is_some() && slot.state.graphics().is_some()
+            }) {
+                Some(i) => Some(i),
+                None => {
+                    self.clear_shown_graphics();
+                    return;
+                }
+            }
         };
 
-        let Some((area, payload)) = wanted else {
-            // Nothing to show any more, so remove whatever is still on screen.
-            if let Some((old, _, _)) = self.preview_graphics_shown.take() {
-                self.erase_graphics(old);
+        // Borrowed, not cloned: only the geometry and length are needed to decide
+        // whether anything changed.
+        let (area, len) = {
+            let state = match source {
+                None => &self.preview,
+                Some(i) => &self.info_previews[i].state,
+            };
+            match (state.graphics_area, state.graphics()) {
+                (Some(area), Some(payload)) => (area, payload.len()),
+                _ => {
+                    self.clear_shown_graphics();
+                    return;
+                }
             }
-            return;
         };
 
         // Identify what is on screen by where it is and what it is, so a resize,
         // a page turn or a different file all re-emit, and an idle tick does not.
-        let stamp = (area, payload.len(), self.preview.current_page());
+        let stamp = (area, len, self.preview.current_page());
         if self.preview_graphics_shown == Some(stamp) {
             return;
         }
+
+        // Only now is the copy worth making — this frame really is going to write
+        // the image. Taken by value because erasing the old one needs `&mut
+        // self`, which cannot coexist with a payload borrowed out of `self`.
+        let payload = match source {
+            None => self.preview.graphics().unwrap_or_default().to_string(),
+            Some(i) => self.info_previews[i]
+                .state
+                .graphics()
+                .unwrap_or_default()
+                .to_string(),
+        };
 
         // Remove whatever was there first, or a smaller image drawn over a larger
         // one leaves the old edges showing.
@@ -2355,6 +2404,16 @@ impl FileBrowser {
         let placed = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
         if self.write_graphics(&placed) && self.write_graphics(&payload) {
             self.preview_graphics_shown = Some(stamp);
+        }
+    }
+
+    /// Erase whatever image is still on screen, if any.
+    ///
+    /// The "nothing to show any more" arm of [`Self::flush_preview_graphics`],
+    /// which several checks there reach independently.
+    fn clear_shown_graphics(&mut self) {
+        if let Some((old, _, _)) = self.preview_graphics_shown.take() {
+            self.erase_graphics(old);
         }
     }
 
