@@ -5812,7 +5812,14 @@ impl FileBrowser {
             ));
             return;
         }
-        let Some(dest_dir) = self.active_panel().dest_dir() else {
+        // The pane root, not `dest_dir`. Those two answer different questions
+        // and only one of them applies here: `dest_dir` is where a copy *into*
+        // this panel should land, so it follows the cursor — which is right for
+        // `c`, where the cursor marks the destination. Here the cursor marks the
+        // *source*. Following it put the archive of `code/booker2` inside
+        // `code/booker2`, which is both surprising and the one directory the
+        // archive should not be in.
+        let Some(dest_dir) = self.active_panel().current_dir() else {
             return;
         };
 

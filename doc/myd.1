@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.50.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.50.2" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -1140,11 +1140,17 @@ and \fB\(da\fR choose a format, as do the digits \fB1\fR\-\fB4\fR. Changing the
 format rewrites the name's extension to match, until the name is edited by hand.
 \fBEnter\fR creates the archive.
 .PP
-The archive is created in the directory the panel is scoped to \(em where
-\fBN\fR would create a directory \(em rather than inside the directory under the
-cursor. A selected directory goes in under its own name, so archiving
-\fBsrc\fR produces an archive containing \fBsrc/main.rs\fR, and unpacking it
-recreates \fBsrc\fR rather than scattering its contents.
+The archive is created in the directory at the top of the tree \(em what the
+panel is rooted at \(em however deep the cursor has wandered into it. Archiving
+\fBcode/booker2\fR from a pane rooted at \fBcode\fR puts \fBbooker2.zip\fR in
+\fBcode\fR, beside the directory it holds rather than inside it. This is
+deliberately not where \fBN\fR creates a directory: \fBN\fR follows the cursor,
+because there the cursor marks the destination, whereas here it marks the
+source.
+.PP
+A selected directory goes in under its own name, so archiving \fBsrc\fR produces
+an archive containing \fBsrc/main.rs\fR, and unpacking it recreates \fBsrc\fR
+rather than scattering its contents.
 .PP
 The write streams, so what can be packed is not bounded by memory, and it runs
 in the panel: the other pane stays usable and \fBq\fR stops it. An interrupted

@@ -561,11 +561,16 @@ on — into a new archive. A dialog asks for the name and offers four formats:
 format, or press `1`–`4`. Changing the format renames the extension to match,
 until you edit the name yourself. `Enter` creates it.
 
-The archive lands in **the directory the panel is scoped to** — where `N` would
-make a directory — not inside the directory under the cursor. A selected
-directory goes in under its own name, so archiving `src/` gives you an archive
-containing `src/main.rs`, and unpacking it recreates `src/` rather than
-scattering its contents.
+The archive lands in **the directory at the top of the tree** — what the panel
+is rooted at — however deep the cursor has wandered into it. Archiving
+`code/booker2` from a pane rooted at `code` puts `booker2.zip` in `code`, beside
+the directory it holds rather than inside it. (This is deliberately not where
+`N` creates a directory: `N` follows the cursor, because there the cursor marks
+the destination. Here it marks the source.)
+
+A selected directory goes in under its own name, so archiving `src/` gives you
+an archive containing `src/main.rs`, and unpacking it recreates `src/` rather
+than scattering its contents.
 
 Writing streams, so the size of what you are packing is not bounded by memory,
 and it runs in the panel — the other pane stays usable, and `q` stops it. An
