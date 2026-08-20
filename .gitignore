@@ -1,6 +1,11 @@
 # Rust build artifacts
 myd/target/
 
+# Recorded demo casts. The scripts that produce them are committed; the output
+# is regenerated with demo/record.sh and would otherwise be a large binary-ish
+# blob rewritten on every re-record.
+demo/cast/
+
 # Archives kept in the tree for performance testing. These are large real-world
 # containers, not fixtures — the tests that need an archive build their own.
 *.rar
