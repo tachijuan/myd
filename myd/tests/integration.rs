@@ -14905,6 +14905,82 @@ async fn gz_creates_an_archive_of_the_tagged_files() {
     );
 }
 
+/// The archive lands in the pane root, not inside the directory being archived.
+///
+/// `dest_dir` follows the cursor, which is right for `c` — there the cursor
+/// marks where the copy should land. Here it marks the *source*, so following
+/// it put the archive of `code/booker2` inside `code/booker2`: surprising, and
+/// the one directory it should not be in.
+#[tokio::test]
+async fn an_archive_of_a_directory_lands_beside_it_not_inside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("booker2/src")).unwrap();
+    std::fs::write(dir.path().join("booker2/src/main.rs"), b"fn main() {}\n").unwrap();
+    std::fs::write(dir.path().join("other.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "booker2");
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    assert_eq!(app.modal_kind_for_test(), "create_archive");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_archive(&mut app).await;
+
+    assert!(
+        dir.path().join("booker2.zip").is_file(),
+        "the archive should be in the pane root, beside the directory it holds"
+    );
+    assert!(
+        !dir.path().join("booker2/booker2.zip").exists(),
+        "the archive was created inside the directory being archived"
+    );
+}
+
+/// The pane root wins however deep the cursor has wandered.
+///
+/// Expanding into a subtree moves the cursor without changing what the panel is
+/// scoped to, and the dialog says where the archive is going — so "the
+/// directory at the top of the tree" is the answer that matches what is on
+/// screen, wherever in the tree the cursor happens to be.
+#[tokio::test]
+async fn an_archive_of_a_nested_file_still_lands_in_the_pane_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+    std::fs::write(dir.path().join("a/b/deep.txt"), b"deep\n").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Expand down to the nested file, without re-rooting the panel.
+    cursor_onto(&mut app, "a");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "b");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "deep.txt");
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_archive(&mut app).await;
+
+    assert!(
+        dir.path().join("deep.txt.zip").is_file(),
+        "the archive should be in the pane root: {:?}",
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !dir.path().join("a/b/deep.txt.zip").exists(),
+        "the archive followed the cursor into the subtree"
+    );
+}
+
 #[tokio::test]
 async fn an_existing_archive_asks_before_overwriting() {
     let dir = tempfile::tempdir().unwrap();
