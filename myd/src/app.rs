@@ -3772,13 +3772,17 @@ impl FileBrowser {
         let sort_mode = state.tree.sort_mode;
 
         // A fresh scan rather than an in-place edit: the sizes are what changed,
-        // and they are computed during the walk. Going shallow discards the cache
-        // too, since its entries are the totals now being disowned.
-        let cache = if shallow {
-            None
-        } else {
-            Some(state.tree.size_cache.clone())
-        };
+        // and they are computed during the walk.
+        //
+        // The cache is dropped in *both* directions, because it is wrong in both.
+        // Going shallow, its entries are the totals being disowned. Coming out of
+        // shallow, they are the zeros shallow mode wrote: `dir_size` returns 0
+        // there and the loader caches that like any other answer, so carrying
+        // them over meant the measured scan's "already known, skip it" check saw
+        // a zero and never walked. A directory holding gigabytes then reported a
+        // few bytes, while opening myd in it afresh reported it correctly —
+        // there was no cache to inherit that way.
+        let cache = None;
         // Replaced rather than pushed. The stack is the navigation history, so
         // only entering a directory belongs on it: pushing here meant `S` left a
         // screen behind showing the *same* directory in the other mode, and the
