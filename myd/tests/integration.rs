@@ -12013,6 +12013,100 @@ async fn shallow_flag_opens_a_single_panel_unmeasured() {
     assert!(!tree_is_shallow(&app), "without -s the tree is measured");
 }
 
+/// Leaving shallow mode measures directories that shallow mode never measured.
+///
+/// Shallow `dir_size` returns 0, and the loader caches that 0 like any other
+/// answer. `S` then handed the same cache to the measured scan, whose
+/// "already known, skip it" check saw the zeros and never walked — so a
+/// directory holding gigabytes reported a few bytes. Starting myd in the
+/// directory afresh measured it correctly, which is what made the stale cache
+/// the suspect.
+#[tokio::test]
+async fn leaving_shallow_mode_measures_what_shallow_mode_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("code/project")).unwrap();
+    // Big enough that a real measurement cannot be confused with an inode size.
+    std::fs::write(dir.path().join("code/project/big.bin"), vec![b'x'; 300_000]).unwrap();
+
+    let mut app = FileBrowser::new_shallow(Some(dir.path().to_path_buf()), None, false, true);
+    settle(&mut app).await;
+    assert!(tree_is_shallow(&app), "-s starts unmeasured");
+
+    // Into `code`, as pressing Enter on it does. The child screen inherits the
+    // shallow source, so its listing caches zeros for everything below.
+    cursor_onto(&mut app, "code");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    // Now leave shallow mode, and confirm the walk that follows.
+    app.handle_key_for_test(char_key('S'));
+    if app.modal_kind_for_test() == "confirm" {
+        app.handle_key_for_test(char_key('y'));
+    }
+    settle(&mut app).await;
+    assert!(!tree_is_shallow(&app), "S should have left shallow mode");
+
+    let measured = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s
+            .tree
+            .lines
+            .iter()
+            .find(|l| l.name.contains("project"))
+            .and_then(|l| s.tree.size_cache.get(&l.resolved_path)),
+        _ => None,
+    };
+    assert_eq!(
+        measured,
+        Some(300_000),
+        "the directory kept its shallow-mode zero instead of being measured"
+    );
+}
+
+/// The same, for a directory reached by expanding rather than by entering.
+///
+/// `l` expands in place and loads that level through the tree's own cache, so
+/// a subtree first seen while shallow could keep its zeros after `S` even
+/// though the top level was measured.
+#[tokio::test]
+async fn expanding_after_leaving_shallow_mode_measures_the_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("outer/inner")).unwrap();
+    std::fs::write(dir.path().join("outer/inner/big.bin"), vec![b'x'; 250_000]).unwrap();
+
+    let mut app = FileBrowser::new_shallow(Some(dir.path().to_path_buf()), None, false, true);
+    settle(&mut app).await;
+
+    // See the subtree while shallow, so its zeros are cached.
+    cursor_onto(&mut app, "outer");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('S'));
+    if app.modal_kind_for_test() == "confirm" {
+        app.handle_key_for_test(char_key('y'));
+    }
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "outer");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+
+    let measured = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s
+            .tree
+            .lines
+            .iter()
+            .find(|l| l.name.contains("inner"))
+            .and_then(|l| s.tree.size_cache.get(&l.resolved_path)),
+        _ => None,
+    };
+    assert_eq!(
+        measured,
+        Some(250_000),
+        "an expanded subtree kept its shallow-mode zero"
+    );
+}
+
 /// `-s` applies to both panes of a split, not just the active one.
 #[tokio::test]
 async fn shallow_flag_applies_to_both_panes() {
