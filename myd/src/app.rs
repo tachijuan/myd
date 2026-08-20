@@ -5807,6 +5807,13 @@ impl FileBrowser {
 
         match result {
             ConnectResult::Connected(vfs, home) => {
+                // Read before the state is cleared below: whether this pane was
+                // the one waiting decides if focus should follow the connection.
+                let was_waiting = self
+                    .panels
+                    .get(target_panel)
+                    .and_then(|p| p.busy.as_ref())
+                    .is_some_and(|b| b.verb == "Connecting");
                 self.clear_connect_busy(target_panel);
                 self.pending_connect = None;
                 let backend = self.backends.register(vfs.clone());
@@ -5825,7 +5832,18 @@ impl FileBrowser {
                 // case the panel layout changed while connecting.
                 let panel = target_panel.min(self.panels.len().saturating_sub(1));
                 self.panels[panel] = Panel::new_remote(source, home);
-                self.active = panel;
+
+                // Focus follows the connection only if the user is still on the
+                // pane that asked for it. Connecting used to block everything,
+                // so focus could not have moved and taking it back was free;
+                // now that the other pane stays usable, the user can be part way
+                // through moving around in it when the host finally answers.
+                // Pulling the keyboard away at that moment means the next
+                // keystroke lands on a different tree than the one being looked
+                // at — which is how the wrong file gets acted on.
+                if self.active == panel || !was_waiting {
+                    self.active = panel;
+                }
 
                 // Promote the saved host now that the connection actually
                 // worked. Doing it when the picker was dismissed would let a
