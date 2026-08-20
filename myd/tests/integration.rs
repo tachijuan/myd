@@ -3379,10 +3379,11 @@ async fn an_unknown_chord_beeps_and_does_nothing_else() {
         _ => unreachable!("settled onto a main screen"),
     };
 
-    // `gz` is not a chord. `z` alone is not a binding either, but the point is
-    // that the *chord* failing is what beeps.
+    // `gy` is not a chord. `y` alone is not a binding either, but the point is
+    // that the *chord* failing is what beeps. (This used to be `gz`, which now
+    // creates an archive.)
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('z'));
+    app.handle_key_for_test(char_key('y'));
     assert_eq!(
         app.bells_rung_for_test(),
         bells + 1,
@@ -14710,6 +14711,292 @@ async fn help_documents_the_archive_keys() {
         text.contains("Browse an archive"),
         "entering an archive is not documented:\n{text}"
     );
+    assert!(
+        text.contains("gz"),
+        "creating an archive is not documented:\n{text}"
+    );
+}
+
+/// Drive the app until the archive being written has landed.
+async fn settle_archive(app: &mut FileBrowser) {
+    for _ in 0..400 {
+        app.tick_for_test();
+        if !app.panel_is_busy_for_test(0) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the archive never finished");
+}
+
+#[tokio::test]
+async fn gz_opens_the_create_archive_dialog() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "create_archive",
+        "gz did not open the dialog"
+    );
+}
+
+/// The end-to-end: two tagged files become an archive in the scoped directory,
+/// and the archive really contains them — read back through the same reader the
+/// app browses one with.
+#[tokio::test]
+async fn gz_creates_an_archive_of_the_tagged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("one.txt"), b"first\n").unwrap();
+    std::fs::write(dir.path().join("two.txt"), b"second\n").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // A frame first: the tree needs a layout before its rows can be walked.
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    // Tag both, walking down from the first file row. Tagging does not move the
+    // cursor, so `t` then `j` reaches the next one. Row 0 is the root itself,
+    // and the sort order is not alphabetical, so this walks rather than
+    // searching for each name in turn.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(
+        app.current_screen().tagged_paths().len(),
+        2,
+        "both files should be tagged"
+    );
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    assert_eq!(app.modal_kind_for_test(), "create_archive");
+
+    // Clear the pre-filled name and type one of our own.
+    for _ in 0..40 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    for c in "bundle.zip".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_archive(&mut app).await;
+
+    let made = dir.path().join("bundle.zip");
+    assert!(made.is_file(), "the archive was not created at {made:?}");
+
+    // It is a real zip with both members in it.
+    let bytes = std::fs::read(&made).unwrap();
+    let opened = myd::vfs::archive::open(
+        &bytes,
+        &made,
+        myd::vfs::archive::ArchiveFormat::Zip,
+        myd::vfs::archive::index::MAX_MEMBERS,
+    )
+    .expect("the archive myd wrote must be one myd can read");
+    assert!(
+        opened.index.get(std::path::Path::new("/one.txt")).is_some(),
+        "one.txt is not in the archive"
+    );
+    assert!(
+        opened.index.get(std::path::Path::new("/two.txt")).is_some(),
+        "two.txt is not in the archive"
+    );
+}
+
+#[tokio::test]
+async fn an_existing_archive_asks_before_overwriting() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("taken.zip"), b"original").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "a.txt");
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    for _ in 0..40 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    for c in "taken.zip".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "an existing archive was overwritten without asking"
+    );
+    let message = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        message.contains("exists. Overwrite?"),
+        "unexpected prompt: {message}"
+    );
+
+    // Declining leaves the original alone.
+    app.handle_key_for_test(char_key('n'));
+    settle_archive(&mut app).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("taken.zip")).unwrap(),
+        "original",
+        "declining still overwrote the file"
+    );
+}
+
+#[tokio::test]
+async fn gz_inside_an_archive_refuses() {
+    // An archive backend is read-only, and a new container cannot be written
+    // into one.
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "gz inside an archive must be refused"
+    );
+    let message = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        message.contains("read-only"),
+        "the refusal should say why: {message}"
+    );
+}
+
+/// The guard that `refuse_if_read_only` does not provide: a remote panel is
+/// writable, so nothing else stops `gz` there — and the writer reads through
+/// `std::fs`, so it would archive whatever *local* paths happened to share
+/// those names.
+#[tokio::test]
+async fn gz_on_a_remote_panel_refuses_rather_than_archiving_local_files() {
+    // Rooted where a local twin exists, which is the only arrangement that
+    // tests the guard: rooted somewhere absent, the writer would fail anyway
+    // and the test would pass with the guard removed.
+    let local_twin = tempfile::tempdir().unwrap();
+    std::fs::write(local_twin.path().join("big_file"), b"local decoy").unwrap();
+    let tree = remote_tree_rooted_at(local_twin.path());
+
+    let start = tempfile::tempdir().unwrap();
+    let mut app = FileBrowser::new(Some(start.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.replace_panel_with_remote_for_test(tree);
+
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "gz on a remote panel must be refused with a message"
+    );
+    let message = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        message.contains("remote"),
+        "the refusal should say why: {message}"
+    );
+    // And nothing was written next to the local decoy.
+    assert!(
+        std::fs::read_dir(local_twin.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| e.file_name() == "big_file"),
+        "a remote gz wrote something into the local twin"
+    );
+}
+
+/// Resizing the info panel must not rewrite an unrelated preference.
+///
+/// The exit-time save rebuilds the whole `Prefs` struct from the live panel, so
+/// a field nothing in the session touches has to be carried through from the
+/// file — otherwise dragging the info panel would quietly reset a hand-set
+/// archive format to the default.
+#[tokio::test]
+async fn saving_the_panel_width_keeps_the_archive_format() {
+    let cfg = tempfile::tempdir().unwrap();
+    let path = cfg.path().join("prefs.toml");
+    std::fs::write(&path, "info_panel_pct = 30\ndefault_archive_format = \"tgz\"\n").unwrap();
+    let _guard = PrefsGuard::set(&path);
+
+    // Change the one thing the session does own, then flush. `>` resizes only
+    // while the info panel has the focus, which Tab gives it.
+    let (_fixture, mut app) = info_fixture().await;
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    app.handle_key_for_test(char_key('>'));
+    assert!(
+        app.prefs_dirty_for_test(),
+        "the width did not change, so the save under test would not happen"
+    );
+    app.save_prefs_for_test();
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.contains("default_archive_format = \"tgz\""),
+        "the archive format was reset by an unrelated save:\n{body}"
+    );
+}
+
+/// `q` on the busy panel stops the write and leaves nothing behind.
+///
+/// Whether the write is still running when `q` lands depends on timing, so this
+/// asserts the invariant that holds either way: no `.part` file survives, and
+/// the panel is not left busy. The guard itself — that a write interrupted
+/// mid-entry removes its temporary file — is pinned deterministically by
+/// `cancelling_part_way_leaves_no_partial_file` in the writer's own tests,
+/// which trips the token from another thread rather than racing the event loop.
+#[tokio::test]
+async fn cancelling_a_write_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..200 {
+        std::fs::write(dir.path().join(format!("f{i:03}.txt")), vec![b'x'; 20_000]).unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag everything, so the write has enough to do to be interrupted.
+    for _ in 0..200 {
+        app.handle_key_for_test(char_key('t'));
+        app.handle_key_for_test(char_key('j'));
+    }
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    // Stop it on the panel it is running in, the way a user would.
+    app.tick_for_test();
+    app.handle_key_for_test(char_key('q'));
+    settle_archive(&mut app).await;
+
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".part"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a partial archive was left behind: {leftovers:?}"
+    );
+    assert!(
+        !app.panel_is_busy_for_test(0),
+        "the panel was left busy after cancelling"
+    );
 }
 
 #[test]
@@ -18154,6 +18441,3 @@ async fn an_unchanged_preview_image_is_not_reflushed() {
         "an idle flush with no image must not record anything"
     );
 }
-
-
-

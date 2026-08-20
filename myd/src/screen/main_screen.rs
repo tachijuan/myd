@@ -1610,11 +1610,11 @@ fn chord_footer(c: char, width: usize) -> (String, String) {
     // which still says which keys are live, and at least the prefix badge
     // survives to show the app is mid-sequence.
     const FULL: &str =
-        " g:top  u:parent  d:go to…  s:sort  r:rename tagged  x:cancel transfers  Esc:cancel ";
+        " g:top  u:parent  d:go to…  s:sort  r:rename tagged  z:archive  x:cancel transfers  Esc:cancel ";
     const MEDIUM: &str =
-        " g:top  u:parent  d:go to…  s:sort  r:rename  x:cancel  Esc:back ";
-    const SHORT: &str = " g:top  u:parent  d:go to  s:sort  r:rename  x:cancel ";
-    const TERSE: &str = " g u d s r x ";
+        " g:top  u:parent  d:go to…  s:sort  r:rename  z:archive  x:cancel  Esc:back ";
+    const SHORT: &str = " g:top  u:parent  d:go to  s:sort  r:rename  z:archive  x:cancel ";
+    const TERSE: &str = " g u d s r z x ";
     let budget = width.saturating_sub(prefix.chars().count());
     let keys = if budget >= FULL.chars().count() {
         FULL

@@ -142,6 +142,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("Enter", "Browse an archive as a filesystem"),
                 ("c", "Extract the tagged or selected entries"),
                 ("h", "Leave the archive"),
+                ("gz", "Create an archive from the tagged or selected"),
+                ("  ", "  zip, 7z, tar or tgz; lands in this directory"),
             ],
         },
         HelpCategory {
@@ -201,6 +203,10 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("  Actions", "  Go, save, edit, forget, pin, move, shallow"),
                 ("  j / k", "  Walk the actions; Enter runs one"),
                 ("  ", "  Or press the highlighted letter to run it"),
+                ("gz", "Create an archive of the tagged or selected"),
+                ("  Tab", "  Cycle the name, the format, the buttons"),
+                ("  ↑ / ↓", "  Choose the format; or press 1-4"),
+                ("  Enter", "  Create it, in the current directory"),
             ],
         },
         HelpCategory {

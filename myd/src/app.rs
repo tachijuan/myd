@@ -104,6 +104,8 @@ pub enum Modal {
     Open(crate::widget::open_dialog::OpenDialog),
     /// Change one attribute of the selection, opened by Enter in the info panel.
     Attr(crate::widget::attr_dialog::AttrDialog),
+    /// Name and format a new archive of the selection, opened by `gz`.
+    CreateArchive(crate::widget::archive_dialog::ArchiveDialog),
 }
 
 /// Context for modal operations.
@@ -153,6 +155,10 @@ pub enum ModalTarget {
     CancelTransfer { id: crate::transfer::TransferId },
     /// Confirm quitting while transfers are still in flight.
     QuitConfirm,
+    /// Confirm replacing an archive that is already there.
+    ArchiveOverwrite {
+        req: crate::vfs::archive::WriteRequest,
+    },
 }
 
 /// Main application state machine.
@@ -239,6 +245,8 @@ pub struct FileBrowser {
     connect_task: Option<ConnectTask>,
     /// An archive being indexed off the event loop.
     archive_open_task: Option<ArchiveOpenTask>,
+    /// An archive being written off the event loop.
+    archive_create_task: Option<ArchiveCreateTask>,
     /// Connection details being retried after a credential prompt.
     pending_connect: Option<PendingConnect>,
     /// Saved remote locations, loaded once at startup and written back on every
@@ -433,6 +441,16 @@ struct ArchiveOpenTask {
     target_panel: usize,
 }
 
+/// An archive being written off the event loop.
+struct ArchiveCreateTask {
+    rx: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
+    /// Where it is being written, so the panel showing that directory can be
+    /// reloaded once it lands.
+    dest: PathBuf,
+    /// The panel that asked, so the overlay is cleared where it was raised.
+    target_panel: usize,
+}
+
 /// A listing of a typed copy destination, in flight.
 ///
 /// A destination typed into the single-panel prompt is not on screen, so there
@@ -557,6 +575,7 @@ impl FileBrowser {
             transfer_panel_override: None,
             connect_task: None,
             archive_open_task: None,
+            archive_create_task: None,
             pending_connect: None,
             hosts: HostCatalog::load(),
             connecting_label: None,
@@ -775,6 +794,8 @@ impl FileBrowser {
             self.resolve_connect();
             // And any archive being indexed off the event loop.
             self.resolve_archive_open();
+            // And any archive being written off it.
+            self.resolve_create_archive();
             // And any listing of a typed copy destination.
             self.resolve_dest_probe();
             // Install a finished preview, and start one if the cursor has moved
@@ -1078,6 +1099,7 @@ impl FileBrowser {
             Modal::Rename(d) => d.render(f, full),
             Modal::Open(d) => d.render(f, full),
             Modal::Attr(d) => d.render(f, full),
+            Modal::CreateArchive(d) => d.render(f, full),
             Modal::Help(state) => render_help(f, full, state),
             Modal::None => {
                 // A delete that started from the confirm dialog also runs in the
@@ -1394,6 +1416,13 @@ impl FileBrowser {
             Some(ModalTarget::CancelTransfer { id }) if result => {
                 self.transfers.cancel(id);
             }
+            // Declining simply drops it. The dialog is not reopened: `gz` is
+            // one keystroke, and coming back from a declined confirm to a form
+            // the user has already left is a state machine nothing else here
+            // has.
+            Some(ModalTarget::ArchiveOverwrite { req }) if result => {
+                self.spawn_create_archive(req);
+            }
             Some(ModalTarget::MeasureDirs) if result => {
                 self.set_shallow(false);
             }
@@ -1469,12 +1498,18 @@ impl FileBrowser {
         self.draw(frame);
     }
 
+    /// Whether `panel` is waiting on a long operation.
+    pub fn panel_is_busy_for_test(&self, panel: usize) -> bool {
+        self.panels.get(panel).is_some_and(|p| p.is_busy())
+    }
+
     /// Advance the background-task machinery one tick, as the event loop does
     /// (connection attempts, loading, transfers). For tests driving the remote
     /// connect + browse flow headlessly.
     pub fn tick_for_test(&mut self) {
         self.resolve_connect();
         self.resolve_archive_open();
+        self.resolve_create_archive();
         self.resolve_dest_probe();
         self.resolve_loading();
         self.resolve_deleting();
@@ -1688,6 +1723,7 @@ impl FileBrowser {
             Modal::Rename(_) => "rename",
             Modal::Open(_) => "open",
             Modal::Attr(_) => "attr",
+            Modal::CreateArchive(_) => "create_archive",
         }
     }
 
@@ -1983,6 +2019,19 @@ impl FileBrowser {
                 };
                 let outcome = dialog.click_at(x, y);
                 return self.apply_attr_dialog_outcome(outcome);
+            }
+            return true;
+        }
+
+        // And the archive dialog, whose format rows are clickable as well as
+        // its buttons.
+        if matches!(self.modal, Modal::CreateArchive(_)) {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Modal::CreateArchive(dialog) = &mut self.modal else {
+                    return true;
+                };
+                let outcome = dialog.click_at(x, y);
+                return self.apply_create_archive_outcome(outcome);
             }
             return true;
         }
@@ -3401,9 +3450,17 @@ impl FileBrowser {
             return;
         }
         self.prefs_dirty = false;
+        // Start from what is on disk and overwrite only what this session owns.
+        // Building the struct from the live panel alone would write a default
+        // over every field the panel does not carry — so resizing the info
+        // panel would silently reset a hand-set `default_archive_format`.
+        // Re-read rather than `prefs::startup()`, which is a snapshot from
+        // launch: an edit made to the file since then is the user's, and this
+        // save must not undo it either.
         let prefs = crate::prefs::Prefs {
             info_panel_pct: self.active_panel().view_prefs.info_panel_pct,
             info_meta_bias: self.active_panel().view_prefs.info_meta_bias,
+            ..crate::prefs::Prefs::load()
         };
         if let Err(e) = prefs.save() {
             tracing::warn!(error = %e, "could not save preferences");
@@ -4464,6 +4521,10 @@ impl FileBrowser {
                 self.open_pattern_rename();
                 true
             }
+            Action::CreateArchive => {
+                self.open_create_archive_dialog();
+                true
+            }
             Action::Bell => {
                 self.ring_bell();
                 true
@@ -4828,6 +4889,7 @@ impl FileBrowser {
                     | Action::OpenSortMenu
                     | Action::SetSort(_)
                     | Action::PatternRename
+                    | Action::CreateArchive
                     | Action::Bell => unreachable!(),
                     Action::None => true,
                 }
@@ -4866,6 +4928,14 @@ impl FileBrowser {
         if let Modal::Attr(dialog) = &mut self.modal {
             let outcome = dialog.handle_key(key);
             return self.apply_attr_dialog_outcome(outcome);
+        }
+
+        // And the archive dialog, whose name field has to take every printable
+        // character — including the digits that pick a format when the radio
+        // group has the focus instead.
+        if let Modal::CreateArchive(dialog) = &mut self.modal {
+            let outcome = dialog.handle_key(key);
+            return self.apply_create_archive_outcome(outcome);
         }
 
         match &mut self.modal {
@@ -5083,7 +5153,8 @@ impl FileBrowser {
                             ModalTarget::HostDelete { .. }
                             | ModalTarget::CancelTransfer { .. }
                             | ModalTarget::MeasureDirs
-                            | ModalTarget::QuitConfirm => {}
+                            | ModalTarget::QuitConfirm
+                            | ModalTarget::ArchiveOverwrite { .. } => {}
                             ModalTarget::Password => {
                                 if value.is_empty() {
                                     // An empty entry cancels the whole attempt.
@@ -5109,7 +5180,11 @@ impl FileBrowser {
             }
             // Handled by the early returns at the top of this function, which
             // need `&mut self` for the whole call and so can't sit in this match.
-            Modal::SortMenu(_) | Modal::Rename(_) | Modal::Open(_) | Modal::Attr(_) => true,
+            Modal::SortMenu(_)
+            | Modal::Rename(_)
+            | Modal::Open(_)
+            | Modal::Attr(_)
+            | Modal::CreateArchive(_) => true,
             Modal::None => true,
         }
     }
@@ -5689,6 +5764,208 @@ impl FileBrowser {
         self.panels[panel]
             .screen_stack
             .push(Screen::loading_remote(source, PathBuf::from("/"), None));
+    }
+
+    /// Open the dialog that names a new archive of the selection.
+    ///
+    /// Two refusals, and they are different questions. A read-only backend is
+    /// an archive, which cannot be written into at all; a remote panel is
+    /// writable but its files are not on this disk, and the writer reads
+    /// through `std::fs`. Without the second check `gz` on an SFTP panel would
+    /// quietly archive whatever *local* paths happened to share those names —
+    /// so the guard `refuse_if_read_only` provides is not enough on its own,
+    /// which its own doc says outright.
+    fn open_create_archive_dialog(&mut self) {
+        if self.active_backend_is_read_only() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot create an archive inside another archive — archives are \
+                 read-only here. Copy what you need out first (c), then archive \
+                 the copy.",
+            ));
+            return;
+        }
+        if !self.active_panel().backend.is_local() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot create an archive on a remote panel — the files would have \
+                 to be downloaded whole first. Copy them here (c), then archive them.",
+            ));
+            return;
+        }
+        // One at a time, for a stronger reason than the indexing path has: two
+        // writes addressed to the same name would race for the same file.
+        if self.archive_create_task.is_some() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "An archive is already being created. Wait for it to finish, or \
+                 press q to stop it.",
+            ));
+            return;
+        }
+
+        let sources = self.selection_targets();
+        if sources.is_empty() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Nothing to archive. Tag files with t, or put the cursor on one.",
+            ));
+            return;
+        }
+        let Some(dest_dir) = self.active_panel().dest_dir() else {
+            return;
+        };
+
+        self.modal = Modal::CreateArchive(crate::widget::archive_dialog::ArchiveDialog::new(
+            sources,
+            dest_dir,
+            crate::prefs::startup().default_archive_format,
+        ));
+    }
+
+    /// Apply what the archive dialog decided.
+    fn apply_create_archive_outcome(
+        &mut self,
+        outcome: crate::widget::archive_dialog::ArchiveDialogOutcome,
+    ) -> bool {
+        use crate::widget::archive_dialog::ArchiveDialogOutcome;
+
+        match outcome {
+            ArchiveDialogOutcome::Continue => true,
+            ArchiveDialogOutcome::Cancelled => {
+                self.modal = Modal::None;
+                true
+            }
+            ArchiveDialogOutcome::Create { name, format } => {
+                let Modal::CreateArchive(dialog) = &self.modal else {
+                    return true;
+                };
+                let sources = dialog.sources().to_vec();
+                let dest_dir = dialog.dest_dir().clone();
+                self.modal = Modal::None;
+
+                // A path is a different feature. The archive goes in the
+                // directory the panel is scoped to, and silently creating
+                // `a/b.zip` where `a` may not exist is a worse answer than
+                // saying no to it.
+                if name.contains('/') || name.contains('\\') {
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                        "'{name}' is a path, not a name. The archive is created in \
+                         the current directory."
+                    )));
+                    return true;
+                }
+                // The radio is the declared intent, so it wins over a typed
+                // extension — but by appending rather than replacing, since
+                // `notes.txt` is a stem worth keeping in `notes.txt.zip`.
+                let name = if crate::vfs::archive::writer::strip_known_extension(&name)
+                    == name.as_str()
+                {
+                    format!("{name}.{}", format.extension())
+                } else {
+                    crate::vfs::archive::writer::with_extension_for(&name, format)
+                };
+
+                let req = crate::vfs::archive::WriteRequest {
+                    dest: dest_dir.join(&name),
+                    format,
+                    sources,
+                };
+                if req.dest.exists() {
+                    // The same question, and the same words, the copy path
+                    // already asks when a destination is taken.
+                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                        "'{name}' exists. Overwrite?"
+                    )));
+                    self.modal_target = Some(ModalTarget::ArchiveOverwrite { req });
+                    return true;
+                }
+                self.spawn_create_archive(req);
+                true
+            }
+        }
+    }
+
+    /// Start writing an archive off the event loop.
+    ///
+    /// Unlike indexing, this passes a cancel token: the write checks it once
+    /// per entry, so `q` on the busy panel stops a large archive part way and
+    /// takes the partial file with it.
+    fn spawn_create_archive(&mut self, req: crate::vfs::archive::WriteRequest) {
+        let progress = crate::widget::progress::OpProgress::new();
+        let cancel = CancelToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let dest = req.dest.clone();
+        let worker_progress = progress.clone();
+        let worker_cancel = cancel.clone();
+        // `spawn_blocking`, not `spawn`: compressing is CPU-bound and would
+        // otherwise stall every other task sharing that worker thread.
+        tokio::task::spawn_blocking(move || {
+            let result =
+                crate::vfs::archive::create_archive(&req, Some(&worker_progress), &worker_cancel);
+            let _ = tx.send(result);
+        });
+
+        let target = self.active;
+        self.archive_create_task = Some(ArchiveCreateTask {
+            rx,
+            dest,
+            target_panel: target,
+        });
+        if let Some(panel) = self.panels.get_mut(target) {
+            panel.set_busy("Creating archive", Some(progress), Some(cancel));
+        }
+    }
+
+    /// Land a finished archive: clear the overlay, report a failure, and show
+    /// the new file.
+    fn resolve_create_archive(&mut self) {
+        let Some(task) = self.archive_create_task.as_mut() else {
+            return;
+        };
+        let waiting_panel = task.target_panel;
+        let result = match task.rx.try_recv() {
+            Ok(r) => r,
+            // Still writing.
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.archive_create_task = None;
+                self.clear_busy_verb(waiting_panel, "Creating archive");
+                return;
+            }
+        };
+        let Some(task) = self.archive_create_task.take() else {
+            return;
+        };
+        self.clear_busy_verb(waiting_panel, "Creating archive");
+
+        if let Err(e) = result {
+            // A cancel is the user's own doing and already visible — the
+            // overlay went with it — so it is not reported as a failure.
+            if !e.to_string().contains("cancelled") {
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                    "Could not create the archive: {}",
+                    explain_error(&e)
+                )));
+            }
+            return;
+        }
+
+        // Tags are staged input to the archive, as they are to a copy — clear
+        // them once it lands.
+        if let Some(panel) = self.panels.get_mut(waiting_panel) {
+            panel.current_screen_mut().clear_tags();
+        }
+        // Show the new file. A targeted reload of the one directory level it
+        // landed in, not a full refresh of the tree.
+        if let Some(parent) = task.dest.parent() {
+            let parent = parent.to_path_buf();
+            for panel in &mut self.panels {
+                if !panel.backend.is_local() {
+                    continue;
+                }
+                if let Screen::Main(state) = panel.current_screen_mut() {
+                    state.reload_dir_public(&parent);
+                }
+            }
+        }
     }
 
     /// Whether the active panel is showing a remote (non-local) tree.

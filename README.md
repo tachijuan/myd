@@ -545,7 +545,44 @@ and tints amber-brown, and in a `📦 ARCHIVE (read-only)` badge in the footer.
 Leaving with `h` puts you back where you were, with the panel retagged so the
 next delete addresses your own disk again.
 
+### Creating an archive
+
+**`gz`** packs the tagged files — or, with nothing tagged, whatever the cursor is
+on — into a new archive. A dialog asks for the name and offers four formats:
+
+| Format | | |
+|---|---|---|
+| **zip** | widest support | the default |
+| **7z** | smallest, slower | written in process, no `7z` binary needed |
+| **tar** | no compression | |
+| **tgz** | tar plus gzip | |
+
+`Tab` moves between the name, the formats and the buttons; `↑`/`↓` choose a
+format, or press `1`–`4`. Changing the format renames the extension to match,
+until you edit the name yourself. `Enter` creates it.
+
+The archive lands in **the directory the panel is scoped to** — where `N` would
+make a directory — not inside the directory under the cursor. A selected
+directory goes in under its own name, so archiving `src/` gives you an archive
+containing `src/main.rs`, and unpacking it recreates `src/` rather than
+scattering its contents.
+
+Writing streams, so the size of what you are packing is not bounded by memory,
+and it runs in the panel — the other pane stays usable, and `q` stops it. An
+interrupted or failed write leaves nothing behind: the archive is built in a
+`.part` file beside the destination and renamed only once it is complete, so
+there is never a half-written file wearing a real archive's name.
+
+**No RAR.** Creating one needs RARLAB's proprietary `rar` tool; the format is
+patent-encumbered and no free library writes it, libarchive included. myd
+*reads* RAR fine (see below) — it just cannot make one.
+
+The default format is configurable — see [Preferences](#preferences) below.
+
 ### Formats
+
+Many more formats can be read than written — the list below is what myd
+*reads*; `gz` writes the four in [Creating an archive](#creating-an-archive).
 
 Read in-process, with no external tools: **zip** (and `.jar`, `.apk`, `.whl`,
 `.xpi`, …), **tar** and its compressed forms (`.tar.gz`/`.tgz`, `.tar.bz2`,
@@ -635,6 +672,32 @@ Run `myd` with `--dual` (or pass two directory paths) to view two independent tr
 - **`m`** moves them instead. Within one filesystem that's a rename, so it finishes instantly however large the files are. Between two different hosts the bytes are copied through the transfer queue and each source is removed only once its own copy has landed — a failed or cancelled copy leaves the source untouched. A name already taken at the destination prompts you to overwrite it, skip that file, or cancel the whole move.
 
 Each panel can independently change its root (`gd`), so you can, for example, browse a backup on one side and your working tree on the other, then copy files across with a single `c`.
+
+## Preferences
+
+Settings that outlive a session live in `~/.config/myd/prefs.toml` (or
+`$XDG_CONFIG_HOME/myd/prefs.toml`; `$MYD_PREFS` names the file outright). It is
+written on exit, and only when something has actually changed. The file is meant
+to be edited by hand:
+
+```toml
+# Info panel width, as a percentage of the panel it sits in (15–60).
+info_panel_pct = 30
+
+# Rows shifted from the metadata to the preview beneath it. Negative
+# gives the preview more.
+info_meta_bias = 0
+
+# The format `gz` offers first: "zip", "7z", "tar" or "tgz".
+default_archive_format = "zip"
+```
+
+Every setting has a default, so a file that omits one — or one written by an
+older version — still loads. A value that is out of range is brought back into
+it and an unrecognised one falls back to its default, costing that setting
+rather than the file: a typo in `default_archive_format` will not take your
+panel width with it. A file that is malformed outright is left alone rather than
+overwritten, so it can be repaired by hand.
 
 ## License
 

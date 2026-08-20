@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.45.4" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.50.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -713,6 +713,27 @@ otherwise live in \fB$XDG_CONFIG_HOME/myd/prefs.toml\fR, falling back to
 a preference has actually changed; a missing or malformed one costs the
 settings rather than the session, and is left alone so it can be repaired by
 hand.
+.SH PREFERENCES
+The preferences file is TOML and is meant to be edited by hand. Every setting
+has a default, so a file that omits one \(em or one written by an older version
+\(em still loads.
+.TP
+.B info_panel_pct
+Info panel width, as a percentage of the panel it sits in. 15 to 60, default 30.
+Set with \fB<\fR and \fB>\fR while the info panel has the focus.
+.TP
+.B info_meta_bias
+Rows shifted from the info panel's metadata to the preview beneath it; negative
+gives the preview more. Default 0. Set with \fB+\fR and \fB\-\fR.
+.TP
+.B default_archive_format
+The format \fBg z\fR offers first: \fBzip\fR (the default), \fB7z\fR, \fBtar\fR
+or \fBtgz\fR. Read when the dialog opens; a format chosen in the dialog applies
+to that archive alone and is not written back here.
+.PP
+A value out of range is brought back into it, and an unrecognised one falls back
+to its default \(em costing that setting rather than the file, so a typo in
+\fBdefault_archive_format\fR does not take the panel width with it.
 .SH SORT MODES
 Press \fBs\fR to cycle through the available sort modes, or type the mode's
 number (\fB1\fR\-\fB8\fR, as listed in the \fBg s\fR menu) to go straight to it:
@@ -1107,7 +1128,37 @@ Archives are read\-only. \fBD\fR, \fBR\fR, \fBN\fR and \fBm\fR refuse with a
 message rather than appearing to work. The pane says so in its title, which
 names the archive and is tinted amber\-brown, and in a read\-only badge in the
 footer.
+.SS Creating
+\fBg z\fR packs the tagged files \(em or, with nothing tagged, the entry under
+the cursor \(em into a new archive. A dialog asks for a name and offers four
+formats: \fBzip\fR (widest support, the default), \fB7z\fR (smallest, slower,
+written in process with no \fB7z\fR binary required), \fBtar\fR (no compression)
+and \fBtgz\fR (tar plus gzip).
+.PP
+\fBTab\fR moves between the name, the format list and the buttons; \fB\(ua\fR
+and \fB\(da\fR choose a format, as do the digits \fB1\fR\-\fB4\fR. Changing the
+format rewrites the name's extension to match, until the name is edited by hand.
+\fBEnter\fR creates the archive.
+.PP
+The archive is created in the directory the panel is scoped to \(em where
+\fBN\fR would create a directory \(em rather than inside the directory under the
+cursor. A selected directory goes in under its own name, so archiving
+\fBsrc\fR produces an archive containing \fBsrc/main.rs\fR, and unpacking it
+recreates \fBsrc\fR rather than scattering its contents.
+.PP
+The write streams, so what can be packed is not bounded by memory, and it runs
+in the panel: the other pane stays usable and \fBq\fR stops it. An interrupted
+or failed write leaves nothing behind \(em the archive is built in a \fB.part\fR
+file beside the destination and renamed only once complete, so a half\-written
+file never wears a real archive's name. An existing file of the same name is
+confirmed before it is replaced.
+.PP
+RAR cannot be created. The format is proprietary to RARLAB and no free library
+writes it, libarchive included; myd reads RAR but cannot produce one.
 .SS Formats
+The formats below are what myd \fIreads\fR; \fBg z\fR writes the four listed
+under \fBCreating\fR above.
+.PP
 Read in process, with no external tools: \fBzip\fR (and \fB.jar\fR, \fB.apk\fR,
 \fB.whl\fR, \fB.xpi\fR, and the rest of the family), \fBtar\fR and its
 compressed forms (\fB.tar.gz\fR/\fB.tgz\fR, \fB.tar.bz2\fR, \fB.tar.xz\fR,

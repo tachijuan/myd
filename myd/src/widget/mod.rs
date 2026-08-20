@@ -1,5 +1,6 @@
 pub mod ansi;
 pub mod confirm_dialog;
+pub mod archive_dialog;
 pub mod attr_dialog;
 pub mod file_info;
 pub mod file_tree;
