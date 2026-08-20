@@ -71,6 +71,30 @@ pub struct Panel {
     /// registered remote backend for an SFTP panel. Copies consult this to route
     /// a cross-backend transfer through the queue rather than a local copy.
     pub backend: crate::vfs::BackendId,
+    /// A long operation this panel is waiting on, if any.
+    ///
+    /// Held here rather than as an app-wide modal so the *other* panel stays
+    /// usable: a connect to an unreachable host, or a move that is one round
+    /// trip per entry, otherwise locked the whole interface behind an overlay
+    /// that only `q`/`Esc` could dismiss. `delete_task` above has always worked
+    /// this way; this brings the rest into line with it.
+    pub busy: Option<PanelBusy>,
+}
+
+/// What a panel is waiting on, and how to describe and stop it.
+pub struct PanelBusy {
+    /// Shown in the panel's overlay — "Connecting", "Moving", …
+    pub verb: &'static str,
+    /// Live counts for the operations that report them. `None` leaves the
+    /// overlay a plain spinner, which is all an unmeasurable wait can honestly
+    /// show.
+    pub progress: Option<crate::widget::progress::OpProgress>,
+    /// Stops the work when the user backs out with `q`/`Esc`.
+    ///
+    /// A connect has nothing cooperative to cancel — dropping the receiver
+    /// detaches the task — so it leaves this `None` and is cancelled through
+    /// `cancel_connect` instead.
+    pub cancel: Option<crate::utils::sizes::CancelToken>,
 }
 
 impl Panel {
@@ -120,6 +144,7 @@ impl Panel {
             screen_stack: vec![screen],
             view_prefs: ViewPrefs::default(),
             delete_task: None,
+            busy: None,
             deleting_paths: Vec::new(),
             backend: crate::vfs::BackendId::LOCAL,
         }
@@ -235,6 +260,41 @@ impl Panel {
         self.delete_task.is_some()
     }
 
+    /// Mark this panel as waiting on `verb`.
+    ///
+    /// The panel's screen stack is left alone — the overlay draws over whatever
+    /// it was showing, so clearing the state is all it takes to put the pane
+    /// back, and a failed operation cannot leave it blank.
+    pub fn set_busy(
+        &mut self,
+        verb: &'static str,
+        progress: Option<crate::widget::progress::OpProgress>,
+        cancel: Option<crate::utils::sizes::CancelToken>,
+    ) {
+        self.busy = Some(PanelBusy {
+            verb,
+            progress,
+            cancel,
+        });
+    }
+
+    /// Whether this panel is waiting on a long operation.
+    pub fn is_busy(&self) -> bool {
+        self.busy.is_some()
+    }
+
+    /// Stop whatever this panel is waiting on, revealing the screen underneath.
+    ///
+    /// Returns the verb that was cancelled, so the caller can tell which kind of
+    /// work it just stopped (a connect needs its task detached as well).
+    pub fn cancel_busy(&mut self) -> Option<&'static str> {
+        let busy = self.busy.take()?;
+        if let Some(cancel) = &busy.cancel {
+            cancel.cancel();
+        }
+        Some(busy.verb)
+    }
+
     /// The directory the top Main screen is rooted at — the destination when
     /// this panel is the *other* panel in a cross-panel copy. `None` when the
     /// panel is showing a dir picker or still loading.
@@ -302,6 +362,7 @@ impl Panel {
             screen_stack: vec![screen],
             view_prefs: ViewPrefs::default(),
             delete_task: None,
+            busy: None,
             deleting_paths: Vec::new(),
             backend: crate::vfs::BackendId::LOCAL,
         }
@@ -315,6 +376,7 @@ impl Panel {
             screen_stack: vec![Screen::loading_remote(source, path, None)],
             view_prefs: ViewPrefs::default(),
             delete_task: None,
+            busy: None,
             deleting_paths: Vec::new(),
             backend,
         }
@@ -334,6 +396,7 @@ impl Panel {
             )],
             view_prefs: ViewPrefs::default(),
             delete_task: None,
+            busy: None,
             deleting_paths: Vec::new(),
             backend: crate::vfs::BackendId::LOCAL,
         }
@@ -359,6 +422,7 @@ impl Panel {
             screen_stack: vec![screen],
             view_prefs: ViewPrefs::default(),
             delete_task: None,
+            busy: None,
             deleting_paths: Vec::new(),
             backend: crate::vfs::BackendId::LOCAL,
         }
