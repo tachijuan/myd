@@ -14,6 +14,7 @@
 //!
 //! ```toml
 //! info_panel_pct = 35
+//! default_archive_format = "zip"
 //! ```
 
 use anyhow::{Context, Result};
@@ -55,10 +56,40 @@ pub struct Prefs {
     /// preview beneath it starts. Negative gives the preview more.
     #[serde(default)]
     pub info_meta_bias: i16,
+    /// The format `gz` offers first when creating an archive.
+    ///
+    /// Read when the dialog opens; the format chosen there applies to that
+    /// archive only and is not written back. Every other preference here is
+    /// set by an explicit toggle, and inferring a lasting preference from one
+    /// use of a one-shot action would be a different bargain.
+    #[serde(default, deserialize_with = "lenient_archive_format")]
+    pub default_archive_format: crate::vfs::archive::WriteFormat,
 }
 
 fn default_info_pct() -> u16 {
     DEFAULT_INFO_PCT
+}
+
+/// Read an archive format, falling back to the default rather than failing.
+///
+/// Without this a hand-written `default_archive_format = "rar"` fails the whole
+/// `toml::from_str`, and [`Prefs::load_from`] then discards the entire file —
+/// so one typo in the format would silently reset the info panel width as well.
+/// The promise this file makes is that a stray character costs *the setting*,
+/// and that has to hold per setting to mean anything.
+fn lenient_archive_format<'de, D>(d: D) -> Result<crate::vfs::archive::WriteFormat, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::vfs::archive::WriteFormat;
+    let raw = Option::<String>::deserialize(d).unwrap_or_default();
+    let Some(raw) = raw else {
+        return Ok(WriteFormat::default());
+    };
+    Ok(WriteFormat::from_label(&raw).unwrap_or_else(|| {
+        tracing::warn!(value = %raw, "ignoring an unknown default_archive_format");
+        WriteFormat::default()
+    }))
 }
 
 impl Default for Prefs {
@@ -66,6 +97,7 @@ impl Default for Prefs {
         Self {
             info_panel_pct: DEFAULT_INFO_PCT,
             info_meta_bias: 0,
+            default_archive_format: crate::vfs::archive::WriteFormat::default(),
         }
     }
 }
@@ -145,6 +177,10 @@ impl Prefs {
         self.info_meta_bias = self
             .info_meta_bias
             .clamp(-MAX_META_BIAS, MAX_META_BIAS);
+        // `default_archive_format` has no arm: an enum is in range by
+        // construction, and an unrecognised name never becomes one — see
+        // `lenient_archive_format`. Mentioned so its absence reads as a
+        // decision rather than an omission.
         self
     }
 
@@ -205,11 +241,74 @@ mod tests {
         let path = dir.path().join("prefs.toml");
         Prefs {
             info_panel_pct: 45,
-            info_meta_bias: 0,
+            ..Prefs::default()
         }
         .save_to(&path)
         .unwrap();
         assert_eq!(Prefs::load_from(&path).info_panel_pct, 45);
+    }
+
+    #[test]
+    fn a_saved_archive_format_comes_back() {
+        use crate::vfs::archive::WriteFormat;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        Prefs {
+            default_archive_format: WriteFormat::TarGz,
+            ..Prefs::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        assert_eq!(
+            Prefs::load_from(&path).default_archive_format,
+            WriteFormat::TarGz
+        );
+    }
+
+    /// The file is hand-editable, so it is written in the same words the dialog
+    /// shows rather than in Rust's spelling of the variant.
+    #[test]
+    fn the_archive_format_is_written_as_its_label() {
+        use crate::vfs::archive::WriteFormat;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        Prefs {
+            default_archive_format: WriteFormat::SevenZ,
+            ..Prefs::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("default_archive_format = \"7z\""),
+            "expected the label, got:\n{body}"
+        );
+    }
+
+    /// A typo in one setting must not cost the others. Plain serde fails the
+    /// whole parse on an unknown variant, which would take the width down with
+    /// it — the reason `lenient_archive_format` exists.
+    #[test]
+    fn an_unknown_archive_format_costs_only_that_setting() {
+        use crate::vfs::archive::WriteFormat;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        std::fs::write(
+            &path,
+            "info_panel_pct = 45\ndefault_archive_format = \"rar\"\n",
+        )
+        .unwrap();
+
+        let prefs = Prefs::load_from(&path);
+        assert_eq!(
+            prefs.default_archive_format,
+            WriteFormat::Zip,
+            "an unwritable format should fall back to the default"
+        );
+        assert_eq!(
+            prefs.info_panel_pct, 45,
+            "the unrelated setting was thrown away with it"
+        );
     }
 
     /// The file is meant to be hand-edited, so a value out of range has to be

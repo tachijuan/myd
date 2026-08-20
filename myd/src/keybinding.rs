@@ -38,6 +38,8 @@ pub enum Action {
     SetSort(usize),
     /// Rename every tagged file through a regex and a replacement (`gr`).
     PatternRename,
+    /// Create an archive of the tagged set, or of the cursor's entry.
+    CreateArchive,
     ToggleHidden,
     ToggleBar,
     CollapseAll,
@@ -195,7 +197,7 @@ impl KeyBindingHandler {
     /// The footer's pending-chord hint is built from this, so a chord added to
     /// `resolve_chord` without a hint is a test failure rather than a key the
     /// user has no way to discover.
-    pub const G_CHORD_KEYS: &'static [char] = &['g', 'u', 'd', 's', 'r', 'x'];
+    pub const G_CHORD_KEYS: &'static [char] = &['g', 'u', 'd', 's', 'r', 'x', 'z'];
 
     /// Resolve a chord (two-character sequence, only g-prefix).
     fn resolve_chord(&self, combined: &str) -> Option<Action> {
@@ -218,6 +220,11 @@ impl KeyBindingHandler {
             // this is the same operation over the tagged set.
             "gr" => Some(Action::PatternRename),
             "gx" => Some(Action::CancelTransfers),
+            // `z` for zip, the format most people mean by "archive" and the
+            // default the dialog opens on. Lower case, matching the other
+            // chords; `c` was taken by copy, which is also how an archive is
+            // *extracted*, so the two directions stay distinct keys.
+            "gz" => Some(Action::CreateArchive),
             _ => None,
         }
     }

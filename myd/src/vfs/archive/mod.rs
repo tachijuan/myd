@@ -17,6 +17,13 @@
 //! `Vfs::open_write` has no mode parameter to pass it through, so a `chmod +x`
 //! script comes out of an extract non-executable. Fixing it means widening the
 //! trait for every backend.
+//!
+//! Writing is the other direction and deliberately not part of that model: an
+//! archive opened as a backend stays read-only, and [`writer`] creates a *new*
+//! container from paths on the local disk instead. Mapping a container that
+//! something else may rewrite is undefined behaviour, which is why an opened
+//! archive cannot be edited in place — creating a fresh one has no such
+//! problem, and covers what the editing would have been for.
 
 pub mod container;
 pub mod format;
@@ -27,12 +34,14 @@ pub mod listing;
 pub mod rar_reader;
 pub mod sevenz_reader;
 pub mod tar_reader;
+pub mod writer;
 pub mod zip_reader;
 
 pub use container::Container;
 pub use format::{archive_format, resolved_format, ArchiveFormat};
 pub use fs::ArchiveFs;
 pub use index::ArchiveIndex;
+pub use writer::{create as create_archive, WriteFormat, WriteRequest};
 
 use anyhow::Result;
 
