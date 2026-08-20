@@ -472,6 +472,74 @@ sftp_test!(gr_opens_remote_in_the_active_panel, env, {
     assert_eq!(app.active_panel_index(), 0, "active panel stays the one that connected");
 });
 
+sftp_test!(a_connect_that_lands_does_not_steal_focus_back, env, {
+    // Connecting no longer blocks, so the user can Tab to the other pane and
+    // keep working while a slow host is still answering. When the connection
+    // finally lands it must open in its own pane *without* pulling the keyboard
+    // back — the cursor was moving somewhere else, and having a keystroke
+    // suddenly apply to the remote tree is how a wrong file gets acted on.
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("l.txt"), "l").unwrap();
+    for n in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        std::fs::write(right.path().join(n), "r").unwrap();
+    }
+    let mut app = myd::app::FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    for _ in 0..400 {
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0).is_some() && app.panel_current_dir(1).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    assert_eq!(app.active_panel_index(), 0, "left panel active at start");
+
+    // Dial from the left pane, then Tab to the right one as the user did.
+    let target = format!(
+        "sftp://{}@{}:{}{}",
+        whoami(),
+        env.host,
+        env.port,
+        env.remote_dir.display()
+    );
+    app.connect_on_start_in_panel(&target, 0);
+    let tab = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    for _ in 0..4 {
+        if app.active_panel_index() == 1 {
+            break;
+        }
+        app.handle_key_for_test(tab);
+    }
+    assert_eq!(app.active_panel_index(), 1, "focus moved to the local pane");
+
+    // Let the connect land and the remote tree enumerate.
+    let mut opened = false;
+    for _ in 0..1000 {
+        app.tick_for_test();
+        app.resolve_loading_for_test();
+        if app.panel_current_dir(0) == Some(env.remote_dir.clone()) {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened, "the remote should have opened in panel 0");
+
+    // The whole point: focus is still where the user left it.
+    assert_eq!(
+        app.active_panel_index(),
+        1,
+        "a connection landing must not steal focus from the pane the user moved to"
+    );
+});
+
 sftp_test!(remote_transfer_ghost_updates_on_completion, env, {
     // Local source file to upload.
     let local = tempfile::tempdir().unwrap();
