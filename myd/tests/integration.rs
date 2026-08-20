@@ -3571,6 +3571,226 @@ async fn q_cancels_a_hanging_connection_and_returns_to_browsing() {
 }
 
 // ---------------------------------------------------------------------------
+// A busy pane must not freeze the other one.
+//
+// Connecting, moving, copying and reading an archive used to raise an app-wide
+// modal that swallowed every key but q/Esc/Ctrl-C, so a connect to an
+// unreachable host locked both panes until TCP gave up. The work was always in
+// the background; only the interface was blocking.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn connecting_in_one_pane_leaves_the_other_interactive() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("left.txt"), "l").unwrap();
+    for n in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        std::fs::write(right.path().join(n), "r").unwrap();
+    }
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+
+    // Dial an unroutable address from panel 0, so the attempt hangs.
+    app.connect_on_start_in_panel("sftp://192.0.2.1/tmp", 0); // TEST-NET-1
+    assert!(app.is_connecting_for_test());
+    assert_eq!(app.panel_busy_verb_for_test(0), Some("Connecting"));
+    assert_eq!(
+        app.panel_busy_verb_for_test(1),
+        None,
+        "the pane that is not connecting must not be marked busy"
+    );
+
+    // Tab must still move focus off the connecting pane — the whole point.
+    let before = app.active_panel_for_test();
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    let _ = screen_text(&mut app, 170, 40);
+    assert_ne!(
+        app.active_panel_for_test(),
+        before,
+        "Tab must move focus while the other pane is connecting"
+    );
+
+    // ...and the pane it landed on must actually take a motion.
+    let start = app.selected_name_for_test();
+    app.handle_key_for_test(char_key('j'));
+    let _ = screen_text(&mut app, 170, 40);
+    assert_ne!(
+        app.selected_name_for_test(),
+        start,
+        "j must move the cursor in the pane that is not connecting"
+    );
+
+    // The connect is still in flight throughout: nothing above resolved it.
+    assert!(app.is_connecting_for_test());
+}
+
+#[tokio::test]
+async fn a_busy_panes_screen_does_not_swallow_keys_meant_for_the_other_pane() {
+    // The picker is a raw-key consumer: it takes Tab for its own focus toggle.
+    // While it sits under a busy pane's overlay it is not reachable, so it must
+    // not keep eating keys — the Tab it swallowed was the user's way out to the
+    // pane that still works.
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("l.txt"), "l").unwrap();
+    for n in ["alpha.txt", "beta.txt"] {
+        std::fs::write(right.path().join(n), "r").unwrap();
+    }
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+
+    // Leave a picker up on panel 0, then put that pane into a connect.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    let _ = screen_text(&mut app, 170, 40);
+    assert!(matches!(app.current_screen(), Screen::DirPicker(_)));
+    app.connect_on_start_in_panel("sftp://192.0.2.1/tmp", 0); // TEST-NET-1
+    assert_eq!(app.panel_busy_verb_for_test(0), Some("Connecting"));
+    assert!(
+        matches!(app.current_screen(), Screen::DirPicker(_)),
+        "the picker is still on the stack under the overlay"
+    );
+
+    // Tab must reach the app's focus rotation rather than the buried picker.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    let _ = screen_text(&mut app, 170, 40);
+    assert_eq!(
+        app.active_panel_for_test(),
+        1,
+        "a busy pane's screen must not swallow the Tab that escapes it"
+    );
+}
+
+#[tokio::test]
+async fn connecting_from_the_gd_picker_does_not_swallow_the_other_panes_keys() {
+    // The reported bug's exact route. Connecting from the picker leaves the
+    // picker on the connecting pane's stack (so a failure returns to the list),
+    // and the picker consumes raw keys — which ate the Tab that was supposed to
+    // move focus away from it. Dialling directly does not reproduce this, so
+    // this test goes through `gd` and types the address.
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("left.txt"), "l").unwrap();
+    for n in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        std::fs::write(right.path().join(n), "r").unwrap();
+    }
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+    assert_eq!(app.active_panel_for_test(), 0);
+
+    // gd, then type an unroutable sftp URL into the path field and submit.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('d'));
+    let _ = screen_text(&mut app, 170, 40);
+    for ch in "sftp://192.0.2.1/tmp".chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    let _ = screen_text(&mut app, 170, 40);
+
+    assert!(
+        app.is_connecting_for_test(),
+        "the picker should have started a connection"
+    );
+    assert_eq!(app.panel_busy_verb_for_test(0), Some("Connecting"));
+
+    // Tab must escape the connecting pane even though its picker is still on
+    // the stack underneath the overlay.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    let _ = screen_text(&mut app, 170, 40);
+    assert_eq!(
+        app.active_panel_for_test(),
+        1,
+        "Tab must reach the other pane; the picker must not swallow it"
+    );
+
+    // And that pane takes motions.
+    let start = app.selected_name_for_test();
+    app.handle_key_for_test(char_key('j'));
+    let _ = screen_text(&mut app, 170, 40);
+    assert_ne!(
+        app.selected_name_for_test(),
+        start,
+        "the other pane must still respond to j"
+    );
+}
+
+#[tokio::test]
+async fn q_on_a_connecting_pane_restores_it_and_keeps_the_app_running() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("left.txt"), "l").unwrap();
+    std::fs::write(right.path().join("right.txt"), "r").unwrap();
+    let mut app = FileBrowser::new(
+        Some(left.path().to_path_buf()),
+        Some(right.path().to_path_buf()),
+        true,
+    );
+    settle(&mut app).await;
+
+    app.connect_on_start_in_panel("sftp://192.0.2.1/tmp", 0);
+    assert_eq!(app.panel_busy_verb_for_test(0), Some("Connecting"));
+
+    // Focus the connecting pane, then back out of it.
+    while app.active_panel_for_test() != 0 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+        let _ = screen_text(&mut app, 170, 40);
+    }
+    let keep_running = app.handle_key_for_test(char_key('q'));
+    let _ = screen_text(&mut app, 170, 40);
+
+    assert!(keep_running, "q cancels the connect, it does not quit");
+    assert!(!app.is_connecting_for_test());
+    assert_eq!(
+        app.panel_busy_verb_for_test(0),
+        None,
+        "the pane must come out of its waiting state"
+    );
+    // Both panes are still there, and the split survived.
+    assert_eq!(app.panel_count(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_connect_leaves_the_pane_showing_its_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Port 1 on localhost refuses immediately, so this resolves as a failure
+    // rather than hanging.
+    app.connect_on_start("sftp://127.0.0.1:1/tmp");
+    for _ in 0..400 {
+        app.tick_for_test();
+        if !app.is_connecting_for_test() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(!app.is_connecting_for_test(), "the attempt should have failed");
+    assert_eq!(
+        app.panel_busy_verb_for_test(0),
+        None,
+        "a failed connect must not leave the pane spinning"
+    );
+    // The pane is back on its own tree, not blank.
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+}
+
+// ---------------------------------------------------------------------------
 // Ghost entries + auto-update of the destination on transfer completion.
 // ---------------------------------------------------------------------------
 
@@ -17934,3 +18154,6 @@ async fn an_unchanged_preview_image_is_not_reflushed() {
         "an idle flush with no image must not record anything"
     );
 }
+
+
+

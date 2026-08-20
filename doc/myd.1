@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 0.45.2" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 0.45.3" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -402,10 +402,11 @@ mouse wheel scroll it; the title bar shows your position in the list.
 .TP
 .B q
 Back out of the current state, or quit when there is none. One thing at a time,
-innermost first: a running scan is cancelled, the \fBg d\fR picker is closed, an
-active filter is cleared, and an archive is left \(em so a filter set inside an
-archive takes two presses, one for each. Everywhere else the key means "back out
-of this", and ending the whole session instead was a surprise.
+innermost first: an operation the pane is waiting on (a connection attempt, a
+move) is abandoned, a running scan is cancelled, the \fBg d\fR picker is closed,
+an active filter is cleared, and an archive is left \(em so a filter set inside
+an archive takes two presses, one for each. Everywhere else the key means "back
+out of this", and ending the whole session instead was a surprise.
 .IP
 With nothing left to undo it quits. Transfers still queued or running are
 confirmed first, since abandoning one discards a partial copy. \fBCtrl+C\fR

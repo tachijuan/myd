@@ -95,9 +95,6 @@ pub enum Modal {
     None,
     Confirm(ConfirmDialog),
     Input(InputDialog),
-    /// A background copy or delete is running. The verb ("Copying"/"Deleting")
-    /// titles the overlay; live counts come from `FileBrowser::op_progress`.
-    Operation { verb: &'static str },
     Help(HelpState),
     /// Numbered sort-order menu, opened by clicking the "Sort:" indicator.
     SortMenu(SortMenu),
@@ -992,6 +989,27 @@ impl FileBrowser {
             self.panels[0].current_screen_mut().render(f, area);
         }
 
+        // A pane waiting on a long operation draws its own overlay, inside its
+        // own column. That containment is the point: the other pane stays
+        // visible and usable, which an app-wide modal made impossible.
+        let busy_areas: Vec<(Rect, &'static str, Option<crate::widget::progress::OpProgress>)> =
+            self.panels
+                .iter()
+                .enumerate()
+                .filter_map(|(i, panel)| {
+                    let busy = panel.busy.as_ref()?;
+                    let area = self.panel_areas.get(i).copied()?;
+                    Some((area, busy.verb, busy.progress.clone()))
+                })
+                .collect();
+        for (area, verb, progress) in busy_areas {
+            let overlay = match &progress {
+                Some(p) => ProgressOverlay::for_operation(verb, p),
+                None => ProgressOverlay::new().with_message(verb),
+            };
+            overlay.render(f, area);
+        }
+
         // The preview covers the panels, so it is drawn after them and before any
         // modal. Drawn over the whole frame rather than the panel column: it is a
         // view of one file, not of one panel.
@@ -1053,9 +1071,6 @@ impl FileBrowser {
 
         // Modals center on the whole terminal, not the tree column, so toggling
         // the sidebar doesn't shift a dialog under the cursor.
-        // Taken by value so the picker can render with `&mut self` (it keeps a
-        // scroll offset), then put back.
-        let op_progress = self.op_progress.clone();
         match &mut self.modal {
             Modal::Confirm(d) => d.render(f, full),
             Modal::Input(d) => d.render(f, full),
@@ -1063,13 +1078,6 @@ impl FileBrowser {
             Modal::Rename(d) => d.render(f, full),
             Modal::Open(d) => d.render(f, full),
             Modal::Attr(d) => d.render(f, full),
-            Modal::Operation { verb } => {
-                let overlay = match &op_progress {
-                    Some(p) => ProgressOverlay::for_operation(verb, p),
-                    None => ProgressOverlay::new().with_message(*verb),
-                };
-                overlay.render(f, full);
-            }
             Modal::Help(state) => render_help(f, full, state),
             Modal::None => {
                 // A delete that started from the confirm dialog also runs in the
@@ -1206,9 +1214,11 @@ impl FileBrowser {
                     }
                 }
             }
-            // Dismiss the "Deleting"/"Moving" overlay.
-            if matches!(self.modal, Modal::Operation { .. }) {
-                self.modal = Modal::None;
+            // Dismiss the "Moving" overlay on whichever pane carried it. A
+            // plain delete never sets one — it has always drawn from
+            // `is_deleting` instead — so this is a no-op for that path.
+            for i in 0..self.panels.len() {
+                self.clear_busy_verb(i, "Moving");
             }
             // Report anything the move couldn't do — a silently skipped file
             // would look like it moved.
@@ -1234,7 +1244,7 @@ impl FileBrowser {
                 self.copy_task.take();
                 self.op_progress = None;
                 self.op_cancel = None;
-                self.modal = Modal::None;
+                self.clear_busy_verb(self.copy_dest_panel, "Copying");
                 // Tags are staged input to the copy — clear them once it lands.
                 if let Some(panel) = self.panels.get_mut(self.copy_source_panel) {
                     panel.current_screen_mut().clear_tags();
@@ -1673,7 +1683,6 @@ impl FileBrowser {
             Modal::None => "none",
             Modal::Confirm(_) => "confirm",
             Modal::Input(_) => "input",
-            Modal::Operation { .. } => "operation",
             Modal::Help(_) => "help",
             Modal::SortMenu(_) => "sort_menu",
             Modal::Rename(_) => "rename",
@@ -1706,14 +1715,22 @@ impl FileBrowser {
         &self.hosts
     }
 
-    /// Whether a connection attempt is in flight (for tests).
     /// Whether a background copy/delete/move batch is still running.
     pub fn is_operation_running_for_test(&self) -> bool {
         self.panels.iter().any(|p| p.is_deleting()) || self.copy_task.is_some()
     }
 
+    /// Whether a connection attempt is in flight (for tests).
     pub fn is_connecting_for_test(&self) -> bool {
         self.is_connecting()
+    }
+
+    /// The verb a panel is waiting on, if any — "Connecting", "Moving", … .
+    ///
+    /// The state that used to be an app-wide modal, so a test can assert *which
+    /// pane* is occupied rather than only that something is.
+    pub fn panel_busy_verb_for_test(&self, panel: usize) -> Option<&'static str> {
+        self.panels.get(panel)?.busy.as_ref().map(|b| b.verb)
     }
 
     /// The saved-directory catalog, for tests that need a preference recorded
@@ -3960,16 +3977,25 @@ impl FileBrowser {
             return result;
         }
 
-        // Let the current screen handle raw keys first (e.g., dir picker input).
-        if let Some(result) = self
-            .active_panel_mut()
-            .current_screen_mut()
-            .handle_raw_key(key)
-        {
-            // The picker cannot reach the catalog, so it records a requested
-            // favourite change and the app applies and persists it here.
-            self.apply_favorite_edit();
-            return result;
+        // Let the current screen handle raw keys first (e.g., dir picker input)
+        // — unless this pane is waiting on something, in which case its screen
+        // is behind an overlay and must not eat the keystroke.
+        //
+        // The picker is what made this necessary: connecting from `gd` leaves
+        // the picker on the stack (so a failed connect returns to the list), and
+        // as a raw-key consumer it swallowed everything — including the `Tab`
+        // that was supposed to move focus to the pane that is *not* busy.
+        if !self.active_panel().is_busy() {
+            if let Some(result) = self
+                .active_panel_mut()
+                .current_screen_mut()
+                .handle_raw_key(key)
+            {
+                // The picker cannot reach the catalog, so it records a requested
+                // favourite change and the app applies and persists it here.
+                self.apply_favorite_edit();
+                return result;
+            }
         }
 
         // Fall back to the global keybinding handler.
@@ -4019,6 +4045,27 @@ impl FileBrowser {
 
         match action {
             Action::Quit => {
+                // A pane waiting on something backs out of that first, so a slow
+                // host or a long move can always be abandoned — the same "undo
+                // one thing at a time" rule the rest of this chain follows.
+                //
+                // A connect additionally needs its task dropped, which is what
+                // detaches the handshake; the other operations carry a cancel
+                // token that `cancel_busy` trips.
+                if self.active_panel().is_busy() {
+                    if self.connecting_panel() == Some(self.active) {
+                        self.cancel_connect();
+                    } else {
+                        self.active_panel_mut().cancel_busy();
+                        // The app-level token the operation actually watches;
+                        // the panel's is a clone of it, so tripping either does
+                        // the job, but this is the one the resolver clears.
+                        if let Some(cancel) = self.op_cancel.take() {
+                            cancel.cancel();
+                        }
+                    }
+                    return true;
+                }
                 // While a directory is being scanned, q/Esc cancels that scan
                 // rather than quitting outright. The background walk stops
                 // promptly, and resolve_loading then returns to the previous
@@ -4102,12 +4149,17 @@ impl FileBrowser {
 
                 let mut stops: Vec<Stop> = Vec::new();
                 for (i, panel) in self.panels.iter().enumerate() {
+                    // A busy pane keeps its stop: the user can Tab onto it to
+                    // watch what it is doing, and back out of it with q there.
                     stops.push(Stop::Panel(i));
                     let shows_info = matches!(
                         panel.current_screen(),
                         Screen::Main(state) if !state.info_panel_hidden
                     );
-                    if shows_info {
+                    // Its info panel is another matter — it sits under the
+                    // overlay and has nothing to edit until the wait is over, so
+                    // it would be a dead stop in the rotation.
+                    if shows_info && !panel.is_busy() {
                         stops.push(Stop::Info(i));
                     }
                 }
@@ -5050,20 +5102,6 @@ impl FileBrowser {
                 }
                 true
             }
-            Modal::Operation { .. } => {
-                // q/Esc abandons whatever this overlay is covering, so a slow
-                // host can never trap the user behind it: a hanging connection
-                // attempt, or a delete/copy that is one round trip per entry
-                // against a distant server.
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    if self.is_connecting() {
-                        self.cancel_connect();
-                    } else if let Some(cancel) = self.op_cancel.take() {
-                        cancel.cancel();
-                    }
-                }
-                true
-            }
             Modal::Help(_) => {
                 // Dismiss help — the real key is handled by handle_key.
                 self.modal = Modal::None;
@@ -5440,7 +5478,16 @@ impl FileBrowser {
         });
 
         self.connect_task = Some(ConnectTask { rx, target_panel });
-        self.modal = Modal::Operation { verb: "Connecting" };
+        // The wait belongs to the pane being dialled, not to the app. An
+        // app-wide modal here meant a connect to an unreachable host froze both
+        // panes until it timed out — the handshake was already in the
+        // background, but every key was being swallowed by the overlay.
+        //
+        // No cancel token: there is nothing cooperative to trip inside a russh
+        // handshake, so `q`/`Esc` detaches the task through `cancel_connect`.
+        if let Some(panel) = self.panels.get_mut(target_panel) {
+            panel.set_busy("Connecting", None, None);
+        }
     }
 
     /// Whether the active panel's backend refuses mutations.
@@ -5574,8 +5621,17 @@ impl FileBrowser {
             target_panel: self.active,
         });
         // Says what is happening while it happens, rather than letting the
-        // interface look wedged.
-        self.modal = Modal::Operation { verb: "Reading archive" };
+        // interface look wedged — in the pane doing the reading, so the other
+        // pane stays usable while a large archive is indexed.
+        //
+        // No cancel token: `ArchiveFs::open` is a synchronous parse with nothing
+        // cooperative to trip. `q` takes the overlay down and lets the task
+        // finish unobserved, which `resolve_archive_open` handles by finding no
+        // panel still waiting.
+        let target = self.active;
+        if let Some(panel) = self.panels.get_mut(target) {
+            panel.set_busy("Reading archive", None, None);
+        }
     }
 
     /// Register a freshly indexed archive and open a panel on it.
@@ -5585,13 +5641,14 @@ impl FileBrowser {
         let Some(task) = self.archive_open_task.as_mut() else {
             return;
         };
+        let waiting_panel = task.target_panel;
         let result = match task.rx.try_recv() {
             Ok(r) => r,
             // Still indexing.
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 self.archive_open_task = None;
-                self.modal = Modal::None;
+                self.clear_busy_verb(waiting_panel, "Reading archive");
                 return;
             }
         };
@@ -5600,7 +5657,7 @@ impl FileBrowser {
         };
         // The overlay goes now, whatever the answer: an error replaces it with
         // its own dialog, and success has a panel to show.
-        self.modal = Modal::None;
+        self.clear_busy_verb(waiting_panel, "Reading archive");
 
         let fs = match result {
             Ok(fs) => std::sync::Arc::new(fs),
@@ -5669,14 +5726,44 @@ impl FileBrowser {
         self.connect_task.is_some()
     }
 
+    /// Take a panel out of the given busy state, revealing its screen again.
+    ///
+    /// Matched on the verb so a stale resolver cannot clear an overlay that now
+    /// belongs to a *different* operation — the user can start a move in a pane
+    /// whose earlier connect is only just being reaped.
+    fn clear_busy_verb(&mut self, panel: usize, verb: &str) {
+        if let Some(panel) = self.panels.get_mut(panel) {
+            if panel.busy.as_ref().is_some_and(|b| b.verb == verb) {
+                panel.cancel_busy();
+            }
+        }
+    }
+
+    /// Take a panel out of its "Connecting" state. A no-op when that panel is
+    /// not waiting on a connect, so it is safe to call on every outcome.
+    fn clear_connect_busy(&mut self, panel: usize) {
+        self.clear_busy_verb(panel, "Connecting");
+    }
+
+    /// The panel a connection attempt is opening into, if one is in flight.
+    fn connecting_panel(&self) -> Option<usize> {
+        self.connect_task.as_ref().map(|t| t.target_panel)
+    }
+
     /// Abandon an in-flight connection attempt and return to browsing.
     ///
     /// Dropping the task's receiver detaches it; the background connect task
     /// runs to completion on its own and its result is discarded. Cheaper and
     /// simpler than trying to interrupt a russh handshake mid-flight.
     fn cancel_connect(&mut self) {
+        if let Some(panel) = self.connecting_panel() {
+            self.clear_connect_busy(panel);
+        }
         self.connect_task = None;
         self.pending_connect = None;
+        // A cancelled attempt must not promote the host in the picker's
+        // ranking: it never connected.
+        self.connecting_label = None;
         self.modal = Modal::None;
     }
 
@@ -5685,11 +5772,14 @@ impl FileBrowser {
     fn abort_remote_work(&mut self) {
         self.connect_task = None;
         self.pending_connect = None;
-        for panel in &self.panels {
+        for panel in &mut self.panels {
             let screen = panel.current_screen();
             if screen.is_loading() {
                 screen.cancel_loading();
             }
+            // Stop anything a pane is waiting on too, so Ctrl-C leaves nothing
+            // spinning on the way out.
+            panel.cancel_busy();
         }
         self.transfers.cancel_all();
     }
@@ -5700,13 +5790,16 @@ impl FileBrowser {
         let Some(task) = self.connect_task.as_mut() else {
             return;
         };
-        let (result, target_panel) = match task.rx.try_recv() {
-            Ok(r) => (r, task.target_panel),
+        // Read before the receiver is borrowed: every arm below needs to know
+        // which pane was waiting, including the one where the task vanished.
+        let target_panel = task.target_panel;
+        let result = match task.rx.try_recv() {
+            Ok(r) => r,
             // Still connecting, or the task vanished.
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 self.connect_task = None;
-                self.modal = Modal::None;
+                self.clear_connect_busy(target_panel);
                 return;
             }
         };
@@ -5714,7 +5807,7 @@ impl FileBrowser {
 
         match result {
             ConnectResult::Connected(vfs, home) => {
-                self.modal = Modal::None;
+                self.clear_connect_busy(target_panel);
                 self.pending_connect = None;
                 let backend = self.backends.register(vfs.clone());
                 let source = match crate::widget::source::RemoteSource::new(backend, vfs) {
@@ -5748,6 +5841,9 @@ impl FileBrowser {
                 self.prompt_for_credential(target, creds, need, target_panel);
             }
             ConnectResult::Failed(msg) => {
+                // Put the pane back to what it was showing before reporting: a
+                // failed connect must not leave it blank.
+                self.clear_connect_busy(target_panel);
                 self.modal = Modal::Confirm(ConfirmDialog::new(format!(
                     "Connection failed: {}",
                     msg
@@ -5769,6 +5865,11 @@ impl FileBrowser {
         target_panel: usize,
     ) {
         let prompt = credential_prompt(&need);
+        // Stop the pane's spinner while the prompt is up: nothing is in flight
+        // until the answer comes back, and a "Connecting" overlay behind a
+        // password box would claim otherwise. The prompt stays modal on
+        // purpose — a secret typed into the wrong pane is worse than a wait.
+        self.clear_connect_busy(target_panel);
         self.pending_connect = Some(PendingConnect {
             target,
             creds,
@@ -6219,7 +6320,7 @@ impl FileBrowser {
     fn spawn_copy_batch(&mut self) {
         let batch = std::mem::take(&mut self.approved_copies);
         if batch.is_empty() {
-            // Nothing survived the collision prompts; just close the overlay.
+            // Nothing survived the collision prompts; close the last one.
             self.modal = Modal::None;
             return;
         }
@@ -6239,7 +6340,20 @@ impl FileBrowser {
             progress.finish();
         });
         self.copy_task = Some(task);
-        self.modal = Modal::Operation { verb: "Copying" };
+        // Shown in the pane the files are landing in, since that is where the
+        // result will appear. Only same-backend copies reach here at all —
+        // anything cross-backend goes through the transfer queue, which has
+        // never blocked — so this is the local case, fast on a local disk and
+        // worth not freezing the other pane on a slow mount.
+        //
+        // No cancel token: this path has never had one (`op_cancel` is set by
+        // move and delete only), and adding cancellation to it is a change of
+        // behaviour rather than of layout.
+        let dest = self.copy_dest_panel;
+        let progress_handle = self.op_progress.clone();
+        if let Some(panel) = self.panels.get_mut(dest) {
+            panel.set_busy("Copying", progress_handle, None);
+        }
     }
 
     /// Move the active panel's tagged files (or the cursor selection) into the
@@ -6453,7 +6567,13 @@ impl FileBrowser {
         self.panels[src_panel].deleting_paths = Vec::new();
         self.panels[src_panel].current_screen_mut().clear_tags();
         self.copy_dest_panel = dest_panel;
-        self.modal = Modal::Operation { verb: "Moving" };
+        // On the pane the files are leaving, which is the one whose tree
+        // changes as they go. On a remote panel this is one round trip per
+        // entry, so it is the slowest of the four and the one that most needed
+        // to stop holding the other pane hostage.
+        let progress_handle = self.op_progress.clone();
+        let cancel_handle = self.op_cancel.clone();
+        self.panels[src_panel].set_busy("Moving", progress_handle, cancel_handle);
     }
 
     /// Rename `old_path` to `new_name` within its own directory.
