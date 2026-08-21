@@ -1878,8 +1878,14 @@ mod tests {
         let mut state = MainScreenState::from_tree(dir.path().to_path_buf(), tree);
         state.active = true;
         state.tree.set_filter(regex::Regex::new("rs").unwrap());
+        // Wide enough that the whole title fits, whatever the temporary
+        // directory is called. macOS hands out `/private/var/folders/…` where
+        // Linux gives `/tmp/…`, and at 100 columns the longer one pushed
+        // "Sort: …" past the right border — where the hit box is correctly
+        // clipped away to nothing, so the test failed on the platform rather
+        // than on the behaviour it is about.
         let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(240, 12)).unwrap();
         term.draw(|f| state.render(f, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let area = state.sort_area.expect("the sort region should be recorded");
