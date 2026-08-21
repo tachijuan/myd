@@ -62,3 +62,37 @@ quadrants (`▖ ▗ ▘ ▝ ▚ ▞`) are painted as rectangles instead of glyph
 text they leave hairline gaps that turn the size bars into dashed columns and an
 image preview into scattered punctuation. Emoji go to Noto Color Emoji, which is
 a bitmap font that only renders at its native 109px and has to be scaled down.
+
+## The treemap shot needs its own tree
+
+`demo/fixtures.sh` is built for the recorded tour, where one 7MB photo giving
+the treemap a single dominant tile is fine. For a screenshot it is not: the
+picture is one big rectangle and five slivers, which shows the algorithm doing
+nothing.
+
+A treemap reads well when several categories are *comparable* in size, so the
+shot uses a directory built for it — around ten files between 12KB and 96KB,
+spread across images, docs, code, data, archives and other:
+
+```bash
+filler() { yes 'lorem ipsum dolor sit amet' | head -c "$1" > "$2"; }
+filler 96000 bundle/screenshot.png
+filler 74000 bundle/manual.md
+filler 61000 bundle/engine.rs
+filler 58000 bundle/dataset.csv
+filler 47000 bundle/archive.tar.gz
+filler 39000 bundle/theme.css
+filler 31000 bundle/notes.txt
+filler 24000 bundle/setup.toml
+filler 18000 bundle/logo.svg
+filler 12000 bundle/build.log
+```
+
+Root the pane on that directory and press `v`. Files rather than directories,
+because a directory tile takes the colour of whatever dominates it — a screen
+of those is one hue per box and says less about the colour coding than a screen
+of named files does.
+
+Watch the tile labels: myd truncates a name to fit its box, so a narrow tile can
+show `config.tom` and read as a rendering bug in a still image. Rename the
+fixture rather than accept the truncation (`setup.toml` above was `config.toml`).
