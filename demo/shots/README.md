@@ -96,3 +96,25 @@ of named files does.
 Watch the tile labels: myd truncates a name to fit its box, so a narrow tile can
 show `config.tom` and read as a rendering bug in a still image. Rename the
 fixture rather than accept the truncation (`setup.toml` above was `config.toml`).
+
+## The archive shots
+
+`demo/fixtures.sh` already builds `archives/bundle.zip` and `backup.tar.gz`
+from a small staged tree, and those are what the listing and browsing shots
+use — no extra fixture needed.
+
+Three states, in the order the README shows them:
+
+- **Listing** — `space` on the zip. Shows the header line (members, stored vs
+  uncompressed, ratio) and per-member permissions and compression.
+- **Browsing** — `Enter` on it, then `l` into `bundle`, tag two files with `t`,
+  and `Ctrl+p` for the info panel. That one frame carries the amber title, the
+  `📦 ARCHIVE (read-only)` badge, `▶ 2 tagged` in the footer, and a markdown
+  preview read out of the archive.
+- **Creating** — root a pane on `project`, tag a few entries, `gz`. The dialog
+  shows the summary line, the name field and the four formats.
+
+Press Enter on the create dialog once and check the result before keeping the
+screenshot: a picture of a dialog is worth nothing if the button does not work.
+Delete the archive afterwards, or the next shot of that directory has an extra
+file in it.

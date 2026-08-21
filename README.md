@@ -34,6 +34,23 @@ and as blocks (shown here) everywhere else:
 
 ![A photograph previewed full screen](doc/screenshots/04-image.png)
 
+The same `space` on an archive lists what is inside it instead — member count,
+what it costs compressed and uncompressed, and the path exactly as the archive
+stores it:
+
+![An archive's contents listed](doc/screenshots/07-archive-list.png)
+
+`Enter` goes *in*. The archive becomes an ordinary tree: tag, filter, sort,
+preview a file from inside it, and press `c` to extract what you tagged. It
+stays read-only throughout, which the title and the footer badge both say:
+
+![Browsing inside an archive](doc/screenshots/08-archive-browse.png)
+
+`gz` goes the other way, packing the tagged files — or the entry under the
+cursor — into a new archive in zip, 7z, tar or tgz:
+
+![Creating an archive](doc/screenshots/09-archive-create.png)
+
 `gd` goes anywhere: saved directories, recent ones, and remote hosts in one
 list, with a path field that accepts an `sftp://` URL directly:
 
