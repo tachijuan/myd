@@ -4046,7 +4046,7 @@ async fn test_input_dialog_scrolls_long_value_to_cursor() {
     use myd::widget::input_dialog::InputDialog;
 
     // Far longer than the 60-column box a small terminal gets.
-    let long = "/home/juan/projects/deeply/nested/directory/tree/that/keeps/going/further/still/final";
+    let long = "/home/user/projects/deeply/nested/directory/tree/that/keeps/going/further/still/final";
     let mut dialog = InputDialog::new("Edit directory path:", "/path/to/directory")
         .with_default(long);
 
@@ -4059,7 +4059,7 @@ async fn test_input_dialog_scrolls_long_value_to_cursor() {
     );
     // The head has scrolled off, and the box says so.
     assert!(
-        !text.contains("/home/juan/projects/deeply"),
+        !text.contains("/home/user/projects/deeply"),
         "the whole path was drawn, overflowing the box: {}",
         text
     );
@@ -4073,7 +4073,7 @@ async fn test_input_dialog_scrolls_long_value_to_cursor() {
     dialog.handle_key(KeyEvent::from(KeyCode::Home));
     let text = render_input_dialog(&dialog, 80, 30);
     assert!(
-        text.contains("/home/juan/projects/deeply"),
+        text.contains("/home/user/projects/deeply"),
         "Home did not scroll back to the start of the path: {}",
         text
     );
@@ -15774,12 +15774,15 @@ async fn a_rar_member_costs_the_same_wherever_it_sits() {
     // position effect to show — and nothing in the tree writes a RAR. Without a
     // real one there is nothing to measure, so this reports and returns rather
     // than asserting on a fixture that cannot exercise the bug.
-    let Some(container) = ["/home/juan/code/untest/myd/Nonsane_-_Adicktion_Therapy_V_Text.rar"]
-        .into_iter()
+    //
+    // Point `MYD_TEST_RAR` at a large multi-member RAR to run it. Kept out of
+    // the tree deliberately: a container big enough to show the effect is
+    // hundreds of megabytes, which is not something to carry in a repository.
+    let Some(container) = std::env::var_os("MYD_TEST_RAR")
         .map(std::path::PathBuf::from)
-        .find(|p| p.is_file())
+        .filter(|p| p.is_file())
     else {
-        eprintln!("skipping: no large RAR on this machine");
+        eprintln!("skipping: set MYD_TEST_RAR to a large RAR to run this");
         return;
     };
 

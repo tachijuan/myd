@@ -1064,7 +1064,7 @@ mod tests {
         // rather than assuming an empty list.
         let seeded = c.favorites().len();
         c.upsert(SavedHost::new("prod", "prod.example.com"));
-        assert!(c.add_favorite(SavedDir::new("/home/juan/code")));
+        assert!(c.add_favorite(SavedDir::new("/home/user/code")));
         c.save().unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1089,7 +1089,7 @@ mod tests {
             "saving a host change must not drop favourites"
         );
         assert!(
-            after.favorites().iter().any(|f| f.path == "/home/juan/code"),
+            after.favorites().iter().any(|f| f.path == "/home/user/code"),
             "the added directory survives"
         );
     }
