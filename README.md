@@ -1,5 +1,8 @@
 # myd
 
+[![CI](https://github.com/tachijuan/myd/actions/workflows/ci.yml/badge.svg)](https://github.com/tachijuan/myd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A **vi-like terminal file browser** built with [ratatui](https://ratatui.rs/) and [crossterm](https://crates.io/crates/crossterm).
 
 Navigate your filesystem with familiar `vi` key bindings, inspect file details in a live sidebar, and visualize disk usage with proportional size bars — all from your terminal.
@@ -58,20 +61,30 @@ Navigate your filesystem with familiar `vi` key bindings, inspect file details i
 
 ## Installation
 
+Requires a Rust toolchain (1.85 or newer). Nothing else is needed to build —
+every archive format and the SFTP client are compiled in; the optional
+image-preview helpers are described under [Features](#features).
+
 ```bash
-# Clone and install
-git clone http://umbrel:8085/juan/myd.git
+# Clone and install. The crate lives in myd/, so that is what cargo is pointed at.
+git clone https://github.com/tachijuan/myd.git
 cd myd
-cargo install --path . --locked
+cargo install --path myd --locked
 ```
 
-Or build and run in release mode:
+Or build and run in release mode without installing:
 
 ```bash
-cd myd
-cargo build --release
-./target/release/myd
-./target/release/myd ~/Documents
+cargo build --release --manifest-path myd/Cargo.toml
+./myd/target/release/myd
+./myd/target/release/myd ~/Documents
+```
+
+The man page is at `doc/myd.1`; install it wherever your system keeps them, for
+example:
+
+```bash
+sudo install -Dm644 doc/myd.1 /usr/local/share/man/man1/myd.1
 ```
 
 ## Usage
@@ -704,6 +717,17 @@ rather than the file: a typo in `default_archive_format` will not take your
 panel width with it. A file that is malformed outright is left alone rather than
 overwritten, so it can be repaired by hand.
 
+## Contributing
+
+Issues and pull requests are welcome. `cargo test` runs the suite (roughly 1100
+tests across the library and the integration files); `cargo clippy --all-targets`
+and `cargo fmt --check` are what CI enforces. The SFTP tests are ignored by
+default and need a local server — `myd/scripts/sftp_test_env.sh` sets one up.
+
+Commit messages carry the release notes for this project: there is no separate
+changelog, so a behaviour change is expected to explain what was wrong, what
+changed, and what deliberately did not.
+
 ## License
 
-MIT
+[MIT](LICENSE) © Juan Orlandini

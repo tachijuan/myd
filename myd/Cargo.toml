@@ -1,7 +1,20 @@
 [package]
 name = "myd"
-version = "0.50.2"
+version = "1.0.0"
 edition = "2021"
+authors = ["Juan Orlandini <tachijuan@gmail.com>"]
+description = "A terminal file browser with size bars, a treemap, previews, archives and SFTP"
+repository = "https://github.com/tachijuan/myd"
+homepage = "https://github.com/tachijuan/myd"
+documentation = "https://github.com/tachijuan/myd"
+license = "MIT"
+readme = "../README.md"
+keywords = ["tui", "file-manager", "terminal", "sftp", "treemap"]
+categories = ["command-line-utilities", "filesystem"]
+# Verified against the toolchain this is developed on. Older releases may work
+# but are not tested, so the floor is stated rather than guessed downward.
+rust-version = "1.85"
+exclude = ["scripts/", "tests/fixtures/"]
 
 [features]
 # The diagnostic binaries in src/bin are gated behind this and off by default,

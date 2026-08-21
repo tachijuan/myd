@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should say why, not print a megabyte of backtrace.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the result on the other.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: myd
+
+      - name: Build
+        run: cargo build --locked --all-targets --manifest-path myd/Cargo.toml
+
+      - name: Test
+        # The SFTP suite is #[ignore]d and needs a live server; everything else
+        # runs headless against ratatui's TestBackend.
+        run: cargo test --locked --manifest-path myd/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --manifest-path myd/Cargo.toml
+
+  fmt:
+    name: Format (advisory)
+    runs-on: ubuntu-latest
+    # Reports rustfmt's opinion without failing the build. The codebase predates
+    # any rustfmt enforcement and reformatting it wholesale would bury real
+    # changes in whitespace; this makes the drift visible so it can be paid down
+    # deliberately rather than in one unreviewable commit.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check --manifest-path myd/Cargo.toml

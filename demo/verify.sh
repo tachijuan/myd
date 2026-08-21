@@ -20,7 +20,9 @@ CAST_DIR="$HERE/cast"
 # pyte is import-only tooling for this check, and is not needed to record.
 PY_BIN="${DEMO_PYTHON:-}"
 if [[ -z "$PY_BIN" ]]; then
-  for candidate in python3 /home/juan/miniconda3/bin/python3; do
+  # Plain python3 first; a conda install is the common case where the system
+  # python has no pyte. Set DEMO_PYTHON to point at something else outright.
+  for candidate in python3 "$HOME/miniconda3/bin/python3" "$HOME/anaconda3/bin/python3"; do
     if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import pyte' 2>/dev/null; then
       PY_BIN="$candidate"; break
     fi
