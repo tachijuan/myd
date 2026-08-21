@@ -31,6 +31,13 @@ demo/cast/
 *.png
 *.heic
 
+# The README's screenshots are the exception: documentation, small, and they
+# have to travel with the repository to render on the project page. A negation
+# only overrides a pattern that came before it, so this has to sit here rather
+# than beside the comment above.
+!doc/screenshots/
+!doc/screenshots/*.png
+
 # General
 __pycache__/
 *.py[cod]

@@ -7,6 +7,37 @@ A **vi-like terminal file browser** built with [ratatui](https://ratatui.rs/) an
 
 Navigate your filesystem with familiar `vi` key bindings, inspect file details in a live sidebar, and visualize disk usage with proportional size bars — all from your terminal.
 
+## A look at it
+
+The tree, with a proportional size bar beside every entry. Bars are scaled
+against their siblings, so the one directory worth looking at stands out at any
+depth:
+
+![The file tree with size bars](doc/screenshots/01-tree.png)
+
+`Ctrl+p` opens the info panel: metadata above, and the file itself previewed
+below, syntax highlighted in around a hundred languages:
+
+![The info panel with a file preview](doc/screenshots/02-preview-panel.png)
+
+`space` gives a file the whole screen. With [`timg`](https://timg.sh/) or
+[`chafa`](https://hpjansson.org/chafa/) installed that includes images — drawn
+as real pixels in terminals that support the kitty, iTerm2 or sixel protocols,
+and as blocks (shown here) everywhere else:
+
+![A photograph previewed full screen](doc/screenshots/04-image.png)
+
+`gd` goes anywhere: saved directories, recent ones, and remote hosts in one
+list, with a path field that accepts an `sftp://` URL directly:
+
+![The go-to picker](doc/screenshots/03-picker.png)
+
+Two panes, one local and one on a server over SFTP. Copy between them with `c`.
+Remote directories show a dash rather than a size — measuring one would cost a
+round trip per directory, so myd declines to guess:
+
+![Dual panes with an SFTP remote](doc/screenshots/05-dual-sftp.png)
+
 ## Features
 
 - **vi-style navigation** — `j`/`k` to move, `h`/`l` to collapse/expand, `gg`/`G` to jump to top/bottom, and more.
