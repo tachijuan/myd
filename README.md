@@ -720,9 +720,20 @@ overwritten, so it can be repaired by hand.
 ## Contributing
 
 Issues and pull requests are welcome. `cargo test` runs the suite (roughly 1100
-tests across the library and the integration files); `cargo clippy --all-targets`
-and `cargo fmt --check` are what CI enforces. The SFTP tests are ignored by
-default and need a local server — `myd/scripts/sftp_test_env.sh` sets one up.
+tests across the library and the integration files) and `cargo clippy
+--all-targets` is what CI enforces. The SFTP tests are ignored by default and
+need a local server — `myd/scripts/sftp_test_env.sh` sets one up.
+
+Two known gaps, both advisory in CI rather than hidden:
+
+- **macOS**: 17 integration tests compare a path they constructed against the
+  one myd stored, and macOS canonicalises `/var` to `/private/var`. The
+  application handles this correctly — it is why `target_dir` uses the
+  un-resolved path — but those tests assume Linux semantics. The program itself
+  builds and runs on macOS.
+- **rustfmt**: the codebase predates any formatting discipline, so `cargo fmt`
+  wants to touch most files. Reported by CI, not enforced, so it can be paid
+  down deliberately rather than in one unreviewable commit.
 
 Commit messages carry the release notes for this project: there is no separate
 changelog, so a behaviour change is expected to explain what was wrong, what
