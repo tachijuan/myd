@@ -15,6 +15,13 @@ depth:
 
 ![The file tree with size bars](doc/screenshots/01-tree.png)
 
+`v` switches to a squarified treemap of whatever the pane is showing. Each box
+is sized by its contents and coloured by what kind of file it holds, with the
+legend naming the colours on screen — so a directory full of build output, or
+of images, is recognisable before you read a single filename:
+
+![The treemap view](doc/screenshots/06-treemap.png)
+
 `Ctrl+p` opens the info panel: metadata above, and the file itself previewed
 below, syntax highlighted in around a hundred languages:
 
