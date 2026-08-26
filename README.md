@@ -69,7 +69,7 @@ round trip per directory, so myd declines to guess:
 - **Treemap view** — switch to a squarified treemap (`v`) that visualizes disk usage as proportional boxes, colored by file type so related content reads as one group. Navigate it with the same `hjkl` keys as the tree, `Enter` to open a directory, and `v` again to return to the tree with the same entry highlighted. Directory tiles end in a `/`.
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
-- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`), delete (`D`) or bulk-rename (`gr`) every tagged file at once. Tagging works in the treemap as well as the tree, and both share one set of tags, so switching views with `v` never changes what is staged. Tagged rows are highlighted and tagged tiles carry a `▶` marker and a green outline. Untag one with `t`, all with `U`.
+- **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`), delete (`D`) or bulk-rename (`gr`) every tagged file at once. Tagging works in the treemap as well as the tree, and both share one set of tags, so switching views with `v` never changes what is staged. Tagged rows are highlighted and tagged tiles carry a `▶` marker and a green outline. Untag one with `t`, all with `U` or `gt`.
 - **Patterned rename** — `gr` renames every tagged file by regex, with `$1` for the first capture group. The dialog previews the pattern against the first tagged file before it is applied, and files the pattern doesn't match are skipped rather than treated as failures.
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
 - **Create directories** — make a new directory in the current location with `N`.
@@ -213,6 +213,7 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 | `t`       | Tag / untag the selection (tree **or** treemap) |
 | `V`       | Visual mode — sweep `j`/`k` to tag a range (tree only) |
 | `U`       | Untag everything                               |
+| `gt`      | Untag everything (the same, as a `g` chord)    |
 | `c`       | Copy tagged / selected files                   |
 | `m`       | Move tagged / selected files to the other panel |
 | `D`       | Delete tagged / selected files                 |
@@ -409,7 +410,7 @@ Most operations act on a single file — the one under the cursor. To act on sev
 
 - Press **`t`** to tag (or untag) the current selection. Tagged rows are highlighted with a bright marker so their staged state is obvious. This works in the **treemap** as well as the tree — a tagged tile carries a `▶` marker and a green outline, so it reads as tagged even when it is too small for a label. Both views share one set of tags, so switching with `v` never changes what is staged.
 - Press **`V`** to enter **visual mode**, then move with `j`/`k` to sweep-tag a whole range. Leaving visual mode keeps the tags, so you can re-enter it elsewhere to tag files that aren't next to each other. Visual mode is tree-only: a range is a span of consecutive rows and the treemap's squarified tiles have no such order, so pressing `V` there says so rather than doing nothing.
-- Press **`U`** to clear every tag.
+- Press **`U`** — or the chord **`gt`** — to clear every tag. Both do the same thing; the chord is the one that shows up in the footer while a `g` is pending, so it's findable without opening the help.
 
 Once files are tagged, **`c`** (copy), **`m`** (move), **`D`** (delete) and **`gr`** (patterned rename) operate on the entire tagged set instead of just the cursor. Copying tagged files into another directory prompts once per name collision; deleting asks for a single confirmation (`y`, `n`, or `a` to stop asking for the session). Tags are cleared automatically when the operation completes. When nothing is tagged, these fall back to the file under the cursor.
 

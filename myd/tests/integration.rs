@@ -2479,6 +2479,100 @@ async fn test_delete_falls_back_to_cursor_when_no_tags() {
 // Progress overlays render live counts (issues 3 & 4).
 // ---------------------------------------------------------------------------
 
+/// `U` drops every tag at once, from either view.
+///
+/// Untagging one by one is fine for two files and tedious for twenty, and a
+/// stale tag is silent: the next `c`, `m` or `D` acts on the whole set rather
+/// than the cursor, which is exactly the surprise the footer count exists to
+/// prevent. The treemap half matters because tags live in one set keyed by
+/// `resolved_path` and both views tag into it -- a clear that honoured only the
+/// tree would leave the other view's tags in place while the footer said zero.
+#[tokio::test]
+async fn untag_all_clears_every_tag_from_either_view() {
+    use myd::app::FileBrowser;
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag three files in the tree.
+    for _ in 0..3 {
+        app.handle_key_for_test(char_key('j'));
+        app.handle_key_for_test(char_key('t'));
+    }
+    assert_eq!(tag_count(&app), 3, "three files should be tagged");
+
+    app.handle_key_for_test(char_key('U'));
+    assert_eq!(tag_count(&app), 0, "U must drop every tag");
+
+    // And the footer stops advertising a selection that is no longer there.
+    let after = screen_text(&mut app, 120, 40);
+    assert!(
+        !after.contains("tagged"),
+        "the footer should not still claim a tagged set: {after}"
+    );
+
+    // The same from the treemap, where tags go into the one shared set.
+    app.handle_key_for_test(char_key('v'));
+    // The treemap has no cells until it has been laid out, and `selected_cell`
+    // is what `t` tags through -- so it must be drawn before it can be tagged.
+    let _ = screen_text(&mut app, 120, 40);
+    let _ = screen_text(&mut app, 120, 40);
+    app.handle_key_for_test(char_key('t'));
+    // `h`, not `j`: these tiles sit side by side, so "down" finds no neighbour
+    // and the cursor would stay put -- making the second `t` untag the tile the
+    // first one just tagged. The cursor starts on the rightmost tile, so left is
+    // the direction with somewhere to go.
+    app.handle_key_for_test(char_key('h'));
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(
+        tag_count(&app),
+        2,
+        "the treemap should tag into the shared set"
+    );
+
+    app.handle_key_for_test(char_key('U'));
+    assert_eq!(tag_count(&app), 0, "U must clear tags made in the treemap too");
+}
+
+/// `gt` untags everything, exactly as `U` does.
+///
+/// Two keys for one action on purpose: `U` came first, and the chord is what
+/// makes the operation findable while browsing, since the footer lists what `g`
+/// completes to. They must not drift -- a chord that beeped or half-ran would be
+/// worse than not having it.
+#[tokio::test]
+async fn the_g_chord_untags_everything_like_u_does() {
+    use myd::app::FileBrowser;
+
+    let dir = flat_files_fixture();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    for _ in 0..3 {
+        app.handle_key_for_test(char_key('j'));
+        app.handle_key_for_test(char_key('t'));
+    }
+    assert_eq!(tag_count(&app), 3, "three files should be tagged");
+
+    let bells = app.bells_rung_for_test();
+    app.handle_key_for_test(char_key('g'));
+    assert_eq!(
+        app.pending_chord_for_test(),
+        Some('g'),
+        "the g prefix should be pending"
+    );
+    app.handle_key_for_test(char_key('t'));
+
+    assert_eq!(tag_count(&app), 0, "gt must drop every tag");
+    assert_eq!(
+        app.bells_rung_for_test(),
+        bells,
+        "gt is a real chord and must not beep"
+    );
+    assert_eq!(app.pending_chord_for_test(), None, "the prefix is consumed");
+}
+
 /// Flatten a TestBackend buffer to a single string for substring assertions.
 fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
     let mut s = String::new();
@@ -3391,10 +3485,12 @@ async fn an_unknown_chord_beeps_and_does_nothing_else() {
     );
     assert_eq!(app.pending_chord_for_test(), None, "and the prefix is cleared");
 
-    // `gt` is not a chord either, and `t` alone tags — which must not happen.
+    // `gV` is not a chord either, and `V` alone enters visual mode and tags the
+    // row it anchors on — which must not happen. (This used to be `gt`, which
+    // now untags everything.)
     let bells = app.bells_rung_for_test();
     app.handle_key_for_test(char_key('g'));
-    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('V'));
     assert_eq!(app.bells_rung_for_test(), bells + 1, "beeps again");
     match app.current_screen() {
         Screen::Main(s) => assert!(
@@ -15500,6 +15596,17 @@ async fn help_documents_tagging_in_both_views() {
     assert!(
         text.contains("V (visual range) needs the tree view"),
         "and that V is the tree-only exception:\n{text}"
+    );
+    // Both ways to untag everything are listed. The chord is the discoverable
+    // one -- it appears in the footer while a `g` is pending -- but `U` is the
+    // older binding and still works, so the help must not imply it is gone.
+    assert!(
+        text.contains("Untag all files"),
+        "the help must document untagging everything:\n{text}"
+    );
+    assert!(
+        text.contains("gt"),
+        "and that the g chord does it too:\n{text}"
     );
 }
 

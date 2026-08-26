@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.0.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.1.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -237,6 +237,11 @@ the treemap says so rather than doing nothing.
 .TP
 .B U
 Remove every tag.
+.TP
+.B gt
+Remove every tag, the same as \fBU\fR. Both work; the chord is listed in the
+footer while a \fBg\fR is pending, so the operation is findable while browsing
+rather than only by opening the help.
 .SS File Operations
 .TP
 .B D

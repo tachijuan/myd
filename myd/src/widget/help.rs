@@ -168,6 +168,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
                 ("t", "Tag / untag the selection (tree or treemap)"),
                 ("V", "Visual mode: tag a range as you move (tree)"),
                 ("U", "Untag all files"),
+                ("gt", "Untag all files (the same, as a g chord)"),
                 ("c", "Copy tagged files (or selection)"),
                 ("m", "Move tagged files (or selection)"),
             ],

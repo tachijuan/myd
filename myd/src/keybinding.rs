@@ -197,7 +197,7 @@ impl KeyBindingHandler {
     /// The footer's pending-chord hint is built from this, so a chord added to
     /// `resolve_chord` without a hint is a test failure rather than a key the
     /// user has no way to discover.
-    pub const G_CHORD_KEYS: &'static [char] = &['g', 'u', 'd', 's', 'r', 'x', 'z'];
+    pub const G_CHORD_KEYS: &'static [char] = &['g', 'u', 'd', 's', 'r', 't', 'x', 'z'];
 
     /// Resolve a chord (two-character sequence, only g-prefix).
     fn resolve_chord(&self, combined: &str) -> Option<Action> {
@@ -219,6 +219,13 @@ impl KeyBindingHandler {
             // Lower case, matching the other chords. Plain `R` renames one file;
             // this is the same operation over the tagged set.
             "gr" => Some(Action::PatternRename),
+            // The same action as `U`, reachable the way the other set-wide
+            // operations are. `U` came first and still works; this is here
+            // because the chord footer lists what `g` completes to, so an
+            // operation on the tagged set is findable while browsing rather
+            // than only by opening the help. `t` for tag, matching the `t` that
+            // made the tags in the first place.
+            "gt" => Some(Action::UntagAll),
             "gx" => Some(Action::CancelTransfers),
             // `z` for zip, the format most people mean by "archive" and the
             // default the dialog opens on. Lower case, matching the other
