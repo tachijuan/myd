@@ -2512,6 +2512,22 @@ impl FileBrowser {
         // copy used to be made up front, so an idle loop spent it ten times a
         // second only to reach the stamp check below and find nothing to redraw.
         //
+        // A modal is drawn as cells, and an image is not — so ratatui paints the
+        // dialog into the buffer and the terminal goes on compositing the image
+        // above it, and the picture shows through what should be an opaque box.
+        // Nothing the dialog draws can cover it, because ratatui does not know
+        // the image is there.
+        //
+        // So the image comes off the terminal for as long as a modal is up, and
+        // goes back when it closes: the stamp is cleared with it, so the next
+        // flush after the dialog closes sees a changed state and re-sends. Help
+        // is included — it is full-screen, so it has the same problem in the
+        // most visible form.
+        if !matches!(self.modal, Modal::None) {
+            self.clear_shown_graphics();
+            return;
+        }
+
         // `None` = the full pane, `Some(i)` = that inline slot.
         let source: Option<usize> = if self.preview_open {
             match (&self.preview.graphics_area, self.preview.graphics()) {

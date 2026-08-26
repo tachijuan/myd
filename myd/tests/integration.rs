@@ -18972,6 +18972,74 @@ async fn an_image_is_re_sent_after_a_repaint_rather_than_dropped() {
     );
 }
 
+/// A modal takes the image off the terminal, and closing it puts it back.
+///
+/// A dialog is drawn as cells; an image is not. ratatui paints the box into its
+/// buffer and the terminal goes on compositing the image above it, so a
+/// photograph showed through what should be an opaque dialog -- the filter and
+/// search prompts most visibly, because they are small and land right over the
+/// info panel. Nothing the dialog draws can cover it: ratatui does not know the
+/// image is there.
+#[tokio::test]
+async fn a_modal_hides_the_inline_image_and_closing_it_brings_the_image_back() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.seed_info_preview_graphics_for_test(0, "\x1b_Gf=100,a=T;SEEDED\x1b\\");
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    let shown = app
+        .preview_graphics_stamp_for_test()
+        .expect("the image should be on screen to begin with");
+
+    // `f` opens the filter prompt.
+    app.handle_key_for_test(char_key('f'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    assert!(
+        app.preview_graphics_stamp_for_test().is_none(),
+        "the image must come off the terminal while a dialog is up"
+    );
+
+    // Escape closes it, and the image comes back.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    assert_eq!(
+        app.preview_graphics_stamp_for_test(),
+        Some(shown),
+        "closing the dialog must put the image back"
+    );
+}
+
+/// The same for the help screen, which is full-screen and so shows it worst.
+#[tokio::test]
+async fn the_help_screen_hides_the_inline_image() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.seed_info_preview_graphics_for_test(0, "\x1b_Gf=100,a=T;SEEDED\x1b\\");
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    assert!(app.preview_graphics_stamp_for_test().is_some());
+
+    app.handle_key_for_test(char_key('?'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    assert!(
+        app.preview_graphics_stamp_for_test().is_none(),
+        "the help screen must not have an image floating over it"
+    );
+}
+
 /// A repaint asked for by anything else still happens.
 ///
 /// The fix above drops the flag when an image is written, which must not become
