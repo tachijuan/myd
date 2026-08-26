@@ -18690,6 +18690,123 @@ async fn the_filter_dialog_covers_the_tree_and_leaves_nothing_behind() {
     }
 }
 
+/// Opening the full pane over an inline image and closing it again leaves the
+/// sub-panel showing that image.
+///
+/// `space` covers the panels, `space` again uncovers them -- and the sub-panel
+/// went blank where an image had been. The full pane owns the terminal's one
+/// image slot while it is open, so closing it clears every placement; the
+/// sub-panel then has to put its own image back, and nothing asked it to.
+/// Its cells and its content were both still the ones from before, so the
+/// dedup check in `request_info_preview_for` saw a key it was already showing
+/// and returned, while the escape that would have drawn it was gone from the
+/// terminal.
+#[tokio::test]
+async fn closing_the_full_pane_restores_the_inline_image() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.seed_info_preview_graphics_for_test(0, "\x1b_Gf=100,a=T;SEEDED\x1b\\");
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    let inline = app
+        .preview_graphics_stamp_for_test()
+        .expect("the inline image should be on screen");
+
+    // Cover the panels with the full pane, then uncover them.
+    app.handle_key_for_test(char_key(' '));
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    app.handle_key_for_test(char_key(' '));
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+
+    assert!(
+        app.info_preview_has_graphics_for_test(0),
+        "the sub-panel should still hold its image after the full pane closes"
+    );
+    assert_eq!(
+        app.preview_graphics_stamp_for_test(),
+        Some(inline),
+        "and that image should be back on the terminal, not left cleared"
+    );
+}
+
+/// Writing an image cancels a repaint that would land on top of it.
+///
+/// The event loop's order within a tick is: take `force_repaint` and clear,
+/// draw, then write graphics. `flush_preview_graphics` is what *sets* the flag,
+/// via the region erase -- so a repaint requested there is served on the *next*
+/// tick, after the image has already gone out, and `Terminal::clear` wipes it.
+///
+/// This was an iTerm2 and sixel bug and not a kitty one: only the protocols with
+/// no delete operation are removed by erasing their cells, and only that path
+/// asks for a repaint. kitty deletes the image as an object and leaves the cells
+/// alone. The symptom was closing the full pane over an inline image and finding
+/// the sub-panel blank -- erase, redraw, then clear a tick later.
+///
+/// Proven on the wire before it was fixed: after closing the pane the byte
+/// stream ran erase-lines, the image, then `ESC[2J`.
+#[tokio::test]
+async fn writing_an_image_cancels_a_pending_repaint() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.seed_info_preview_graphics_for_test(0, "\x1b_Gf=100,a=T;SEEDED\x1b\\");
+    let _ = screen_text(&mut app, 120, 40);
+
+    // Stand in for the region erase the cell-erasing protocols perform.
+    app.request_repaint_for_test();
+    assert!(
+        app.force_repaint_pending_for_test(),
+        "the erase should have asked for a repaint"
+    );
+
+    app.flush_preview_graphics_for_test();
+
+    assert!(
+        app.preview_graphics_stamp_for_test().is_some(),
+        "the image should have been written"
+    );
+    assert!(
+        !app.force_repaint_pending_for_test(),
+        "a repaint left pending would clear the image on the next tick"
+    );
+}
+
+/// A repaint asked for by anything else still happens.
+///
+/// The fix above drops the flag when an image is written, which must not become
+/// "images suppress repaints generally" -- Ctrl+L over an image still has to
+/// redraw, or the escape hatch for a corrupted screen stops working.
+#[tokio::test]
+async fn a_repaint_requested_after_the_image_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.seed_info_preview_graphics_for_test(0, "\x1b_Gf=100,a=T;SEEDED\x1b\\");
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+
+    app.handle_key_for_test(ctrl_key('l'));
+    assert!(
+        app.force_repaint_pending_for_test(),
+        "Ctrl+L must still force a redraw when an image is on screen"
+    );
+}
+
 /// Hiding the info panel takes its image off the terminal with it.
 ///
 /// The sub-panel's `graphics_area` is recorded during its *render*, and hiding

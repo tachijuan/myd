@@ -1572,6 +1572,18 @@ impl FileBrowser {
         self.force_repaint
     }
 
+    /// Set the pending-repaint flag, for tests.
+    ///
+    /// Stands in for the region erase that only the cell-erasing protocols
+    /// (iTerm2, sixel) perform. Which protocol is in use is decided once per
+    /// process behind a `OnceLock`, so a test cannot choose one — but the
+    /// ordering bug it caused is not protocol-specific: a repaint left pending
+    /// when an image has just been written will wipe that image on the next
+    /// tick, whatever asked for it.
+    pub fn request_repaint_for_test(&mut self) {
+        self.force_repaint = true;
+    }
+
     /// Whether the preview pane is open, and whether it has focus (for tests).
     pub fn preview_open_for_test(&self) -> bool {
         self.preview_open
@@ -2547,6 +2559,22 @@ impl FileBrowser {
         let placed = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
         if self.write_graphics(&placed) && self.write_graphics(&payload) {
             self.preview_graphics_shown = Some(stamp);
+            // The erase above may have asked for a full repaint, and this runs
+            // *after* the frame — so that repaint would land on the next tick,
+            // on top of the image just written, and wipe it.
+            //
+            // Only the protocols erased by clearing cells set the flag, which is
+            // why this was an iTerm2 and sixel bug and not a kitty one: kitty
+            // deletes the image as an object and leaves the cells alone, so it
+            // never asks for a repaint here. The visible symptom was closing the
+            // full pane over an inline image and finding the sub-panel blank --
+            // erase, redraw, then `terminal.clear()` a tick later.
+            //
+            // Safe to drop rather than defer: the region was erased and then
+            // immediately painted with this image, so the cells ratatui believes
+            // it drew there are the ones it is about to leave blank for the image
+            // anyway. Anything else that needs a repaint sets the flag again.
+            self.force_repaint = false;
         }
     }
 
