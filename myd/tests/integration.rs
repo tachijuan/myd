@@ -18921,23 +18921,29 @@ async fn closing_the_full_pane_restores_the_inline_image() {
     );
 }
 
-/// Writing an image cancels a repaint that would land on top of it.
+/// A repaint that must run keeps the image: it is re-sent afterwards.
 ///
 /// The event loop's order within a tick is: take `force_repaint` and clear,
 /// draw, then write graphics. `flush_preview_graphics` is what *sets* the flag,
 /// via the region erase -- so a repaint requested there is served on the *next*
-/// tick, after the image has already gone out, and `Terminal::clear` wipes it.
+/// tick, after the image has gone out, and `Terminal::clear` wipes it.
 ///
-/// This was an iTerm2 and sixel bug and not a kitty one: only the protocols with
-/// no delete operation are removed by erasing their cells, and only that path
-/// asks for a repaint. kitty deletes the image as an object and leaves the cells
-/// alone. The symptom was closing the full pane over an inline image and finding
-/// the sub-panel blank -- erase, redraw, then clear a tick later.
+/// The first fix for that dropped the flag when an image was written, reasoning
+/// that the erased region had just been repainted with the image. That was
+/// wrong, and 1.1.2 shipped the bug: the erased region belongs to the *old*
+/// image, which for the full pane is most of the screen, while the new inline
+/// image covers a small part of it. Dropping the repaint left everything else
+/// in that region -- the tree, the panel borders -- blank.
 ///
-/// Proven on the wire before it was fixed: after closing the pane the byte
-/// stream ran erase-lines, the image, then `ESC[2J`.
+/// So the repaint has to run, and the image has to be re-sent after it. This
+/// pins the queueing half; the loop performs the re-send.
+///
+/// This is an iTerm2 and sixel concern only. Those protocols have no delete
+/// operation, so an image is removed by erasing its cells and only that path
+/// asks for a repaint; kitty deletes the image as an object and leaves the
+/// cells alone.
 #[tokio::test]
-async fn writing_an_image_cancels_a_pending_repaint() {
+async fn an_image_is_re_sent_after_a_repaint_rather_than_dropped() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
@@ -18950,11 +18956,6 @@ async fn writing_an_image_cancels_a_pending_repaint() {
 
     // Stand in for the region erase the cell-erasing protocols perform.
     app.request_repaint_for_test();
-    assert!(
-        app.force_repaint_pending_for_test(),
-        "the erase should have asked for a repaint"
-    );
-
     app.flush_preview_graphics_for_test();
 
     assert!(
@@ -18962,8 +18963,12 @@ async fn writing_an_image_cancels_a_pending_repaint() {
         "the image should have been written"
     );
     assert!(
-        !app.force_repaint_pending_for_test(),
-        "a repaint left pending would clear the image on the next tick"
+        app.force_repaint_pending_for_test(),
+        "the repaint must still run -- it is what puts the tree back"
+    );
+    assert!(
+        app.reflush_after_repaint_pending_for_test(),
+        "and the image must be queued to go out again after it"
     );
 }
 

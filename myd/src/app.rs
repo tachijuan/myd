@@ -355,6 +355,17 @@ pub struct FileBrowser {
     /// Erasing an image writes over cells ratatui still believes it drew, so the
     /// next frame has to be a full repaint rather than a diff.
     force_repaint: bool,
+    /// An image to re-send once a pending full repaint has run.
+    ///
+    /// Erasing an image on the protocols that have no delete operation clears
+    /// the *cells* it occupied, which is why it asks for a repaint: ratatui
+    /// still believes it drew those cells and would emit nothing for them.
+    /// When the old image was the full pane's and the new one is the inline
+    /// sub-panel's, the erased region is most of the screen while the new image
+    /// covers a small part of it — so the repaint is what puts the tree back,
+    /// and it must run, but it also paints over the image. Re-sending it after
+    /// the repaint is the only order that leaves both on screen.
+    reflush_after_repaint: Option<(String, String)>,
     /// How to browse a directory that has no remembered traversal mode of its
     /// own. Seeded from `-s` and moved by the `S` toggle.
     ///
@@ -599,6 +610,7 @@ impl FileBrowser {
             info_previews: Vec::new(),
             preview_graphics_shown: None,
             force_repaint: false,
+            reflush_after_repaint: None,
             shallow_default: false,
             skip_delete_confirm: false,
             last_open_command: None,
@@ -812,10 +824,20 @@ impl FileBrowser {
             // so its buffer no longer describes the screen and a diff would leave
             // the erased region blank. `clear` discards that belief and forces the
             // next draw to emit everything.
-            if std::mem::take(&mut self.force_repaint) {
+            let repainted = std::mem::take(&mut self.force_repaint);
+            if repainted {
                 terminal.clear()?;
             }
             terminal.draw(|f| self.draw(f))?;
+            // The repaint just overwrote the cells an image was sitting in, so
+            // put it back before anything else is drawn. Only the protocols
+            // without a delete operation ever queue this — see the field.
+            if repainted {
+                if let Some((placed, payload)) = self.reflush_after_repaint.take() {
+                    self.write_graphics(&placed);
+                    self.write_graphics(&payload);
+                }
+            }
             // A high-resolution image is escape data the terminal draws itself, so
             // it can only go out after the frame has been flushed — ratatui would
             // otherwise overwrite the cells it lands on. The pane leaves a blank
@@ -1563,6 +1585,11 @@ impl FileBrowser {
     /// effect.
     pub fn force_repaint_pending_for_test(&self) -> bool {
         self.force_repaint
+    }
+
+    /// Whether an image is queued to be re-sent after a pending repaint.
+    pub fn reflush_after_repaint_pending_for_test(&self) -> bool {
+        self.reflush_after_repaint.is_some()
     }
 
     /// Set the pending-repaint flag, for tests.
@@ -2552,22 +2579,11 @@ impl FileBrowser {
         let placed = format!("\x1b[{};{}H", area.y + 1, area.x + 1);
         if self.write_graphics(&placed) && self.write_graphics(&payload) {
             self.preview_graphics_shown = Some(stamp);
-            // The erase above may have asked for a full repaint, and this runs
-            // *after* the frame — so that repaint would land on the next tick,
-            // on top of the image just written, and wipe it.
-            //
-            // Only the protocols erased by clearing cells set the flag, which is
-            // why this was an iTerm2 and sixel bug and not a kitty one: kitty
-            // deletes the image as an object and leaves the cells alone, so it
-            // never asks for a repaint here. The visible symptom was closing the
-            // full pane over an inline image and finding the sub-panel blank --
-            // erase, redraw, then `terminal.clear()` a tick later.
-            //
-            // Safe to drop rather than defer: the region was erased and then
-            // immediately painted with this image, so the cells ratatui believes
-            // it drew there are the ones it is about to leave blank for the image
-            // anyway. Anything else that needs a repaint sets the flag again.
-            self.force_repaint = false;
+            // If the erase above asked for a full repaint, the image just
+            // written has to be re-sent after it. See `redraw_pending_under_image`.
+            if self.force_repaint {
+                self.reflush_after_repaint = Some((placed, payload));
+            }
         }
     }
 
