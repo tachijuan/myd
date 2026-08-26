@@ -1069,6 +1069,15 @@ impl FileBrowser {
                 _ => None,
             })
             .collect();
+        // Whether each panel's info panel is on screen at all — which is not the
+        // same question as whether it has a rect. A visible panel too short to
+        // split off a preview row records `None` too, and treating that as
+        // "hidden" would throw away the preview of a panel the user is looking at.
+        let info_shown: Vec<bool> = self
+            .panels
+            .iter()
+            .map(|p| matches!(p.current_screen(), Screen::Main(s) if !s.info_panel_hidden))
+            .collect();
         for (i, rect) in rects.iter().enumerate() {
             self.info_previews[i].cells = rect.map(|a| {
                 (
@@ -1077,6 +1086,28 @@ impl FileBrowser {
                     a.height.saturating_sub(1).max(1),
                 )
             });
+            // A hidden info panel is showing nothing, so discard what it held.
+            //
+            // `graphics_area` is recorded by `render_compact`, which does not run
+            // for a hidden panel — so without this the rect and the payload both
+            // survive from the last visible frame, and `flush_preview_graphics`
+            // goes on believing an image is still wanted. Nothing re-emits it, so
+            // it is never redrawn; it simply stays on the terminal, because a
+            // kitty or iTerm2 image is not made of cells and ratatui cannot paint
+            // over one it knows nothing about. The image outlived its panel.
+            //
+            // Reset rather than merely ignored: the payload is the whole picture,
+            // which for a photograph is megabytes worth holding on to only while
+            // something is showing it. Reopening the panel reloads from the
+            // cursor anyway, so nothing useful is thrown away.
+            if !info_shown[i]
+                && (self.info_previews[i].state.has_content()
+                    || self.info_previews[i].task.is_some())
+            {
+                self.cancel_info_preview_task(i);
+                self.info_previews[i].state = crate::widget::preview::PreviewState::new();
+                self.info_previews[i].settle = None;
+            }
         }
         if !self.preview_open {
             for (i, rect) in rects.iter().enumerate() {
@@ -1570,6 +1601,52 @@ impl FileBrowser {
     /// taken from the request actually issued rather than from the predicate.
     pub fn info_preview_wants_graphics_for_test(&self) -> Option<bool> {
         self.info_preview_last_cells_only.map(|cells| !cells)
+    }
+
+    /// Seed panel `i`'s inline preview with a real graphics payload, as a
+    /// finished load would.
+    ///
+    /// A test backend reports no graphics protocol, so nothing here can produce
+    /// one for real. Installing the content directly is what lets a test reach
+    /// the paths that only run once an image is genuinely on the terminal.
+    pub fn seed_info_preview_graphics_for_test(&mut self, i: usize, payload: &str) {
+        use crate::preview::PreviewContent;
+        use crate::widget::preview::PreviewKey;
+
+        let key = PreviewKey {
+            path: std::path::PathBuf::from("seeded.png"),
+            backend: self.panels[i.min(self.panels.len() - 1)].backend,
+            cols: 20,
+            rows: 10,
+            page: 0,
+        };
+
+        self.info_previews
+            .resize_with(self.panels.len().max(i + 1), Default::default);
+        self.info_previews[i].state.set_content(
+            key,
+            PreviewContent::Graphics {
+                payload: payload.to_string(),
+                rows: 10,
+                backend: "test",
+                page: 0,
+                pages: None,
+            },
+        );
+    }
+
+    /// Whether panel `i`'s inline preview holds any loaded content.
+    pub fn info_preview_has_content_for_test(&self, i: usize) -> bool {
+        self.info_previews
+            .get(i)
+            .is_some_and(|s| s.state.has_content())
+    }
+
+    /// Whether panel `i`'s inline preview still holds a graphics payload.
+    pub fn info_preview_has_graphics_for_test(&self, i: usize) -> bool {
+        self.info_previews
+            .get(i)
+            .is_some_and(|s| s.state.graphics().is_some())
     }
 
     /// Index of the active panel, for tests.

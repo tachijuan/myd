@@ -18583,6 +18583,96 @@ async fn the_filter_dialog_covers_the_tree_and_leaves_nothing_behind() {
     }
 }
 
+/// Hiding the info panel takes its image off the terminal with it.
+///
+/// The sub-panel's `graphics_area` is recorded during its *render*, and hiding
+/// the panel stops that render from running — so the rect and the payload both
+/// stayed at whatever the last visible frame left, and `flush_preview_graphics`
+/// went on believing an image was still wanted. Nothing re-emitted it, so it was
+/// never redrawn; it simply stayed on the terminal, because a kitty or iTerm2
+/// image is not made of cells and ratatui cannot paint over one it knows nothing
+/// about. The result was a photograph floating over the tree with no panel
+/// around it.
+///
+/// The sibling bug in the *cells* was already fixed in `render_main`, which
+/// clears `info_preview_area` when the panel is not drawn. This is the same
+/// mistake one layer further out, in the escape written after the frame.
+#[tokio::test]
+async fn hiding_the_info_panel_clears_its_image() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Show the info panel, then put a real image in it. A test backend reports
+    // no graphics protocol, so the payload has to be seeded rather than loaded.
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.seed_info_preview_graphics_for_test(0, "\x1b_Gf=100,a=T;SEEDED\x1b\\");
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+    assert!(
+        app.info_preview_has_graphics_for_test(0),
+        "the seeded image should be installed in the sub-panel"
+    );
+
+    // Hide it. The image must not survive the panel that was showing it.
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    app.flush_preview_graphics_for_test();
+
+    assert!(
+        app.preview_graphics_stamp_for_test().is_none(),
+        "hiding the info panel must clear the image the app believes is on screen"
+    );
+    assert!(
+        !app.info_preview_has_graphics_for_test(0),
+        "the hidden sub-panel must not still be holding a graphics payload"
+    );
+}
+
+/// A visible info panel keeps its preview even when it has no room for one.
+///
+/// The near-miss version of [`hiding_the_info_panel_clears_its_image`]: clearing
+/// on "this panel recorded no preview rect" looks equivalent and is not.
+/// `info_preview_area` is `None` for a *visible* panel that is too short to
+/// split a preview row off its metadata, so keying the reset on the rect throws
+/// away the preview of a panel the user is looking at — the content vanishes
+/// while its box stays on screen. The reset must key on the panel being hidden.
+#[tokio::test]
+async fn a_visible_info_panel_with_no_room_keeps_its_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"KEEPMARKER\n").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(ctrl_key('p'));
+    let _ = screen_text(&mut app, 120, 40);
+    cursor_onto(&mut app, "a.txt");
+    settle_subpanel(&mut app).await;
+    assert!(
+        app.info_preview_has_content_for_test(0),
+        "the preview should be loaded before the terminal is squeezed"
+    );
+
+    // Short enough that the info panel has no preview row to give, but still
+    // shown. Several frames, so a reset would have every chance to fire.
+    for _ in 0..3 {
+        let _ = screen_text(&mut app, 120, 14);
+    }
+    assert!(
+        app.info_preview_has_content_for_test(0),
+        "a visible panel with no preview row must keep what it loaded"
+    );
+
+    // And it is still there when the terminal grows back, without a reload.
+    let back = screen_text(&mut app, 120, 40);
+    assert!(
+        back.contains("KEEPMARKER"),
+        "the preview should come straight back with the room for it: {back}"
+    );
+}
+
 /// An unchanged image is not re-copied on every frame.
 ///
 /// `flush_preview_graphics` runs after every draw, and used to clone the whole
