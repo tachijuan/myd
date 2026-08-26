@@ -242,14 +242,48 @@ impl Panel {
         }
     }
 
+    /// Re-list `dir` in every screen on this panel's stack that is showing it.
+    ///
+    /// Every screen, not just the visible one, for the reason spelled out on
+    /// [`Self::resolve_deleting`]: `Enter` pushes a screen and each keeps its
+    /// own tree, so refreshing only the top one leaves the views beneath
+    /// describing a directory as it was before the change. `h` back up then
+    /// shows a name that has been renamed away, or misses one just created.
+    ///
+    /// A screen not showing `dir` is left alone, so this disturbs nothing that
+    /// was not already displaying the directory that changed.
+    pub fn reload_dir_everywhere(&mut self, dir: &std::path::Path) {
+        for screen in &mut self.screen_stack {
+            if let Screen::Main(state) = screen {
+                let shows = state.root_path() == dir
+                    || state.tree.lines.iter().any(|l| l.path == dir);
+                if shows {
+                    state.reload_dir_public(dir);
+                }
+            }
+        }
+    }
+
     /// Check for a completed delete task and remove every deleted path from the
-    /// tree in place.
+    /// trees in place.
+    ///
+    /// Every screen on the stack, not just the visible one. `Enter` into a
+    /// directory pushes a screen and each keeps the tree it was built with, so
+    /// telling only the top one left the screens beneath still listing files
+    /// that had been deleted -- and `h` back up showed those ghosts, with the
+    /// header counting them. A row for a path that is not there is worse than a
+    /// stale count: acting on one addresses a file that no longer exists.
+    ///
+    /// A screen that never held the path ignores it, so this costs a lookup per
+    /// screen and the stack is a handful deep.
     pub fn resolve_deleting(&mut self) {
         if let Some(ref task) = self.delete_task {
             if task.is_finished() {
                 self.delete_task.take();
                 for path in std::mem::take(&mut self.deleting_paths) {
-                    self.current_screen_mut().remove_path(&path);
+                    for screen in &mut self.screen_stack {
+                        screen.remove_path(&path);
+                    }
                 }
             }
         }

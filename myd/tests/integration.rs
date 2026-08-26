@@ -13189,6 +13189,191 @@ async fn settle_gone(app: &mut myd::app::FileBrowser, path: &std::path::Path) {
     panic!("{} was never deleted", path.display());
 }
 
+/// Deleting inside a subdirectory removes the files from the parent view too.
+///
+/// `Enter` into a directory pushes a screen; `h` pops back to the one beneath,
+/// which still holds the tree it was built with. The delete only ever told the
+/// *top* screen what had gone, so stepping back up showed rows for files that
+/// no longer existed -- and acting on one of those ghosts is an operation
+/// against a path that is not there.
+#[tokio::test]
+async fn deleting_in_a_subdirectory_clears_the_rows_in_the_parent_view() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    for n in ["gone_a.txt", "gone_b.txt", "stays.txt"] {
+        std::fs::write(sub.join(n), "x").unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Expand `sub` first, so the parent view is *already* showing its files
+    // when we drill in. That is the state the report describes: the rows were
+    // on screen before the delete, and still there after coming back.
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    let before = screen_text(&mut app, 120, 40);
+    assert!(
+        before.contains("gone_a.txt"),
+        "the parent view should be showing sub's files before the delete:\n{before}"
+    );
+
+    // Drill into `sub` with Enter, as the report describes.
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    let depth = app.screen_stack_depth();
+    assert!(depth > 1, "Enter should have pushed a screen");
+
+    // Tag two files and delete them.
+    cursor_onto(&mut app, "gone_a.txt");
+    app.handle_key_for_test(char_key('t'));
+    cursor_onto(&mut app, "gone_b.txt");
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('D'));
+    app.handle_key_for_test(char_key('y'));
+    settle_gone(&mut app, &sub.join("gone_a.txt")).await;
+    settle_gone(&mut app, &sub.join("gone_b.txt")).await;
+    settle(&mut app).await;
+
+    // Back up to the original view.
+    while app.screen_stack_depth() > 1 {
+        app.handle_key_for_test(char_key('h'));
+        settle(&mut app).await;
+    }
+
+    // No re-expanding here: `sub` was already open before the drill-in, and
+    // re-opening it would re-read the directory and hide the bug.
+    let text = screen_text(&mut app, 120, 40);
+    assert!(
+        !text.contains("gone_a.txt"),
+        "the parent view still lists a deleted file:\n{text}"
+    );
+    assert!(
+        !text.contains("gone_b.txt"),
+        "the parent view still lists a deleted file:\n{text}"
+    );
+    assert!(
+        text.contains("stays.txt"),
+        "and must still list the one that was not deleted:\n{text}"
+    );
+    // The header counts what the tree holds, so a stale row would also leave a
+    // stale count -- and the count is what the user reads to check a delete
+    // worked. One directory, one file.
+    assert!(
+        text.contains("2 items | 1 dirs | 1 files"),
+        "the parent's header should count only what is left:\n{text}"
+    );
+}
+
+/// Renaming inside a subdirectory updates the parent view too.
+///
+/// The sibling of the delete case: `reload_dir_public` is called on
+/// `current_screen_mut()`, so the screens beneath keep the old name.
+#[tokio::test]
+async fn renaming_in_a_subdirectory_updates_the_parent_view() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("before.txt"), "x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    assert!(
+        screen_text(&mut app, 120, 40).contains("before.txt"),
+        "the parent should be showing the file before the rename"
+    );
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "before.txt");
+    app.handle_key_for_test(char_key('R'));
+    // The dialog pre-fills the current name so an edit is a correction rather
+    // than a retype -- clear it before typing a whole new one.
+    for _ in 0..40 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    for c in "after.txt".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(sub.join("after.txt").exists(), "the rename should have happened");
+
+    while app.screen_stack_depth() > 1 {
+        app.handle_key_for_test(char_key('h'));
+        settle(&mut app).await;
+    }
+
+    let text = screen_text(&mut app, 120, 40);
+    assert!(
+        !text.contains("before.txt"),
+        "the parent view still shows the old name:\n{text}"
+    );
+    assert!(
+        text.contains("after.txt"),
+        "the parent view should show the new name:\n{text}"
+    );
+}
+
+/// A new file created inside a subdirectory shows up in the parent view.
+///
+/// The other direction of the same fault: the delete case left rows for files
+/// that were gone, and this one would miss rows for files that had arrived.
+/// Both come from refreshing only the visible screen.
+#[tokio::test]
+async fn a_directory_created_in_a_subdirectory_appears_in_the_parent_view() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("existing.txt"), "x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    // Make a directory while drilled in.
+    app.handle_key_for_test(char_key('N'));
+    for c in "fresh".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    assert!(sub.join("fresh").is_dir(), "the directory should exist");
+
+    while app.screen_stack_depth() > 1 {
+        app.handle_key_for_test(char_key('h'));
+        settle(&mut app).await;
+    }
+
+    let text = screen_text(&mut app, 120, 40);
+    assert!(
+        text.contains("fresh"),
+        "the parent view should show the new directory:\n{text}"
+    );
+}
+
 #[tokio::test]
 async fn always_on_the_delete_prompt_stops_it_asking_again() {
     let (dir, mut app) = delete_app().await;

@@ -1262,9 +1262,7 @@ impl FileBrowser {
                 // Reload where the entries actually landed, which is the cursor's
                 // directory — the same place `dest_dir` sent them.
                 if let Some(dir) = panel.dest_dir() {
-                    if let Screen::Main(state) = panel.current_screen_mut() {
-                        state.reload_dir_public(&dir);
-                    }
+                    panel.reload_dir_everywhere(&dir);
                 }
             }
             // Dismiss the "Moving" overlay on whichever pane carried it. A
@@ -1339,16 +1337,11 @@ impl FileBrowser {
             if panel.backend != dest.backend {
                 continue;
             }
-            if let Screen::Main(state) = panel.current_screen_mut() {
-                // Only reload if this panel's tree actually contains the parent
-                // directory (cheap check against the loaded lines), so unrelated
-                // panels aren't disturbed.
-                let has_parent = state.root_path() == parent
-                    || state.tree.lines.iter().any(|l| l.path == parent);
-                if has_parent {
-                    state.reload_dir_public(parent);
-                }
-            }
+            // Only the screens actually showing the parent directory, so
+            // unrelated panels aren't disturbed — and every screen on the
+            // stack, not just the visible one, or stepping back with `h`
+            // reveals a tree built before the change.
+            panel.reload_dir_everywhere(parent);
         }
     }
 
@@ -5192,12 +5185,22 @@ impl FileBrowser {
                                 }
                             }
                             ModalTarget::CreateDir => {
+                                // Where it will land, read before the call: the
+                                // screen updates its own tree, and the screens
+                                // beneath it need the same directory re-listed
+                                // or `h` back up misses the new entry.
+                                let parent = match self.active_panel().current_screen() {
+                                    Screen::Main(s) => Some(s.target_dir()),
+                                    _ => None,
+                                };
                                 let failure = self
                                     .active_panel_mut()
                                     .current_screen_mut()
                                     .create_dir(&value);
                                 if let Some(msg) = failure {
                                     self.modal = Modal::Confirm(ConfirmDialog::new(msg));
+                                } else if let Some(parent) = parent {
+                                    self.active_panel_mut().reload_dir_everywhere(&parent);
                                 }
                             }
                             ModalTarget::CopyDest { srcs } => {
@@ -6077,9 +6080,7 @@ impl FileBrowser {
                 if !panel.backend.is_local() {
                     continue;
                 }
-                if let Screen::Main(state) = panel.current_screen_mut() {
-                    state.reload_dir_public(&parent);
-                }
+                panel.reload_dir_everywhere(&parent);
             }
         }
     }
@@ -7025,9 +7026,7 @@ impl FileBrowser {
         // Re-list just the containing directory so the new name appears, keeping
         // the rest of the tree and the size cache intact. A full refresh would
         // re-scan everything — and on a remote panel would rebuild it as local.
-        if let Screen::Main(state) = self.active_panel_mut().current_screen_mut() {
-            state.reload_dir_public(parent);
-        }
+        self.active_panel_mut().reload_dir_everywhere(parent);
         None
     }
 
