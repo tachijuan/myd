@@ -19196,6 +19196,125 @@ async fn a_saved_app_survives_into_the_next_open_dialog() {
     );
 }
 
+/// A refresh keeps the filter and the tags.
+///
+/// `refresh` builds a fresh `FileTree`, and a fresh tree has no filter, no tags
+/// and no visual anchor. Those three are deliberately *not* derived from the
+/// directory — they survive a reflatten (sort, expand, filter) precisely
+/// because they are the user's staged state, and rebuilding threw them away.
+/// So filtering a directory and then running a program with `O` came back to
+/// the unfiltered tree, with any tagged files silently untagged.
+#[tokio::test]
+async fn refreshing_keeps_the_filter_and_the_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["keep-one.log", "keep-two.log", "other.txt"] {
+        std::fs::write(dir.path().join(n), "x").unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Filter to the logs.
+    app.handle_key_for_test(char_key('f'));
+    for c in "keep".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    let filtered = screen_text(&mut app, 120, 40);
+    assert!(!filtered.contains("other.txt"), "the filter should be on:\n{filtered}");
+
+    // Tag one of the survivors.
+    cursor_onto(&mut app, "keep-one.log");
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 1);
+
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    let after = screen_text(&mut app, 120, 40);
+    assert!(
+        !after.contains("other.txt"),
+        "a refresh must not drop the filter:\n{after}"
+    );
+    assert_eq!(tag_count(&app), 1, "nor the tags");
+}
+
+/// A tag on a file the refresh no longer finds does not survive it.
+///
+/// Tags are carried across a refresh, but a program run with `O` may well have
+/// deleted what was tagged — that is often why it was run. A tag pointing at a
+/// path that is gone would make the next `c` or `D` act on nothing, or worse on
+/// a new file that has taken the name.
+#[tokio::test]
+async fn a_tag_on_a_vanished_file_does_not_survive_a_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    // Distinct sizes, so the default Largest sort gives a stable order.
+    std::fs::write(dir.path().join("stays.txt"), vec![b'x'; 300]).unwrap();
+    std::fs::write(dir.path().join("goes.txt"), vec![b'x'; 100]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "stays.txt");
+    app.handle_key_for_test(char_key('t'));
+    cursor_onto(&mut app, "goes.txt");
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 2);
+
+    // As a program would.
+    std::fs::remove_file(dir.path().join("goes.txt")).unwrap();
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    let tags = match app.current_screen() {
+        myd::screen::Screen::Main(s) => s.tagged_paths(),
+        _ => panic!("expected a main screen"),
+    };
+    assert!(
+        tags.iter().any(|p| p.ends_with("stays.txt")),
+        "the surviving file keeps its tag: {tags:?}"
+    );
+    assert!(
+        !tags.iter().any(|p| p.ends_with("goes.txt")),
+        "a tag on a file that is gone must not survive: {tags:?}"
+    );
+}
+
+/// A tag on a file the filter is hiding survives a refresh.
+///
+/// The stale-tag sweep checks the rebuilt tree's lines, and the filter is
+/// applied after it for exactly this reason: filtering it first would make
+/// "not on screen" mean "gone", and a refresh would quietly untag everything
+/// the filter happened to be hiding.
+#[tokio::test]
+async fn a_tag_hidden_by_the_filter_survives_a_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("match-me.log"), vec![b'x'; 300]).unwrap();
+    std::fs::write(dir.path().join("hidden.txt"), vec![b'x'; 100]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Tag the one the filter will hide.
+    cursor_onto(&mut app, "hidden.txt");
+    app.handle_key_for_test(char_key('t'));
+    assert_eq!(tag_count(&app), 1);
+
+    app.handle_key_for_test(char_key('f'));
+    for c in "match".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    assert_eq!(
+        tag_count(&app),
+        1,
+        "a file hidden by the filter is still there, so its tag stands"
+    );
+}
+
 /// Refreshing a shallow tree leaves it shallow.
 ///
 /// `refresh` rebuilt the tree from its root, sort mode, hidden flag, size-bar

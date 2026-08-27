@@ -567,10 +567,18 @@ impl MainScreenState {
     /// just this one.
     pub fn refresh(&mut self) -> bool {
         self.tree.size_cache.clear();
-        // The source comes forward: it is what carries shallow mode and the
-        // backend, and a rebuild from the path alone silently returned a
-        // `myd -s` tree to measuring — so `r`, or coming back from a program
-        // run with `O`, started walking directories the user had excluded.
+        // What a rebuild would otherwise lose. These are not derived from the
+        // directory — they are what the user has staged on top of it, and they
+        // survive a reflatten (sort, expand, filter) for exactly that reason.
+        // A refresh is a re-read of the *disk*, not a reset of the view, so
+        // they come across: `r`, or coming back from a program run with `O`,
+        // used to drop the filter and silently untag everything.
+        //
+        // The source comes with them. It carries shallow mode and which backend
+        // the tree is on, neither recoverable from a path, so rebuilding
+        // without it turned a `myd -s` tree back into a measuring one.
+        let filter = self.tree.filter().cloned();
+        let tagged = std::mem::take(&mut self.tree.tagged);
         self.tree = FileTree::with_source_and_cache(
             self.tree.source.clone(),
             self.root_path.clone(),
@@ -579,6 +587,22 @@ impl MainScreenState {
             self.tree.show_size_bar,
             self.tree.size_cache.clone(),
         );
+        // Only the tags whose files are still there. A program run with `O`
+        // may well have deleted what was tagged — that is often why it was run
+        // — and a tag pointing at a path that is gone would make the next `c`
+        // or `D` act on nothing, or on whatever new file has taken the name.
+        // Checked against the rebuilt tree rather than the disk, so one lookup
+        // covers a remote backend too.
+        let present: std::collections::HashSet<_> = self
+            .tree
+            .lines
+            .iter()
+            .map(|l| l.resolved_path.clone())
+            .collect();
+        self.tree.tagged = tagged.into_iter().filter(|p| present.contains(p)).collect();
+        if let Some(re) = filter {
+            self.tree.set_filter(re);
+        }
         self.rebuild_treemap_and_info();
         true
     }

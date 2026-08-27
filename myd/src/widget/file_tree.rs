@@ -1205,6 +1205,11 @@ impl FileTree {
         self.filter.as_ref().map(|re| re.as_str())
     }
 
+    /// The active filter itself, for carrying across a rebuild.
+    pub fn filter(&self) -> Option<&regex::Regex> {
+        self.filter.as_ref()
+    }
+
     /// Clear the active filter, restoring the full view.
     pub fn clear_filter(&mut self) {
         if self.filter.is_some() {
