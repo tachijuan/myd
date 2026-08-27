@@ -1102,6 +1102,22 @@ impl FileTree {
         self.tag_visual_span();
     }
 
+    /// Put the cursor on `path`, if the tree is showing it.
+    ///
+    /// Returns whether it landed. Keyed on the resolved path because the cursor
+    /// itself is a line index, which means nothing across a rebuild: the
+    /// listing may have gained or lost entries, so the same index is a
+    /// different file. Used to restore the user's place after a refresh.
+    pub fn cursor_to_path(&mut self, path: &Path) -> bool {
+        match self.lines.iter().position(|l| l.resolved_path == path) {
+            Some(i) => {
+                self.set_cursor(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Move cursor to top.
     pub fn to_top(&mut self) {
         self.set_cursor(0);

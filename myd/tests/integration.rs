@@ -19407,6 +19407,67 @@ async fn a_filtered_view_keeps_its_expanded_subdirectory_across_a_refresh() {
     );
 }
 
+/// A refresh leaves the cursor where it was.
+///
+/// The cursor is a line *index*, which means nothing across a rebuild — so a
+/// refresh dropped it to the top of the tree and a program run with `O` lost
+/// the user's place, even once the filter and the expansion were being kept.
+/// The fifth thing `refresh` was throwing away.
+#[tokio::test]
+async fn refreshing_leaves_the_cursor_where_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    // Distinct sizes, so the default Largest sort gives a stable order.
+    std::fs::write(sub.join("inner-a.txt"), vec![b'x'; 400]).unwrap();
+    std::fs::write(sub.join("inner-b.txt"), vec![b'x'; 300]).unwrap();
+    std::fs::write(dir.path().join("top.txt"), vec![b'x'; 100]).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "inner-b.txt");
+    let before = selected(&app);
+    assert!(before.ends_with("inner-b.txt"), "parked on it: {before:?}");
+
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    assert_eq!(
+        selected(&app),
+        before,
+        "the cursor must come back to the same entry"
+    );
+}
+
+/// A cursor on a file the refresh no longer finds does not panic or wander.
+///
+/// The program run with `O` may have deleted what the cursor was on. There is
+/// no right answer for where to go, but it must be a valid line — the cursor is
+/// an index into `lines`, and a stale one would point past the end.
+#[tokio::test]
+async fn a_cursor_on_a_vanished_file_lands_somewhere_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("stays.txt"), vec![b'x'; 300]).unwrap();
+    std::fs::write(dir.path().join("goes.txt"), vec![b'x'; 100]).unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "goes.txt");
+    std::fs::remove_file(dir.path().join("goes.txt")).unwrap();
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    // Whatever it settled on has to be a real entry, and the pane has to draw.
+    let path = selected(&app);
+    assert!(path.exists(), "the cursor must be on something that exists: {path:?}");
+    let text = screen_text(&mut app, 120, 40);
+    assert!(text.contains("stays.txt"), "and the pane still draws:\n{text}");
+}
+
 /// Refreshing a shallow tree leaves it shallow.
 ///
 /// `refresh` rebuilt the tree from its root, sort mode, hidden flag, size-bar

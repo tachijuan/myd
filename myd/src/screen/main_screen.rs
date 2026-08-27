@@ -581,6 +581,10 @@ impl MainScreenState {
         let filter = self.tree.filter().cloned();
         let tagged = std::mem::take(&mut self.tree.tagged);
         let expanded = self.tree.expanded_paths();
+        let cursor_on = self
+            .tree
+            .selected_line()
+            .map(|l| l.resolved_path.clone());
         self.tree = FileTree::with_source_and_cache(
             self.tree.source.clone(),
             self.root_path.clone(),
@@ -609,6 +613,14 @@ impl MainScreenState {
         self.tree.tagged = tagged.into_iter().filter(|p| present.contains(p)).collect();
         if let Some(re) = filter {
             self.tree.set_filter(re);
+        }
+        // Back to where the user was standing. Last, because the cursor is a
+        // line index and the lines are only final once the expansion has been
+        // replayed and the filter reapplied. A file the refresh no longer finds
+        // leaves the cursor at the top, which is where it would have been
+        // anyway.
+        if let Some(path) = cursor_on {
+            self.tree.cursor_to_path(&path);
         }
         self.rebuild_treemap_and_info();
         true
