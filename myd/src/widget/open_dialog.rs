@@ -197,13 +197,18 @@ impl OpenDialog {
 
     /// Whether the list section is drawn at all.
     ///
-    /// The actions panel lives inside that section, so it cannot be a focus
-    /// stop when the section is absent: Tab would land on a panel nobody can
-    /// see, and the next letter would fire an action instead of typing. With
-    /// no presets saved yet the dialog is exactly what it was before this
-    /// feature — a field and two buttons.
+    /// Either half is enough: entries to list, or an action to offer. Gating
+    /// this on the presets alone made the feature unreachable from a fresh
+    /// install — with nothing saved there was no section, so no Save action,
+    /// and Save was the only way to get a first entry. The section still
+    /// disappears entirely when there is nothing to put in it, which is an
+    /// empty field and an empty catalogue.
+    ///
+    /// The panel must never be a focus stop while the section is hidden: Tab
+    /// would land somewhere nobody can see, and the next letter would fire an
+    /// action instead of typing a character.
     fn has_list(&self) -> bool {
-        !self.presets.is_empty()
+        !self.presets.is_empty() || !self.actions().is_empty()
     }
 
     /// Start with the field pre-filled, for a remembered command.
@@ -462,7 +467,12 @@ impl OpenDialog {
         let buttons = self.buttons().len();
         let mut stops: Vec<(OpenFocus, usize)> = vec![(OpenFocus::Field, 0)];
         if self.has_list() {
-            stops.push((OpenFocus::List, 0));
+            // The list is only a stop when it has rows; the panel only when it
+            // has actions. With nothing saved yet there is a panel offering
+            // Save and no list to walk, and Tab must skip the empty half.
+            if !self.presets.is_empty() {
+                stops.push((OpenFocus::List, 0));
+            }
             if !self.actions().is_empty() {
                 stops.push((OpenFocus::Actions, self.action.min(self.actions().len() - 1)));
             }
@@ -899,24 +909,55 @@ mod tests {
         ])
     }
 
-    /// With nothing saved the dialog is exactly what it was before the list
-    /// existed: a field and two buttons, and Tab walks only those.
+    /// With nothing saved but something typed, Save is reachable.
     ///
-    /// The actions panel lives inside the list section, so it must not become a
-    /// focus stop when there is no section to draw it in — Tab would land
-    /// somewhere invisible and the next letter would fire an action instead of
-    /// typing a character.
+    /// This is how the first entry ever gets made, and gating the section on
+    /// the presets alone made that impossible: no entries meant no section,
+    /// which meant no Save action, which meant no way to get an entry. The
+    /// feature was unreachable from a fresh install.
     #[test]
-    fn an_empty_catalog_leaves_the_dialog_as_it_was() {
+    fn the_first_app_can_be_saved_with_an_empty_catalog() {
         let mut d = OpenDialog::new(one_file());
         type_str(&mut d, "vim");
+        assert!(d.presets().is_empty(), "nothing saved yet");
+        assert!(
+            d.actions().contains(&OpenAction::Save),
+            "Save must be offered, or the first entry can never be made"
+        );
+
+        // Tab reaches the panel — skipping the list, which has no rows.
+        d.handle_key(code(KeyCode::Tab));
+        assert_eq!(
+            d.handle_key(key('s')),
+            OpenDialogOutcome::Save {
+                label: "vim".to_string(),
+                command: "vim".to_string()
+            }
+        );
+    }
+
+    /// And the section is absent entirely when there is nothing to put in it:
+    /// no entries and an empty field. Then the dialog is what it always was.
+    #[test]
+    fn an_empty_catalog_and_an_empty_field_leave_the_dialog_as_it_was() {
+        let mut d = OpenDialog::new(one_file());
         assert!(d.presets().is_empty());
+        assert!(d.actions().is_empty(), "nothing to save, nothing to forget");
         d.handle_key(code(KeyCode::Tab));
         assert_eq!(d.focused_button(), Some(OpenButton::Ok));
         d.handle_key(code(KeyCode::Tab));
         assert_eq!(d.focused_button(), Some(OpenButton::Cancel));
         d.handle_key(code(KeyCode::Tab));
         assert_eq!(d.focused_button(), None, "and back to the field");
+    }
+
+    /// A letter must still be text in the field when a panel exists beside it.
+    #[test]
+    fn a_letter_in_the_field_is_text_even_when_save_is_offered() {
+        let mut d = OpenDialog::new(one_file());
+        type_str(&mut d, "vims");
+        assert_eq!(d.command(), "vims", "the trailing s is a character");
+        assert!(d.presets().is_empty(), "and saved nothing");
     }
 
     /// Tab reaches the list and the panel, and never runs anything on the way.
@@ -1240,7 +1281,11 @@ mod tests {
         let mut d = OpenDialog::new(one_file());
         type_str(&mut d, "vim");
 
+        // Something in the field means a Save action, so Tab reaches the panel
+        // before the buttons: field → actions → OK → Cancel.
+        d.handle_key(code(KeyCode::Tab)); // actions
         d.handle_key(code(KeyCode::Tab)); // OK
+        assert_eq!(d.focused_button(), Some(OpenButton::Ok));
         assert_eq!(
             d.handle_key(code(KeyCode::Enter)),
             OpenDialogOutcome::Run {
@@ -1249,6 +1294,7 @@ mod tests {
         );
 
         d.handle_key(code(KeyCode::Tab)); // Cancel
+        assert_eq!(d.focused_button(), Some(OpenButton::Cancel));
         assert_eq!(d.handle_key(code(KeyCode::Enter)), OpenDialogOutcome::Cancelled);
     }
 

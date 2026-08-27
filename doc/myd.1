@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.3.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.3.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -464,6 +464,11 @@ never presses one; \fBEnter\fR in the command field is the same as \fBOK\fR.
 The programs you actually open files with are worth keeping. The dialog lists
 the saved ones under the command field, and \fBTab\fR cycles the command, the
 list and an actions panel \(em the same shape as the \fBgd\fR picker.
+.PP
+The section appears as soon as there is something to put in it: with nothing
+saved yet, typing a command is enough to offer \fBS\fRave, which is how the
+first entry is made. With an empty catalogue and an empty field there is no
+section at all, and the dialog is a command field and two buttons.
 .PP
 In the list, the arrows move and \fBEnter\fR runs the highlighted program;
 typing a letter jumps to the first entry starting with it, and a letter matching
