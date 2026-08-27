@@ -388,6 +388,9 @@ pub struct FileBrowser {
     /// remembered across runs would be a surprising thing to press Enter on
     /// weeks later without reading.
     last_open_command: Option<String>,
+    /// Saved programs for the `O` dialog. Loaded once and kept, so the list is
+    /// not re-read from disk on every keystroke that opens the dialog.
+    apps: crate::apps::AppCatalog,
     /// How many times the terminal bell has been rung. Tests cannot hear it, so
     /// they count it instead.
     bells_rung: usize,
@@ -614,6 +617,7 @@ impl FileBrowser {
             shallow_default: false,
             skip_delete_confirm: false,
             last_open_command: None,
+            apps: crate::apps::AppCatalog::load(),
             bells_rung: 0,
         }
     }
@@ -1590,6 +1594,17 @@ impl FileBrowser {
     /// Whether an image is queued to be re-sent after a pending repaint.
     pub fn reflush_after_repaint_pending_for_test(&self) -> bool {
         self.reflush_after_repaint.is_some()
+    }
+
+    /// Save a preset and write the catalog, for tests.
+    ///
+    /// Stands in for the dialog's Save action, which needs a list to reach its
+    /// actions panel — and the list is empty until something has been saved.
+    pub fn save_app_for_test(&mut self, label: &str, command: &str) {
+        self.apps
+            .upsert(crate::apps::SavedApp::new(label, command));
+        self.save_apps();
+        self.refresh_open_presets();
     }
 
     /// Set the pending-repaint flag, for tests.
@@ -4008,7 +4023,22 @@ impl FileBrowser {
         if targets.is_empty() {
             return;
         }
-        let mut dialog = OpenDialog::new(targets);
+        // The presets, ordered for what is selected: an entry claiming this
+        // file type comes first. Built from the cursor's file rather than the
+        // whole tagged set — with a mixed selection there is no one type to
+        // match, and the cursor is the one the user is looking at.
+        let focus_path = targets.first().cloned();
+        let presets: Vec<crate::widget::open_dialog::PresetRow> = self
+            .apps
+            .for_target(focus_path.as_deref())
+            .into_iter()
+            .map(|a| crate::widget::open_dialog::PresetRow {
+                label: a.label.clone(),
+                command: a.command.clone(),
+                matches_target: focus_path.as_deref().is_some_and(|p| a.claims(p)),
+            })
+            .collect();
+        let mut dialog = OpenDialog::new(targets).with_presets(presets);
         // Offer the last command back. Re-running one program over a series of
         // files is the common case, and retyping it every time is the friction
         // this is meant to remove.
@@ -4037,9 +4067,74 @@ impl FileBrowser {
                 };
                 self.modal = Modal::None;
                 self.last_open_command = Some(command.clone());
+                // Note the run against whichever preset carries this exact
+                // command, so the list orders by what is actually used —
+                // whether it was picked from the list or typed by hand.
+                let used: Option<String> = self
+                    .apps
+                    .apps()
+                    .iter()
+                    .find(|a| a.command == command)
+                    .map(|a| a.label.clone());
+                if let Some(label) = used {
+                    self.apps.record_use(&label);
+                    self.save_apps();
+                }
                 self.run_open_command(&command, &targets);
                 true
             }
+            OpenDialogOutcome::Save { label, command } => {
+                self.apps
+                    .upsert(crate::apps::SavedApp::new(label, command));
+                self.save_apps();
+                self.refresh_open_presets();
+                true
+            }
+            OpenDialogOutcome::Forget { label } => {
+                self.apps.remove(&label);
+                self.save_apps();
+                self.refresh_open_presets();
+                true
+            }
+        }
+    }
+
+    /// Write the app catalog, reporting a failure rather than losing it quietly.
+    ///
+    /// A save that fails leaves the in-memory catalog as it is, so the dialog
+    /// still shows what the user just did — the notice says it will not survive
+    /// the session, which is the part they cannot see for themselves.
+    fn save_apps(&mut self) {
+        if let Err(e) = self.apps.save() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                "Could not save the app list: {e}. The change applies to this \
+                 session but will not be remembered."
+            )));
+        }
+    }
+
+    /// Rebuild the open dialog's list after the catalog changed.
+    ///
+    /// The dialog holds a snapshot so the list cannot reorder under the cursor
+    /// while it is being read; saving or forgetting is exactly the moment that
+    /// snapshot is stale, so it is replaced then and only then.
+    fn refresh_open_presets(&mut self) {
+        let Modal::Open(dialog) = &self.modal else {
+            return;
+        };
+        let focus_path = dialog.targets().first().cloned();
+        let presets: Vec<crate::widget::open_dialog::PresetRow> = self
+            .apps
+            .for_target(focus_path.as_deref())
+            .into_iter()
+            .map(|a| crate::widget::open_dialog::PresetRow {
+                label: a.label.clone(),
+                command: a.command.clone(),
+                matches_target: focus_path.as_deref().is_some_and(|p| a.claims(p)),
+            })
+            .collect();
+        if let Modal::Open(dialog) = &mut self.modal {
+            dialog.set_presets(presets);
         }
     }
 

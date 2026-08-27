@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.2.1" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.3.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -460,6 +460,51 @@ the screen.
 .IP
 The dialog's buttons are \fBOK\fR and \fBCancel\fR. \fBTab\fR reaches them and
 never presses one; \fBEnter\fR in the command field is the same as \fBOK\fR.
+.SS Saved apps
+The programs you actually open files with are worth keeping. The dialog lists
+the saved ones under the command field, and \fBTab\fR cycles the command, the
+list and an actions panel \(em the same shape as the \fBgd\fR picker.
+.PP
+In the list, the arrows move and \fBEnter\fR runs the highlighted program;
+typing a letter jumps to the first entry starting with it, and a letter matching
+nothing goes to the command field instead. Whatever is highlighted appears in
+the field, so \fBOK\fR and the actions always act on something visible.
+.PP
+The actions are \fBS\fRave (keep what is in the field as a new entry),
+\fBU\fRpdate (replace the highlighted entry's command with it) and \fBF\fRorget.
+Press the highlighted letter to run one, as in the \fBgd\fR picker. A new entry
+is named after the command's first word, without its path or arguments, so
+\fB/usr/bin/gimp \-n\fR is saved as \fBgimp\fR.
+.PP
+The list is ordered most-recently-used first. An entry may also claim file
+types, and one that claims the selection sorts to the top with a \fB\(bu\fR
+beside it \(em pressing \fBO\fR on a photograph offers the image editor first.
+Nothing is hidden by this: a general-purpose entry stays reachable whatever is
+selected.
+.PP
+Saved in \fB~/.config/myd/apps.toml\fR, hand-editable, and honouring
+\fB$XDG_CONFIG_HOME\fR (and \fB$MYD_APPS\fR ahead of both):
+.PP
+.RS
+.EX
+[[app]]
+label = "gimp"
+command = "gimp"
+match = ["*.png", "*.jpg", "*.xcf"]
+uses = 4
+last_used = "2026-08-27T09:14:00Z"
+.EE
+.RE
+.PP
+\fBmatch\fR is optional; an entry without it is offered for any file. Patterns
+are extensions \(em \fB*.png\fR, \fB.png\fR and \fBpng\fR all mean the same
+thing \(em matched case-insensitively, so a camera writing \fB.JPG\fR needs no
+entry of its own. A pattern that is not an extension matches nothing rather
+than failing the file to load.
+.PP
+A missing or malformed file costs nothing but itself: the list comes up empty
+and the file is left alone, so a typo can be fixed by hand instead of silently
+costing every saved entry.
 .IP
 Refused inside an archive and on remote panels, for the same reason \fBo\fR is:
 there is no path on this machine to give the program.
@@ -753,6 +798,11 @@ otherwise live in \fB$XDG_CONFIG_HOME/myd/prefs.toml\fR, falling back to
 a preference has actually changed; a missing or malformed one costs the
 settings rather than the session, and is left alone so it can be repaired by
 hand.
+.TP
+.B MYD_APPS
+Names the saved-apps file outright, ahead of the usual lookup. It otherwise
+lives in \fB$XDG_CONFIG_HOME/myd/apps.toml\fR, falling back to
+\fB~/.config/myd/apps.toml\fR. See \fBSaved apps\fR under \fBO\fR.
 .SH PREFERENCES
 The preferences file is TOML and is meant to be edited by hand. Every setting
 has a default, so a file that omits one \(em or one written by an older version

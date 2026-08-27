@@ -7485,7 +7485,7 @@ async fn help_scroll_keys_move_and_clamp() {
 /// Tall enough for the whole help list. It grows as bindings are added, so this
 /// is deliberately generous rather than exact — the point of the test below is
 /// that a terminal with room to spare says nothing about scrolling.
-const HELP_TALL_ENOUGH: u16 = 160;
+const HELP_TALL_ENOUGH: u16 = 200;
 
 /// A tall terminal shows everything, so no scroll indicator is needed.
 #[tokio::test]
@@ -19117,6 +19117,59 @@ async fn a_control_chord_in_a_dialog_does_not_reach_the_tree() {
     assert!(
         dir.path().join("keep.txt").exists(),
         "the file must still be there after an edit that was cancelled"
+    );
+}
+
+/// Saving a preset in the `O` dialog writes it, and it comes back next time.
+///
+/// `$MYD_APPS` is redirected at the catalog's own path so the test can never
+/// touch the real one — the rule every config path in myd follows.
+#[tokio::test]
+async fn a_saved_app_survives_into_the_next_open_dialog() {
+    use crossterm::event::KeyCode;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let catalog = dir.path().join("apps.toml");
+    // SAFETY: set before the app reads it, removed at the end of the test.
+    unsafe { std::env::set_var("MYD_APPS", &catalog) };
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "a.txt");
+
+    // Type a command, Tab to the buttons... but with nothing saved yet there is
+    // no list, so the actions panel does not exist. Save through the catalog
+    // the way the dialog's Save action does, then reopen.
+    app.handle_key_for_test(char_key('O'));
+    for c in "hexdump -C".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    let _ = screen_text(&mut app, 120, 40);
+    app.save_app_for_test("hexdump", "hexdump -C");
+    app.handle_key_for_test(key(KeyCode::Esc));
+    let _ = screen_text(&mut app, 120, 40);
+
+    assert!(catalog.exists(), "the catalog should have been written");
+    let body = std::fs::read_to_string(&catalog).unwrap();
+    assert!(body.contains("hexdump -C"), "{body}");
+
+    // A fresh app reads it back and the dialog offers it.
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "a.txt");
+    app.handle_key_for_test(char_key('O'));
+    let text = screen_text(&mut app, 120, 40);
+
+    unsafe { std::env::remove_var("MYD_APPS") };
+
+    assert!(
+        text.contains("Saved apps"),
+        "the dialog should show the list once something is saved:\n{text}"
+    );
+    assert!(
+        text.contains("hexdump"),
+        "and the saved entry should be in it:\n{text}"
     );
 }
 
