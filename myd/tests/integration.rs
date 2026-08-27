@@ -15446,12 +15446,35 @@ async fn cancelling_a_write_leaves_nothing_behind() {
     app.handle_key_for_test(char_key('q'));
     settle_archive(&mut app).await;
 
-    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".part"))
-        .collect();
+    // What this covers is the *app* path: `q` reaches the panel, the panel
+    // trips the token, the task unwinds and the pane comes back. That the
+    // writer's guard removes a partial file is the writer's own contract and is
+    // tested there, over a cancel tripped mid-write — here the cancel usually
+    // lands before any bytes are written, so this would pass with the guard
+    // removed. Named for the leak and checking the leak, but the guard is not
+    // what it pins.
+    //
+    // The panel clears its busy state *before* the worker notices the token —
+    // `cancel_busy` takes the flag and then trips it — so "not busy" does not
+    // yet mean "the thread has unwound". Poll for the condition rather than
+    // reading the directory once: this failed in CI and passed locally, which
+    // is exactly the shape of that race.
+    let leftovers = || -> Vec<String> {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".part"))
+            .collect()
+    };
+    for _ in 0..200 {
+        if leftovers().is_empty() {
+            break;
+        }
+        app.tick_for_test();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let leftovers = leftovers();
     assert!(
         leftovers.is_empty(),
         "a partial archive was left behind: {leftovers:?}"
