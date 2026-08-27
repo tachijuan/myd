@@ -12,6 +12,7 @@ pub mod progress;
 pub mod rename_dialog;
 pub mod size_bar;
 pub mod sort_menu;
+pub mod text_field;
 pub mod source;
 pub mod transfer_panel;
 pub mod treemap;

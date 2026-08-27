@@ -252,7 +252,20 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut HelpState) {
         },
         HelpCategory {
             title: "Dialogs",
-            items: &[("Enter", "Confirm"), ("Esc", "Cancel")],
+            items: &[
+                ("Enter", "Confirm"),
+                ("Esc", "Cancel"),
+                ("Tab", "Move focus (never confirms)"),
+                ("", "Text fields take the usual shell editing keys:"),
+                ("  C-a / C-e", "  Start / end of line"),
+                ("  C-b / C-f", "  Back / forward one character"),
+                ("  M-b / M-f", "  Back / forward one word"),
+                ("  C-w", "  Delete the word before the cursor"),
+                ("  C-u", "  Delete the whole line"),
+                ("  C-k", "  Delete to the end of the line"),
+                ("  C-d", "  Delete the character under the cursor"),
+                ("  C-h", "  Backspace"),
+            ],
         },
     ];
 

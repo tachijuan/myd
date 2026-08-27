@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "myd"
-version = "1.1.4"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1779,6 +1779,8 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tui-input",
+ "unicode-width 0.1.14",
  "url",
  "walkdir",
  "zip",
@@ -3327,6 +3329,16 @@ dependencies = [
  "arc-swap",
  "serde",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "tui-input"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74f679521b7fd35e17fbca58ec5aac64c5d331e54a9034510ec26b193ffd7597"
+dependencies = [
+ "crossterm",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

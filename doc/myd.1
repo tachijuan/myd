@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.1.4" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.2.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -582,6 +582,41 @@ land on a transfer that merely slid up into that slot.
 .TP
 .B gx
 Cancel all queued and in-flight transfers.
+.SS Editing text fields
+Every dialog that takes typed input \(em rename, filter, search, new directory,
+open-with, the attribute editor, the archive name \(em accepts the readline
+editing keys familiar from a shell prompt.
+.TP
+.BR C-a " / " C-e
+Move to the start or the end of the line. \fBHome\fR and \fBEnd\fR do the same.
+.TP
+.BR C-b " / " C-f
+Move back or forward one character, as the arrow keys do.
+.TP
+.BR M-b " / " M-f
+Move back or forward one word. \fBCtrl+\fR with an arrow key does the same.
+.TP
+.B C-w
+Delete the word before the cursor.
+.TP
+.B C-u
+Delete the whole line.
+.TP
+.B C-k
+Delete from the cursor to the end of the line.
+.TP
+.B C-d
+Delete the character under the cursor. At the end of the line it does nothing:
+a field cannot honour the shell's "end of input" meaning, and doing nothing
+beats borrowing it.
+.TP
+.B C-h
+Backspace.
+.IP
+\fBTab\fR moves the focus and never accepts, \fBEnter\fR confirms and \fBEsc\fR
+cancels \(em the field leaves all three to the dialog. Before version 1.2.0 a
+Ctrl chord inserted its own letter, so \fBCtrl+A\fR in a rename dialog typed an
+\fBa\fR into the filename.
 .SH REMOTE BROWSING
 myd can browse and transfer files over SFTP. Connect from the \fBgd\fR picker
 \(em pick a saved host, or type an \fBsftp://\fR URL into its path field \(em or

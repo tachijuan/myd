@@ -6,6 +6,7 @@
 //! and copying both keeps `Tab`, `Enter` and clicks meaning what they already
 //! mean everywhere else here.
 
+use crate::widget::text_field::TextField;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -40,9 +41,7 @@ pub enum OpenButton {
 }
 
 pub struct OpenDialog {
-    command: String,
-    /// Char index within `command`, converted to bytes by [`Self::byte_index`].
-    cursor: usize,
+    command: TextField,
     focus: OpenFocus,
     /// Index into [`Self::buttons`].
     button: usize,
@@ -58,8 +57,7 @@ pub struct OpenDialog {
 impl OpenDialog {
     pub fn new(targets: Vec<PathBuf>) -> Self {
         Self {
-            command: String::new(),
-            cursor: 0,
+            command: TextField::new(),
             focus: OpenFocus::Field,
             button: 0,
             targets,
@@ -69,13 +67,13 @@ impl OpenDialog {
 
     /// Start with the field pre-filled, for a remembered command.
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
-        self.command = command.into();
-        self.cursor = self.command.chars().count();
+        self.command = TextField::with_value(command);
+        // The field keeps its own cursor.
         self
     }
 
     pub fn command(&self) -> &str {
-        &self.command
+        self.command.value()
     }
 
     pub fn targets(&self) -> &[PathBuf] {
@@ -109,7 +107,7 @@ impl OpenDialog {
     /// and Enter on it should keep the dialog rather than close it having done
     /// nothing visible.
     fn is_runnable(&self) -> bool {
-        !self.command.trim().is_empty()
+        !self.command.value().trim().is_empty()
     }
 
     /// What pressing `button` decides.
@@ -123,7 +121,7 @@ impl OpenDialog {
     fn run_outcome(&self) -> OpenDialogOutcome {
         if self.is_runnable() {
             OpenDialogOutcome::Run {
-                command: self.command.trim().to_string(),
+                command: self.command.value().trim().to_string(),
             }
         } else {
             OpenDialogOutcome::Continue
@@ -177,49 +175,20 @@ impl OpenDialog {
             // Everything below edits the field. Typing while the buttons have
             // focus returns to the field and inserts, so a user who tabbed too
             // far and kept typing does not lose the characters.
-            KeyCode::Char(c) => {
-                self.focus = OpenFocus::Field;
-                let at = self.byte_index();
-                self.command.insert(at, c);
-                self.cursor += 1;
-                OpenDialogOutcome::Continue
-            }
-            KeyCode::Backspace => {
-                self.focus = OpenFocus::Field;
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = self.byte_index();
-                    self.command.remove(at);
+            // Everything below edits the field. A key that types or deletes
+            // returns focus to the field first, so a user who tabbed too far
+            // and kept typing does not lose the characters; a bare motion does
+            // not steal focus back.
+            _ => {
+                let edits = !matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+                );
+                if self.command.handle_key(key) && edits {
+                    self.focus = OpenFocus::Field;
                 }
                 OpenDialogOutcome::Continue
             }
-            KeyCode::Delete => {
-                self.focus = OpenFocus::Field;
-                let at = self.byte_index();
-                if at < self.command.len() {
-                    self.command.remove(at);
-                }
-                OpenDialogOutcome::Continue
-            }
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                OpenDialogOutcome::Continue
-            }
-            KeyCode::Right => {
-                if self.cursor < self.command.chars().count() {
-                    self.cursor += 1;
-                }
-                OpenDialogOutcome::Continue
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                OpenDialogOutcome::Continue
-            }
-            KeyCode::End => {
-                self.cursor = self.command.chars().count();
-                OpenDialogOutcome::Continue
-            }
-            _ => OpenDialogOutcome::Continue,
         }
     }
 
@@ -250,14 +219,6 @@ impl OpenDialog {
     ///
     /// Paths get pasted in here and they carry multibyte characters; indexing by
     /// the char cursor directly would panic mid-codepoint.
-    fn byte_index(&self) -> usize {
-        self.command
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.command.len())
-    }
-
     /// Answer a click at `(x, y)`.
     ///
     /// A click on a button is that button's decision, the same one Enter makes
@@ -330,20 +291,16 @@ impl OpenDialog {
                 dim
             },
         )));
-        let shown = if field_focused {
-            let cut = self.byte_index();
-            format!("  {}█{}", &self.command[..cut], &self.command[cut..])
+        // Two columns of indent, then the field. The cursor is a styled cell,
+        // not a character spliced into the text — see `TextField`.
+        let field_style = if field_focused {
+            normal.add_modifier(Modifier::BOLD)
         } else {
-            format!("  {}", self.command)
+            normal
         };
-        lines.push(Line::from(Span::styled(
-            pad_to(&shown, inner),
-            if field_focused {
-                normal.add_modifier(Modifier::BOLD)
-            } else {
-                normal
-            },
-        )));
+        let mut field_spans = vec![Span::styled("  ".to_string(), field_style)];
+        field_spans.extend(self.command.spans(inner.saturating_sub(2), field_style, field_focused));
+        lines.push(Line::from(field_spans));
 
         lines.push(Line::from(Span::styled(String::new(), normal)));
         lines.push(Line::from(Span::styled(
@@ -420,15 +377,6 @@ fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-fn pad_to(s: &str, width: usize) -> String {
-    let len = s.chars().count();
-    if len >= width {
-        return s.chars().take(width).collect();
-    }
-    let mut out = s.to_string();
-    out.extend(std::iter::repeat_n(' ', width - len));
-    out
-}
 
 fn centered(inner: Rect, outer: Rect) -> Rect {
     let x = outer.x + outer.width.saturating_sub(inner.width) / 2;

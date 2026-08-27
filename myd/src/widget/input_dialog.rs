@@ -1,3 +1,4 @@
+use crate::widget::text_field::TextField;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -11,9 +12,10 @@ pub struct InputDialog {
     pub title: &'static str,
     pub message: String,
     pub placeholder: String,
-    pub value: String,
-    /// Cursor position in the input value.
-    cursor: usize,
+    /// The edited text and its cursor. `TextField` carries the readline
+    /// bindings; this dialog keeps its own rendering, which scrolls with
+    /// ellipsis markers and can mask the value.
+    field: TextField,
     /// When set, the entered text is rendered as dots — for passphrases and
     /// passwords, which must not appear on screen.
     masked: bool,
@@ -25,8 +27,7 @@ impl InputDialog {
             title: "Input",
             message: message.into(),
             placeholder: placeholder.into(),
-            value: String::new(),
-            cursor: 0,
+            field: TextField::new(),
             masked: false,
         }
     }
@@ -43,18 +44,13 @@ impl InputDialog {
     }
 
     pub fn with_default(mut self, default: impl Into<String>) -> Self {
-        self.value = default.into();
-        self.cursor = self.value.chars().count();
+        self.field = TextField::with_value(default.into());
         self
     }
 
-    /// Byte offset of char index `n` in `value`, for slicing on a boundary.
-    fn byte_at(&self, n: usize) -> usize {
-        self.value
-            .char_indices()
-            .nth(n)
-            .map(|(i, _)| i)
-            .unwrap_or(self.value.len())
+    /// The text entered so far.
+    pub fn value(&self) -> &str {
+        self.field.value()
     }
 
     /// Handle key input. Returns `Some(value)` on submit, `None` if still editing.
@@ -62,50 +58,13 @@ impl InputDialog {
         use crossterm::event::KeyCode;
         match key.code {
             KeyCode::Esc => Some(String::new()), // Cancel.
-            KeyCode::Enter => Some(self.value.clone()),
-            KeyCode::Char(c) => {
-                self.insert_char(c);
+            KeyCode::Enter => Some(self.field.value().to_string()),
+            // Everything else is line editing. `TextField` declines Enter, Esc
+            // and Tab, so the two arms above keep their meaning.
+            _ => {
+                self.field.handle_key(key);
                 None
             }
-            KeyCode::Backspace => {
-                self.backspace();
-                None
-            }
-            KeyCode::Left => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
-                None
-            }
-            KeyCode::Right => {
-                if self.cursor < self.value.chars().count() {
-                    self.cursor += 1;
-                }
-                None
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                None
-            }
-            KeyCode::End => {
-                self.cursor = self.value.chars().count();
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn insert_char(&mut self, c: char) {
-        let at = self.byte_at(self.cursor);
-        self.value.insert(at, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let at = self.byte_at(self.cursor);
-            self.value.remove(at);
         }
     }
 
@@ -138,13 +97,13 @@ impl InputDialog {
         // stores it as cells — so it drew as visible "[4m" text *and* ate eight
         // columns of the line's width, leaving that much of the row beyond it
         // unpainted and the tree underneath showing through.
-        let showing_placeholder = self.value.is_empty() && !self.placeholder.is_empty();
+        let showing_placeholder = self.field.is_empty() && !self.placeholder.is_empty();
         let display = if showing_placeholder {
             self.placeholder.clone()
         } else if self.masked {
-            "•".repeat(self.value.chars().count())
+            "•".repeat(self.field.value().chars().count())
         } else {
-            self.value.clone()
+            self.field.value().to_string()
         };
         // Underlined and dim, so it still reads as a hint rather than as text
         // that has been typed.
@@ -165,7 +124,7 @@ impl InputDialog {
         let chars: Vec<char> = display.chars().collect();
         // One column is reserved for the cursor block.
         let window = inner_width.saturating_sub(1).max(1);
-        let cursor = self.cursor.min(chars.len());
+        let cursor = self.field.cursor().min(chars.len());
         let input_line = if showing_placeholder || chars.len() <= window {
             // The cursor sits at the start of a placeholder: nothing is typed
             // yet, so it must not appear to sit after the hint text.

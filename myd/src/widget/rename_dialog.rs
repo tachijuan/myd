@@ -9,6 +9,7 @@
 //! regex that does what you meant, and a rename batch is not something you want
 //! to discover was wrong afterwards.
 
+use crate::widget::text_field::TextField;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -54,10 +55,8 @@ pub enum Preview {
 
 /// An open patterned-rename dialog.
 pub struct RenameDialog {
-    pattern: String,
-    replacement: String,
-    /// Cursor within whichever field has the focus, in chars.
-    cursor: usize,
+    pattern: TextField,
+    replacement: TextField,
     focus: Field,
     /// The name previewed against — the first tagged file.
     sample: String,
@@ -72,9 +71,8 @@ impl RenameDialog {
     /// Build a dialog previewing against `sample`, one of `count` tagged files.
     pub fn new(sample: impl Into<String>, count: usize) -> Self {
         let mut d = Self {
-            pattern: String::new(),
-            replacement: String::new(),
-            cursor: 0,
+            pattern: TextField::new(),
+            replacement: TextField::new(),
             focus: Field::Pattern,
             sample: sample.into(),
             count,
@@ -86,11 +84,11 @@ impl RenameDialog {
     }
 
     pub fn pattern(&self) -> &str {
-        &self.pattern
+        self.pattern.value()
     }
 
     pub fn replacement(&self) -> &str {
-        &self.replacement
+        self.replacement.value()
     }
 
     pub fn focus(&self) -> Field {
@@ -116,7 +114,7 @@ impl RenameDialog {
             self.preview = Preview::Empty;
             return;
         }
-        self.preview = match regex::Regex::new(&self.pattern) {
+        self.preview = match regex::Regex::new(self.pattern.value()) {
             // The message is reported as-is: regex's own errors name the
             // position and the construct, which is more use than "invalid
             // pattern" would be.
@@ -125,20 +123,13 @@ impl RenameDialog {
                 if !re.is_match(&self.sample) {
                     Preview::NoMatch
                 } else {
-                    Preview::Renamed(re.replace_all(&self.sample, &self.replacement).into_owned())
+                    Preview::Renamed(re.replace_all(&self.sample, self.replacement.value()).into_owned())
                 }
             }
         }
     }
 
-    fn active(&self) -> &String {
-        match self.focus {
-            Field::Pattern => &self.pattern,
-            Field::Replacement => &self.replacement,
-        }
-    }
-
-    fn active_mut(&mut self) -> &mut String {
+    fn active_mut(&mut self) -> &mut TextField {
         match self.focus {
             Field::Pattern => &mut self.pattern,
             Field::Replacement => &mut self.replacement,
@@ -148,7 +139,7 @@ impl RenameDialog {
     /// Move the focus to `field`, putting the cursor at the end of its text.
     fn focus_field(&mut self, field: Field) {
         self.focus = field;
-        self.cursor = self.active().chars().count();
+        // The field keeps its own cursor, so focus does not move it.
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> RenameDialogOutcome {
@@ -179,69 +170,24 @@ impl RenameDialog {
                 // dialog back, so the patterns can be fixed rather than retyped.
                 if self.is_applicable() {
                     RenameDialogOutcome::Apply {
-                        pattern: self.pattern.clone(),
-                        replacement: self.replacement.clone(),
+                        pattern: self.pattern.value().to_string(),
+                        replacement: self.replacement.value().to_string(),
                     }
                 } else {
                     RenameDialogOutcome::Continue
                 }
             }
-            KeyCode::Char(c) => {
-                let at = self.byte_index();
-                self.active_mut().insert(at, c);
-                self.cursor += 1;
-                self.recompute();
-                RenameDialogOutcome::Continue
-            }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = self.byte_index();
-                    self.active_mut().remove(at);
+            // Everything else is line editing: the field answers to the
+            // readline bindings and reports whether it took the key. Enter,
+            // Esc and Tab are handled above and `TextField` declines them, so
+            // the dialog's own contract is unchanged.
+            _ => {
+                if self.active_mut().handle_key(key) {
                     self.recompute();
                 }
                 RenameDialogOutcome::Continue
             }
-            KeyCode::Delete => {
-                let at = self.byte_index();
-                if at < self.active().len() {
-                    self.active_mut().remove(at);
-                    self.recompute();
-                }
-                RenameDialogOutcome::Continue
-            }
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                RenameDialogOutcome::Continue
-            }
-            KeyCode::Right => {
-                if self.cursor < self.active().chars().count() {
-                    self.cursor += 1;
-                }
-                RenameDialogOutcome::Continue
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                RenameDialogOutcome::Continue
-            }
-            KeyCode::End => {
-                self.cursor = self.active().chars().count();
-                RenameDialogOutcome::Continue
-            }
-            _ => RenameDialogOutcome::Continue,
         }
-    }
-
-    /// The cursor's byte offset in the focused field.
-    ///
-    /// The fields hold a regex, which people paste with multibyte characters in
-    /// it; indexing by the char cursor directly would panic mid-codepoint.
-    fn byte_index(&self) -> usize {
-        let s = self.active();
-        s.char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len())
     }
 
     /// Focus whichever field was clicked. Clicks elsewhere do nothing: this is
@@ -310,25 +256,18 @@ impl RenameDialog {
                     dim
                 },
             )));
-            let shown = if focused {
-                let cut = value
-                    .char_indices()
-                    .nth(self.cursor)
-                    .map(|(b, _)| b)
-                    .unwrap_or(value.len());
-                format!("  {}█{}", &value[..cut], &value[cut..])
-            } else {
-                format!("  {}", value)
-            };
             // Row index within the box: border + title + blank + (2 rows per
             // field) + 1 for the value row.
             let row = center.y + 1 + 2 + (i as u16 * 2) + 1;
             self.field_areas
                 .push(Rect::new(center.x + 1, row, width.saturating_sub(2), 1));
-            lines.push(Line::from(Span::styled(
-                pad_to(&shown, inner),
-                if focused { normal.add_modifier(Modifier::BOLD) } else { normal },
-            )));
+            // Two columns of indent, then the field. The cursor is a styled
+            // cell rather than a character spliced into the text, so moving it
+            // does not shift what is to its right — see `TextField`.
+            let style = if focused { normal.add_modifier(Modifier::BOLD) } else { normal };
+            let mut spans = vec![Span::styled("  ".to_string(), style)];
+            spans.extend(value.spans(inner.saturating_sub(2), style, focused));
+            lines.push(Line::from(spans));
         }
 
         lines.push(Line::from(Span::styled(String::new(), normal)));

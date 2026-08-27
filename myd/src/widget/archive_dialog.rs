@@ -11,6 +11,7 @@
 //! group that answers a single question in four Tabs. Inside it the arrows
 //! move, which is what an arrow does on a list.
 
+use crate::widget::text_field::TextField;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -48,9 +49,8 @@ pub enum ArchiveButton {
 }
 
 pub struct ArchiveDialog {
-    name: String,
-    /// Char index within `name`, converted to bytes by [`Self::byte_index`].
-    cursor: usize,
+    name: TextField,
+
     focus: ArchiveFocus,
     /// Index into [`WriteFormat::ALL`].
     format: usize,
@@ -101,11 +101,11 @@ impl ArchiveDialog {
                     .map(|n| n.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "archive".to_string());
-        let name = with_extension_for(&stem, default_format);
-        let cursor = name.chars().count();
+        // Cursor at the end: the name is a suggestion to adjust, and the usual
+        // adjustment is to the tail.
+        let name = TextField::with_value(with_extension_for(&stem, default_format));
         Self {
             name,
-            cursor,
             focus: ArchiveFocus::Field,
             format,
             button: 0,
@@ -118,7 +118,7 @@ impl ArchiveDialog {
     }
 
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.value()
     }
 
     pub fn format(&self) -> WriteFormat {
@@ -152,13 +152,13 @@ impl ArchiveDialog {
     /// Enter on it keeps the dialog rather than closing it having silently done
     /// nothing.
     fn is_creatable(&self) -> bool {
-        !self.name.trim().is_empty()
+        !self.name.value().trim().is_empty()
     }
 
     fn create_outcome(&self) -> ArchiveDialogOutcome {
         if self.is_creatable() {
             ArchiveDialogOutcome::Create {
-                name: self.name.trim().to_string(),
+                name: self.name.value().trim().to_string(),
                 format: self.format(),
             }
         } else {
@@ -181,8 +181,8 @@ impl ArchiveDialog {
         }
         self.format = index;
         if !self.name_touched {
-            self.name = with_extension_for(&self.name, self.format());
-            self.cursor = self.name.chars().count();
+            let updated = with_extension_for(self.name.value(), self.format());
+            self.name.set_value(updated);
         }
     }
 
@@ -289,52 +289,30 @@ impl ArchiveDialog {
             // Everything below edits the name. Typing while something else has
             // focus returns to the field and inserts, so a user who tabbed too
             // far and kept typing does not lose the characters.
-            KeyCode::Char(c) => {
-                self.focus = ArchiveFocus::Field;
-                self.name_touched = true;
-                let at = self.byte_index();
-                self.name.insert(at, c);
-                self.cursor += 1;
-                ArchiveDialogOutcome::Continue
-            }
-            KeyCode::Backspace => {
-                self.focus = ArchiveFocus::Field;
-                self.name_touched = true;
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = self.byte_index();
-                    self.name.remove(at);
+            // Everything below edits the name. A key that types or deletes
+            // returns focus to the field first, so a user who tabbed too far
+            // and kept typing does not lose the characters; a bare motion does
+            // not steal focus back.
+            _ => {
+                let edits = !matches!(
+                    key.code,
+                    KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                );
+                if self.name.handle_key(key) {
+                    if edits {
+                        self.focus = ArchiveFocus::Field;
+                        // The name is the user's from here: the format radio
+                        // stops rewriting the extension. See `name_touched`.
+                        self.name_touched = true;
+                    }
+                    ArchiveDialogOutcome::Continue
+                } else {
+                    ArchiveDialogOutcome::Continue
                 }
-                ArchiveDialogOutcome::Continue
             }
-            KeyCode::Delete => {
-                self.focus = ArchiveFocus::Field;
-                self.name_touched = true;
-                let at = self.byte_index();
-                if at < self.name.len() {
-                    self.name.remove(at);
-                }
-                ArchiveDialogOutcome::Continue
-            }
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                ArchiveDialogOutcome::Continue
-            }
-            KeyCode::Right => {
-                if self.cursor < self.name.chars().count() {
-                    self.cursor += 1;
-                }
-                ArchiveDialogOutcome::Continue
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                ArchiveDialogOutcome::Continue
-            }
-            KeyCode::End => {
-                self.cursor = self.name.chars().count();
-                ArchiveDialogOutcome::Continue
-            }
-            _ => ArchiveDialogOutcome::Continue,
         }
     }
 
@@ -377,14 +355,6 @@ impl ArchiveDialog {
     ///
     /// A file name can carry multibyte characters; indexing by the char cursor
     /// directly would panic mid-codepoint.
-    fn byte_index(&self) -> usize {
-        self.name
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.name.len())
-    }
-
     /// Answer a click at `(x, y)`.
     ///
     /// A click on a button is that button's decision. A click on a format row
@@ -473,20 +443,16 @@ impl ArchiveDialog {
                 dim
             },
         )));
-        let shown = if field_focused {
-            let cut = self.byte_index();
-            format!("  {}█{}", &self.name[..cut], &self.name[cut..])
+        // Two columns of indent, then the field. The cursor is a styled cell,
+        // not a character spliced into the name — see `TextField`.
+        let style = if field_focused {
+            normal.add_modifier(Modifier::BOLD)
         } else {
-            format!("  {}", self.name)
+            normal
         };
-        lines.push(Line::from(Span::styled(
-            pad_to(&shown, inner),
-            if field_focused {
-                normal.add_modifier(Modifier::BOLD)
-            } else {
-                normal
-            },
-        )));
+        let mut name_spans = vec![Span::styled("  ".to_string(), style)];
+        name_spans.extend(self.name.spans(inner.saturating_sub(2), style, field_focused));
+        lines.push(Line::from(name_spans));
 
         lines.push(Line::from(Span::styled(String::new(), normal)));
         let group_focused = self.focus == ArchiveFocus::Format;

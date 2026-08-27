@@ -7422,12 +7422,24 @@ async fn help_scrolls_to_reach_the_transfer_keys() {
         "the transfer keys should be below the fold on a 24-row terminal"
     );
 
-    // G jumps to the bottom, where the transfer keys live.
-    app.handle_key_for_test(char_key('G'));
-    let bottom = help_text(&mut app, 80, 24);
+    // Scrolling reaches them. Not `G`: the transfer keys are not the last
+    // section — Mouse, Exit and Dialogs follow — so jumping to the bottom
+    // scrolls straight past them. This walks down until they appear, which is
+    // what the test is really about and does not break when a section is added
+    // above or below.
+    let mut bottom = String::new();
+    let mut found = false;
+    for _ in 0..200 {
+        app.handle_key_for_test(char_key('j'));
+        bottom = help_text(&mut app, 80, 24);
+        if bottom.contains("Cancel the selected transfer") {
+            found = true;
+            break;
+        }
+    }
     assert!(
-        bottom.contains("Cancel the selected transfer"),
-        "scrolling to the bottom must reveal how to cancel a transfer:\n{}",
+        found,
+        "scrolling must reveal how to cancel a transfer:\n{}",
         bottom
     );
     assert!(app.is_help_open(), "scrolling must not dismiss the overlay");
@@ -19037,6 +19049,74 @@ async fn the_help_screen_hides_the_inline_image() {
     assert!(
         app.preview_graphics_stamp_for_test().is_none(),
         "the help screen must not have an image floating over it"
+    );
+}
+
+/// The readline bindings reach the rename dialog through the real key path.
+///
+/// The unit tests cover `TextField` directly; this proves the app routes a
+/// Ctrl chord into the field rather than swallowing it or treating it as a
+/// global binding. `R` opens the rename dialog pre-filled with the current
+/// name, which is exactly the case the report was about.
+#[tokio::test]
+async fn readline_editing_works_in_the_rename_dialog() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("report-draft.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "report-draft.txt");
+    app.handle_key_for_test(char_key('R'));
+    let _ = screen_text(&mut app, 120, 40);
+
+    // C-a to the start, C-d to drop the first character. Before this, C-a typed
+    // a literal "a" into the name and C-d typed a "d".
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    app.handle_key_for_test(key(KeyCode::Enter));
+    settle(&mut app).await;
+
+    assert!(
+        dir.path().join("eport-draft.txt").exists(),
+        "C-a then C-d should have removed the leading character; dir holds {:?}",
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !dir.path().join("report-draft.txt").exists(),
+        "the original name should be gone"
+    );
+}
+
+/// A Ctrl chord in a dialog must not fire the global binding of that letter.
+///
+/// `d` is not a global binding but `D` (delete) is, and `u`/`f`/`w` all mean
+/// something in the tree. A dialog owns the keyboard while it is up.
+#[tokio::test]
+async fn a_control_chord_in_a_dialog_does_not_reach_the_tree() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "keep.txt");
+    app.handle_key_for_test(char_key('R'));
+    let _ = screen_text(&mut app, 120, 40);
+
+    // C-u clears the line in the field. It must not reach the tree.
+    app.handle_key_for_test(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.handle_key_for_test(key(KeyCode::Esc));
+    settle(&mut app).await;
+
+    assert!(
+        dir.path().join("keep.txt").exists(),
+        "the file must still be there after an edit that was cancelled"
     );
 }
 

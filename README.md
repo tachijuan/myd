@@ -221,6 +221,8 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 
 Tagged files are highlighted; `c`, `m`, `D` and `gr` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
 
+**Editing text fields.** Every dialog that takes typed input — rename, filter, search, new directory, open-with, the attribute editor, the archive name — accepts the readline keys you already use at a shell prompt: `Ctrl+A`/`Ctrl+E` for start and end, `Ctrl+B`/`Ctrl+F` by character, `Alt+B`/`Alt+F` by word, `Ctrl+W` to kill the previous word, `Ctrl+U` the line, `Ctrl+K` to the end, and `Ctrl+D` to delete forward. `Tab` moves focus and never accepts.
+
 `t` works in both views, and the two share a single set of tags — switching with `v` never changes what is staged. `V` is the exception: a visual range is a span of consecutive rows, and the treemap's tiles have no such order, so it applies in the tree view only and says so if pressed in the treemap.
 
 ### Search & Filter

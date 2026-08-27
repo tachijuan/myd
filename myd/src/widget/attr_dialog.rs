@@ -9,6 +9,7 @@
 //! target is a directory. It is a third focus stop rather than a separate key,
 //! so nothing about it has to be remembered.
 
+use crate::widget::text_field::TextField;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -47,9 +48,7 @@ pub enum AttrButton {
 
 pub struct AttrDialog {
     field: AttrField,
-    value: String,
-    /// Char index within `value`, converted to bytes by [`Self::byte_index`].
-    cursor: usize,
+    value: TextField,
     focus: AttrFocus,
     /// Index into [`Self::buttons`].
     button: usize,
@@ -76,8 +75,7 @@ impl AttrDialog {
     pub fn new(field: AttrField, targets: Vec<PathBuf>, allow_recursive: bool) -> Self {
         Self {
             field,
-            value: String::new(),
-            cursor: 0,
+            value: TextField::new(),
             focus: AttrFocus::Field,
             button: 0,
             recursive: false,
@@ -91,8 +89,8 @@ impl AttrDialog {
     /// Start with the field pre-filled with the current value, so an edit is a
     /// correction rather than a retype.
     pub fn with_value(mut self, value: impl Into<String>) -> Self {
-        self.value = value.into();
-        self.cursor = self.value.chars().count();
+        self.value = TextField::with_value(value);
+        // The field keeps its own cursor.
         self
     }
 
@@ -101,7 +99,7 @@ impl AttrDialog {
     }
 
     pub fn value(&self) -> &str {
-        &self.value
+        self.value.value()
     }
 
     pub fn targets(&self) -> &[PathBuf] {
@@ -142,13 +140,13 @@ impl AttrDialog {
     /// Enter on it should keep the dialog rather than close it having silently
     /// done nothing.
     fn is_applicable(&self) -> bool {
-        !self.value.trim().is_empty()
+        !self.value.value().trim().is_empty()
     }
 
     fn apply_outcome(&self) -> AttrDialogOutcome {
         if self.is_applicable() {
             AttrDialogOutcome::Apply {
-                value: self.value.trim().to_string(),
+                value: self.value.value().trim().to_string(),
                 recursive: self.recursive && self.allow_recursive,
             }
         } else {
@@ -228,49 +226,20 @@ impl AttrDialog {
             // Everything below edits the field. Typing while something else has
             // focus returns to the field and inserts, so a user who tabbed too
             // far and kept typing does not lose the characters.
-            KeyCode::Char(c) => {
-                self.focus = AttrFocus::Field;
-                let at = self.byte_index();
-                self.value.insert(at, c);
-                self.cursor += 1;
-                AttrDialogOutcome::Continue
-            }
-            KeyCode::Backspace => {
-                self.focus = AttrFocus::Field;
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = self.byte_index();
-                    self.value.remove(at);
+            // Everything below edits the field. A key that types or deletes
+            // returns focus to the field first, so a user who tabbed too far
+            // and kept typing does not lose the characters; a bare motion does
+            // not steal focus back.
+            _ => {
+                let edits = !matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+                );
+                if self.value.handle_key(key) && edits {
+                    self.focus = AttrFocus::Field;
                 }
                 AttrDialogOutcome::Continue
             }
-            KeyCode::Delete => {
-                self.focus = AttrFocus::Field;
-                let at = self.byte_index();
-                if at < self.value.len() {
-                    self.value.remove(at);
-                }
-                AttrDialogOutcome::Continue
-            }
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                AttrDialogOutcome::Continue
-            }
-            KeyCode::Right => {
-                if self.cursor < self.value.chars().count() {
-                    self.cursor += 1;
-                }
-                AttrDialogOutcome::Continue
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                AttrDialogOutcome::Continue
-            }
-            KeyCode::End => {
-                self.cursor = self.value.chars().count();
-                AttrDialogOutcome::Continue
-            }
-            _ => AttrDialogOutcome::Continue,
         }
     }
 
@@ -318,14 +287,6 @@ impl AttrDialog {
     ///
     /// A user name can carry multibyte characters; indexing by the char cursor
     /// directly would panic mid-codepoint.
-    fn byte_index(&self) -> usize {
-        self.value
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.value.len())
-    }
-
     /// Answer a click at `(x, y)`.
     ///
     /// A click on a button is that button's decision. A click on the checkbox
@@ -421,20 +382,16 @@ impl AttrDialog {
                 dim
             },
         )));
-        let shown = if field_focused {
-            let cut = self.byte_index();
-            format!("  {}█{}", &self.value[..cut], &self.value[cut..])
+        // Two columns of indent, then the field. The cursor is a styled cell,
+        // not a character spliced into the text — see `TextField`.
+        let field_style = if field_focused {
+            normal.add_modifier(Modifier::BOLD)
         } else {
-            format!("  {}", self.value)
+            normal
         };
-        lines.push(Line::from(Span::styled(
-            pad_to(&shown, inner),
-            if field_focused {
-                normal.add_modifier(Modifier::BOLD)
-            } else {
-                normal
-            },
-        )));
+        let mut field_spans = vec![Span::styled("  ".to_string(), field_style)];
+        field_spans.extend(self.value.spans(inner.saturating_sub(2), field_style, field_focused));
+        lines.push(Line::from(field_spans));
 
         lines.push(Line::from(Span::styled(String::new(), normal)));
         lines.push(Line::from(Span::styled(
@@ -803,7 +760,7 @@ mod tests {
         let d = AttrDialog::new(AttrField::Perms, one_file(), false).with_value("rw-r--r--");
         assert_eq!(d.value(), "rw-r--r--");
         // The cursor sits at the end, so typing appends rather than prepends.
-        assert_eq!(d.cursor, 9);
+        assert_eq!(d.value.cursor(), 9);
     }
 
     fn render_to(d: &mut AttrDialog, w: u16, h: u16) -> String {

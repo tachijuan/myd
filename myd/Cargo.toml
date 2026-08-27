@@ -1,6 +1,6 @@
 [package]
 name = "myd"
-version = "1.1.4"
+version = "1.2.0"
 edition = "2021"
 authors = ["Juan Orlandini <tachijuan@gmail.com>"]
 description = "A terminal file browser with size bars, a treemap, previews, archives and SFTP"
@@ -85,6 +85,25 @@ zstd = "0.13"
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["bzip2", "ppmd", "util", "aes256", "deflate", "zstd", "compress"] }
 rars = "0.4"
 memmap2 = "0.9.11"
+# Line editing for the text fields: the readline bindings people expect from a
+# shell prompt (C-a, C-e, C-w, C-u, C-k, alt-b/f/d, word-wise C-arrows), plus
+# the width-aware cursor and scroll arithmetic that keeps a long name usable in
+# a narrow box.
+#
+# Pinned to 0.13.0 deliberately. 0.14+ require crossterm 0.29 and ratatui 0.30,
+# which would compile a *second* copy of each alongside the ones myd uses — and
+# a `KeyEvent` from the other crossterm is a different type, so the event loop's
+# keys would not even typecheck against it. 0.13.0 resolves against crossterm
+# 0.28.1, the version already in the tree, and adds exactly one package.
+#
+# Only the `crossterm` feature: the ratatui backends are what pull the newer
+# ratatui in, and myd does its own rendering anyway. Ctrl-D is not in the
+# crate's key map (it stops at `Delete`); `text_field` adds it.
+tui-input = { version = "0.13.0", default-features = false, features = ["crossterm"] }
+# Already in the tree via ratatui and tui-input; named here because
+# `text_field` measures cursor columns with it directly, and a dependency used
+# in this crate's own code should be declared by it rather than borrowed.
+unicode-width = "0.1.14"
 
 [dev-dependencies]
 tempfile = "3"
