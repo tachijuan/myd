@@ -1607,6 +1607,19 @@ impl FileBrowser {
         self.refresh_open_presets();
     }
 
+    /// Whether the active panel's tree is in shallow mode, for tests.
+    pub fn active_tree_is_shallow_for_test(&self) -> bool {
+        matches!(
+            self.active_panel().current_screen(),
+            Screen::Main(state) if state.tree.is_shallow()
+        )
+    }
+
+    /// Refresh the active panel, as running a program does on the way back.
+    pub fn refresh_active_for_test(&mut self) {
+        self.active_panel_mut().current_screen_mut().refresh();
+    }
+
     /// Set the pending-repaint flag, for tests.
     ///
     /// Stands in for the region erase that only the cell-erasing protocols

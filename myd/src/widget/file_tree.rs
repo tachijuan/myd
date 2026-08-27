@@ -620,6 +620,33 @@ impl FileTree {
             .expect("uncancelled build always yields a tree")
     }
 
+    /// As [`Self::with_cache`], keeping an existing source.
+    ///
+    /// The source is what carries shallow mode and which backend the tree is
+    /// on, and neither can be recovered from a path. Rebuilding without it
+    /// turned a `myd -s` tree back into a measuring one, so anything that
+    /// refreshed silently left the mode the user had chosen.
+    pub fn with_source_and_cache(
+        source: Source,
+        path: PathBuf,
+        sort_mode: SortMode,
+        show_hidden: bool,
+        show_size_bar: bool,
+        cache: SizeCache,
+    ) -> Self {
+        Self::build_with_source(
+            source,
+            path,
+            sort_mode,
+            show_hidden,
+            show_size_bar,
+            cache,
+            None,
+            None,
+        )
+        .expect("uncancelled build always yields a tree")
+    }
+
     /// Build a tree, aborting the initial size scan if `cancel` is tripped.
     ///
     /// Returns `None` if the scan was cancelled before it finished, so the

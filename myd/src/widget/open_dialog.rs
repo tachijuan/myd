@@ -689,7 +689,21 @@ impl OpenDialog {
                         // promotion at the top of the list has a visible reason
                         // rather than looking like an arbitrary order.
                         let claim = if p.matches_target { "• " } else { "  " };
-                        let text = pad_to(&format!("{marker}{claim}{}", p.label), col);
+                        // The command, not the label. The label is only the
+                        // command's first word, so showing it alone hid every
+                        // argument — a saved `open -a VLC.app` read as plain
+                        // `open`, which is a different program entirely.
+                        //
+                        // A label the user renamed by hand is worth showing
+                        // too, since it is then not derivable from the command;
+                        // an auto-derived one would only repeat the first word.
+                        let derived = default_label(&p.command);
+                        let shown = if p.label == derived {
+                            p.command.clone()
+                        } else {
+                            format!("{}  ({})", p.command, p.label)
+                        };
+                        let text = pad_to(&format!("{marker}{claim}{shown}"), col);
                         let style = if selected && list_focused {
                             normal.add_modifier(Modifier::REVERSED)
                         } else if selected {
@@ -1124,6 +1138,39 @@ mod tests {
         );
         assert_eq!(d.selected_preset().map(|p| p.label.as_str()), Some("code"));
         assert_eq!(d.command(), "code -w", "and shows what was clicked");
+    }
+
+    /// The list shows the command, arguments and all.
+    ///
+    /// It used to show only the label, which is the command's *first word* —
+    /// so a saved `open -a VLC.app` was listed as plain `open`, a different
+    /// program. The entry ran correctly; it just described itself wrongly,
+    /// which is worse than not listing it.
+    #[test]
+    fn the_list_shows_the_whole_command_not_just_its_first_word() {
+        let mut d = OpenDialog::new(one_file())
+            .with_presets(vec![row("open", "open -a VLC.app")]);
+        let text = render_to(&mut d, 90, 24);
+        assert!(
+            text.contains("open -a VLC.app"),
+            "the arguments must be visible:\n{text}"
+        );
+    }
+
+    /// A label the user renamed by hand is shown beside the command, since it
+    /// is then not derivable from it. An auto-derived label is not, because it
+    /// would only repeat the command's first word.
+    #[test]
+    fn a_hand_named_label_is_shown_and_a_derived_one_is_not() {
+        let mut d = OpenDialog::new(one_file())
+            .with_presets(vec![row("player", "open -a VLC.app")]);
+        let text = render_to(&mut d, 90, 24);
+        assert!(text.contains("open -a VLC.app"), "{text}");
+        assert!(text.contains("(player)"), "the chosen name is worth showing:\n{text}");
+
+        let mut d = OpenDialog::new(one_file()).with_presets(vec![row("vim", "vim")]);
+        let text = render_to(&mut d, 90, 24);
+        assert!(!text.contains("(vim)"), "a derived label is just noise:\n{text}");
     }
 
     #[test]

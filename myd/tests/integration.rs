@@ -19173,6 +19173,38 @@ async fn a_saved_app_survives_into_the_next_open_dialog() {
     );
 }
 
+/// Refreshing a shallow tree leaves it shallow.
+///
+/// `refresh` rebuilt the tree from its root, sort mode, hidden flag, size-bar
+/// flag and cache — and dropped the *source*, which is where shallow lives. So
+/// anything that refreshes turned `myd -s` back into a measuring tree, and the
+/// pane started walking directories the user had asked it not to. Running a
+/// program with `O` does exactly that on the way back, which is how it was
+/// found.
+#[tokio::test]
+async fn refreshing_a_shallow_tree_does_not_start_measuring() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("big.bin"), vec![7u8; 4096]).unwrap();
+
+    let mut app =
+        FileBrowser::new_shallow(Some(dir.path().to_path_buf()), None, false, true);
+    settle(&mut app).await;
+    assert!(
+        app.active_tree_is_shallow_for_test(),
+        "the app was started with -s"
+    );
+
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    assert!(
+        app.active_tree_is_shallow_for_test(),
+        "a refresh must not silently leave shallow mode"
+    );
+}
+
 /// A repaint asked for by anything else still happens.
 ///
 /// The fix above drops the flag when an image is written, which must not become

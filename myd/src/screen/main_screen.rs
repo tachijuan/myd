@@ -567,7 +567,12 @@ impl MainScreenState {
     /// just this one.
     pub fn refresh(&mut self) -> bool {
         self.tree.size_cache.clear();
-        self.tree = FileTree::with_cache(
+        // The source comes forward: it is what carries shallow mode and the
+        // backend, and a rebuild from the path alone silently returned a
+        // `myd -s` tree to measuring — so `r`, or coming back from a program
+        // run with `O`, started walking directories the user had excluded.
+        self.tree = FileTree::with_source_and_cache(
+            self.tree.source.clone(),
             self.root_path.clone(),
             self.tree.sort_mode,
             self.tree.show_hidden,
