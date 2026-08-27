@@ -1,4 +1,4 @@
-use crate::widget::text_field::TextField;
+use crate::widget::text_field::{display_width, TextField};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -119,51 +119,47 @@ impl InputDialog {
         // onto it that scrolls to keep the cursor visible — otherwise a long
         // path just ran past the border and the user typed blind.
         //
-        // The placeholder stands in for an empty value, so scrolling applies to
-        // real input only.
-        let chars: Vec<char> = display.chars().collect();
-        // One column is reserved for the cursor block.
-        let window = inner_width.saturating_sub(1).max(1);
-        let cursor = self.field.cursor().min(chars.len());
-        let input_line = if showing_placeholder || chars.len() <= window {
-            // The cursor sits at the start of a placeholder: nothing is typed
-            // yet, so it must not appear to sit after the hint text.
-            let split = if showing_placeholder { 0 } else { cursor };
-            let cut: String = chars[..split].iter().collect();
-            let rest: String = chars[split..].iter().collect();
+        // The cursor is a styled cell over the character it marks, never a block
+        // spliced into the string: a spliced cursor is one column wider than the
+        // text it describes, so every press of `←` shoved everything to its
+        // right sideways. That was the reported "characters slide around", and
+        // this dialog kept a copy of it after the other four were converted.
+        //
+        // Reserve a column for each ellipsis marker so the assembled line never
+        // overflows the box and wraps. Budgeting for both up front costs at most
+        // one column when only one marker is drawn, which is cheaper than a
+        // second pass to find a stable width.
+        let total: usize = display.chars().map(display_width).sum();
+        let scrolls = !showing_placeholder && total > inner_width;
+        let budget = if scrolls {
+            inner_width.saturating_sub(2).max(1)
+        } else {
+            inner_width
+        };
+
+        let input_line = if showing_placeholder {
+            // The placeholder stands in for an empty value, so the cursor sits
+            // at the start of the field: nothing is typed yet, and a cursor
+            // after the hint would read as text already entered.
             Line::from(vec![
-                Span::styled(format!("{}{}", cut, "█"), Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(rest, text_style),
+                Span::styled(
+                    " ".to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
+                Span::styled(display.clone(), text_style),
             ])
         } else {
-            // Scroll so the cursor sits inside the window, keeping as much text
-            // to its left as fits — typing at the tail of a path then shows the
-            // tail, and moving left brings earlier text back into view.
-            //
-            // Reserve a column for each ellipsis marker so the assembled line
-            // never overflows the box and wraps. Budgeting for both up front
-            // costs at most one column when only one marker ends up drawn,
-            // which is cheaper than a second pass to find a stable width.
-            let budget = window.saturating_sub(2).max(1);
-            let start = cursor
-                .saturating_sub(budget)
-                .min(chars.len().saturating_sub(budget));
-            let end = (start + budget).min(chars.len());
-            let visible = &chars[start..end];
-            let rel = cursor - start;
-            let before: String = visible[..rel.min(visible.len())].iter().collect();
-            let after: String = visible[rel.min(visible.len())..].iter().collect();
-            // Ellipsis marks text scrolled off each side.
+            let (visible, _) = self.field.visible(budget);
+            let shown: usize = visible.chars().map(display_width).sum();
+            let scrolled_left = visible.chars().count() < display.chars().count()
+                && !display.starts_with(&visible);
+            let scrolled_right = shown < total && display.starts_with(&visible);
             let mut spans = Vec::new();
-            if start > 0 {
+            if scrolled_left {
                 spans.push(Span::styled("‹", Style::default().fg(Color::DarkGray)));
             }
-            spans.push(Span::styled(
-                format!("{}{}", before, "█"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(after, text_style));
-            if end < chars.len() {
+            spans.extend(self.field.spans(budget, text_style, true));
+            if scrolled_right {
                 spans.push(Span::styled("›", Style::default().fg(Color::DarkGray)));
             }
             Line::from(spans)
@@ -258,4 +254,120 @@ fn centered(r: Rect, area: Rect) -> Rect {
         w,
         h,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn typed(d: &mut InputDialog, s: &str) {
+        for c in s.chars() {
+            d.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// Render the dialog and return the row holding the edited value.
+    fn value_row(d: &InputDialog, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| d.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        // The value row is the one carrying the typed text.
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("abcdef"))
+            .unwrap_or_default()
+    }
+
+    /// The reported bug, in the dialog the report was about.
+    ///
+    /// The cursor used to be spliced into the string as a block character, so
+    /// the rendered line was one column wider than the text and everything to
+    /// the right of the cursor shifted every time it moved. `TextField` fixed
+    /// the other four dialogs; this one kept its own render and kept the bug.
+    #[test]
+    fn moving_the_cursor_does_not_move_the_text() {
+        let mut d = InputDialog::new("Filter:", "pattern");
+        typed(&mut d, "abcdef");
+        let at_end = value_row(&d, 80, 12);
+        for step in 1..=5 {
+            d.handle_key(key(KeyCode::Left));
+            let now = value_row(&d, 80, 12);
+            assert_eq!(
+                now.trim_end(),
+                at_end.trim_end(),
+                "the text moved after {step} left presses:\n{now}\n{at_end}"
+            );
+        }
+    }
+
+    /// And the same for a value long enough to scroll, which is a second
+    /// rendering path with its own copy of the splice.
+    #[test]
+    fn moving_the_cursor_in_a_scrolled_value_does_not_move_the_text() {
+        let mut d = InputDialog::new("Filter:", "pattern");
+        typed(&mut d, "abcdef-and-then-a-great-deal-more-text-than-fits-in-the-box");
+        // A narrow box, so the value is longer than the window.
+        let render = |d: &InputDialog| -> String {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 12)).unwrap();
+            term.draw(|f| d.render(f, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..12)
+                .map(|y| (0..64).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .find(|l| l.contains("text") || l.contains("more"))
+                .unwrap_or_default()
+        };
+        let start = render(&d);
+        for _ in 0..3 {
+            d.handle_key(key(KeyCode::Left));
+        }
+        let moved = render(&d);
+        assert_eq!(
+            start.chars().filter(|c| !c.is_whitespace()).count(),
+            moved.chars().filter(|c| !c.is_whitespace()).count(),
+            "the visible width changed when the cursor moved:\n{start}\n{moved}"
+        );
+    }
+
+    /// The placeholder is a hint, not text: the cursor belongs at the start of
+    /// the field rather than after the hint.
+    #[test]
+    fn the_placeholder_keeps_the_cursor_at_the_start() {
+        let d = InputDialog::new("Filter:", "pattern");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| d.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let line = (0..12)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .find(|l| l.contains("pattern"))
+            .expect("the placeholder should be shown");
+        let hint = line.find("pattern").unwrap();
+        // Whatever marks the cursor sits before the hint, never after it.
+        assert!(
+            line[..hint].contains(' '),
+            "the cursor must not sit after the placeholder: {line:?}"
+        );
+    }
+
+    /// Readline editing reaches this dialog too.
+    #[test]
+    fn the_shell_editing_keys_work_here() {
+        let mut d = InputDialog::new("Filter:", "pattern");
+        typed(&mut d, "hello world");
+        d.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(d.value(), "hello ");
+        d.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(d.value(), "");
+    }
 }

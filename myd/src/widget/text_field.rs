@@ -172,6 +172,15 @@ impl TextField {
 }
 
 /// Display columns for one character, treating an unknown width as one.
+///
+/// Public because the dialogs budget their own decorations — an ellipsis
+/// marker, a leading indent — against the same measure the field uses, and two
+/// definitions of "how wide is this" would disagree on a CJK name.
+pub fn display_width(c: char) -> usize {
+    unicode_width_of(c)
+}
+
+/// Display columns for one character, treating an unknown width as one.
 fn unicode_width_of(c: char) -> usize {
     unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
 }
