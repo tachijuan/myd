@@ -567,9 +567,10 @@ impl MainScreenState {
     /// just this one.
     pub fn refresh(&mut self) -> bool {
         self.tree.size_cache.clear();
-        // What a rebuild would otherwise lose. These are not derived from the
-        // directory — they are what the user has staged on top of it, and they
-        // survive a reflatten (sort, expand, filter) for exactly that reason.
+        // What a rebuild would otherwise lose: the filter, the tags and which
+        // directories are open. None is derived from the directory — they are
+        // what the user has staged on top of it, and they survive a reflatten
+        // (sort, expand, filter) for exactly that reason.
         // A refresh is a re-read of the *disk*, not a reset of the view, so
         // they come across: `r`, or coming back from a program run with `O`,
         // used to drop the filter and silently untag everything.
@@ -579,6 +580,7 @@ impl MainScreenState {
         // without it turned a `myd -s` tree back into a measuring one.
         let filter = self.tree.filter().cloned();
         let tagged = std::mem::take(&mut self.tree.tagged);
+        let expanded = self.tree.expanded_paths();
         self.tree = FileTree::with_source_and_cache(
             self.tree.source.clone(),
             self.root_path.clone(),
@@ -587,6 +589,11 @@ impl MainScreenState {
             self.tree.show_size_bar,
             self.tree.size_cache.clone(),
         );
+        // Re-open what was open. Expansion is per-node state, so a rebuilt tree
+        // starts entirely collapsed — expanding a subdirectory and then running
+        // a program with `O` came back with it shut, losing the place the user
+        // was working in. A directory that is no longer there is skipped.
+        self.tree.expand_paths(&expanded);
         // Only the tags whose files are still there. A program run with `O`
         // may well have deleted what was tagged — that is often why it was run
         // — and a tag pointing at a path that is gone would make the next `c`

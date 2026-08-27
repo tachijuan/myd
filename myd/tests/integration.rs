@@ -19315,6 +19315,98 @@ async fn a_tag_hidden_by_the_filter_survives_a_refresh() {
     );
 }
 
+/// A refresh leaves the expanded directories expanded.
+///
+/// Expansion is per-node state on the tree, and a rebuilt tree starts with
+/// everything collapsed — so expanding a subdirectory and then running a
+/// program with `O` came back with it shut, losing the place the user was
+/// working in. The fourth thing `refresh` was dropping, after shallow mode,
+/// the filter and the tags.
+#[tokio::test]
+async fn refreshing_keeps_the_expanded_directories_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("inner.txt"), vec![b'x'; 200]).unwrap();
+    std::fs::write(dir.path().join("top.txt"), vec![b'x'; 100]).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    assert!(
+        screen_text(&mut app, 120, 40).contains("inner.txt"),
+        "the subdirectory should be open before the refresh"
+    );
+
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    let after = screen_text(&mut app, 120, 40);
+    assert!(
+        after.contains("inner.txt"),
+        "a refresh must not collapse what was expanded:\n{after}"
+    );
+}
+
+/// The reported case: a filtered view with a subdirectory expanded inside it.
+///
+/// Both halves at once, and nested two deep, because the two restores have to
+/// compose: the expansion is replayed against the rebuilt tree before the
+/// filter narrows it, and a directory reached only by walking through its
+/// parent has to have that parent loaded first.
+#[tokio::test]
+async fn a_filtered_view_keeps_its_expanded_subdirectory_across_a_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("keep-sub");
+    let deep = sub.join("keep-deeper");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("keep-buried.txt"), vec![b'x'; 400]).unwrap();
+    std::fs::write(sub.join("keep-inner.txt"), vec![b'x'; 300]).unwrap();
+    std::fs::write(dir.path().join("keep-top.txt"), vec![b'x'; 200]).unwrap();
+    std::fs::write(dir.path().join("excluded.txt"), vec![b'x'; 100]).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Filter, then expand two levels inside it.
+    app.handle_key_for_test(char_key('f'));
+    for c in "keep".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "keep-sub");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "keep-deeper");
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+
+    let before = screen_text(&mut app, 120, 40);
+    assert!(before.contains("keep-buried.txt"), "two levels open:\n{before}");
+    assert!(!before.contains("excluded.txt"), "and filtered:\n{before}");
+
+    app.refresh_active_for_test();
+    settle(&mut app).await;
+
+    let after = screen_text(&mut app, 120, 40);
+    assert!(
+        after.contains("keep-inner.txt"),
+        "the subdirectory must still be open:\n{after}"
+    );
+    assert!(
+        after.contains("keep-buried.txt"),
+        "and so must the one nested inside it:\n{after}"
+    );
+    assert!(
+        !after.contains("excluded.txt"),
+        "with the filter still on:\n{after}"
+    );
+}
+
 /// Refreshing a shallow tree leaves it shallow.
 ///
 /// `refresh` rebuilt the tree from its root, sort mode, hidden flag, size-bar

@@ -1210,6 +1210,42 @@ impl FileTree {
         self.filter.as_ref()
     }
 
+    /// The resolved paths of every expanded directory.
+    ///
+    /// Keyed on the resolved path rather than a line index, for the reason the
+    /// tags are: an index means nothing across a rebuild, where the listing may
+    /// have gained or lost entries.
+    pub fn expanded_paths(&self) -> Vec<PathBuf> {
+        collect_expanded(&self.root)
+            .into_iter()
+            .map(|p| p.to_path_buf())
+            .collect()
+    }
+
+    /// Re-expand the directories named by `paths`, loading children as needed.
+    ///
+    /// Shallowest first, because expanding a nested directory means walking to
+    /// it through its parents — which have to be loaded to be walked through.
+    /// A path that is no longer there is skipped; the program that ran may have
+    /// removed it.
+    pub fn expand_paths(&mut self, paths: &[PathBuf]) {
+        let mut paths = paths.to_vec();
+        paths.sort_by_key(|p| p.components().count());
+        let source = self.source.clone();
+        let cache = self.size_cache.clone();
+        let sort_mode = self.sort_mode;
+        let show_hidden = self.show_hidden;
+        let mut any = false;
+        for path in &paths {
+            if expand_by_path(&mut self.root, &source, path, &cache, sort_mode, show_hidden) {
+                any = true;
+            }
+        }
+        if any {
+            self.reflatten();
+        }
+    }
+
     /// Clear the active filter, restoring the full view.
     pub fn clear_filter(&mut self) {
         if self.filter.is_some() {
@@ -1807,8 +1843,79 @@ fn remove_node_by_path(node: &mut TreeNode, target: &Option<PathBuf>) -> bool {
 }
 
 
+/// Expand the node at `target`, loading children along the way.
+///
+/// Returns whether anything was expanded. The walk descends only into nodes
+/// `target` actually sits under, so a wide tree costs a path comparison per
+/// level rather than a full traversal.
+fn expand_by_path(
+    node: &mut TreeNode,
+    source: &Source,
+    target: &Path,
+    cache: &SizeCache,
+    sort_mode: SortMode,
+    show_hidden: bool,
+) -> bool {
+    if node.resolved_path == target {
+        if node.is_dir {
+            node.expand(source, cache, sort_mode, show_hidden);
+            return true;
+        }
+        return false;
+    }
+    if !target.starts_with(&node.resolved_path) {
+        return false;
+    }
+    // The children have to be loaded before one of them can be descended into.
+    if node.children.is_none() {
+        node.expand(source, cache, sort_mode, show_hidden);
+        // Expanding to reach a descendant must not leave this node open when it
+        // was not: only the paths asked for are expanded.
+        node.is_expanded = false;
+    }
+    let Some(children) = node.children.as_mut() else {
+        return false;
+    };
+    for child in children.iter_mut() {
+        if expand_by_path(child, source, target, cache, sort_mode, show_hidden) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Re-expanding a nested directory must not leave its parents open.
+    ///
+    /// Reaching a child means loading the parent's children, and loading is
+    /// what `expand` does — so the walk has to shut the parent again unless it
+    /// was itself asked for. Otherwise restoring one deep expansion would open
+    /// every directory on the way down to it.
+    #[test]
+    fn expanding_a_path_does_not_open_the_parents_it_walks_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        let deep = sub.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f.txt"), "x").unwrap();
+
+        let mut tree = FileTree::new(dir.path().to_path_buf(), SortMode::Largest, false, false);
+        let deep_resolved = std::fs::canonicalize(&deep).unwrap();
+        tree.expand_paths(std::slice::from_ref(&deep_resolved));
+
+        let expanded = tree.expanded_paths();
+        assert!(
+            expanded.contains(&deep_resolved),
+            "the directory asked for is open: {expanded:?}"
+        );
+        let sub_resolved = std::fs::canonicalize(&sub).unwrap();
+        assert!(
+            !expanded.contains(&sub_resolved),
+            "the parent walked through is not: {expanded:?}"
+        );
+    }
     use super::*;
 
 
