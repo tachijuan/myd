@@ -1303,7 +1303,7 @@ impl FileBrowser {
                 let failures = failures.lock().unwrap().clone();
                 if !failures.is_empty() {
                     let detail = failures.join("; ");
-                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                         "Move failed: {}",
                         detail
                     )));
@@ -1480,7 +1480,7 @@ impl FileBrowser {
                 if result {
                     self.hosts.remove(&label);
                     if let Err(e) = self.hosts.save() {
-                        self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                        self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                             "Could not save the host list: {}",
                             e
                         )));
@@ -1847,6 +1847,25 @@ impl FileBrowser {
             Modal::Confirm(d) => Some(d.message.clone()),
             _ => None,
         }
+    }
+
+    /// What the modal's buttons offer, for tests that check a message is posed
+    /// as the right kind of thing — a report gets one `[ OK ]`, a question gets
+    /// a choice. `None` when no confirm dialog is up.
+    pub fn modal_buttons_for_test(&self) -> Option<Vec<String>> {
+        match &self.modal {
+            Modal::Confirm(d) => Some(d.button_labels()),
+            _ => None,
+        }
+    }
+
+    /// Report a failed connection through the real failure path.
+    ///
+    /// Test hook. Reaching this for real needs a host that refuses or times out,
+    /// which puts it behind the gated SFTP harness; the branch it exercises is
+    /// pure presentation and worth covering without a network.
+    pub fn fail_connect_for_test(&mut self, msg: &str) {
+        self.apply_connect_result(ConnectResult::Failed(msg.to_string()), self.active);
     }
 
     /// Which modal is up, as a stable name (for tests).
@@ -5204,7 +5223,7 @@ impl FileBrowser {
                             ModalTarget::Rename { old_path } => {
                                 if !value.is_empty() {
                                     if let Some(msg) = self.rename_path(&old_path, &value) {
-                                        self.modal = Modal::Confirm(ConfirmDialog::new(msg));
+                                        self.modal = Modal::Confirm(ConfirmDialog::notice(msg));
                                     }
                                 }
                             }
@@ -5229,7 +5248,7 @@ impl FileBrowser {
                                         .search(&value);
                                     if let Some(msg) = failure {
                                         self.modal =
-                                            Modal::Confirm(ConfirmDialog::new(msg));
+                                            Modal::Confirm(ConfirmDialog::notice(msg));
                                     }
                                 }
                             }
@@ -5321,7 +5340,7 @@ impl FileBrowser {
                                     .current_screen_mut()
                                     .filter(&value);
                                 if let Some(msg) = failure {
-                                    self.modal = Modal::Confirm(ConfirmDialog::new(msg));
+                                    self.modal = Modal::Confirm(ConfirmDialog::notice(msg));
                                 }
                             }
                             ModalTarget::CreateDir => {
@@ -5338,7 +5357,7 @@ impl FileBrowser {
                                     .current_screen_mut()
                                     .create_dir(&value);
                                 if let Some(msg) = failure {
-                                    self.modal = Modal::Confirm(ConfirmDialog::new(msg));
+                                    self.modal = Modal::Confirm(ConfirmDialog::notice(msg));
                                 } else if let Some(parent) = parent {
                                     self.active_panel_mut().reload_dir_everywhere(&parent);
                                 }
@@ -5393,7 +5412,7 @@ impl FileBrowser {
                                         self.begin_copy_batch(srcs, dir, active, active);
                                     }
                                 } else {
-                                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                                         "'{}' is not a directory.",
                                         dir.display()
                                     )));
@@ -5458,7 +5477,7 @@ impl FileBrowser {
             Ok(t) => self.spawn_connect(t, crate::vfs::sftp::Credentials::default(), panel),
             Err(e) => {
                 self.modal =
-                    Modal::Confirm(ConfirmDialog::new(format!("Invalid remote target: {}", e)));
+                    Modal::Confirm(ConfirmDialog::notice(format!("Invalid remote target: {}", e)));
             }
         }
     }
@@ -5495,7 +5514,7 @@ impl FileBrowser {
                 self.hosts.upsert(host);
                 if let Err(e) = self.hosts.save() {
                     self.modal_target = None;
-                    self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                    self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                         "Could not save the host list: {}",
                         e
                     )));
@@ -5505,7 +5524,7 @@ impl FileBrowser {
             }
             Err(e) => {
                 self.modal_target = None;
-                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                     "Could not parse '{}': {}\n\nExpected: label = sftp://[user@]host[:port][:path|/path]",
                     url, e
                 )));
@@ -5766,7 +5785,7 @@ impl FileBrowser {
                 self.spawn_connect(t, crate::vfs::sftp::Credentials::default(), target_panel)
             }
             Err(e) => {
-                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                     "Invalid remote target: {}",
                     e
                 )));
@@ -6338,7 +6357,12 @@ impl FileBrowser {
             }
         };
         self.connect_task = None;
+        self.apply_connect_result(result, target_panel);
+    }
 
+    /// Act on a settled connection attempt. Split from the polling above so the
+    /// decision it makes can be exercised without a live socket.
+    fn apply_connect_result(&mut self, result: ConnectResult, target_panel: usize) {
         match result {
             ConnectResult::Connected(vfs, home) => {
                 // Read before the state is cleared below: whether this pane was
@@ -6354,7 +6378,7 @@ impl FileBrowser {
                 let source = match crate::widget::source::RemoteSource::new(backend, vfs) {
                     Ok(s) => crate::widget::source::Source::Remote(s),
                     Err(e) => {
-                        self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                        self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                             "Could not start remote browser: {}",
                             e
                         )));
@@ -6396,7 +6420,11 @@ impl FileBrowser {
                 // Put the pane back to what it was showing before reporting: a
                 // failed connect must not leave it blank.
                 self.clear_connect_busy(target_panel);
-                self.modal = Modal::Confirm(ConfirmDialog::new(format!(
+                // A notice, not a question. The connection already failed and
+                // nothing here is retried, so Yes/No would offer a decision
+                // that does not exist — "No" to a timeout reads as if declining
+                // it would change something.
+                self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
                     "Connection failed: {}",
                     msg
                 )));
@@ -6935,7 +6963,7 @@ impl FileBrowser {
         // A move needs somewhere to move *to*. With one panel there is no
         // destination, so say that rather than silently doing nothing.
         let Some(other) = self.other_index() else {
-            self.modal = Modal::Confirm(ConfirmDialog::new(
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
                 "Move needs two panels — split with | first.".to_string(),
             ));
             return;

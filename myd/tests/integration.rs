@@ -19646,3 +19646,103 @@ async fn an_unchanged_preview_image_is_not_reflushed() {
         "an idle flush with no image must not record anything"
     );
 }
+
+/// A failed connection is a report, not a question.
+///
+/// It used to be built with `ConfirmDialog::new`, so "Connection failed: timed
+/// out" came with `[ Yes ]` and `[ No ]` — offering a decision that does not
+/// exist. Nothing retries on "yes" and nothing is declined by "no"; both merely
+/// closed the box. The message text was never the problem, so this asserts on
+/// the buttons.
+#[tokio::test]
+async fn a_failed_connection_is_reported_not_asked() {
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.fail_connect_for_test("timed out after 10s");
+
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("timed out"),
+        "the reason should still be shown, got {msg:?}"
+    );
+    assert_eq!(
+        app.modal_buttons_for_test().unwrap_or_default(),
+        vec![" [ OK ] ".to_string()],
+        "a failure report should offer one OK, not a yes/no choice"
+    );
+}
+
+/// The counterpart: a dialog that really does ask something keeps both answers.
+///
+/// Without this, collapsing every dialog to a notice would satisfy the test
+/// above. The overwrite prompt is a real question — "no" declines a write that
+/// would otherwise happen — so it must keep Yes and No.
+#[tokio::test]
+async fn a_real_question_still_offers_both_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("taken.zip"), b"original").unwrap();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "a.txt");
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('z'));
+    for _ in 0..40 {
+        app.handle_key_for_test(key(crossterm::event::KeyCode::Backspace));
+    }
+    for c in "taken.zip".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "the overwrite prompt should be up"
+    );
+    let buttons = app.modal_buttons_for_test().unwrap_or_default();
+    assert_eq!(
+        buttons.len(),
+        2,
+        "a question should keep both answers, got {buttons:?}"
+    );
+}
+
+/// A malformed filter pattern reports; it does not ask.
+///
+/// Covers a second site converted at the same time, reached through the input
+/// dialog rather than the connect path.
+#[tokio::test]
+async fn a_bad_filter_pattern_is_reported_not_asked() {
+    use myd::app::FileBrowser;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('f'));
+    for ch in "a(b".chars() {
+        app.handle_key_for_test(char_key(ch));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    {
+        assert_eq!(
+            app.modal_kind_for_test(),
+            "confirm",
+            "a malformed pattern should say so"
+        );
+        assert_eq!(
+            app.modal_buttons_for_test().unwrap_or_default(),
+            vec![" [ OK ] ".to_string()],
+            "a bad pattern should be reported, not posed as a question"
+        );
+    }
+}

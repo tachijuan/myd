@@ -139,7 +139,12 @@ impl ConfirmDialog {
 
     /// The label each button draws, in order. One source for the rendered text
     /// and the click rectangles, so the two can never describe different boxes.
-    fn button_labels(&self) -> Vec<String> {
+    ///
+    /// Public so tests can assert on what a dialog actually offers: whether a
+    /// message is a question or a statement is a property of the buttons, and
+    /// checking the message text alone would not have caught a report being
+    /// posed as Yes/No.
+    pub fn button_labels(&self) -> Vec<String> {
         if self.notice {
             vec![" [ OK ] ".to_string()]
         } else if self.choices.is_empty() {
