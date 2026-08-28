@@ -19746,3 +19746,122 @@ async fn a_bad_filter_pattern_is_reported_not_asked() {
         );
     }
 }
+
+/// Going up a level keeps the traversal mode you are browsing in.
+///
+/// A saved shallow preference used to be re-applied on *every* completed load,
+/// not just at startup. Starting non-shallow in a subdirectory and pressing `h`
+/// into a parent recorded as shallow ran the full traversal — the re-root
+/// correctly inherits the current mode — and then threw the measured tree away
+/// and re-opened shallow. The walk was paid for and discarded, and the pane
+/// showed unmeasured sizes for a directory the user had just measured.
+#[tokio::test]
+async fn going_up_keeps_the_current_traversal_mode() {
+    use myd::app::FileBrowser;
+    use myd::hosts::{HostCatalog, SavedDir};
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(parent.join("big.bin"), vec![0u8; 4096]).unwrap();
+    std::fs::write(child.join("c.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(child.clone()), None, false);
+    // The parent is recorded as shallow; the session is not.
+    app.set_hosts_for_test(HostCatalog::in_memory_dirs(vec![SavedDir {
+        path: parent.to_string_lossy().into_owned(),
+        shallow: true,
+        ..Default::default()
+    }]));
+    settle(&mut app).await;
+    assert!(
+        !app.active_tree_is_shallow_for_test(),
+        "the session started measured"
+    );
+
+    // Up one level, into the directory carrying the preference.
+    app.handle_key_for_test(char_key('h'));
+    app.handle_key_for_test(char_key('h'));
+    settle_into(&mut app, &parent).await;
+
+    assert!(
+        !app.active_tree_is_shallow_for_test(),
+        "a saved preference must not overrule going up: the full traversal had \
+         already run, and discarding it wastes the walk"
+    );
+}
+
+/// The startup case the re-open exists for still works.
+///
+/// Opening a directory from the command line builds its tree before the catalog
+/// is reachable, so the preference cannot be applied when the loading screen is
+/// made. Without this test, scoping the sweep to startup could be "fixed" by
+/// deleting it outright.
+#[tokio::test]
+async fn a_saved_shallow_preference_still_applies_at_startup() {
+    use myd::app::FileBrowser;
+    use myd::hosts::{HostCatalog, SavedDir};
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    std::fs::create_dir_all(parent.join("child")).unwrap();
+    std::fs::write(parent.join("big.bin"), vec![0u8; 4096]).unwrap();
+
+    let mut app = FileBrowser::new(Some(parent.clone()), None, false);
+    app.set_hosts_for_test(HostCatalog::in_memory_dirs(vec![SavedDir {
+        path: parent.to_string_lossy().into_owned(),
+        shallow: true,
+        ..Default::default()
+    }]));
+    settle(&mut app).await;
+    // The re-open is a second load, so let it settle too.
+    settle(&mut app).await;
+
+    assert!(
+        app.active_tree_is_shallow_for_test(),
+        "a directory opened at startup should honour its saved shallow preference"
+    );
+}
+
+/// One saved preference must not turn the whole climb shallow.
+///
+/// The re-open replaced the screen with a `LocalShallow` source, and every later
+/// re-root inherits the source it came from — so passing through a single
+/// directory recorded as shallow left the rest of the way up shallow too,
+/// including directories with no preference at all.
+#[tokio::test]
+async fn a_saved_preference_does_not_leak_into_the_next_level_up() {
+    use myd::app::FileBrowser;
+    use myd::hosts::{HostCatalog, SavedDir};
+
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().join("top");
+    let parent = top.join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(parent.join("big.bin"), vec![0u8; 4096]).unwrap();
+    std::fs::write(child.join("c.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(child.clone()), None, false);
+    // Only the middle directory carries the preference.
+    app.set_hosts_for_test(HostCatalog::in_memory_dirs(vec![SavedDir {
+        path: parent.to_string_lossy().into_owned(),
+        shallow: true,
+        ..Default::default()
+    }]));
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('h'));
+    app.handle_key_for_test(char_key('h'));
+    settle_into(&mut app, &parent).await;
+
+    app.handle_key_for_test(char_key('h'));
+    app.handle_key_for_test(char_key('h'));
+    settle_into(&mut app, &top).await;
+
+    assert!(
+        !app.active_tree_is_shallow_for_test(),
+        "`top` has no preference of its own and must not inherit one"
+    );
+}

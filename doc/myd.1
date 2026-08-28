@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.3.7" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.3.8" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -537,6 +537,13 @@ in an earlier session. A remembered preference still applies when you arrive
 from a measuring pane, and \fBS\fR measures the directory you are in whenever
 you want it. This matters most after climbing out of a tree with \fBh\fR: the
 directory you step back into may well be one you once browsed in full.
+.IP
+Going up with \fBh\fR carries the mode the pane is in, for the same reason:
+a measuring pane keeps measuring as you climb, even through a directory
+remembered as shallow, and a shallow pane stays shallow. A remembered
+preference decides how a directory opens when you go to it \(em from the
+\fBgd\fR picker, with \fBEnter\fR, or on the command line \(em not how it
+looks when you pass back through it.
 .TP
 .B Ctrl+r
 Rescan the file tree.

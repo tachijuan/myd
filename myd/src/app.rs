@@ -374,6 +374,22 @@ pub struct FileBrowser {
     /// which is exactly the recursive walk the flag was asking to avoid. A
     /// directory with a recorded preference still wins over this.
     shallow_default: bool,
+    /// Whether a recorded shallow preference may still re-open a loaded tree.
+    ///
+    /// True until the first batch of loads resolves. The re-open exists for one
+    /// case: a directory opened from the command line, whose tree is built
+    /// before the catalog is reachable, so the preference cannot be applied when
+    /// the loading screen is made. Every other arrival — `gd`, Enter, a re-root
+    /// with `h` — decides its own mode up front and must be left alone.
+    ///
+    /// Without this, the sweep re-ran on *every* completed load and overruled
+    /// navigation: going up into a directory recorded as shallow ran the full
+    /// traversal (the re-root inherits the mode it came from, correctly) and
+    /// then threw the measured tree away, so the walk was paid for and
+    /// discarded. Worse, it re-opened with `Source::LocalShallow`, which the
+    /// next re-root inherits — one saved preference turned the rest of the climb
+    /// shallow, including directories that had no preference at all.
+    apply_saved_shallow_on_load: bool,
     /// Whether the user has asked not to be prompted before deleting.
     ///
     /// Deliberately in memory only, and never written to the catalog: it lasts
@@ -615,6 +631,7 @@ impl FileBrowser {
             force_repaint: false,
             reflush_after_repaint: None,
             shallow_default: false,
+            apply_saved_shallow_on_load: true,
             skip_delete_confirm: false,
             last_open_command: None,
             apps: crate::apps::AppCatalog::load(),
@@ -1186,6 +1203,9 @@ impl FileBrowser {
         // Directories that finished loading this tick, recorded below. Collected
         // first because the catalog cannot be borrowed while a panel is.
         let mut opened: Vec<PathBuf> = Vec::new();
+        // Set if a recorded preference re-opened a tree below, which starts a
+        // second load that must also be allowed through the startup window.
+        let mut reopened = false;
         for i in 0..self.panels.len() {
             let mut just_opened = None;
             if !self.panels[i].resolve_loading_reporting(&mut just_opened) {
@@ -1213,11 +1233,17 @@ impl FileBrowser {
         // swept in every directory drilled into while browsing and buried the
         // handful of places the user had actually chosen. The picker records
         // what the picker opens; see `Action::Confirm`.
-        if !opened.is_empty() {
-            // A directory the user marked shallow may have been loaded the
-            // ordinary way — at startup, before the catalog was reachable.
-            // Re-open it in shallow mode rather than leaving a measured tree the
-            // preference says they did not want.
+        if !opened.is_empty() && self.apply_saved_shallow_on_load {
+            // Startup only. The command line opens a directory before the
+            // catalog is reachable, so a recorded shallow preference cannot be
+            // applied when that first loading screen is built; this re-opens it
+            // in the mode the preference asked for.
+            //
+            // Every later arrival already chose its mode deliberately — `gd` and
+            // Enter consult the preference themselves, and a re-root with `h`
+            // carries the mode the user is currently browsing in. Re-deciding
+            // here would overrule navigation with a saved setting the user is
+            // actively navigating away from.
             //
             // Only an explicitly recorded preference forces a re-open;
             // `shallow_default` is deliberately not consulted. Arrivals already
@@ -1244,9 +1270,19 @@ impl FileBrowser {
                             None,
                             crate::screen::SortMode::default(),
                         );
+                        // The re-open is itself a load, and it must be allowed
+                        // to resolve before the window closes — otherwise the
+                        // startup fix would be undone by its own second pass.
+                        reopened = true;
                     }
                 }
             }
+        }
+        // Startup is over once a batch of loads settles without needing a
+        // re-open. Anything that finishes after this point was navigated to, and
+        // navigation decides its own mode.
+        if !opened.is_empty() && !reopened {
+            self.apply_saved_shallow_on_load = false;
         }
         keep_running
     }
