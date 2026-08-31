@@ -5019,6 +5019,22 @@ impl FileBrowser {
                 true
             }
             Action::Expand => {
+                // In the treemap, `l` slides the cursor right and nothing more.
+                // Everything below reads `state.tree` — the *tree's* cursor —
+                // which in this view is not what the user is pointing at, so
+                // acting on it navigates somewhere they never selected.
+                //
+                // The archive and remote-directory branches made that visible:
+                // both ask `state.tree.selected_line()`, and an archive is a
+                // remote source, so `l` on a tile pushed a loading screen for
+                // whatever the hidden tree cursor happened to be on instead of
+                // moving between tiles. `Action::Collapse` already guards this
+                // way; this is the same guard on the other side.
+                if let Screen::Main(state) = self.active_panel().current_screen() {
+                    if state.focus == FocusTarget::Treemap {
+                        return self.active_panel_mut().current_screen_mut().expand();
+                    }
+                }
                 // `l` on an archive enters it, matching Enter. An archive is a
                 // file, so the expand below would otherwise do nothing at all.
                 if let Screen::Main(state) = self.active_panel().current_screen() {

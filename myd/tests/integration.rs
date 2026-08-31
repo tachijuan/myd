@@ -19865,3 +19865,61 @@ async fn a_saved_preference_does_not_leak_into_the_next_level_up() {
         "`top` has no preference of its own and must not inherit one"
     );
 }
+
+/// In the treemap, `l` moves between tiles — it must not navigate.
+///
+/// It used to, inside an archive. `Action::Expand` read `state.tree` without
+/// asking which view had focus, and one of its branches routes a *remote*
+/// directory through the async loading screen. An archive is a remote source,
+/// so `l` on a tile pushed a screen for whatever the hidden tree cursor was on,
+/// and the pane jumped somewhere the user had not selected. A local panel hid
+/// the bug: `is_remote()` is false there, so it fell through to the treemap.
+///
+/// Asserting on the pane's depth and directory rather than on the tile cursor
+/// is deliberate — the symptom was navigation, and a cursor assertion would
+/// still pass while the pane moved underneath it.
+#[tokio::test]
+async fn treemap_keys_do_not_navigate_inside_an_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    archive_fixture(dir.path());
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    cursor_onto(&mut app, "bundle.zip");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+
+    // Into the treemap.
+    app.handle_key_for_test(char_key('v'));
+    let focus = match app.panel_screen_for_test(0) {
+        Some(myd::screen::Screen::Main(s)) => s.focus,
+        _ => panic!("expected a main screen"),
+    };
+    assert_eq!(
+        focus,
+        myd::widget::treemap::FocusTarget::Treemap,
+        "`v` should have switched the archive pane to the treemap"
+    );
+
+    let depth = app.panel_depth_for_test(0);
+    let dir_now = app.panel_current_dir(0).map(|p| p.to_path_buf());
+
+    // `h` is deliberately excluded: on a left-edge tile it steps up to the
+    // parent, mirroring tree `h`, and a local treemap at the same depth does
+    // exactly the same thing. The bug was about the other keys.
+    for k in ['l', 'j', 'k'] {
+        app.handle_key_for_test(char_key(k));
+        settle(&mut app).await;
+        assert_eq!(
+            app.panel_depth_for_test(0),
+            depth,
+            "'{k}' in the treemap pushed or popped a screen instead of moving \
+             between tiles"
+        );
+        assert_eq!(
+            app.panel_current_dir(0).map(|p| p.to_path_buf()),
+            dir_now,
+            "'{k}' in the treemap changed the pane's directory"
+        );
+    }
+}
