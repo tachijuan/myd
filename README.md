@@ -8,6 +8,51 @@ A **vi-like terminal file browser** built with [ratatui](https://ratatui.rs/) an
 
 Navigate your filesystem with familiar `vi` key bindings, inspect file details in a live sidebar, and visualize disk usage with proportional size bars — all from your terminal.
 
+## Install
+
+```bash
+# Homebrew (macOS and Linux)
+brew install tachijuan/myd/myd
+
+# Cargo — the crate is myd-tui; the command it installs is still `myd`
+cargo install myd-tui
+```
+
+Both build from source and take a minute or two. Homebrew pulls in a Rust
+toolchain itself and installs the man page; the Cargo route needs Rust 1.85+
+already present and installs the binary only.
+
+Nothing else is required. Every archive format that myd reads natively and the
+whole SFTP client are compiled in, so a plain install is fully functional.
+
+A few **optional** command-line tools unlock extra previews when they are on
+your `PATH`. myd detects each one at runtime and falls back gracefully — a
+missing tool costs you that one feature and says which tool it wanted, never a
+broken pane:
+
+| Tool | Unlocks | Without it |
+|---|---|---|
+| [`timg`](https://timg.sh/) | Image previews, and PDF previews when built with poppler (check `timg --version`) | The preview pane shows file details instead |
+| [`chafa`](https://hpjansson.org/chafa/) | Image previews, if `timg` is absent — `timg` is preferred when both exist | As above. chafa cannot render PDFs at all |
+| `pdfinfo` (poppler-utils) | The page count of a PDF | You can still page forward, just with no known last page |
+| `bsdtar` (libarchive) | Browsing `.iso`, `.cab`, `.cpio`, `.lha`, `.xar` and package formats | Those formats can't be opened; zip, 7z, tar, gz, bz2, xz, zst and rar are built in and unaffected |
+
+```bash
+# macOS: bsdtar is already there, as the system `tar`
+brew install timg chafa poppler
+
+# Debian / Ubuntu
+sudo apt install timg chafa poppler-utils libarchive-tools
+```
+
+For **pixel-resolution images** rather than block approximations, you also need
+a terminal that speaks the kitty graphics protocol, iTerm2 inline images, or
+sixel. Inside `tmux` see [Terminal graphics](#terminal-graphics) — sixel needs
+one setting and the other two protocols need a different one.
+
+Other install routes, including building from a clone, are under
+[Installation](#installation).
+
 ## A look at it
 
 The tree, with a proportional size bar beside every entry. Bars are scaled
@@ -112,36 +157,52 @@ round trip per directory, so myd declines to guess:
 
 ## Requirements
 
-- Rust 1.75+ (stable)
-- A terminal with true color support
-- Optional: [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/)
-  for image previews in the preview pane. Neither is required — without them the
-  pane falls back to showing the file's details. PDF previews need `timg` built
-  with poppler (`timg --version` lists it); `chafa` cannot render PDFs.
-- Optional: `pdfinfo` (poppler-utils) so the preview knows how many pages a PDF
-  has. Without it you can still page forward, just without a known last page.
-- Optional, for pixel-resolution images rather than block approximations: a
-  terminal implementing the kitty graphics protocol, iTerm2 inline images, or
-  sixel. Inside `tmux` see *Terminal graphics* below — sixel needs one setting,
-  and the other two protocols need a different one.
+To run a released build, only a terminal with true color support. To build from
+source, Rust 1.85 or newer — `brew install` provides it for you.
+
+Everything below is optional and detected at runtime; see the table under
+[Install](#install) for the one-line summary and the packages to install.
+
+- [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/) for
+  image previews. Without either, the pane falls back to showing the file's
+  details. `timg` is preferred when both are present, and it is the only one
+  that renders PDFs — that needs `timg` built with poppler (`timg --version`
+  lists it); `chafa`'s loaders stop at image formats.
+- `pdfinfo` (poppler-utils) so the preview knows how many pages a PDF has.
+  Without it you can still page forward, just without a known last page.
+- `bsdtar` (libarchive) for `.iso`, `.cab`, `.cpio`, `.lha`, `.xar` and the
+  package formats — the long tail that would not be worth a bundled reader
+  each. zip, 7z, tar, gz, bz2, xz, zst and rar are compiled in and need
+  nothing.
+- For pixel-resolution images rather than block approximations: a terminal
+  implementing the kitty graphics protocol, iTerm2 inline images, or sixel.
+  Inside `tmux` see *Terminal graphics* below — sixel needs one setting, and
+  the other two protocols need a different one.
 
 ## Installation
 
-### Homebrew (macOS and Linux)
+The two short answers are under [Install](#install) at the top. This section
+covers the rest: tracking `master`, upgrading, and building from a clone.
+
+### Homebrew
 
 ```bash
-brew install tachijuan/myd/myd
+# Track master instead of the newest release
+brew install --HEAD tachijuan/myd/myd
+
+# Upgrade
+brew update && brew upgrade myd
 ```
 
-This builds from source, so it installs a Rust toolchain as a build dependency
-and takes a minute or two. The man page comes with it. To follow `master`
-instead of the newest release, add `--HEAD`.
+`brew update` first is what refreshes the tap — without it Homebrew is still
+reading the formula it cached and will not see a new release. If you are on a
+`--HEAD` build, `brew upgrade myd` alone will report you are up to date, since
+Homebrew treats HEAD as ahead of any tagged version; use
+`brew upgrade --fetch-HEAD myd` to pick up newer commits, or
+`brew uninstall myd && brew install tachijuan/myd/myd` to return to the latest
+stable release.
 
 ### Cargo
-
-```bash
-cargo install myd-tui
-```
 
 The crate is `myd-tui` because `myd` was already taken on crates.io by an
 unrelated package; the command it installs is still `myd`. This route does not
@@ -151,7 +212,7 @@ install the man page — see below for that.
 
 Requires a Rust toolchain (1.85 or newer). Nothing else is needed to build —
 every archive format and the SFTP client are compiled in; the optional
-image-preview helpers are described under [Features](#features).
+preview and archive helpers are listed under [Requirements](#requirements).
 
 ```bash
 # Clone and install. The crate lives in myd/, so that is what cargo is pointed at.
