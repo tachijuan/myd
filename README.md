@@ -126,6 +126,18 @@ round trip per directory, so myd declines to guess:
 
 ## Installation
 
+### Homebrew (macOS and Linux)
+
+```bash
+brew install tachijuan/myd/myd
+```
+
+This builds from source, so it installs a Rust toolchain as a build dependency
+and takes a minute or two. The man page comes with it. To follow `master`
+instead of the newest release, add `--HEAD`.
+
+### From source
+
 Requires a Rust toolchain (1.85 or newer). Nothing else is needed to build —
 every archive format and the SFTP client are compiled in; the optional
 image-preview helpers are described under [Features](#features).
