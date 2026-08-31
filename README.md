@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/tachijuan/myd/actions/workflows/ci.yml/badge.svg)](https://github.com/tachijuan/myd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/myd-tui.svg)](https://crates.io/crates/myd-tui)
 
 A **vi-like terminal file browser** built with [ratatui](https://ratatui.rs/) and [crossterm](https://crates.io/crates/crossterm).
 
@@ -135,6 +136,16 @@ brew install tachijuan/myd/myd
 This builds from source, so it installs a Rust toolchain as a build dependency
 and takes a minute or two. The man page comes with it. To follow `master`
 instead of the newest release, add `--HEAD`.
+
+### Cargo
+
+```bash
+cargo install myd-tui
+```
+
+The crate is `myd-tui` because `myd` was already taken on crates.io by an
+unrelated package; the command it installs is still `myd`. This route does not
+install the man page — see below for that.
 
 ### From source
 

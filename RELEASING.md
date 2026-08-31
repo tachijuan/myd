@@ -16,11 +16,11 @@ mismatch shows up as `myd --version` disagreeing with the tag.
 | File | What to change |
 |---|---|
 | `myd/Cargo.toml` | `version = "X.Y.Z"` near the top |
-| `myd/Cargo.lock` | the `version` under `name = "myd"` |
+| `myd/Cargo.lock` | the `version` under `name = "myd-tui"` |
 | `doc/myd.1` | line 1, the `"myd X.Y.Z"` field of `.TH` |
 
 Patch for a bug fix, minor for a feature. The `Cargo.lock` entry can be
-regenerated with `cargo update -p myd` rather than edited by hand.
+regenerated with `cargo update -p myd-tui` rather than edited by hand.
 
 Check the man page still renders:
 
@@ -100,7 +100,22 @@ brew test tachijuan/myd/myd
 
 Commit and push.
 
-## 8. Verify from a user's position
+## 8. Publish to crates.io
+
+```bash
+cargo publish --manifest-path myd/Cargo.toml
+```
+
+The crate is **`myd-tui`**, not `myd` — that name was taken by an unrelated
+package. The `[lib]` and `[[bin]]` sections both pin the name `myd`, so the
+installed command and every `myd::` path in the tests are unaffected. Do not
+"fix" the package name back to `myd`; it will fail to publish.
+
+Publishing is irreversible. A version can be yanked, which hides it from new
+resolutions, but it can never be deleted and the version number can never be
+reused.
+
+## 9. Verify from a user's position
 
 ```bash
 brew update && brew upgrade myd
@@ -117,11 +132,6 @@ brew install tachijuan/myd/myd
 
 ## Notes
 
-- **Publishing to crates.io is not part of this.** The name `myd` is taken by
-  an unrelated crate, so `cargo install` is not currently an install route. If
-  that changes, `cargo publish --manifest-path myd/Cargo.toml` goes after step 5,
-  and note that publishing is irreversible — a version can be yanked but never
-  deleted.
 - **Bottles are not set up.** `brew install` builds from source (~45s) and pulls
   a Rust toolchain as a build dependency. Prebuilt bottles would need a release
   workflow building a macOS arm64 / macOS x86_64 / Linux matrix.
