@@ -78,8 +78,24 @@ differ and Homebrew will reject the download.
 
 ## 7. Update the Homebrew tap
 
-In a clone of [`tachijuan/homebrew-myd`](https://github.com/tachijuan/homebrew-myd),
-edit `Formula/myd.rb`:
+The tap is the clone Homebrew already keeps:
+
+```bash
+cd "$(brew --repository tachijuan/myd)"
+```
+
+**Set the git identity first — it will be missing.** Step 9 untaps and
+re-installs to verify the release from a user's position, and that re-clones
+the repo, discarding any local config. So every release starts with a clone
+that has no `user.name`, and the commit below fails with "Author identity
+unknown". Set it locally rather than globally, matching the existing history:
+
+```bash
+git config user.name "Juan Orlandini"
+git config user.email "tachijuan@gmail.com"
+```
+
+Then edit `Formula/myd.rb`:
 
 - `url` — point at the new tag
 - `sha256` — the number from step 6
