@@ -169,6 +169,14 @@ pub struct LatencyVfs {
     written: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
     /// Models the SSH channel window as a byte budget.
     window: Option<Arc<tokio::sync::Semaphore>>,
+    /// Serialises payload time so that `bandwidth_bps` models one shared pipe.
+    ///
+    /// Without this, the per-request delay is slept concurrently and N parallel
+    /// requests each get the full bandwidth — so the simulated link delivers N
+    /// times its own rate and concurrency always looks free. A real link is
+    /// shared, which is exactly the condition under which extra parallelism
+    /// stops helping, so getting this wrong hides the effect under test.
+    pipe: Option<Arc<tokio::sync::Mutex<()>>>,
     parallel_reads: bool,
     /// Weak self-reference, set by [`LatencyVfs::shared`]. The reader and writer
     /// streams need an owned handle to the backend that shares its stats; taking
@@ -202,6 +210,9 @@ impl LatencyVfs {
         let window = profile
             .channel_window
             .map(|w| Arc::new(tokio::sync::Semaphore::new(w)));
+        let pipe = profile
+            .bandwidth_bps
+            .map(|_| Arc::new(tokio::sync::Mutex::new(())));
         let mut nodes = BTreeMap::new();
         nodes.insert(
             PathBuf::from("/"),
@@ -216,6 +227,7 @@ impl LatencyVfs {
             nodes: Mutex::new(nodes),
             written: Mutex::new(BTreeMap::new()),
             window,
+            pipe,
             parallel_reads: true,
             self_ref: Mutex::new(None),
         }
@@ -329,13 +341,20 @@ impl LatencyVfs {
             _ => None,
         };
 
-        let mut delay = self.profile.rtt;
-        if let Some(bps) = self.profile.bandwidth_bps {
+        // Propagation delay is genuinely concurrent: every request is in flight
+        // at the same time, which is the whole point of a pipeline.
+        tokio::time::sleep(self.profile.rtt).await;
+
+        // Serialisation time is not. The bytes of concurrent requests share one
+        // pipe, so their transmission times add rather than overlap. Holding the
+        // pipe for each request's payload is what makes the modelled link have a
+        // real aggregate ceiling.
+        if let (Some(bps), Some(pipe)) = (self.profile.bandwidth_bps, &self.pipe) {
             if bps > 0 && bytes > 0 {
-                delay += Duration::from_secs_f64((bytes * 8) as f64 / bps as f64);
+                let _lane = pipe.lock().await;
+                tokio::time::sleep(Duration::from_secs_f64((bytes * 8) as f64 / bps as f64)).await;
             }
         }
-        tokio::time::sleep(delay).await;
         self.stats.leave();
     }
 

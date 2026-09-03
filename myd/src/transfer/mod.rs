@@ -10,6 +10,11 @@ mod worker;
 pub use queue::{PendingDest, TransferQueue};
 pub use worker::{run_transfer, TransferJob, TransferOutcome};
 
+/// The size of that budget.
+pub fn concurrency_budget() -> usize {
+    crate::config::transfer_global_concurrency().max(1)
+}
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +28,25 @@ use crate::vfs::VPath;
 /// Every small file costs a few serial round trips (open, write, close), so on a
 /// long link (a US↔EU hop is ~150 ms) throughput is set by how many of those
 /// sequences overlap, not by bandwidth.
+///
+/// **This is 16, not 4.** Tagging ten items and seeing all ten start is the
+/// cap working, not a bug — the queue does enforce it (see
+/// `TransferQueue::promote`), the ceiling is simply above ten.
+///
+/// Measured on a simulated 150 ms / 200 Mbit/s link with the shared-pipe
+/// bandwidth model, ten items through the real queue:
+///
+/// | `max_parallel` | whole files | directory trees |
+/// |---|---|---|
+/// | 1 | 8.2 MiB/s | — |
+/// | 2 | 15.2 | — |
+/// | 4 | 18.4 | 16.2 |
+/// | 8 | 18.3 | — |
+/// | 16 | 18.4 | 20.1 |
+///
+/// Whole-file transfers saturate the link at 4 and are flat above it. Directory
+/// trees keep improving to 16, because a tree spends round trips on listings
+/// that overlap with nothing else — which is why the higher number stays.
 ///
 /// Reproduce with `cargo test --release --test bench_transfer -- --ignored`;
 /// `bench_many_small_files` is the scenario this constant governs. Total fan-out

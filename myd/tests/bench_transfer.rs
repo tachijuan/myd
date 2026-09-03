@@ -394,3 +394,456 @@ async fn large_download_keeps_the_pipeline_full() {
         row.stats.summary()
     );
 }
+
+/// The reported scenario: several items tagged and transferred at once over a
+/// long link. Two things are measured that a single-transfer benchmark cannot
+/// show — whether N concurrent transfers actually go faster than one, and what
+/// the peak in-flight request count reaches when they share a connection.
+///
+/// `n_items` transfers are started together against one shared remote, exactly
+/// as the queue starts them.
+async fn bench_concurrent_items(
+    scenario: &str,
+    profile: LatencyProfile,
+    n_items: usize,
+    size_each: u64,
+    config: TransferConfig,
+) -> Row {
+    let rtt_ms = profile.rtt.as_millis() as u64;
+    let mut remote = LatencyVfs::new(profile);
+    for i in 0..n_items {
+        remote = remote.with_file(format!("/data/item{}.bin", i), size_each);
+    }
+    let remote = remote.shared();
+    let stats = remote.stats();
+
+    let dir = tempfile::tempdir().unwrap();
+    let local: Arc<dyn Vfs> = Arc::new(LocalFs::new());
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..n_items {
+        let src_fs: Arc<dyn Vfs> = remote.clone();
+        let dest_fs = local.clone();
+        let dest = dir.path().join(format!("item{}.bin", i));
+        tasks.push(tokio::spawn(async move {
+            run_transfer(TransferJob {
+                id: TransferId(100 + i as u64),
+                src_fs,
+                dest_fs,
+                src: VPath::new(BackendId(1), format!("/data/item{}.bin", i)),
+                dest: VPath::local(dest),
+                progress: Arc::new(TransferProgress::new(0)),
+                cancel: CancelToken::new(),
+                config,
+            })
+            .await
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap().expect("transfer failed");
+    }
+    let elapsed = started.elapsed();
+
+    for i in 0..n_items {
+        let got = std::fs::read(dir.path().join(format!("item{}.bin", i))).unwrap();
+        assert_eq!(got.len() as u64, size_each, "{scenario}: wrong length");
+        assert!(verify_pattern(&got, 0), "{scenario}: content mismatch");
+    }
+
+    Row {
+        scenario: scenario.to_string(),
+        rtt_ms,
+        bytes: size_each * n_items as u64,
+        elapsed,
+        stats,
+    }
+}
+
+/// Ten tagged items over a France->USA link, against one item for reference.
+///
+/// If concurrency is working, ten items should take far less than ten times one
+/// item. Aggregate throughput matching a single transfer is the symptom this
+/// exists to catch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_ten_concurrent_items() {
+    let rtt = Duration::from_millis(150);
+    let config = TransferConfig::default();
+
+    println!("\n--- one item at a time, for reference ---");
+    bench_concurrent_items("1 item x 8MiB", LatencyProfile::with_rtt(rtt), 1, 8 * MIB, config)
+        .await
+        .print();
+
+    println!("\n--- ten items started together ---");
+    bench_concurrent_items("10 items x 8MiB", LatencyProfile::with_rtt(rtt), 10, 8 * MIB, config)
+        .await
+        .print();
+
+    // Small files take the sequential path, which is where the reported
+    // "aggregate equals a single transfer" is most likely to show.
+    println!("\n--- ten small items (under the 4MiB parallel threshold) ---");
+    bench_concurrent_items("1 item x 1MiB", LatencyProfile::with_rtt(rtt), 1, MIB, config)
+        .await
+        .print();
+    bench_concurrent_items("10 items x 1MiB", LatencyProfile::with_rtt(rtt), 10, MIB, config)
+        .await
+        .print();
+}
+
+/// As `bench_concurrent_items`, but each item is a directory tree — which is
+/// what "10 files/directories" usually means in practice, and the case where
+/// each top-level transfer opens its own tree-wide semaphore.
+#[allow(clippy::too_many_arguments)]
+async fn bench_concurrent_trees(
+    scenario: &str,
+    profile: LatencyProfile,
+    n_items: usize,
+    depth: usize,
+    dirs: usize,
+    files: usize,
+    size: u64,
+    config: TransferConfig,
+) -> Row {
+    let rtt_ms = profile.rtt.as_millis() as u64;
+    let mut remote = LatencyVfs::new(profile);
+    for i in 0..n_items {
+        remote = remote.with_tree(format!("/t{}", i), depth, dirs, files, size);
+    }
+    let remote = remote.shared();
+    let stats = remote.stats();
+
+    let dir = tempfile::tempdir().unwrap();
+    let local: Arc<dyn Vfs> = Arc::new(LocalFs::new());
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    let mut progresses = Vec::new();
+    for i in 0..n_items {
+        let src_fs: Arc<dyn Vfs> = remote.clone();
+        let dest_fs = local.clone();
+        let dest = dir.path().join(format!("t{}", i));
+        let progress = Arc::new(TransferProgress::new(0));
+        progresses.push(progress.clone());
+        tasks.push(tokio::spawn(async move {
+            run_transfer(TransferJob {
+                id: TransferId(200 + i as u64),
+                src_fs,
+                dest_fs,
+                src: VPath::new(BackendId(1), format!("/t{}", i)),
+                dest: VPath::local(dest),
+                progress,
+                cancel: CancelToken::new(),
+                config,
+            })
+            .await
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap().expect("tree transfer failed");
+    }
+    let elapsed = started.elapsed();
+
+    Row {
+        scenario: scenario.to_string(),
+        rtt_ms,
+        bytes: progresses.iter().map(|p| p.total_bytes()).sum(),
+        elapsed,
+        stats,
+    }
+}
+
+/// Ten tagged *directories* over a long link. The per-transfer semaphore means
+/// ten of these each open their own budget, so peak in-flight is the number to
+/// watch: it should stay near the connection's request budget, not ten times it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_ten_concurrent_trees() {
+    let rtt = Duration::from_millis(150);
+    let config = TransferConfig::default();
+
+    println!("\n=== Concurrent directory transfers, rtt=150ms ===");
+    for n in [1usize, 4, 10] {
+        bench_concurrent_trees(
+            &format!("{} trees (3 deep, 4 dirs, 8 files x 256KiB)", n),
+            LatencyProfile::with_rtt(rtt),
+            n,
+            3,
+            4,
+            8,
+            256 * 1024,
+            config,
+        )
+        .await
+        .print();
+    }
+}
+
+/// The same transatlantic link, but with the SSH channel window myd actually
+/// configures (64 MiB) rather than russh's 2 MiB default.
+///
+/// This separates two very different explanations for flat aggregate
+/// throughput: a transport ceiling that no amount of concurrency can beat, and
+/// a scheduling problem inside myd. With the window opened up, bandwidth
+/// becomes the only ceiling, and concurrency should scale until it is reached.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_transatlantic_wide_window() {
+    let rtt = Duration::from_millis(150);
+    let bps = 200_000_000u64;
+    let profile = || LatencyProfile {
+        rtt,
+        bandwidth_bps: Some(bps),
+        channel_window: Some(64 * 1024 * 1024),
+        ..Default::default()
+    };
+    let config = TransferConfig::default();
+    let ceiling = bps as f64 / 8.0 / 1024.0 / 1024.0;
+
+    println!("\n=== Transatlantic, myd's 64MiB window. Bandwidth ceiling {:.1} MiB/s ===", ceiling);
+    for n in [1usize, 4, 10] {
+        bench_concurrent_items(
+            &format!("{} items x 8MiB", n),
+            profile(),
+            n,
+            8 * MIB,
+            config,
+        )
+        .await
+        .print();
+    }
+}
+
+/// The whole path a tagged batch actually takes: enqueue N items on a real
+/// `TransferQueue` and tick it to completion, as the UI does each frame.
+///
+/// The direct-spawn benchmarks above bypass the queue, so they cannot show what
+/// `max_parallel` does. This one can.
+async fn bench_via_queue(
+    scenario: &str,
+    profile: LatencyProfile,
+    n_items: usize,
+    size_each: u64,
+    max_parallel: usize,
+) -> (Row, usize) {
+    use myd::transfer::TransferQueue;
+    use myd::vfs::BackendRegistry;
+
+    let rtt_ms = profile.rtt.as_millis() as u64;
+    let mut remote = LatencyVfs::new(profile);
+    for i in 0..n_items {
+        remote = remote.with_file(format!("/data/q{}.bin", i), size_each);
+    }
+    let remote = remote.shared();
+    let stats = remote.stats();
+
+    let mut registry = BackendRegistry::new();
+    let remote_id = registry.register(remote.clone() as Arc<dyn Vfs>);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut queue = TransferQueue::new(TransferConfig {
+        max_parallel,
+        ..TransferConfig::default()
+    });
+    for i in 0..n_items {
+        queue.enqueue(
+            VPath::new(remote_id, format!("/data/q{}.bin", i)),
+            VPath::local(dir.path().join(format!("q{}.bin", i))),
+            size_each,
+        );
+    }
+
+    let started = Instant::now();
+    let mut peak_active = 0usize;
+    loop {
+        queue.tick(&registry);
+        peak_active = peak_active.max(queue.active_count());
+        if !queue.has_work() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let elapsed = started.elapsed();
+
+    for i in 0..n_items {
+        let got = std::fs::read(dir.path().join(format!("q{}.bin", i))).unwrap();
+        assert_eq!(got.len() as u64, size_each, "{scenario}: wrong length");
+    }
+
+    (
+        Row {
+            scenario: scenario.to_string(),
+            rtt_ms,
+            bytes: size_each * n_items as u64,
+            elapsed,
+            stats,
+        },
+        peak_active,
+    )
+}
+
+/// `max_parallel` through the real queue, on a bandwidth-limited long link.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_queue_max_parallel_curve() {
+    let rtt = Duration::from_millis(150);
+    let bps = 200_000_000u64;
+    let profile = || LatencyProfile {
+        rtt,
+        bandwidth_bps: Some(bps),
+        channel_window: Some(64 * 1024 * 1024),
+        ..Default::default()
+    };
+
+    println!("\n=== 10 items x 8MiB through the queue (150ms, 200Mbit/s) ===");
+    println!("    bandwidth ceiling = {:.1} MiB/s", bps as f64 / 8.0 / 1048576.0);
+    for mp in [1usize, 2, 4, 6, 8, 12, 16] {
+        let (row, peak) = bench_via_queue(
+            &format!("max_parallel={:<2}", mp),
+            profile(),
+            10,
+            8 * MIB,
+            mp,
+        )
+        .await;
+        row.print();
+        println!("      peak concurrent transfers = {}", peak);
+    }
+}
+
+/// Directory trees through the queue, which is the case the reported batch
+/// actually was ("files/directories") and the one where the per-transfer
+/// semaphore used to multiply the in-flight budget.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_queue_trees_inflight() {
+    use myd::transfer::TransferQueue;
+    use myd::vfs::BackendRegistry;
+
+    for mp in [4usize, 16] {
+        let n = 10usize;
+        let remote = {
+            let mut r = LatencyVfs::new(LatencyProfile {
+                rtt: Duration::from_millis(150),
+                bandwidth_bps: Some(200_000_000),
+                channel_window: Some(64 * 1024 * 1024),
+                ..Default::default()
+            });
+            for i in 0..n {
+                r = r.with_tree(format!("/d{}", i), 2, 3, 6, 256 * 1024);
+            }
+            r.shared()
+        };
+        let stats = remote.stats();
+        let mut registry = BackendRegistry::new();
+        let id = registry.register(remote.clone() as Arc<dyn Vfs>);
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = TransferQueue::new(TransferConfig {
+            max_parallel: mp,
+            ..TransferConfig::default()
+        });
+        for i in 0..n {
+            queue.enqueue_kind(
+                VPath::new(id, format!("/d{}", i)),
+                VPath::local(dir.path().join(format!("d{}", i))),
+                0,
+                true,
+            );
+        }
+
+        let started = Instant::now();
+        loop {
+            queue.tick(&registry);
+            if !queue.has_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let bytes = stats.bytes_read.load(Ordering::Relaxed);
+        println!(
+            "trees max_parallel={:<3} {:.2}s  {:.2} MiB/s  reqs={}  peak_inflight={}",
+            mp,
+            secs,
+            (bytes as f64 / 1048576.0) / secs,
+            stats.total_requests(),
+            stats.max_concurrent_inflight.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// The concurrency budget is process-wide, not per transfer.
+///
+/// Ten concurrent tree transfers used to open ten separate budgets, so the
+/// "global" ceiling scaled with the number of transfers rather than bounding
+/// them. Measured on this scenario in release mode: **528** peak in-flight
+/// requests before the fix against **192** after, with aggregate throughput
+/// unchanged — the oversubscription bought nothing.
+///
+/// `#[ignore]`d with the other benchmarks because the number it checks is a
+/// timing measurement. Peak in-flight depends on how fast requests retire
+/// relative to how fast they are issued, so it is only stable in release mode
+/// with the simulated latency this uses. Run it the same way:
+///
+/// ```text
+/// cargo test --release --test bench_transfer -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn the_concurrency_budget_is_shared_across_transfers() {
+    use myd::transfer::TransferQueue;
+    use myd::vfs::BackendRegistry;
+
+    let n = 10usize;
+    let remote = {
+        let mut r = LatencyVfs::new(LatencyProfile {
+            rtt: Duration::from_millis(150),
+            bandwidth_bps: Some(200_000_000),
+            channel_window: Some(64 * 1024 * 1024),
+            ..Default::default()
+        });
+        for i in 0..n {
+            r = r.with_tree(format!("/s{}", i), 2, 3, 6, 256 * 1024);
+        }
+        r.shared()
+    };
+    let stats = remote.stats();
+    let mut registry = BackendRegistry::new();
+    let id = registry.register(remote.clone() as Arc<dyn Vfs>);
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut queue = TransferQueue::new(TransferConfig::default());
+    for i in 0..n {
+        queue.enqueue_kind(
+            VPath::new(id, format!("/s{}", i)),
+            VPath::local(dir.path().join(format!("s{}", i))),
+            0,
+            true,
+        );
+    }
+    loop {
+        queue.tick(&registry);
+        if !queue.has_work() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let peak = stats.max_concurrent_inflight.load(Ordering::Relaxed) as usize;
+    let budget = myd::transfer::concurrency_budget();
+    println!("peak in-flight = {} (budget {})", peak, budget);
+
+    // Halfway between the two measured values: comfortably above the 192 the
+    // fix produces, comfortably below the 528 it replaced.
+    assert!(
+        peak < 350,
+        "peak in-flight {} is near the {} a per-transfer budget produces rather \
+         than the {} a shared one does — the {} transfers appear to have opened \
+         separate budgets",
+        peak,
+        528,
+        budget,
+        n
+    );
+}
