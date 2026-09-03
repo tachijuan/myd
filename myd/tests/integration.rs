@@ -2617,6 +2617,289 @@ fn test_operation_overlay_shows_item_counts() {
     );
 }
 
+/// The bug this guards: copying one very large file showed "0 / 1 items" for
+/// the entire transfer and then jumped to 1/1, because the item counter only
+/// moves when a whole file lands. With byte totals reported the bar has to
+/// advance partway through a single file.
+#[test]
+fn test_operation_overlay_advances_within_one_large_file() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    // One item, so the item counter can say nothing until the very end.
+    progress.set_total(1);
+    let gib = 1024 * 1024 * 1024u64;
+    progress.set_bytes_total(8 * gib);
+    progress.begin_file("bigfile.iso", 8 * gib);
+    progress.add_bytes(2 * gib);
+
+    let render = |progress: &OpProgress| {
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal
+            .draw(|f| {
+                ProgressOverlay::for_operation("Copying", progress).render(f, f.area());
+            })
+            .unwrap();
+        buffer_to_string(&terminal.backend().buffer().clone())
+    };
+
+    let text = render(&progress);
+    assert!(
+        text.contains("bigfile.iso"),
+        "the overlay names the file in flight:\n{}",
+        text
+    );
+    assert!(
+        text.contains("2.0GB") && text.contains("8.0GB"),
+        "the overlay reports bytes moved against the total:\n{}",
+        text
+    );
+    assert!(
+        text.contains("25%"),
+        "a quarter of the bytes is a quarter of the bar:\n{}",
+        text
+    );
+    // The item count is still there, but it is no longer the only thing shown.
+    assert!(
+        text.contains("0 / 1 items"),
+        "item counts remain available:\n{}",
+        text
+    );
+
+    // The decisive part: more bytes with no extra *item* must redraw further
+    // along. This is what was impossible before.
+    progress.add_bytes(2 * gib);
+    let later = render(&progress);
+    assert!(
+        later.contains("50%"),
+        "the bar advances on bytes alone, with no item completed:\n{}",
+        later
+    );
+    assert_ne!(
+        text, later,
+        "the overlay must change as bytes move within a single file"
+    );
+}
+
+/// The overlay is drawn inside one panel's column, which in a dual-panel split
+/// is narrow. A fixed-width box gets clipped there, and clipping lands
+/// mid-line — cutting the percentage off the end of a bar, which is the number
+/// being looked at. Every line must fit whatever width it is given.
+#[test]
+fn test_operation_overlay_fits_a_narrow_pane() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.set_total(120);
+    progress.set_bytes_total(20_000_000_000);
+    progress.begin_file("archive-part-07.tar.zst", 2_000_000_000);
+    progress.add_bytes(6_400_000_000);
+
+    for width in [24u16, 30, 34, 40, 64] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+        terminal
+            .draw(|f| {
+                ProgressOverlay::for_operation("Copying", &progress).render(f, f.area());
+            })
+            .unwrap();
+        let text = buffer_to_string(&terminal.backend().buffer().clone());
+
+        for line in text.lines() {
+            assert!(
+                line.chars().count() <= width as usize,
+                "width {}: line overflows: {:?}",
+                width,
+                line
+            );
+        }
+        // A bar is only useful with its percentage attached; a clipped bar
+        // silently loses exactly that.
+        for line in text.lines() {
+            if line.contains('\u{2588}') || line.contains('\u{2591}') {
+                assert!(
+                    line.contains('%'),
+                    "width {}: a bar lost its percentage: {:?}",
+                    width,
+                    line
+                );
+            }
+        }
+    }
+}
+
+/// A pane too short for every line must drop whole lines rather than let the
+/// paragraph clip them, and must drop the least useful first — the ETA is worth
+/// more than a second bar breaking down the first.
+#[test]
+fn test_operation_overlay_trims_to_a_short_pane() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.set_total(120);
+    progress.set_bytes_total(20_000_000_000);
+    progress.begin_file("part.bin", 2_000_000_000);
+    progress.add_bytes(6_400_000_000);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    progress.add_bytes(1);
+
+    let mut terminal = Terminal::new(TestBackend::new(64, 8)).unwrap();
+    terminal
+        .draw(|f| {
+            ProgressOverlay::for_operation("Copying", &progress).render(f, f.area());
+        })
+        .unwrap();
+    let text = buffer_to_string(&terminal.backend().buffer().clone());
+
+    assert!(
+        text.contains("left"),
+        "the ETA survives a short pane:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("this file:"),
+        "the per-file breakdown is what gives way:\n{}",
+        text
+    );
+}
+
+/// A pane far too small for the box at all must still render. `centered`
+/// clamps the box to the area, so the width arithmetic has to cope with a
+/// budget smaller than any sensible minimum rather than inverting its range.
+#[test]
+fn test_operation_overlay_survives_a_tiny_pane() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.set_total(2);
+    progress.set_bytes_total(1000);
+    progress.begin_file("x.bin", 1000);
+    progress.add_bytes(500);
+
+    for (w, h) in [(12u16, 6u16), (8, 4), (4, 3), (1, 1)] {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        // The assertion is that this does not panic.
+        terminal
+            .draw(|f| {
+                ProgressOverlay::for_operation("Copying", &progress).render(f, f.area());
+            })
+            .unwrap();
+    }
+}
+
+/// An operation that reports no bytes at all — delete, chmod — keeps the
+/// original item-count bar. The byte path is additive, not a replacement.
+#[test]
+fn test_operation_overlay_falls_back_to_items_without_bytes() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.set_total(4);
+    progress.inc_done();
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    terminal
+        .draw(|f| {
+            ProgressOverlay::for_operation("Deleting", &progress).render(f, f.area());
+        })
+        .unwrap();
+    let text = buffer_to_string(&terminal.backend().buffer().clone());
+    assert!(
+        text.contains("1 / 4 items"),
+        "no byte total means the item bar, unchanged:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("this file:"),
+        "nothing per-file to show when no bytes are reported:\n{}",
+        text
+    );
+}
+
+/// With several files, the overlay shows both bars — overall and current file —
+/// because they genuinely differ. With one file it must not, since two
+/// identical bars read as a rendering fault rather than as extra detail.
+#[test]
+fn test_operation_overlay_per_file_bar_only_when_it_differs() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let render = |progress: &OpProgress| {
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|f| {
+                ProgressOverlay::for_operation("Copying", progress).render(f, f.area());
+            })
+            .unwrap();
+        buffer_to_string(&terminal.backend().buffer().clone())
+    };
+
+    let many = OpProgress::new();
+    many.set_total(3);
+    many.set_bytes_total(3000);
+    many.begin_file("second.bin", 1000);
+    many.add_bytes(1500);
+    assert!(
+        render(&many).contains("this file:"),
+        "a multi-file batch shows the per-file bar too"
+    );
+
+    let one = OpProgress::new();
+    one.set_total(1);
+    one.set_bytes_total(1000);
+    one.begin_file("only.bin", 1000);
+    one.add_bytes(500);
+    assert!(
+        !render(&one).contains("this file:"),
+        "a single file needs one bar, not the same bar twice"
+    );
+}
+
+/// A long filename must not widen the box past its cap; it is elided in the
+/// middle so the extension stays readable.
+#[test]
+fn test_operation_overlay_elides_a_long_filename() {
+    use myd::widget::progress::{OpProgress, ProgressOverlay};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let progress = OpProgress::new();
+    progress.set_total(1);
+    progress.set_bytes_total(1000);
+    progress.begin_file(
+        "a-really-quite-extraordinarily-long-file-name-here.tar.zst",
+        1000,
+    );
+    progress.add_bytes(100);
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    terminal
+        .draw(|f| {
+            ProgressOverlay::for_operation("Copying", &progress).render(f, f.area());
+        })
+        .unwrap();
+    let text = buffer_to_string(&terminal.backend().buffer().clone());
+
+    assert!(text.contains("…"), "a long name is elided:\n{}", text);
+    assert!(
+        text.contains("a-really"),
+        "the start of the name survives:\n{}",
+        text
+    );
+    assert!(
+        text.contains(".zst"),
+        "the extension survives, which is why the middle is what goes:\n{}",
+        text
+    );
+    // Nothing may spill past the terminal width.
+    for line in text.lines() {
+        assert!(line.chars().count() <= 60, "line overflows: {:?}", line);
+    }
+}
+
 #[test]
 fn test_scan_overlay_shows_files_dirs_and_size() {
     use myd::widget::progress::{OpProgress, ProgressOverlay};

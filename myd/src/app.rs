@@ -6957,12 +6957,18 @@ impl FileBrowser {
             return;
         }
 
-        // Count the total entries (files + dirs) across every source so the
-        // overlay can show N / M. This is a shallow metadata walk, far cheaper
-        // than the copy itself.
+        // Count the total entries (files + dirs) and their combined size across
+        // every source, so the overlay can show N / M *and* draw a bar from
+        // bytes. This is a metadata-only walk, far cheaper than the copy itself.
+        //
+        // Bytes are what make the bar useful on a large copy: item counts move
+        // once per file, so copying a single huge file would otherwise sit at
+        // 0/1 until it finished.
         let progress = OpProgress::new();
         let total: u64 = batch.iter().map(|(src, _)| count_entries(src)).sum();
+        let bytes_total: u64 = batch.iter().map(|(src, _)| count_bytes(src)).sum();
         progress.set_total(total);
+        progress.set_bytes_total(bytes_total);
         self.op_progress = Some(progress.clone());
 
         let task = tokio::spawn(async move {
@@ -7519,10 +7525,97 @@ fn count_entries(path: &Path) -> u64 {
     }
 }
 
+/// Sum the bytes of every regular file rooted at `path`, for the progress bar's
+/// denominator.
+///
+/// Sizes come from the same `walkdir` pass that `count_entries` makes, and both
+/// are metadata-only — no file is opened. On a cold cache this is a stat per
+/// entry, which is still far cheaper than the copy that follows.
+///
+/// Unreadable entries contribute 0 rather than aborting: a total that is a
+/// little low makes the bar finish early, whereas refusing to copy because one
+/// file could not be stat'd would be a much worse trade.
+fn count_bytes(path: &Path) -> u64 {
+    if path.is_dir() {
+        walkdir::WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
+    } else {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+/// How much is copied per read/write pair, and so how often the progress bar
+/// can move. 1 MiB is large enough that the syscall overhead is negligible next
+/// to the data, and small enough that even a slow disk updates the bar several
+/// times a second.
+const COPY_CHUNK: usize = 1024 * 1024;
+
+/// Copy one file, reporting bytes as they land.
+///
+/// `std::fs::copy` is a single call that returns only when the whole file is
+/// written, so it can report nothing in between — which is exactly why a large
+/// copy appeared frozen. Streaming in chunks costs a little throughput on the
+/// platforms where `fs::copy` can use a kernel fast path, and buys a bar that
+/// actually moves; for a file big enough to notice the difference, the feedback
+/// is worth more than the microseconds.
+///
+/// Permissions are carried over afterwards to match `fs::copy`, which preserves
+/// the source's mode. Without this an executable would arrive non-executable.
+fn copy_file_streaming(
+    src: &Path,
+    dest: &Path,
+    progress: Option<&OpProgress>,
+) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut reader = std::fs::File::open(src)?;
+    let meta = reader.metadata()?;
+    if let Some(p) = progress {
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| src.display().to_string());
+        p.begin_file(name, meta.len());
+    }
+
+    let mut writer = std::fs::File::create(dest)?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A signal can interrupt a read partway through; that is not a
+            // failure, and retrying is what `fs::copy` does internally too.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        writer.write_all(&buf[..n])?;
+        if let Some(p) = progress {
+            p.add_bytes(n as u64);
+        }
+    }
+    writer.flush()?;
+
+    // Mode last, so it is applied to a file that is already complete.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).ok();
+    }
+
+    Ok(())
+}
+
 /// Copy `src` to `dest`, recursing into directories and bumping `progress` once
-/// per entry copied. Existing files at the destination are overwritten
-/// (`std::fs::copy` semantics); the overwrite decision is made by the caller
-/// before this runs.
+/// per entry copied — plus continuously, by bytes, within each file. Existing
+/// files at the destination are overwritten (`std::fs::copy` semantics); the
+/// overwrite decision is made by the caller before this runs.
 fn copy_path(src: &Path, dest: &Path, progress: Option<&OpProgress>) -> std::io::Result<()> {
     if src.is_dir() {
         for entry in walkdir::WalkDir::new(src)
@@ -7541,7 +7634,7 @@ fn copy_path(src: &Path, dest: &Path, progress: Option<&OpProgress>) -> std::io:
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::copy(entry.path(), &target)?;
+                copy_file_streaming(entry.path(), &target, progress)?;
             }
             if let Some(p) = progress {
                 p.inc_done();
@@ -7552,7 +7645,7 @@ fn copy_path(src: &Path, dest: &Path, progress: Option<&OpProgress>) -> std::io:
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let res = std::fs::copy(src, dest).map(|_| ());
+        let res = copy_file_streaming(src, dest, progress);
         if let Some(p) = progress {
             p.inc_done();
         }
@@ -7594,5 +7687,141 @@ impl PathExt for PathBuf {
             }
         }
         self.clone()
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    /// `copy_file_streaming` replaced `std::fs::copy`, so the first thing to
+    /// establish is that it still copies correctly — the progress reporting is
+    /// worthless if the bytes are wrong.
+    #[test]
+    fn streaming_copy_reproduces_the_file_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dest = dir.path().join("dest.bin");
+
+        // Deliberately not a multiple of the chunk size: an off-by-one in the
+        // loop bounds would show up on the final short read and nowhere else.
+        let data: Vec<u8> = (0..(COPY_CHUNK * 2 + 12345))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&src, &data).unwrap();
+
+        copy_file_streaming(&src, &dest, None).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data, "bytes must match");
+    }
+
+    /// An empty file has no chunks at all, so the loop body never runs. It must
+    /// still produce the file rather than nothing.
+    #[test]
+    fn streaming_copy_handles_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty");
+        let dest = dir.path().join("empty-copy");
+        std::fs::write(&src, b"").unwrap();
+
+        copy_file_streaming(&src, &dest, None).unwrap();
+        assert!(dest.exists(), "an empty source still yields a file");
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
+    }
+
+    /// `std::fs::copy` preserves the source's mode; the streaming replacement
+    /// has to as well, or copying a script would silently make it
+    /// non-executable.
+    #[cfg(unix)]
+    #[test]
+    fn streaming_copy_preserves_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("script.sh");
+        let dest = dir.path().join("script-copy.sh");
+        std::fs::write(&src, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        copy_file_streaming(&src, &dest, None).unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the mode carries over");
+    }
+
+    /// Overwriting is the caller's decision, made before this runs — so when it
+    /// does run onto an existing file it must leave the destination equal to the
+    /// source, with no tail of the old, longer file left behind.
+    #[test]
+    fn streaming_copy_truncates_a_larger_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("short");
+        let dest = dir.path().join("long");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"a much longer previous content").unwrap();
+
+        copy_file_streaming(&src, &dest, None).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    /// The counters the overlay reads: bytes must total the file's size, and
+    /// the file must be announced by name before its bytes arrive.
+    #[test]
+    fn streaming_copy_reports_bytes_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("payload.bin");
+        let dest = dir.path().join("payload-copy.bin");
+        let size = COPY_CHUNK + 500;
+        std::fs::write(&src, vec![7u8; size]).unwrap();
+
+        let progress = OpProgress::new();
+        copy_file_streaming(&src, &dest, Some(&progress)).unwrap();
+
+        assert_eq!(progress.bytes_done(), size as u64, "every byte counted");
+        assert_eq!(progress.file_total(), size as u64);
+        assert_eq!(progress.current_file().as_deref(), Some("payload.bin"));
+    }
+
+    /// A directory copy has to keep both counters honest across files, and
+    /// re-point `current_file` at each one in turn.
+    #[test]
+    fn recursive_copy_totals_bytes_across_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("tree");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), vec![1u8; 100]).unwrap();
+        std::fs::write(src.join("nested/b.txt"), vec![2u8; 250]).unwrap();
+        let dest = dir.path().join("tree-copy");
+
+        // The same two walks `spawn_copy_batch` makes.
+        assert_eq!(
+            count_bytes(&src),
+            350,
+            "sizes are summed, directories are 0"
+        );
+
+        let progress = OpProgress::new();
+        progress.set_total(count_entries(&src));
+        progress.set_bytes_total(count_bytes(&src));
+        copy_path(&src, &dest, Some(&progress)).unwrap();
+
+        assert_eq!(progress.bytes_done(), 350, "both files counted");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), vec![1u8; 100]);
+        assert_eq!(
+            std::fs::read(dest.join("nested/b.txt")).unwrap(),
+            vec![2u8; 250]
+        );
+    }
+
+    /// `count_bytes` is the bar's denominator, so a wrong answer here skews
+    /// every percentage. A single file is its own size; a directory is the sum
+    /// of the files beneath it and nothing else.
+    #[test]
+    fn count_bytes_measures_files_not_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.bin");
+        std::fs::write(&file, vec![0u8; 4096]).unwrap();
+        assert_eq!(count_bytes(&file), 4096, "a lone file is its own size");
+
+        let empty = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(count_bytes(&empty), 0, "a directory contributes nothing");
     }
 }
