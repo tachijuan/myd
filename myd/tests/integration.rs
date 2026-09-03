@@ -14561,6 +14561,137 @@ async fn gr_renames_every_tagged_file_through_the_pattern() {
     );
 }
 
+/// The counter, end to end through the real rename loop: three tagged files
+/// come out numbered in screen order.
+#[tokio::test]
+async fn gr_numbers_the_batch_with_a_sequence_counter() {
+    let (dir, mut app) = rename_app().await;
+    press_gr(&mut app);
+
+    type_into(&mut app, r"IMG_\d+\.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "holiday-##.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    settle_named(&mut app, dir.path(), "holiday-01.jpg").await;
+    for n in ["holiday-01.jpg", "holiday-02.jpg", "holiday-03.jpg"] {
+        assert!(dir.path().join(n).exists(), "{} should exist", n);
+    }
+    for n in ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg"] {
+        assert!(!dir.path().join(n).exists(), "{} should be gone", n);
+    }
+}
+
+/// A counter composes with a capture group, and honours start and step.
+#[tokio::test]
+async fn gr_counter_composes_with_captures_and_options() {
+    let (dir, mut app) = rename_app().await;
+    press_gr(&mut app);
+
+    type_into(&mut app, r"IMG_(\d+)\.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "trip-###:start=7,step=3-${1}.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    settle_named(&mut app, dir.path(), "trip-007-1.jpg").await;
+    for n in ["trip-007-1.jpg", "trip-010-2.jpg", "trip-013-3.jpg"] {
+        assert!(dir.path().join(n).exists(), "{} should exist", n);
+    }
+}
+
+/// A file the pattern skips must not consume a number. Otherwise a mixed
+/// selection — the ordinary case — comes out with gaps in the sequence.
+#[tokio::test]
+async fn a_skipped_file_does_not_consume_a_number() {
+    use myd::app::FileBrowser;
+
+    let dir = tempfile::tempdir().unwrap();
+    // The non-matching file must sort *between* the two that match, or the skip
+    // happens last and cannot shift the numbering either way — the test would
+    // pass even if the counter advanced on every candidate.
+    for n in ["IMG_1.jpg", "IMG_2.txt", "IMG_3.jpg"] {
+        std::fs::write(dir.path().join(n), "x").unwrap();
+    }
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('j'));
+    for _ in 0..3 {
+        app.handle_key_for_test(char_key('t'));
+        app.handle_key_for_test(char_key('j'));
+    }
+
+    press_gr(&mut app);
+    type_into(&mut app, r"IMG_\d+\.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "shot-##.jpg");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    settle_named(&mut app, dir.path(), "shot-01.jpg").await;
+    assert!(
+        dir.path().join("shot-02.jpg").exists(),
+        "the second *matching* file is 02, not 03 — a skip must not burn a number"
+    );
+    assert!(
+        !dir.path().join("shot-03.jpg").exists(),
+        "nothing should be numbered 03: only two files matched"
+    );
+    assert!(
+        dir.path().join("IMG_2.txt").exists(),
+        "the non-matching file is left alone"
+    );
+}
+
+/// The dialog teaches the syntax and shows what the numbering will produce —
+/// `##` is myd's own extension, so there is nowhere else to learn it at the
+/// moment of use.
+#[tokio::test]
+async fn the_rename_dialog_documents_the_counter() {
+    let (_dir, mut app) = rename_app().await;
+    press_gr(&mut app);
+
+    // The syntax hint is present before a counter is typed.
+    let text = app_screen_text(&mut app, 100, 30);
+    assert!(
+        text.contains("## counter"),
+        "the dialog names the counter syntax: {}",
+        text
+    );
+
+    type_into(&mut app, "IMG");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "shot-##:start=7,step=3");
+
+    let text = app_screen_text(&mut app, 100, 30);
+    assert!(
+        text.contains("numbering: 07, 10, 13"),
+        "a worked example makes the options legible: {}",
+        text
+    );
+}
+
+/// A malformed counter blocks the rename the same way a bad regex does, rather
+/// than renaming the whole batch to the literal option text.
+#[tokio::test]
+async fn a_malformed_counter_keeps_the_dialog_open() {
+    let (dir, mut app) = rename_app().await;
+    press_gr(&mut app);
+
+    type_into(&mut app, "IMG");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
+    type_into(&mut app, "shot-##:start=x");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "rename",
+        "a broken counter must not close the dialog"
+    );
+    assert!(
+        dir.path().join("IMG_1.jpg").exists(),
+        "and must not rename anything"
+    );
+}
+
 #[tokio::test]
 async fn the_rename_dialog_previews_the_first_tagged_file() {
     // The preview is the point of the dialog: it has to show the real

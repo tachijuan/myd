@@ -5751,18 +5751,26 @@ impl FileBrowser {
     /// tagging a mixed set and renaming only the ones that match is the ordinary
     /// case, not a mistake.
     fn apply_pattern_rename(&mut self, pattern: &str, replacement: &str) -> Option<String> {
-        use crate::widget::rename_dialog::apply_pattern;
+        use crate::widget::rename_dialog::apply_pattern_indexed;
 
         let targets = self.selection_targets();
         let mut renamed = 0usize;
         let mut skipped = 0usize;
         let mut failures: Vec<String> = Vec::new();
+        // The counter's position in the batch, advanced only when a file is
+        // actually renamed. Counting candidates instead would burn a number on
+        // every file the pattern skipped and leave gaps in the sequence — the
+        // ordinary case being a mixed selection where only some names match.
+        //
+        // `selection_targets` returns on-screen order, so the numbering follows
+        // what the user can see rather than a hash order that changes per run.
+        let mut seq_index = 0usize;
 
         for path in targets {
             let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) else {
                 continue;
             };
-            match apply_pattern(pattern, replacement, &name) {
+            match apply_pattern_indexed(pattern, replacement, &name, seq_index) {
                 // A pattern that stopped compiling between the preview and here
                 // is not something to report per file.
                 Err(e) => return Some(format!("Invalid pattern: {}", e)),
@@ -5779,6 +5787,7 @@ impl FileBrowser {
                         failures.push(format!("{}: {}", name, msg));
                     } else {
                         renamed += 1;
+                        seq_index += 1;
                     }
                 }
             }

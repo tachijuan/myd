@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.3.10" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.4.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -1388,6 +1388,48 @@ pattern            replacement   IMG_1234.JPG becomes
 .PP
 The rename preview shows the first tagged file transformed, so a pattern can be
 checked against a real name before it is applied to the set.
+.SS Sequence numbers
+A replacement may also number the files it renames. This is \fBmyd\fR's own
+extension to the replacement syntax, not part of the \fBregex\fR crate, which
+interpolates capture groups and nothing else.
+.PP
+A run of \fB#\fR is a counter, and its length is the zero\-padded width:
+\fB#\fR counts 1, 2, 3, \fB##\fR counts 01, 02, 03, and \fB###\fR counts 001,
+002, 003. It may appear anywhere in the replacement, as often as needed, mixed
+freely with capture groups. Padding is a minimum rather than a limit, so a
+batch of 150 files numbered \fB##\fR continues 99, 100, 101 rather than
+colliding.
+.PP
+The counter starts at 1 and advances by 1. Both can be set by following the
+run with \fB:start=\fIN\fR, \fB:step=\fIN\fR, or both separated by a comma.
+A negative \fBstep\fR counts down, and a negative value keeps its sign outside
+the padding \(em \fB\-05\fR, not \fB0\-5\fR. The option list ends at the first
+character that cannot belong to it, so an extension after it is safe:
+\fBshot\-###:start=7,step=3.jpg\fR numbers 007, 010, 013 and keeps \fB.jpg\fR.
+.PP
+.RS
+.nf
+pattern            replacement        the tagged files become
+\fB^IMG_\fR              \fBholiday\-##\-\fR      holiday\-01\-1234.JPG, holiday\-02\-…
+\fB(\\w+)\\.jpg\fR         \fBtrip\-##\-${1}.jpg\fR trip\-01\-alpha.jpg, trip\-02\-…
+\fB^\fR                  \fB###:start=10 \fR     010 alpha.jpg, 011 beta.jpg, …
+\fB^\fR                  \fB\\#\fR               a literal # in front of the name
+.fi
+.RE
+.PP
+A literal \fB#\fR is written \fB\\#\fR. A backslash before anything else is
+left alone, since a replacement is not a pattern.
+.PP
+Files are numbered in the order they appear on screen, and only files the
+pattern actually matches are numbered \(em a name the pattern skips does not
+consume a number, so the sequence has no gaps. Because the numbering depends on
+that order, the sort order in force when the rename runs is what determines it:
+sort by date and the counter follows date order.
+.PP
+The dialog shows the counter's first three values under the preview
+(\fBnumbering: 01, 02, 03, …\fR) whenever one is in use, and reports a
+malformed option \(em \fB##:start=x\fR \(em rather than renaming the batch to
+that literal text.
 .SH EXAMPLES
 .TP
 .B myd

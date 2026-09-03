@@ -116,7 +116,7 @@ round trip per directory, so myd declines to guess:
 - **Type-colored tiles** — each treemap tile is filled by content category (code, docs, images, video, audio, archives, data, binaries); directories take the color of whatever content dominates them, and a legend in the status bar names the colors on screen.
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
 - **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`), delete (`D`) or bulk-rename (`gr`) every tagged file at once. Tagging works in the treemap as well as the tree, and both share one set of tags, so switching views with `v` never changes what is staged. Tagged rows are highlighted and tagged tiles carry a `▶` marker and a green outline. Untag one with `t`, all with `U` or `gt`.
-- **Patterned rename** — `gr` renames every tagged file by regex, with `$1` for the first capture group. The dialog previews the pattern against the first tagged file before it is applied, and files the pattern doesn't match are skipped rather than treated as failures.
+- **Patterned rename** — `gr` renames every tagged file by regex, with `$1` for the first capture group and `##` for a sequence number (`#` per digit, so `##` gives `01`, `02`). The dialog previews the pattern against the first tagged file before it is applied, and files the pattern doesn't match are skipped rather than treated as failures.
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
 - **Create directories** — make a new directory in the current location with `N`.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item. `Tab` moves focus into it to edit permissions, owner and group — over the tagged files, or recursively through a directory — and `<` / `>` resize it. When there is room, the lower part previews the selected file, with `+` / `-` moving the split between the two.
@@ -293,7 +293,7 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 |-----------|----------------------------------------|
 | `D`       | Delete tagged / selected (`y` / `n` / `a` to stop asking) |
 | `R`       | Rename                                  |
-| `gr`      | Rename every tagged file by regex       |
+| `gr`      | Rename every tagged file by regex (`##` numbers them) |
 | `N`       | Create a new directory here            |
 | `S`       | Browse without measuring directories    |
 | `o`       | Open with the system default app        |
@@ -311,7 +311,7 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 | `c`       | Copy tagged / selected files                   |
 | `m`       | Move tagged / selected files to the other panel |
 | `D`       | Delete tagged / selected files                 |
-| `gr`      | Rename every tagged file by regex              |
+| `gr`      | Rename every tagged file by regex (`##` numbers them) |
 
 Tagged files are highlighted; `c`, `m`, `D` and `gr` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
 
@@ -511,6 +511,18 @@ Most operations act on a single file — the one under the cursor. To act on sev
 Once files are tagged, **`c`** (copy), **`m`** (move), **`D`** (delete) and **`gr`** (patterned rename) operate on the entire tagged set instead of just the cursor. Copying tagged files into another directory prompts once per name collision; deleting asks for a single confirmation (`y`, `n`, or `a` to stop asking for the session). Tags are cleared automatically when the operation completes. When nothing is tagged, these fall back to the file under the cursor.
 
 **`gr`** renames the whole tagged set by regex: enter a pattern and a replacement, where `$1` is the first capture group, and `Tab` moves between the two fields. The dialog previews the transformation against the first tagged file, so the pattern can be checked before it runs. Files the pattern doesn't match are skipped rather than reported as failures — tagging a mixed set and renaming only part of it is the ordinary case.
+
+The replacement can also number the files. A run of `#` is a counter whose length sets the zero-padded width — `#` counts 1, 2, 3; `##` counts 01, 02, 03; `###` counts 001, 002, 003 — and it can go anywhere in the replacement, as often as you like, mixed with capture groups. This is myd's own addition: the `regex` crate interpolates capture groups and nothing else.
+
+| pattern | replacement | `IMG_1234.JPG`, `IMG_1235.JPG` become |
+|---|---|---|
+| `^IMG_` | `holiday-##-` | `holiday-01-1234.JPG`, `holiday-02-1235.JPG` |
+| `(\w+)\.jpg` | `trip-##-${1}.jpg` | `trip-01-…`, `trip-02-…` |
+| `^` | `###:start=10 ` | `010 IMG_1234.JPG`, `011 IMG_1235.JPG` |
+
+The counter starts at 1 and steps by 1; follow the run with `:start=N`, `:step=N`, or both separated by a comma to change that. A negative step counts down. The option list ends at the first character that can't belong to it, so `shot-###:start=7,step=3.jpg` numbers 007, 010, 013 and keeps its `.jpg`. Padding is a minimum rather than a limit — 150 files numbered `##` continue 99, 100, 101 rather than colliding. Write `\#` for a literal `#`.
+
+Files are numbered in the order they appear on screen, and only files the pattern matches are numbered, so a skipped name doesn't consume a number and leave a gap. Since the numbering follows screen order, the sort order in force is what determines it — sort by date and the counter follows date order. The dialog shows the first three values it will produce (`numbering: 01, 02, 03, …`) and reports a malformed option such as `##:start=x` instead of renaming everything to that literal text.
 
 Large copies and deletes show a progress overlay with an item-by-item count and bar.
 

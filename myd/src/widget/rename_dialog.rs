@@ -109,24 +109,40 @@ impl RenameDialog {
     }
 
     /// Recompute the preview from the current fields.
+    ///
+    /// Routed through `apply_pattern_indexed` rather than calling the regex
+    /// directly, so the counter is resolved here exactly as it will be during
+    /// the rename. Previewing with a raw `replace_all` would show a literal
+    /// `##` and then produce something else — the one thing this dialog exists
+    /// to prevent.
+    ///
+    /// Index 0: the preview is of the *first* file, which is the one the sample
+    /// is taken from, so it shows the counter's starting value.
     fn recompute(&mut self) {
         if self.pattern.is_empty() {
             self.preview = Preview::Empty;
             return;
         }
-        self.preview = match regex::Regex::new(self.pattern.value()) {
+        self.preview = match apply_pattern_indexed(
+            self.pattern.value(),
+            self.replacement.value(),
+            &self.sample,
+            0,
+        ) {
             // The message is reported as-is: regex's own errors name the
             // position and the construct, which is more use than "invalid
-            // pattern" would be.
-            Err(e) => Preview::BadPattern(first_line(&e.to_string())),
-            Ok(re) => {
-                if !re.is_match(&self.sample) {
-                    Preview::NoMatch
-                } else {
-                    Preview::Renamed(re.replace_all(&self.sample, self.replacement.value()).into_owned())
-                }
-            }
+            // pattern" would be. A malformed counter reports its own reason
+            // the same way.
+            Err(e) => Preview::BadPattern(e),
+            Ok(None) => Preview::NoMatch,
+            Ok(Some(name)) => Preview::Renamed(name),
         }
+    }
+
+    /// The counter in the replacement, if there is one — the dialog shows a
+    /// worked example only when one is in play.
+    pub fn sequence(&self) -> Option<SeqSpec> {
+        sequence_spec(self.replacement.value())
     }
 
     fn active_mut(&mut self) -> &mut TextField {
@@ -212,8 +228,10 @@ impl RenameDialog {
         let width = 72.min(area.width.max(1));
         let inner = width.saturating_sub(2).max(1) as usize;
         // title + blank + 2 labelled fields (2 rows each) + blank + sample +
-        // arrow + result + blank + hint, plus borders.
-        let height = 15.min(area.height.max(1));
+        // arrow + result + blank + syntax hint + optional sequence example +
+        // blank + key hint, plus borders.
+        let seq = self.sequence();
+        let height = (16 + usize::from(seq.is_some()) as u16).min(area.height.max(1));
         let center = centered(Rect::new(0, 0, width, height), area);
         if center.width == 0 || center.height == 0 {
             return;
@@ -300,6 +318,31 @@ impl RenameDialog {
             ),
         };
         lines.push(Line::from(Span::styled(pad_to(&arrow, inner), style)));
+
+        // The counter is our own syntax, so the dialog has to teach it — there
+        // is nowhere else the user would learn `##` from at the moment of use.
+        lines.push(Line::from(Span::styled(String::new(), normal)));
+        lines.push(Line::from(Span::styled(
+            truncate(
+                "  $1 group   ## counter (01,02)   \\# literal #",
+                inner.saturating_sub(1),
+            ),
+            dim,
+        )));
+
+        // With a counter in play, show what it will actually produce. A spec
+        // like `##:start=7,step=3` is unreadable until you see 07, 10, 13.
+        if let Some(spec) = seq {
+            let sample: Vec<String> = (0..3).map(|i| spec.format(i)).collect();
+            lines.push(Line::from(Span::styled(
+                truncate(
+                    &format!("  numbering: {}, …", sample.join(", ")),
+                    inner.saturating_sub(1),
+                ),
+                Style::default().fg(Color::Rgb(140, 230, 140)).bg(bg),
+            )));
+        }
+
         lines.push(Line::from(Span::styled(String::new(), normal)));
         lines.push(Line::from(Span::styled(
             " Tab: field   Enter: rename   Esc: cancel".to_string(),
@@ -325,6 +368,232 @@ impl RenameDialog {
     }
 }
 
+/// A sequence-number placeholder parsed out of a replacement string.
+///
+/// `#` is our own syntax, not the regex crate's. The crate's replacement
+/// grammar interpolates capture groups only (`$1`, `${name}`, `$$` for a
+/// literal `$`) and has no counter of any kind, so there is nothing to reuse —
+/// see the module docs for why `${seq}` was not the spelling chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqSpec {
+    /// Zero-padded width, taken from the number of `#` characters. `#` is
+    /// width 1, which pads nothing.
+    pub width: usize,
+    /// First value emitted.
+    pub start: i64,
+    /// Added for each subsequent file.
+    pub step: i64,
+}
+
+impl SeqSpec {
+    /// The counter's value for the `i`th renamed file (0-based), formatted.
+    ///
+    /// Negative values keep the sign outside the padding — `-05`, not `0-5` —
+    /// which is what `format!("{:05}", -5)` would otherwise produce.
+    pub fn format(&self, i: usize) -> String {
+        let n = self.start.saturating_add(self.step.saturating_mul(i as i64));
+        let digits = n.unsigned_abs().to_string();
+        let pad = self.width.saturating_sub(digits.len());
+        let zeros: String = std::iter::repeat_n('0', pad).collect();
+        if n < 0 {
+            format!("-{}{}", zeros, digits)
+        } else {
+            format!("{}{}", zeros, digits)
+        }
+    }
+}
+
+/// What a replacement string's `#` run turned out to be.
+enum Token {
+    /// Literal text, with `\#` already unescaped to `#`.
+    Text(String),
+    /// A counter placeholder.
+    Seq(SeqSpec),
+}
+
+/// Split a replacement into literal text and counter placeholders.
+///
+/// Returns an error message rather than a partial parse: a malformed option
+/// list is a typo the user wants told about, and silently treating
+/// `##:start=x` as literal text would produce a batch of files all named
+/// `##:start=x` — the exact failure the preview exists to prevent.
+fn tokenize(replacement: &str) -> Result<Vec<Token>, String> {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut out: Vec<Token> = Vec::new();
+    let mut text = String::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        match chars[i] {
+            // `\#` is a literal `#`. A backslash before anything else is left
+            // alone: replacement strings are not regexes, and eating every
+            // backslash would mangle Windows-style names.
+            '\\' if i + 1 < chars.len() && chars[i + 1] == '#' => {
+                text.push('#');
+                i += 2;
+            }
+            '#' => {
+                let start = i;
+                while i < chars.len() && chars[i] == '#' {
+                    i += 1;
+                }
+                let width = i - start;
+
+                // An option list may follow: `##:start=5,step=2`. Only consumed
+                // when a `:` is actually followed by a known key, so a name like
+                // `shot-##:final` keeps its literal colon.
+                let mut spec = SeqSpec {
+                    width,
+                    start: 1,
+                    step: 1,
+                };
+                if i < chars.len() && chars[i] == ':' {
+                    if let Some((consumed, parsed)) = parse_options(&chars[i + 1..], spec)? {
+                        spec = parsed;
+                        i += 1 + consumed;
+                    }
+                }
+
+                if !text.is_empty() {
+                    out.push(Token::Text(std::mem::take(&mut text)));
+                }
+                out.push(Token::Seq(spec));
+            }
+            c => {
+                text.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !text.is_empty() {
+        out.push(Token::Text(text));
+    }
+    Ok(out)
+}
+
+/// Parse `start=N,step=N` from the head of `s`.
+///
+/// Returns `None` when `s` does not begin with a known key, leaving the `:`
+/// to be treated as literal text. Returns an error when a key *is* recognised
+/// but its value is not a number, since that is a typo rather than a filename.
+///
+/// Indices are into `s` as a `char` slice, and the count returned is in `char`s
+/// too — the caller's cursor counts characters, and mixing the two would
+/// mis-slice any replacement containing a multibyte character.
+fn parse_options(s: &[char], mut spec: SeqSpec) -> Result<Option<(usize, SeqSpec)>, String> {
+    let mut consumed = 0usize;
+    let mut saw_any = false;
+
+    loop {
+        let rest = &s[consumed..];
+        let Some(key_end) = rest.iter().position(|c| *c == '=') else {
+            break;
+        };
+        let key: String = rest[..key_end].iter().collect();
+        if key != "start" && key != "step" {
+            break;
+        }
+
+        // The value is an optional leading `-` and then digits, and it stops
+        // at the first character that is neither.
+        //
+        // The sign is only accepted in the leading position. A `-` further in
+        // is ordinary text — hyphens are everywhere in filenames, and
+        // `step=3-${1}.jpg` must read as step 3 followed by the rest of the
+        // name rather than as a malformed number.
+        let value_start = key_end + 1;
+        let mut value = String::new();
+        for (n, c) in rest[value_start..].iter().enumerate() {
+            if c.is_ascii_digit() || (n == 0 && *c == '-') {
+                value.push(*c);
+            } else {
+                break;
+            }
+        }
+        if value.is_empty() || value == "-" {
+            return Err(format!("{}= needs a number", key));
+        }
+        let n: i64 = value
+            .parse()
+            .map_err(|_| format!("{}={} is not a number", key, value))?;
+
+        match key.as_str() {
+            "start" => spec.start = n,
+            "step" => spec.step = n,
+            _ => unreachable!("guarded above"),
+        }
+        saw_any = true;
+        consumed += value_start + value.chars().count();
+
+        // Another option only if a comma joins it.
+        if s.get(consumed) == Some(&',') {
+            consumed += 1;
+        } else {
+            break;
+        }
+    }
+
+    if saw_any {
+        Ok(Some((consumed, spec)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The first counter in `replacement`, if it has one.
+///
+/// The dialog uses this to show a worked example of the numbering, which is
+/// the only way `##:start=5,step=2` becomes legible without running it.
+pub fn sequence_spec(replacement: &str) -> Option<SeqSpec> {
+    tokenize(replacement).ok()?.into_iter().find_map(|t| match t {
+        Token::Seq(spec) => Some(spec),
+        Token::Text(_) => None,
+    })
+}
+
+/// Resolve the counter in `replacement` for the `i`th renamed file, yielding a
+/// replacement string for the regex crate to interpolate.
+///
+/// Counters are substituted *before* regex expansion, so the number is fixed
+/// text by the time capture groups are filled in. Doing it the other way round
+/// would let a `#` inside a captured filename be mistaken for a placeholder.
+///
+/// A literal `$` produced by the counter is escaped to `$$`, so a negative
+/// start or an odd step can never be re-read as a capture reference. (Digits
+/// alone cannot form one, but the escape costs nothing and removes the need to
+/// reason about it.)
+pub fn resolve_sequence(replacement: &str, i: usize) -> Result<String, String> {
+    let tokens = tokenize(replacement)?;
+    let mut out = String::new();
+    for t in &tokens {
+        match t {
+            Token::Text(s) => out.push_str(s),
+            Token::Seq(spec) => out.push_str(&spec.format(i).replace('$', "$$")),
+        }
+    }
+    Ok(out)
+}
+
+/// Apply `pattern` -> `replacement` to `name`, resolving any sequence counter
+/// to its value for the `index`th renamed file.
+///
+/// Shared by the dialog's preview and the rename itself, so what was shown is
+/// by construction what gets done — the preview cannot promise one name and the
+/// batch produce another.
+pub fn apply_pattern_indexed(
+    pattern: &str,
+    replacement: &str,
+    name: &str,
+    index: usize,
+) -> Result<Option<String>, String> {
+    let re = regex::Regex::new(pattern).map_err(|e| first_line(&e.to_string()))?;
+    if !re.is_match(name) {
+        return Ok(None);
+    }
+    let replacement = resolve_sequence(replacement, index)?;
+    Ok(Some(re.replace_all(name, replacement.as_str()).into_owned()))
+}
+
 /// Apply `pattern` -> `replacement` to `name`.
 ///
 /// Shared by the dialog's preview and the rename itself, so what was shown is
@@ -335,11 +604,7 @@ pub fn apply_pattern(
     replacement: &str,
     name: &str,
 ) -> Result<Option<String>, String> {
-    let re = regex::Regex::new(pattern).map_err(|e| first_line(&e.to_string()))?;
-    if !re.is_match(name) {
-        return Ok(None);
-    }
-    Ok(Some(re.replace_all(name, replacement).into_owned()))
+    apply_pattern_indexed(pattern, replacement, name, 0)
 }
 
 /// The first line of a multi-line error, for a one-line display.
@@ -534,6 +799,203 @@ mod tests {
         };
         let done = apply_pattern(d.pattern(), d.replacement(), "IMG_7.jpg").unwrap();
         assert_eq!(done, Some(shown));
+    }
+
+    #[test]
+    fn a_bare_hash_counts_from_one_with_no_padding() {
+        for (i, want) in [(0, "1"), (1, "2"), (8, "9"), (9, "10"), (99, "100")] {
+            assert_eq!(resolve_sequence("shot-#", i).unwrap(), format!("shot-{}", want));
+        }
+    }
+
+    /// The width is the number of `#`, which is the whole point of the syntax:
+    /// `##` pads to two, `###` to three.
+    #[test]
+    fn the_number_of_hashes_sets_the_padding() {
+        assert_eq!(resolve_sequence("#", 0).unwrap(), "1");
+        assert_eq!(resolve_sequence("##", 0).unwrap(), "01");
+        assert_eq!(resolve_sequence("###", 0).unwrap(), "001");
+        assert_eq!(resolve_sequence("#####", 0).unwrap(), "00001");
+    }
+
+    /// Padding is a minimum, not a maximum. A batch of 150 files numbered `##`
+    /// must not truncate at 99 — silently colliding names would be far worse
+    /// than a wider number.
+    #[test]
+    fn a_number_wider_than_its_padding_is_not_truncated() {
+        assert_eq!(resolve_sequence("##", 99).unwrap(), "100");
+        assert_eq!(resolve_sequence("##", 998).unwrap(), "999");
+    }
+
+    #[test]
+    fn start_and_step_are_configurable() {
+        assert_eq!(resolve_sequence("##:start=5", 0).unwrap(), "05");
+        assert_eq!(resolve_sequence("##:start=5", 2).unwrap(), "07");
+        assert_eq!(resolve_sequence("##:start=0,step=10", 0).unwrap(), "00");
+        assert_eq!(resolve_sequence("##:start=0,step=10", 3).unwrap(), "30");
+        assert_eq!(resolve_sequence("#:step=2", 4).unwrap(), "9");
+    }
+
+    /// A countdown is expressible, and a negative value keeps its sign outside
+    /// the zero padding — `-05`, not `0-5`, which is what a naive `{:03}` gives.
+    #[test]
+    fn a_negative_value_pads_after_its_sign() {
+        // Width 3 means three digits, with the sign outside them: `-005`.
+        assert_eq!(resolve_sequence("###:start=-5", 0).unwrap(), "-005");
+        assert_eq!(resolve_sequence("##:start=-5", 0).unwrap(), "-05");
+        assert_eq!(resolve_sequence("##:start=3,step=-1", 4).unwrap(), "-01");
+    }
+
+    /// `\#` is the escape, so a literal hash in a filename is still reachable.
+    #[test]
+    fn a_backslash_escapes_a_literal_hash() {
+        assert_eq!(resolve_sequence(r"track\#1", 0).unwrap(), "track#1");
+        assert_eq!(resolve_sequence(r"\#\#", 5).unwrap(), "##");
+        // The escape and a real counter can coexist.
+        assert_eq!(resolve_sequence(r"\#-##", 0).unwrap(), "#-01");
+    }
+
+    /// A backslash before anything else is left alone. Replacement strings are
+    /// not regexes, and eating every backslash would mangle ordinary names.
+    #[test]
+    fn other_backslashes_are_left_alone() {
+        assert_eq!(resolve_sequence(r"a\db", 0).unwrap(), r"a\db");
+    }
+
+    /// A colon that does not introduce a known option is literal text. Names
+    /// like `shot-##:final` are ordinary and must not be read as options.
+    #[test]
+    fn a_colon_without_options_stays_literal() {
+        assert_eq!(resolve_sequence("shot-##:final", 0).unwrap(), "shot-01:final");
+        assert_eq!(resolve_sequence("##:", 0).unwrap(), "01:");
+    }
+
+    /// A recognised key with a broken value is a typo, and is reported. Left as
+    /// literal text it would rename an entire batch to the same bad string.
+    #[test]
+    fn a_malformed_option_is_an_error_not_literal_text() {
+        assert!(resolve_sequence("##:start=x", 0).is_err());
+        assert!(resolve_sequence("##:start=", 0).is_err());
+        assert!(resolve_sequence("##:start=1,step=-", 0).is_err());
+    }
+
+    /// The option list ends at the first character that cannot be part of it,
+    /// so an extension after the options survives. Getting this wrong would
+    /// swallow `.jpg` into the step value.
+    #[test]
+    fn text_after_an_option_list_survives() {
+        assert_eq!(
+            resolve_sequence("shot-###:start=7,step=3.jpg", 0).unwrap(),
+            "shot-007.jpg"
+        );
+        assert_eq!(
+            resolve_sequence("shot-###:start=7,step=3.jpg", 2).unwrap(),
+            "shot-013.jpg"
+        );
+        assert_eq!(resolve_sequence("a-##:start=5.txt", 0).unwrap(), "a-05.txt");
+    }
+
+    /// A `-` is a sign only in the leading position. Hyphens are everywhere in
+    /// filenames, so `step=3-${1}.jpg` has to read as step 3 followed by the
+    /// rest of the name rather than as a malformed number.
+    #[test]
+    fn a_hyphen_after_the_digits_is_text_not_part_of_the_number() {
+        assert_eq!(
+            resolve_sequence("trip-###:start=7,step=3-x", 1).unwrap(),
+            "trip-010-x"
+        );
+        assert_eq!(resolve_sequence("a-##:step=3-x", 0).unwrap(), "a-01-x");
+        // A leading sign still works, and a later hyphen still ends the value.
+        assert_eq!(resolve_sequence("a-##:start=-5-x", 0).unwrap(), "a--05-x");
+    }
+
+    #[test]
+    fn text_around_the_counter_is_preserved() {
+        assert_eq!(
+            resolve_sequence("holiday-##-final.jpg", 1).unwrap(),
+            "holiday-02-final.jpg"
+        );
+    }
+
+    /// Several counters in one replacement each get the same index, which is
+    /// what "the Nth file" means.
+    #[test]
+    fn multiple_counters_share_the_index() {
+        assert_eq!(resolve_sequence("##-of-##", 4).unwrap(), "05-of-05");
+    }
+
+    /// The counter is substituted before regex expansion, so a `$` it produces
+    /// must be escaped or it would be re-read as a capture reference. Digits
+    /// alone cannot form one, but a negative start is written with `-`, and the
+    /// escaping keeps the rule simple rather than conditional.
+    #[test]
+    fn a_counter_and_capture_groups_compose() {
+        let got = apply_pattern_indexed(r"IMG_(\d+)\.jpg", "trip-##-$1.jpg", "IMG_0042.jpg", 2)
+            .unwrap();
+        assert_eq!(got, Some("trip-03-0042.jpg".to_string()));
+    }
+
+    /// A `#` in the *matched filename* is data, not syntax. Resolving the
+    /// counter before expansion is what guarantees this; doing it afterwards
+    /// would rewrite the file's own name.
+    #[test]
+    fn a_hash_inside_the_captured_name_is_not_a_counter() {
+        let got = apply_pattern_indexed(r"(.+)\.txt", "$1-##.txt", "note#3.txt", 0).unwrap();
+        assert_eq!(got, Some("note#3-01.txt".to_string()));
+    }
+
+    #[test]
+    fn sequence_spec_reports_the_counter_for_the_dialog() {
+        assert_eq!(sequence_spec("plain"), None);
+        let spec = sequence_spec("shot-###:start=7,step=3").unwrap();
+        assert_eq!(spec.width, 3);
+        assert_eq!(spec.start, 7);
+        assert_eq!(spec.step, 3);
+    }
+
+    /// The preview must show the counter resolved, not a literal `##` — it is
+    /// the only check before a batch rename.
+    #[test]
+    fn the_preview_resolves_the_counter() {
+        let mut d = RenameDialog::new("IMG_0042.jpg", 3);
+        type_str(&mut d, r"IMG_(\d+)");
+        d.handle_key(code(KeyCode::Tab));
+        type_str(&mut d, "holiday-##");
+        assert_eq!(
+            *d.preview(),
+            Preview::Renamed("holiday-01.jpg".to_string()),
+            "the first file previews with the counter's starting value"
+        );
+        assert!(d.is_applicable());
+    }
+
+    /// A broken counter is reported the same way a broken regex is, and blocks
+    /// Enter rather than renaming a batch to a literal `##:start=x`.
+    #[test]
+    fn a_broken_counter_blocks_the_rename() {
+        let mut d = RenameDialog::new("a.txt", 2);
+        type_str(&mut d, "a");
+        d.handle_key(code(KeyCode::Tab));
+        type_str(&mut d, "x-##:start=q");
+        assert!(
+            matches!(d.preview(), Preview::BadPattern(_)),
+            "got {:?}",
+            d.preview()
+        );
+        assert!(!d.is_applicable());
+        assert_eq!(
+            d.handle_key(code(KeyCode::Enter)),
+            RenameDialogOutcome::Continue
+        );
+    }
+
+    /// A multibyte replacement must not panic. The option parser indexes by
+    /// char, and mixing that with byte offsets would split a codepoint.
+    #[test]
+    fn a_multibyte_replacement_around_a_counter_is_safe() {
+        assert_eq!(resolve_sequence("café-##", 0).unwrap(), "café-01");
+        assert_eq!(resolve_sequence("café-##:start=9", 1).unwrap(), "café-10");
+        assert_eq!(resolve_sequence("日本-##-語", 2).unwrap(), "日本-03-語");
     }
 
     #[test]
