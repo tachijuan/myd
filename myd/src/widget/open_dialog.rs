@@ -23,14 +23,21 @@ pub enum OpenDialogOutcome {
     Continue,
     Cancelled,
     /// Run this command line over the captured targets.
-    Run { command: String },
+    Run {
+        command: String,
+    },
     /// Save the field's command as a preset under `label`.
     ///
     /// The app owns the catalog, so the dialog reports the intent rather than
     /// writing the file — the same split `gd` uses for its saved hosts.
-    Save { label: String, command: String },
+    Save {
+        label: String,
+        command: String,
+    },
     /// Forget the preset with this label.
-    Forget { label: String },
+    Forget {
+        label: String,
+    },
 }
 
 /// Which half of the dialog has the keyboard.
@@ -106,8 +113,12 @@ pub struct OpenDialog {
     /// Index into `actions()`.
     action: usize,
     /// Click targets for the list rows and the action rows, rebuilt with them.
-    row_areas: Vec<Rect>,
-    action_areas: Vec<Rect>,
+    /// Click targets for the visible list rows and action rows, each paired
+    /// with the index it stands for. Paired rather than positional: once the
+    /// list scrolls, the first drawn row is not entry zero, and a positional
+    /// lookup would select whatever happened to be at the top.
+    row_areas: Vec<(usize, Rect)>,
+    action_areas: Vec<(usize, Rect)>,
 }
 
 /// One row of the saved-app list.
@@ -211,6 +222,37 @@ impl OpenDialog {
         !self.presets.is_empty() || !self.actions().is_empty()
     }
 
+    /// How many list rows fit, given the terminal height and how many we have.
+    ///
+    /// Everything outside the list costs 12 rows and the section's own header
+    /// and trailing blank cost 2 more, so what is left over is the list's. The
+    /// floor of one row matters: a list that renders zero rows shows nothing at
+    /// all while still claiming a section, which reads as an empty catalog.
+    fn visible_rows(&self, height: u16, rows: usize) -> usize {
+        if rows == 0 {
+            return 0;
+        }
+        let room = height.saturating_sub(14) as usize;
+        room.clamp(1, rows)
+    }
+
+    /// The first list index to draw, so the highlight is always on screen.
+    ///
+    /// The window follows the selection rather than being scrolled separately:
+    /// there is no scroll key here, and the arrows are what moves the
+    /// highlight, so anchoring the view to it keeps the two from diverging.
+    fn scroll_top(&self, visible: usize, rows: usize) -> usize {
+        if rows <= visible {
+            return 0;
+        }
+        let last = rows - visible;
+        if self.selected < visible {
+            0
+        } else {
+            (self.selected + 1 - visible).min(last)
+        }
+    }
+
     /// Start with the field pre-filled, for a remembered command.
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
         self.command = TextField::with_value(command);
@@ -264,6 +306,28 @@ impl OpenDialog {
         }
     }
 
+    /// A label for a new preset that no existing entry already uses.
+    ///
+    /// The catalog is keyed by label and `upsert` replaces by it, so handing
+    /// back a name that is already taken silently overwrites that entry
+    /// instead of adding one. The first word alone collides constantly —
+    /// `code .`, `code -w` and `code --diff` all derive `code` — which turned
+    /// every subsequent Save of the same program into an edit of the first.
+    ///
+    /// A colliding name gets a numeric suffix: `code`, then `code 2`, `code 3`.
+    /// `Update` is the way to deliberately replace an entry, and it is offered
+    /// right below `Save` whenever a row is highlighted.
+    fn fresh_label(&self, command: &str) -> String {
+        let base = default_label(command);
+        if !self.presets.iter().any(|p| p.label == base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|cand| !self.presets.iter().any(|p| &p.label == cand))
+            .unwrap_or(base)
+    }
+
     /// What an action decides.
     ///
     /// `Save` and `Update` differ only in the label they attach: a new preset
@@ -274,7 +338,7 @@ impl OpenDialog {
         let command = self.command.value().trim().to_string();
         match action {
             OpenAction::Save if !command.is_empty() => OpenDialogOutcome::Save {
-                label: default_label(&command),
+                label: self.fresh_label(&command),
                 command,
             },
             OpenAction::Update if !command.is_empty() => match self.selected_preset() {
@@ -412,10 +476,11 @@ impl OpenDialog {
             // is worse than one where an unmatched letter starts editing.
             KeyCode::Char(c)
                 if self.focus == OpenFocus::List
-                    && self
-                        .presets
-                        .iter()
-                        .any(|p| p.label.to_ascii_lowercase().starts_with(c.to_ascii_lowercase())) =>
+                    && self.presets.iter().any(|p| {
+                        p.label
+                            .to_ascii_lowercase()
+                            .starts_with(c.to_ascii_lowercase())
+                    }) =>
             {
                 let c = c.to_ascii_lowercase();
                 if let Some(i) = self
@@ -474,7 +539,10 @@ impl OpenDialog {
                 stops.push((OpenFocus::List, 0));
             }
             if !self.actions().is_empty() {
-                stops.push((OpenFocus::Actions, self.action.min(self.actions().len() - 1)));
+                stops.push((
+                    OpenFocus::Actions,
+                    self.action.min(self.actions().len() - 1),
+                ));
             }
         }
         for i in 0..buttons {
@@ -485,9 +553,7 @@ impl OpenDialog {
         }
         let here = stops
             .iter()
-            .position(|(f, i)| {
-                *f == self.focus && (*f != OpenFocus::Buttons || *i == self.button)
-            })
+            .position(|(f, i)| *f == self.focus && (*f != OpenFocus::Buttons || *i == self.button))
             .unwrap_or(0);
         let next = if backwards {
             (here + stops.len() - 1) % stops.len()
@@ -502,7 +568,6 @@ impl OpenDialog {
             _ => {}
         }
     }
-
 
     /// Answer a click at `(x, y)`.
     ///
@@ -528,7 +593,8 @@ impl OpenDialog {
         if let Some(i) = self
             .row_areas
             .iter()
-            .position(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(i, _)| *i)
         {
             if i < self.presets.len() {
                 self.focus = OpenFocus::List;
@@ -544,7 +610,8 @@ impl OpenDialog {
         if let Some(i) = self
             .action_areas
             .iter()
-            .position(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(i, _)| *i)
         {
             if let Some(action) = self.actions().get(i).copied() {
                 self.focus = OpenFocus::Actions;
@@ -583,7 +650,12 @@ impl OpenDialog {
         } else {
             0
         };
-        let list_rows = if rows == 0 { 0 } else { rows as u16 + 2 };
+        // The list is given every row it wants when the terminal has them, and
+        // scrolls when it does not. Clamping the whole dialog and letting the
+        // rows fall off the bottom, as this did, hid entries with nothing on
+        // screen saying so — the list simply looked shorter than it was.
+        let visible = self.visible_rows(area.height, rows);
+        let list_rows = if rows == 0 { 0 } else { visible as u16 + 2 };
         let height = (12 + list_rows).min(area.height.max(1));
         let center = centered(Rect::new(0, 0, width, height), area);
         // Not just zero: a 1x1 box is entirely border, with no interior for a
@@ -616,7 +688,10 @@ impl OpenDialog {
         lines.push(Line::from(Span::styled(
             " Command".to_string(),
             if field_focused {
-                Style::default().fg(accent).bg(bg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(accent)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 dim
             },
@@ -629,7 +704,10 @@ impl OpenDialog {
             normal
         };
         let mut field_spans = vec![Span::styled("  ".to_string(), field_style)];
-        field_spans.extend(self.command.spans(inner.saturating_sub(2), field_style, field_focused));
+        field_spans.extend(
+            self.command
+                .spans(inner.saturating_sub(2), field_style, field_focused),
+        );
         lines.push(Line::from(field_spans));
 
         lines.push(Line::from(Span::styled(String::new(), normal)));
@@ -657,11 +735,30 @@ impl OpenDialog {
             let actions_focused = self.focus == OpenFocus::Actions;
             // The list takes the left two thirds, the panel the rest.
             let col = (inner * 2 / 3).max(12);
+            // The header carries the count and the window when the list is
+            // scrolled, so a truncated list says it is truncated instead of
+            // just looking like a shorter catalog.
+            let total = self.presets.len();
+            let shown = self.visible_rows(area.height, self.presets.len().max(actions.len()));
+            let top = self.scroll_top(shown, self.presets.len().max(actions.len()));
+            let heading = if total > shown && shown > 0 {
+                format!(
+                    " Saved apps  {}-{} of {} ↑↓",
+                    top + 1,
+                    (top + shown).min(total),
+                    total
+                )
+            } else {
+                " Saved apps".to_string()
+            };
             lines.push(Line::from(vec![
                 Span::styled(
-                    pad_to(" Saved apps", col),
+                    pad_to(&heading, col),
                     if list_focused {
-                        Style::default().fg(accent).bg(bg).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(accent)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         dim
                     },
@@ -669,7 +766,10 @@ impl OpenDialog {
                 Span::styled(
                     " Actions".to_string(),
                     if actions_focused {
-                        Style::default().fg(accent).bg(bg).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(accent)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         dim
                     },
@@ -679,7 +779,10 @@ impl OpenDialog {
             // just pushed, plus everything before it, plus the top border.
             let first_row = center.y + lines.len() as u16;
             let rows = self.presets.len().max(actions.len());
-            for i in 0..rows {
+            let visible = self.visible_rows(area.height, rows);
+            let top = self.scroll_top(visible, rows);
+            for (slot, i) in (top..(top + visible).min(rows)).enumerate() {
+                let slot = slot as u16;
                 let mut row: Vec<Span> = Vec::new();
                 let left = match self.presets.get(i) {
                     Some(p) => {
@@ -711,12 +814,8 @@ impl OpenDialog {
                         } else {
                             normal
                         };
-                        self.row_areas.push(Rect::new(
-                            center.x + 1,
-                            first_row + i as u16,
-                            col as u16,
-                            1,
-                        ));
+                        self.row_areas
+                            .push((i, Rect::new(center.x + 1, first_row + slot, col as u16, 1)));
                         Span::styled(truncate(&text, col), style)
                     }
                     None => Span::styled(pad_to("", col), normal),
@@ -733,11 +832,14 @@ impl OpenDialog {
                         normal
                     };
                     let label = format!(" [{}]{}", action.shortcut(), &action.label()[1..]);
-                    self.action_areas.push(Rect::new(
-                        center.x + 1 + col as u16,
-                        first_row + i as u16,
-                        label.chars().count() as u16,
-                        1,
+                    self.action_areas.push((
+                        i,
+                        Rect::new(
+                            center.x + 1 + col as u16,
+                            first_row + slot,
+                            label.chars().count() as u16,
+                            1,
+                        ),
                     ));
                     row.push(Span::styled(label, style));
                 }
@@ -811,13 +913,15 @@ fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-
 /// Right-pad to `width` display columns.
 ///
 /// Measured with the same `display_width` the text field uses, so a CJK label
 /// does not push the actions panel out of alignment.
 fn pad_to(s: &str, width: usize) -> String {
-    let w: usize = s.chars().map(crate::widget::text_field::display_width).sum();
+    let w: usize = s
+        .chars()
+        .map(crate::widget::text_field::display_width)
+        .sum();
     let mut out = s.to_string();
     for _ in w..width {
         out.push(' ');
@@ -828,7 +932,11 @@ fn pad_to(s: &str, width: usize) -> String {
 /// Move an index one place, wrapping at both ends.
 fn step(current: usize, last: usize, down: bool) -> usize {
     if down {
-        if current >= last { 0 } else { current + 1 }
+        if current >= last {
+            0
+        } else {
+            current + 1
+        }
     } else if current == 0 {
         last
     } else {
@@ -893,16 +1001,11 @@ mod tests {
 
     /// Render the dialog and return the screen as text.
     fn render_to(d: &mut OpenDialog, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| d.render(f, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         (0..h)
-            .map(|y| {
-                (0..w)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -946,6 +1049,72 @@ mod tests {
             OpenDialogOutcome::Save {
                 label: "vim".to_string(),
                 command: "vim".to_string()
+            }
+        );
+    }
+
+    /// Saving a second command for the same program adds an entry rather than
+    /// replacing the first.
+    ///
+    /// The regression this pins: the label was the command's first word alone,
+    /// and the catalog replaces by label, so every `code ...` variant saved
+    /// over the previous one. The list looked like it refused to grow.
+    #[test]
+    fn saving_a_second_command_for_one_program_does_not_replace_the_first() {
+        let mut d = OpenDialog::new(one_file()).with_presets(vec![PresetRow {
+            label: "code".to_string(),
+            command: "code".to_string(),
+            matches_target: false,
+        }]);
+        type_str(&mut d, "code --diff");
+
+        let OpenDialogOutcome::Save { label, command } = d.run_action(OpenAction::Save) else {
+            panic!("Save must produce a Save outcome");
+        };
+        assert_eq!(command, "code --diff");
+        assert_ne!(
+            label, "code",
+            "reusing the existing label overwrites the saved entry instead of adding one"
+        );
+        assert_eq!(label, "code 2");
+    }
+
+    /// And it keeps stepping rather than colliding with the suffixed name too.
+    #[test]
+    fn each_further_save_of_the_same_program_gets_its_own_name() {
+        let preset = |l: &str, c: &str| PresetRow {
+            label: l.to_string(),
+            command: c.to_string(),
+            matches_target: false,
+        };
+        let mut d = OpenDialog::new(one_file()).with_presets(vec![
+            preset("code", "code"),
+            preset("code 2", "code --diff"),
+        ]);
+        type_str(&mut d, "code -w");
+
+        let OpenDialogOutcome::Save { label, .. } = d.run_action(OpenAction::Save) else {
+            panic!("Save must produce a Save outcome");
+        };
+        assert_eq!(label, "code 3");
+    }
+
+    /// Update is still how an entry is deliberately replaced: it keeps the
+    /// highlighted row's label, so the catalog overwrites that row.
+    #[test]
+    fn update_still_replaces_the_highlighted_entry() {
+        let mut d = OpenDialog::new(one_file()).with_presets(vec![PresetRow {
+            label: "code".to_string(),
+            command: "code".to_string(),
+            matches_target: false,
+        }]);
+        type_str(&mut d, "code --diff");
+
+        assert_eq!(
+            d.run_action(OpenAction::Update),
+            OpenDialogOutcome::Save {
+                label: "code".to_string(),
+                command: "code --diff".to_string()
             }
         );
     }
@@ -1074,15 +1243,17 @@ mod tests {
 
     #[test]
     fn save_names_the_entry_after_the_command() {
+        // A program the fixture has not saved, so this measures the naming and
+        // not the collision suffix — that has tests of its own above.
         let mut d = with_saved();
-        type_str(&mut d, "/usr/bin/gimp -n");
+        type_str(&mut d, "/usr/bin/inkscape -n");
         d.handle_key(code(KeyCode::Tab));
         d.handle_key(code(KeyCode::Tab)); // actions
         assert_eq!(
             d.handle_key(key('s')),
             OpenDialogOutcome::Save {
-                label: "gimp".to_string(),
-                command: "/usr/bin/gimp -n".to_string()
+                label: "inkscape".to_string(),
+                command: "/usr/bin/inkscape -n".to_string()
             },
             "the label is the program, without its path or arguments"
         );
@@ -1095,8 +1266,8 @@ mod tests {
         let mut d = with_saved();
         d.handle_key(code(KeyCode::Tab)); // list
         d.handle_key(code(KeyCode::Down)); // code
-        // Walking the list filled the field with `code -w`; clear it and type
-        // the replacement, which is what editing a preset actually looks like.
+                                           // Walking the list filled the field with `code -w`; clear it and type
+                                           // the replacement, which is what editing a preset actually looks like.
         d.handle_key(code(KeyCode::BackTab));
         d.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         type_str(&mut d, "codium -w");
@@ -1119,7 +1290,10 @@ mod tests {
     fn an_empty_field_offers_no_save() {
         let d = with_saved();
         assert!(!d.actions().contains(&OpenAction::Save));
-        assert!(d.actions().contains(&OpenAction::Forget), "but forget applies");
+        assert!(
+            d.actions().contains(&OpenAction::Forget),
+            "but forget applies"
+        );
     }
 
     /// A click on a preset selects it and does not run it. Running a program is
@@ -1128,9 +1302,12 @@ mod tests {
     fn clicking_a_preset_selects_without_running() {
         let mut d = with_saved();
         let text = render_to(&mut d, 90, 24);
-        assert!(text.contains("Saved apps"), "the list should be drawn:\n{text}");
+        assert!(
+            text.contains("Saved apps"),
+            "the list should be drawn:\n{text}"
+        );
         // The second row's rectangle, from the render that just happened.
-        let r = d.row_areas[1];
+        let r = d.row_areas[1].1;
         assert_eq!(
             d.click_at(r.x + 1, r.y),
             OpenDialogOutcome::Continue,
@@ -1148,8 +1325,7 @@ mod tests {
     /// which is worse than not listing it.
     #[test]
     fn the_list_shows_the_whole_command_not_just_its_first_word() {
-        let mut d = OpenDialog::new(one_file())
-            .with_presets(vec![row("open", "open -a VLC.app")]);
+        let mut d = OpenDialog::new(one_file()).with_presets(vec![row("open", "open -a VLC.app")]);
         let text = render_to(&mut d, 90, 24);
         assert!(
             text.contains("open -a VLC.app"),
@@ -1162,15 +1338,21 @@ mod tests {
     /// would only repeat the command's first word.
     #[test]
     fn a_hand_named_label_is_shown_and_a_derived_one_is_not() {
-        let mut d = OpenDialog::new(one_file())
-            .with_presets(vec![row("player", "open -a VLC.app")]);
+        let mut d =
+            OpenDialog::new(one_file()).with_presets(vec![row("player", "open -a VLC.app")]);
         let text = render_to(&mut d, 90, 24);
         assert!(text.contains("open -a VLC.app"), "{text}");
-        assert!(text.contains("(player)"), "the chosen name is worth showing:\n{text}");
+        assert!(
+            text.contains("(player)"),
+            "the chosen name is worth showing:\n{text}"
+        );
 
         let mut d = OpenDialog::new(one_file()).with_presets(vec![row("vim", "vim")]);
         let text = render_to(&mut d, 90, 24);
-        assert!(!text.contains("(vim)"), "a derived label is just noise:\n{text}");
+        assert!(
+            !text.contains("(vim)"),
+            "a derived label is just noise:\n{text}"
+        );
     }
 
     #[test]
@@ -1186,12 +1368,116 @@ mod tests {
     /// The box grows with the list rather than clipping the buttons off.
     #[test]
     fn a_long_list_does_not_push_the_buttons_out_of_the_box() {
-        let mut d = OpenDialog::new(one_file()).with_presets(
-            (0..8).map(|i| row(&format!("app{i}"), "run")).collect(),
-        );
+        let mut d = OpenDialog::new(one_file())
+            .with_presets((0..8).map(|i| row(&format!("app{i}"), "run")).collect());
         let text = render_to(&mut d, 90, 40);
         assert!(text.contains("[ OK ]"), "the buttons must survive:\n{text}");
         assert!(text.contains("app7"), "and so must the last entry:\n{text}");
+    }
+
+    /// A tall terminal shows every saved entry, with no scrolling and no
+    /// indicator — there is plenty of vertical room, so use it.
+    #[test]
+    fn a_tall_terminal_shows_the_whole_list_at_once() {
+        let mut d = OpenDialog::new(one_file()).with_presets(
+            (0..10)
+                .map(|i| row(&format!("app{i}"), &format!("run{i}")))
+                .collect(),
+        );
+        let text = render_to(&mut d, 90, 40);
+        for i in 0..10 {
+            assert!(
+                text.contains(&format!("run{i}")),
+                "entry {i} must show:\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("of 10"),
+            "nothing is hidden, so no scroll indicator:\n{text}"
+        );
+    }
+
+    /// A short terminal scrolls instead of silently dropping the overflow, and
+    /// says so in the header.
+    ///
+    /// The regression: the dialog clamped to the terminal height and the extra
+    /// rows simply fell off, so a catalog of ten looked like a catalog of one
+    /// with nothing on screen suggesting otherwise.
+    #[test]
+    fn a_short_terminal_scrolls_the_list_and_says_so() {
+        let mut d = OpenDialog::new(one_file()).with_presets(
+            (0..10)
+                .map(|i| row(&format!("app{i}"), &format!("run{i}")))
+                .collect(),
+        );
+        let text = render_to(&mut d, 90, 20);
+        assert!(
+            text.contains("of 10"),
+            "a truncated list must say how much it is hiding:\n{text}"
+        );
+        assert!(
+            text.contains("run0"),
+            "the window starts at the top:\n{text}"
+        );
+        assert!(text.contains("[ OK ]"), "and the buttons survive:\n{text}");
+    }
+
+    /// Walking past the bottom of the window scrolls it rather than moving the
+    /// highlight somewhere the user cannot see.
+    #[test]
+    fn the_window_follows_the_highlight_down_the_list() {
+        let mut d = OpenDialog::new(one_file()).with_presets(
+            (0..10)
+                .map(|i| row(&format!("app{i}"), &format!("run{i}")))
+                .collect(),
+        );
+        let _ = render_to(&mut d, 90, 20);
+        d.handle_key(code(KeyCode::Tab)); // the list
+        for _ in 0..9 {
+            d.handle_key(code(KeyCode::Down));
+        }
+        let text = render_to(&mut d, 90, 20);
+        assert_eq!(d.selected_preset().map(|p| p.label.as_str()), Some("app9"));
+        assert!(
+            text.contains("run9"),
+            "the highlighted entry must be on screen:\n{text}"
+        );
+        // And the view actually moved: the first entries have scrolled off.
+        assert!(
+            !text.contains("run0"),
+            "the window must follow the highlight, not stay at the top:\n{text}"
+        );
+        assert!(
+            text.contains("of 10"),
+            "and it still reports the window:\n{text}"
+        );
+    }
+
+    /// And a click on a scrolled list selects the row under the pointer, not
+    /// the entry that happens to share its position in the window.
+    #[test]
+    fn clicking_a_scrolled_row_selects_what_was_clicked() {
+        let mut d = OpenDialog::new(one_file()).with_presets(
+            (0..10)
+                .map(|i| row(&format!("app{i}"), &format!("run{i}")))
+                .collect(),
+        );
+        let _ = render_to(&mut d, 90, 20);
+        d.handle_key(code(KeyCode::Tab));
+        for _ in 0..9 {
+            d.handle_key(code(KeyCode::Down));
+        }
+        let _ = render_to(&mut d, 90, 20);
+
+        // The topmost drawn row is not entry zero any more.
+        let (index, rect) = d.row_areas[0];
+        assert_ne!(index, 0, "the list is scrolled for this to mean anything");
+        d.click_at(rect.x + 1, rect.y);
+        assert_eq!(
+            d.selected_preset().map(|p| p.label.as_str()),
+            Some(format!("app{index}").as_str()),
+            "a click must select the row it landed on"
+        );
     }
 
     /// A terminal too small for the box leaves no click targets behind.
@@ -1301,14 +1587,20 @@ mod tests {
             OpenDialogOutcome::Continue,
             "an empty command has nothing to run"
         );
-        assert_eq!(d.handle_key(code(KeyCode::Esc)), OpenDialogOutcome::Cancelled);
+        assert_eq!(
+            d.handle_key(code(KeyCode::Esc)),
+            OpenDialogOutcome::Cancelled
+        );
     }
 
     #[test]
     fn a_blank_command_is_not_runnable() {
         let mut d = OpenDialog::new(one_file());
         type_str(&mut d, "   ");
-        assert_eq!(d.handle_key(code(KeyCode::Enter)), OpenDialogOutcome::Continue);
+        assert_eq!(
+            d.handle_key(code(KeyCode::Enter)),
+            OpenDialogOutcome::Continue
+        );
     }
 
     #[test]
@@ -1342,7 +1634,10 @@ mod tests {
 
         d.handle_key(code(KeyCode::Tab)); // Cancel
         assert_eq!(d.focused_button(), Some(OpenButton::Cancel));
-        assert_eq!(d.handle_key(code(KeyCode::Enter)), OpenDialogOutcome::Cancelled);
+        assert_eq!(
+            d.handle_key(code(KeyCode::Enter)),
+            OpenDialogOutcome::Cancelled
+        );
     }
 
     #[test]
