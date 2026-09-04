@@ -4,7 +4,7 @@
 # `myd` (see [lib] and [[bin]] below), so `cargo install myd-tui` installs a
 # `myd` command and every `myd::` path in the tests still resolves.
 name = "myd-tui"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 authors = ["Juan Orlandini <tachijuan@gmail.com>"]
 description = "A terminal file browser with size bars, a treemap, previews, archives and SFTP"

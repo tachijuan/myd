@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.6.0" "User Commands"
+.TH "MYD" "1" "September 2026" "myd 1.7.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -1473,24 +1473,28 @@ batch of 150 files numbered \fB##\fR continues 99, 100, 101 rather than
 colliding.
 .PP
 The counter starts at 1 and advances by 1. Both can be set by following the
-run with \fB:start=\fIN\fR, \fB:step=\fIN\fR, or both separated by a comma.
-A negative \fBstep\fR counts down, and a negative value keeps its sign outside
-the padding \(em \fB\-05\fR, not \fB0\-5\fR. The option list ends at the first
-character that cannot belong to it, so an extension after it is safe:
-\fBshot\-###:start=7,step=3.jpg\fR numbers 007, 010, 013 and keeps \fB.jpg\fR.
+run with a braced option list: \fB##{\fI7\fB}\fR starts at 7, and
+\fB##{\fI7\fB+\fI3\fB}\fR starts at 7 and advances by 3. A minus is a negative
+step, so \fB###{10\-1}\fR counts 010, 009, 008 downwards, and a negative value
+keeps its sign outside the padding \(em \fB\-05\fR, not \fB0\-5\fR.
+.PP
+The braces delimit the options, so where they end is never in question:
+\fBshot\-###{7+3}.jpg\fR numbers 007, 010, 013 and keeps \fB.jpg\fR, and
+\fB##{7}2024\fR is the counter followed by a literal 2024.
 .PP
 .RS
 .nf
 pattern            replacement        the tagged files become
 \fB^IMG_\fR              \fBholiday\-##\-\fR      holiday\-01\-1234.JPG, holiday\-02\-…
 \fB(\\w+)\\.jpg\fR         \fBtrip\-##\-${1}.jpg\fR trip\-01\-alpha.jpg, trip\-02\-…
-\fB^\fR                  \fB###:start=10 \fR     010 alpha.jpg, 011 beta.jpg, …
+\fB^\fR                  \fB###{10} \fR          010 alpha.jpg, 011 beta.jpg, …
 \fB^\fR                  \fB\\#\fR               a literal # in front of the name
 .fi
 .RE
 .PP
-A literal \fB#\fR is written \fB\\#\fR. A backslash before anything else is
-left alone, since a replacement is not a pattern.
+A literal \fB#\fR is written \fB\\#\fR, and a literal \fB{\fR straight after a
+counter is written \fB\\{\fR. A backslash before anything else is left alone,
+since a replacement is not a pattern.
 .PP
 Files are numbered in the order they appear on screen, and only files the
 pattern actually matches are numbered \(em a name the pattern skips does not
@@ -1500,8 +1504,8 @@ sort by date and the counter follows date order.
 .PP
 The dialog shows the counter's first three values under the preview
 (\fBnumbering: 01, 02, 03, …\fR) whenever one is in use, and reports a
-malformed option \(em \fB##:start=x\fR \(em rather than renaming the batch to
-that literal text.
+malformed option \(em \fB##{x}\fR, or an unclosed brace \(em rather than
+renaming the batch to that literal text.
 .SH EXAMPLES
 .TP
 .B myd

@@ -544,11 +544,11 @@ The replacement can also number the files. A run of `#` is a counter whose lengt
 |---|---|---|
 | `^IMG_` | `holiday-##-` | `holiday-01-1234.JPG`, `holiday-02-1235.JPG` |
 | `(\w+)\.jpg` | `trip-##-${1}.jpg` | `trip-01-…`, `trip-02-…` |
-| `^` | `###:start=10 ` | `010 IMG_1234.JPG`, `011 IMG_1235.JPG` |
+| `^` | `###{10} ` | `010 IMG_1234.JPG`, `011 IMG_1235.JPG` |
 
-The counter starts at 1 and steps by 1; follow the run with `:start=N`, `:step=N`, or both separated by a comma to change that. A negative step counts down. The option list ends at the first character that can't belong to it, so `shot-###:start=7,step=3.jpg` numbers 007, 010, 013 and keeps its `.jpg`. Padding is a minimum rather than a limit — 150 files numbered `##` continue 99, 100, 101 rather than colliding. Write `\#` for a literal `#`.
+The counter starts at 1 and steps by 1. Follow the run with braces to change that: `##{7}` starts at 7, and `##{7+3}` starts at 7 and steps by 3. A minus is a negative step, so `###{10-1}` counts 010, 009, 008 down. The braces delimit the options, so nothing has to be guessed about where they end — `shot-###{7+3}.jpg` numbers 007, 010, 013 and keeps its `.jpg`, and `##{7}2024` is the counter followed by a literal 2024. Padding is a minimum rather than a limit — 150 files numbered `##` continue 99, 100, 101 rather than colliding. Write `\#` for a literal `#`, and `\{` for a literal brace straight after a counter.
 
-Files are numbered in the order they appear on screen, and only files the pattern matches are numbered, so a skipped name doesn't consume a number and leave a gap. Since the numbering follows screen order, the sort order in force is what determines it — sort by date and the counter follows date order. The dialog shows the first three values it will produce (`numbering: 01, 02, 03, …`) and reports a malformed option such as `##:start=x` instead of renaming everything to that literal text.
+Files are numbered in the order they appear on screen, and only files the pattern matches are numbered, so a skipped name doesn't consume a number and leave a gap. Since the numbering follows screen order, the sort order in force is what determines it — sort by date and the counter follows date order. The dialog shows the first three values it will produce (`numbering: 01, 02, 03, …`) and reports a malformed option such as `##{x}` instead of renaming everything to that literal text.
 
 Large copies and deletes show a progress overlay with an item-by-item count and bar.
 

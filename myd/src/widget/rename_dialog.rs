@@ -324,7 +324,7 @@ impl RenameDialog {
         lines.push(Line::from(Span::styled(String::new(), normal)));
         lines.push(Line::from(Span::styled(
             truncate(
-                "  $1 group   ## counter (01,02)   \\# literal #",
+                "  $1 group   ## counter   ##{7+3} from 7 by 3   \\# literal #",
                 inner.saturating_sub(1),
             ),
             dim,
@@ -432,6 +432,15 @@ fn tokenize(replacement: &str) -> Result<Vec<Token>, String> {
                 text.push('#');
                 i += 2;
             }
+            // `\{` is a literal `{`, so a name can still contain a brace
+            // directly after a counter — `##\{draft}` is `01{draft}`. Only
+            // needed in that one position, but accepted everywhere so the rule
+            // is "backslash-brace is a brace" rather than a positional
+            // exception the user has to reason about.
+            '\\' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                text.push('{');
+                i += 2;
+            }
             '#' => {
                 let start = i;
                 while i < chars.len() && chars[i] == '#' {
@@ -447,7 +456,11 @@ fn tokenize(replacement: &str) -> Result<Vec<Token>, String> {
                     start: 1,
                     step: 1,
                 };
-                if i < chars.len() && chars[i] == ':' {
+                if i < chars.len() && chars[i] == '{' {
+                    let (consumed, parsed) = parse_braced(&chars[i + 1..])?;
+                    spec = SeqSpec { width, ..parsed };
+                    i += 1 + consumed;
+                } else if i < chars.len() && chars[i] == ':' {
                     if let Some((consumed, parsed)) = parse_options(&chars[i + 1..], spec)? {
                         spec = parsed;
                         i += 1 + consumed;
@@ -471,7 +484,96 @@ fn tokenize(replacement: &str) -> Result<Vec<Token>, String> {
     Ok(out)
 }
 
+/// Parse a braced counter option list — `{7}` or `{7+3}` — from just after
+/// the `{`, returning how many characters it consumed (including the `}`).
+///
+/// This is the documented spelling. Unlike the `:start=`/`:step=` form it is
+/// self-delimiting: the `}` says where the options stop, so the parser never
+/// has to guess whether the next character belongs to the number or to the
+/// filename. That guess is the reason the older form was hard to predict.
+///
+/// The step's sign is its separator: `{7+3}` counts up by 3, `{10-1}` counts
+/// down by 1. There is no `+`/`-` ambiguity with the start value because the
+/// start is read first and a sign there is only meaningful in the leading
+/// position — `{-5+2}` starts at -5 and steps by 2.
+///
+/// An unclosed or malformed brace is an error rather than literal text. The
+/// whole point of the delimiter is that its extent is unambiguous, so a missing
+/// `}` is a typo the user wants told about, not a filename.
+fn parse_braced(s: &[char]) -> Result<(usize, SeqSpec), String> {
+    let Some(end) = s.iter().position(|c| *c == '}') else {
+        return Err("unclosed { — write \\{ for a literal brace".to_string());
+    };
+    let body: String = s[..end].iter().collect();
+    let spec = parse_brace_body(&body)?;
+    // +1 for the closing brace itself.
+    Ok((end + 1, spec))
+}
+
+/// Parse the inside of a braced counter: `7`, `7+3`, `-5+2`, `10-1`.
+///
+/// Width is filled in by the caller from the `#` run; the placeholder here is
+/// overwritten, never read.
+fn parse_brace_body(body: &str) -> Result<SeqSpec, String> {
+    let mut spec = SeqSpec {
+        width: 1,
+        start: 1,
+        step: 1,
+    };
+    let body = body.trim();
+    if body.is_empty() {
+        // `##{}` is the default counter. Harmless, and rejecting it would be a
+        // rule with no purpose.
+        return Ok(spec);
+    }
+
+    let chars: Vec<char> = body.chars().collect();
+    // The start value: an optional leading sign, then digits.
+    let mut i = 0usize;
+    if chars[0] == '-' || chars[0] == '+' {
+        i = 1;
+    }
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let start_text: String = chars[..i].iter().collect();
+    let start = parse_signed(&start_text, body)?;
+    spec.start = start;
+
+    if i == chars.len() {
+        return Ok(spec);
+    }
+
+    // What remains must be the step, introduced by its own sign. Anything else
+    // is a typo: `{7x3}` should be reported, not silently read as start=7.
+    if chars[i] != '+' && chars[i] != '-' {
+        return Err(format!("{{{}}} — expected + or - before the step", body));
+    }
+    let step_text: String = chars[i..].iter().collect();
+    spec.step = parse_signed(&step_text, body)?;
+    Ok(spec)
+}
+
+/// Parse a signed integer, reporting the whole brace body for context.
+///
+/// A bare sign, an empty string, or an overflowing value are all typos rather
+/// than filenames, so each is an error the dialog surfaces.
+fn parse_signed(text: &str, body: &str) -> Result<i64, String> {
+    // `+7` is not accepted by `i64::from_str`, but it is the natural way to
+    // write a positive step, so the sign is stripped first.
+    let normalised = text.strip_prefix('+').unwrap_or(text);
+    if normalised.is_empty() || normalised == "-" {
+        return Err(format!("{{{}}} needs a number", body));
+    }
+    normalised
+        .parse::<i64>()
+        .map_err(|_| format!("{{{}}} is not a number", body))
+}
+
 /// Parse `start=N,step=N` from the head of `s`.
+///
+/// The older, undocumented spelling. Kept so patterns written before the braced
+/// form keep working; `{7+3}` is what the dialog and the docs teach.
 ///
 /// Returns `None` when `s` does not begin with a known key, leaving the `:`
 /// to be treated as literal text. Returns an error when a key *is* recognised
@@ -825,6 +927,92 @@ mod tests {
     fn a_number_wider_than_its_padding_is_not_truncated() {
         assert_eq!(resolve_sequence("##", 99).unwrap(), "100");
         assert_eq!(resolve_sequence("##", 998).unwrap(), "999");
+    }
+
+    /// The documented spelling: `{start}` and `{start+step}`.
+    #[test]
+    fn a_braced_counter_sets_start_and_step() {
+        assert_eq!(resolve_sequence("##{7}", 0).unwrap(), "07");
+        assert_eq!(resolve_sequence("##{7}", 2).unwrap(), "09");
+        assert_eq!(resolve_sequence("##{7+3}", 0).unwrap(), "07");
+        assert_eq!(resolve_sequence("##{7+3}", 2).unwrap(), "13");
+        // The `#` run still sets the width; the braces only carry the numbers.
+        assert_eq!(resolve_sequence("####{7+3}", 2).unwrap(), "0013");
+    }
+
+    /// A minus introduces a negative step, which is how a countdown is written.
+    #[test]
+    fn a_braced_counter_counts_down() {
+        assert_eq!(resolve_sequence("###{10-1}", 0).unwrap(), "010");
+        assert_eq!(resolve_sequence("###{10-1}", 3).unwrap(), "007");
+        // A negative start keeps its sign outside the padding.
+        assert_eq!(resolve_sequence("##{-5+2}", 0).unwrap(), "-05");
+        assert_eq!(resolve_sequence("##{-5+2}", 3).unwrap(), "01");
+    }
+
+    /// The whole reason for braces: the option list cannot leak into the
+    /// filename, because `}` says where it stops. The `:start=` form had to
+    /// guess, which is what made it unpredictable.
+    #[test]
+    fn a_brace_delimits_the_options_from_the_filename() {
+        assert_eq!(
+            resolve_sequence("shot-###{7+3}.jpg", 0).unwrap(),
+            "shot-007.jpg"
+        );
+        // A digit straight after the brace is filename, not part of the start.
+        // This is the ambiguity that ruled out the bare `##7` spelling.
+        assert_eq!(resolve_sequence("##{7}2024", 0).unwrap(), "072024");
+        // As is a letter, with no separator needed.
+        assert_eq!(resolve_sequence("##{7}x", 0).unwrap(), "07x");
+    }
+
+    /// `\{` escapes a literal brace, mirroring `\#`.
+    #[test]
+    fn a_backslash_escapes_a_literal_brace() {
+        assert_eq!(resolve_sequence(r"##\{draft}", 0).unwrap(), "01{draft}");
+        assert_eq!(resolve_sequence(r"\{7+3}", 0).unwrap(), "{7+3}");
+    }
+
+    /// An empty brace is just the default counter.
+    #[test]
+    fn an_empty_brace_is_the_plain_counter() {
+        assert_eq!(resolve_sequence("##{}", 0).unwrap(), "01");
+        assert_eq!(resolve_sequence("##{}", 4).unwrap(), "05");
+    }
+
+    /// A malformed brace is reported rather than renaming the batch to the
+    /// literal text — the same contract the `:start=` form has.
+    #[test]
+    fn a_malformed_brace_is_an_error() {
+        assert!(resolve_sequence("##{7", 0).is_err(), "unclosed");
+        assert!(resolve_sequence("##{7x3}", 0).is_err(), "junk after start");
+        assert!(resolve_sequence("##{x}", 0).is_err(), "not a number");
+        assert!(resolve_sequence("##{7+}", 0).is_err(), "bare sign");
+    }
+
+    /// The unclosed-brace message has to name the escape, or the user has no
+    /// way to type a literal brace after a counter.
+    #[test]
+    fn the_unclosed_brace_error_names_the_escape() {
+        let e = resolve_sequence("##{7", 0).unwrap_err();
+        assert!(e.contains(r"\{"), "must point at the escape: {e}");
+    }
+
+    /// The older spelling keeps working. It is undocumented now, but patterns
+    /// written before the braced form must not start failing.
+    #[test]
+    fn the_legacy_colon_form_still_parses() {
+        assert_eq!(resolve_sequence("##:start=7,step=3", 2).unwrap(), "13");
+    }
+
+    /// A counter and capture groups compose under the braced form too, with the
+    /// counter resolved before the regex sees the string.
+    #[test]
+    fn a_braced_counter_composes_with_capture_groups() {
+        assert_eq!(
+            resolve_sequence("trip-##{7+3}-${1}.jpg", 1).unwrap(),
+            "trip-10-${1}.jpg"
+        );
     }
 
     #[test]

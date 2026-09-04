@@ -14595,7 +14595,7 @@ async fn gr_counter_composes_with_captures_and_options() {
 
     type_into(&mut app, r"IMG_(\d+)\.jpg");
     app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
-    type_into(&mut app, "trip-###:start=7,step=3-${1}.jpg");
+    type_into(&mut app, "trip-###{7+3}-${1}.jpg");
     app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
 
     settle_named(&mut app, dir.path(), "trip-007-1.jpg").await;
@@ -14661,10 +14661,15 @@ async fn the_rename_dialog_documents_the_counter() {
         "the dialog names the counter syntax: {}",
         text
     );
+    assert!(
+        text.contains("##{7+3}"),
+        "and teaches the start/step spelling, which is not guessable: {}",
+        text
+    );
 
     type_into(&mut app, "IMG");
     app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
-    type_into(&mut app, "shot-##:start=7,step=3");
+    type_into(&mut app, "shot-##{7+3}");
 
     let text = app_screen_text(&mut app, 100, 30);
     assert!(
@@ -14683,7 +14688,7 @@ async fn a_malformed_counter_keeps_the_dialog_open() {
 
     type_into(&mut app, "IMG");
     app.handle_key_for_test(key(crossterm::event::KeyCode::Tab));
-    type_into(&mut app, "shot-##:start=x");
+    type_into(&mut app, "shot-##{x}");
     app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
 
     assert_eq!(
