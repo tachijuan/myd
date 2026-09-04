@@ -93,6 +93,8 @@ pub enum Action {
     OpenWithDefaultApp,
     /// Ask which program to run, then run it over the selection.
     OpenWith,
+    /// Open the selection in the configured editor.
+    Edit,
     /// Browse without measuring directory sizes, and back again.
     ToggleShallow,
     /// Show or hide the tree's `ls -l` permissions column.
@@ -290,6 +292,10 @@ impl KeyBindingHandler {
             KeyCode::Char('B') => Some(Action::ToggleBar),
             KeyCode::Char('o') => Some(Action::OpenWithDefaultApp),
             KeyCode::Char('O') => Some(Action::OpenWith),
+            // `o` and `O` already open things; `e` edits one. Distinct from
+            // both because it needs no dialog and no desktop association — the
+            // editor is configured once and then it just runs.
+            KeyCode::Char('e') => Some(Action::Edit),
             KeyCode::Char('S') => Some(Action::ToggleShallow),
             KeyCode::Char('P') => Some(Action::TogglePerms),
             KeyCode::Char('T') => Some(Action::ToggleTimes),

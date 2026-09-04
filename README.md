@@ -118,6 +118,7 @@ round trip per directory, so myd declines to guess:
 - **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`), delete (`D`) or bulk-rename (`gr`) every tagged file at once. Tagging works in the treemap as well as the tree, and both share one set of tags, so switching views with `v` never changes what is staged. Tagged rows are highlighted and tagged tiles carry a `▶` marker and a green outline. Untag one with `t`, all with `U` or `gt`.
 - **Patterned rename** — `gr` renames every tagged file by regex, with `$1` for the first capture group and `##` for a sequence number (`#` per digit, so `##` gives `01`, `02`). The dialog previews the pattern against the first tagged file before it is applied, and files the pattern doesn't match are skipped rather than treated as failures.
 - **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `N`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
+- **Edit in place** — press `e` to open the tagged files (or the one under the cursor) in your editor. myd suspends, hands over the terminal, and takes it back when the editor exits, so a terminal editor behaves exactly as it would from a shell. The editor is the `editor` setting in `prefs.toml` if set, otherwise `$EDITOR`, otherwise `vim` — and either may carry arguments, as in `code -w`. It works in the preview pane too, where it edits the file you are reading.
 - **Create directories** — make a new directory in the current location with `gn`.
 - **Yank, cut and paste** — `y` holds the tagged files (or the one under the cursor), `x` holds them to be moved, and `p` puts them wherever you have navigated to. The destination is chosen *after* the sources, so this is how you copy within a single pane — no split required. A held set shows as a badge in the footer (`YANK report.txt`, `CUT 3 items`) so it is never invisible state, `Esc` clears it, and `u` undoes the last paste after asking. A name already taken is suffixed rather than confirmed, which makes pasting back into the source directory the way to duplicate a file.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item. `Tab` moves focus into it to edit permissions, owner and group — over the tagged files, or recursively through a directory — and `<` / `>` resize it. When there is room, the lower part previews the selected file, with `+` / `-` moving the split between the two.
@@ -297,6 +298,7 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 | `gr`      | Rename every tagged file by regex (`##` numbers them) |
 | `gn`      | Create a new directory here            |
 | `S`       | Browse without measuring directories    |
+| `e`       | Edit in your editor                     |
 | `o`       | Open with the system default app        |
 | `O`       | Open with a program you name             |
 | `r`       | Refresh tree                            |
@@ -896,7 +898,17 @@ info_meta_bias = 0
 
 # The format `gz` offers first: "zip", "7z", "tar" or "tgz".
 default_archive_format = "zip"
+
+# The editor `e` opens files with. Overrides $EDITOR; myd falls back to vim
+# when neither is set. Takes arguments, e.g. "code -w" or "vim -p".
+# editor = "vim"
 ```
+
+myd writes that last entry, commented out, into a fresh preferences file — the
+setting has no key that toggles it, so it would otherwise be discoverable only
+by reading the manual. It does that **once**: a launch that finds the comment,
+or a real `editor` key, leaves the file alone, so the entry never accumulates.
+Delete it and it stays deleted until the file mentions neither.
 
 Every setting has a default, so a file that omits one — or one written by an
 older version — still loads. A value that is out of range is brought back into

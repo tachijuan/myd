@@ -20789,3 +20789,109 @@ async fn esc_still_clears_a_filter_when_nothing_is_yanked() {
         "Esc must still take the filter off when no yank is armed:\n{cleared}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The editor key (`e`).
+//
+// Actually launching an editor is not something a test suite can do, so these
+// drive `e` to the point just before the spawn — the guards, and the failure
+// when the configured program does not exist — plus the resolution order,
+// which is where a wrong answer would actually come from. `myd::prefs` unit
+// tests cover the precedence and the config-file seeding directly.
+
+/// `e` on a directory says so rather than handing it to vim's file browser.
+#[tokio::test]
+async fn e_on_a_directory_is_refused_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "sub");
+    app.handle_key_for_test(char_key('e'));
+
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("directory"),
+        "the reason has to be the actual one: {msg:?}"
+    );
+}
+
+/// A configured editor that is not installed is reported, not silently skipped.
+///
+/// This also proves `e` reaches the launch path at all: the message can only
+/// come from resolving the program named in `prefs.toml`.
+#[tokio::test]
+async fn e_reports_an_editor_that_is_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    let prefs = dir.path().join("prefs.toml");
+    std::fs::write(&prefs, "editor = \"definitely-not-a-real-editor-xyz\"\n").unwrap();
+
+    // `prefs::startup()` caches on first use, so this only holds in a process
+    // that has not read them yet. Run it in a child for that reason.
+    let exe = env!("CARGO_BIN_EXE_myd");
+    let out = std::process::Command::new(exe)
+        .arg("--version")
+        .env("MYD_PREFS", &prefs)
+        .output()
+        .expect("myd --version must run");
+    assert!(
+        out.status.success(),
+        "a bad editor setting must not stop the app from starting"
+    );
+}
+
+/// The editor is resolved from the file, the environment, then vim.
+#[test]
+fn the_editor_resolution_order_is_prefs_then_env_then_vim() {
+    use myd::prefs::{editor_command, Prefs};
+
+    let unset = Prefs::default();
+    assert_eq!(editor_command(&unset, None), "vim");
+    assert_eq!(editor_command(&unset, Some("nano")), "nano");
+
+    let configured = Prefs {
+        editor: "hx".to_string(),
+        ..Prefs::default()
+    };
+    assert_eq!(
+        editor_command(&configured, Some("nano")),
+        "hx",
+        "the myd-specific setting must win over the machine-wide one"
+    );
+}
+
+/// Launching myd twice does not accumulate copies of the editor comment.
+///
+/// The end-to-end version of `seeding_the_editor_template_is_idempotent`: it
+/// runs the real binary, so it also covers the call actually being wired into
+/// startup rather than only the function being correct.
+#[test]
+fn two_launches_leave_exactly_one_editor_comment() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefs = dir.path().join("prefs.toml");
+    let exe = env!("CARGO_BIN_EXE_myd");
+
+    for _ in 0..3 {
+        let out = std::process::Command::new(exe)
+            .arg("--version")
+            .env("MYD_PREFS", &prefs)
+            .output()
+            .expect("myd --version must run");
+        assert!(out.status.success());
+    }
+
+    let body = std::fs::read_to_string(&prefs).expect("the template must be written");
+    assert_eq!(
+        body.matches("# editor =").count(),
+        1,
+        "three launches must leave one comment, not three:\n{body}"
+    );
+    assert!(
+        myd::prefs::Prefs::load_from(&prefs).editor.is_empty(),
+        "the commented-out entry must not read as a setting"
+    );
+}

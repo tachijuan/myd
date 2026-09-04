@@ -3192,6 +3192,15 @@ impl FileBrowser {
                 self.modal = Modal::Input(InputDialog::new("Search in file (regex):", ""));
                 Some(true)
             }
+            // Edit what is being previewed. The pane binds its own keys rather
+            // than falling through to the tree's, so `e` has to be listed here
+            // too — reading a file and then wanting to change it is the
+            // ordinary next step, and closing the pane first to reach it would
+            // be a detour.
+            KeyCode::Char('e') => {
+                self.edit_selection();
+                Some(true)
+            }
             // n/p step forward/back; N/P reverse each, as in the tree.
             KeyCode::Char('n') => {
                 self.preview.step_match(true);
@@ -4117,6 +4126,49 @@ impl FileBrowser {
     }
 
     /// Open the "run a program over the selection" dialog.
+    /// Open the selection in the configured editor.
+    ///
+    /// The editor comes from `prefs.toml`, then `$EDITOR`, then `vim` — see
+    /// [`crate::prefs::editor_command`]. Unlike `O` there is no dialog: the
+    /// program is decided by configuration rather than asked for each time,
+    /// which is the whole difference between "edit this" and "open this with".
+    ///
+    /// Works from the preview pane as well as the tree. Both read the cursor's
+    /// file — the preview shows whatever the cursor is on — so `e` edits what
+    /// is on screen either way, and the pane is closed first so the editor is
+    /// not drawn over by a stale preview when it exits.
+    fn edit_selection(&mut self) {
+        if self.refuse_open_with_if_not_local() {
+            return;
+        }
+        let targets = self.selection_targets();
+        if targets.is_empty() {
+            return;
+        }
+        // Editing a directory is almost never what was meant, and handing one
+        // to vim opens its netrw listing — a different program's file browser
+        // inside this one. Say so instead.
+        if targets.len() == 1 && targets[0].is_dir() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "That is a directory. Press e on a file to edit it.",
+            ));
+            return;
+        }
+
+        // The preview owns a graphics surface the child would draw over, and
+        // its content is a snapshot of a file the editor is about to change.
+        // Closing it first avoids both.
+        if self.preview_open {
+            self.close_preview();
+        }
+
+        let command = crate::prefs::editor_command(
+            &crate::prefs::startup(),
+            std::env::var("EDITOR").ok().as_deref(),
+        );
+        self.run_open_command(&command, &targets);
+    }
+
     fn open_with_program(&mut self) {
         if self.refuse_open_with_if_not_local() {
             return;
@@ -4862,6 +4914,10 @@ impl FileBrowser {
                 self.open_with_program();
                 true
             }
+            Action::Edit => {
+                self.edit_selection();
+                true
+            }
             Action::ToggleShallow => {
                 self.toggle_shallow();
                 true
@@ -5258,6 +5314,7 @@ impl FileBrowser {
                     | Action::ToggleMouse
                     | Action::OpenWithDefaultApp
                     | Action::OpenWith
+                    | Action::Edit
                     | Action::TogglePreview
                     | Action::Redraw
                     | Action::ToggleShallow

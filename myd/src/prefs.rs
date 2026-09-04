@@ -47,7 +47,7 @@ pub const MAX_META_BIAS: i16 = 40;
 /// Every field is `#[serde(default)]` so a file written by an older version —
 /// or edited by hand down to a single line — still loads, gaining the defaults
 /// for anything it does not mention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prefs {
     /// Info panel width, as a percentage of the panel it sits in.
     #[serde(default = "default_info_pct")]
@@ -64,6 +64,44 @@ pub struct Prefs {
     /// use of a one-shot action would be a different bargain.
     #[serde(default, deserialize_with = "lenient_archive_format")]
     pub default_archive_format: crate::vfs::archive::WriteFormat,
+    /// The program `e` hands a file to, overriding `$EDITOR`.
+    ///
+    /// Empty means "not set", which is what an absent key deserialises to —
+    /// so the precedence below is decided by one rule rather than by whether
+    /// the key exists. A command line, not just a program name: `code -w` and
+    /// `vim -p` both need their arguments to behave as an editor should.
+    #[serde(default)]
+    pub editor: String,
+}
+
+/// The commented-out template written into a fresh `prefs.toml`.
+///
+/// A setting nobody can see is a setting nobody uses, and `editor` is the one
+/// preference here with no key that toggles it — it can only be discovered by
+/// reading the file or the manual. The comment puts it in front of whoever
+/// opens the file for any other reason.
+///
+/// Written once, when the key is absent from the file *and* the comment is not
+/// already there. Re-adding it on every launch would grow the file without
+/// bound and would fight anyone who deliberately deleted it.
+pub const EDITOR_TEMPLATE: &str = "\
+# The editor `e` opens files with. Overrides $EDITOR; myd falls back to vim
+# when neither is set. Takes arguments, e.g. \"code -w\" or \"vim -p\".
+# editor = \"vim\"
+";
+
+/// Whether `body` already carries the editor template's own comment.
+///
+/// Matched on the distinctive first line rather than the whole block, so a
+/// user who edited the wording, reflowed it, or uncommented the key keeps
+/// their version instead of getting a second copy appended beneath it.
+pub fn has_editor_template(body: &str) -> bool {
+    body.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("# The editor `e` opens")
+            || l.starts_with("editor ")
+            || l.starts_with("editor=")
+    })
 }
 
 fn default_info_pct() -> u16 {
@@ -98,7 +136,80 @@ impl Default for Prefs {
             info_panel_pct: DEFAULT_INFO_PCT,
             info_meta_bias: 0,
             default_archive_format: crate::vfs::archive::WriteFormat::default(),
+            editor: String::new(),
         }
+    }
+}
+
+/// Put the commented-out `editor` template in the preferences file, once.
+///
+/// Called at startup. Does nothing when the file already mentions the setting
+/// in any form — the comment, or a real `editor =` key — so a launch never
+/// re-adds what a previous launch wrote, and never argues with someone who
+/// deleted the comment or filled the key in. That check is the whole point:
+/// appending unconditionally would grow the file by a paragraph per run.
+///
+/// Failures are ignored. Seeding a comment is a convenience, and a read-only
+/// config directory must not stop the app from starting.
+pub fn seed_editor_template() {
+    let Some(path) = default_path() else {
+        return;
+    };
+    seed_editor_template_at(&path);
+}
+
+pub fn seed_editor_template_at(path: &std::path::Path) {
+    let existing = std::fs::read_to_string(path);
+    if let Ok(body) = &existing {
+        if has_editor_template(body) {
+            return;
+        }
+    }
+    // A malformed file is left alone, exactly as `load_from` leaves it: the
+    // user is going to open it to fix the typo, and finding myd had also
+    // rewritten it would make that harder, not easier.
+    if let Ok(body) = &existing {
+        if toml::from_str::<Prefs>(body).is_err() {
+            return;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let body = match existing {
+        Ok(body) => format!("{EDITOR_TEMPLATE}{body}"),
+        // No file yet: write the comment alone. An empty TOML document is a
+        // valid `Prefs` (every field has a default), so this does not need to
+        // serialise anything to be loadable.
+        Err(_) => EDITOR_TEMPLATE.to_string(),
+    };
+    let tmp = path.with_extension("toml.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// The editor to run, in precedence order.
+///
+/// `prefs.toml` first, then `$EDITOR`, then `vim`. The file beats the
+/// environment deliberately: `$EDITOR` is set globally for every tool on the
+/// machine, and the point of the preference is to say "in myd, use this one".
+/// A user who wants to follow the environment simply leaves the key unset,
+/// which is the default.
+///
+/// Whitespace-only values count as unset — a key left as `editor = ""` is a
+/// half-finished edit, and running the empty string would fail with a message
+/// about a program named "".
+pub fn editor_command(prefs: &Prefs, env_editor: Option<&str>) -> String {
+    let from_prefs = prefs.editor.trim();
+    if !from_prefs.is_empty() {
+        return from_prefs.to_string();
+    }
+    match env_editor.map(str::trim) {
+        Some(e) if !e.is_empty() => e.to_string(),
+        _ => "vim".to_string(),
     }
 }
 
@@ -116,7 +227,7 @@ impl Default for Prefs {
 /// running layout.
 pub fn startup() -> Prefs {
     static CACHE: std::sync::OnceLock<Prefs> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(Prefs::load)
+    CACHE.get_or_init(Prefs::load).clone()
 }
 
 /// Where the preferences live.
@@ -200,7 +311,18 @@ impl Prefs {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
-        let body = toml::to_string_pretty(self).context("could not serialise the preferences")?;
+        let mut body =
+            toml::to_string_pretty(self).context("could not serialise the preferences")?;
+        // Serialising the struct cannot produce a comment, so a save would
+        // otherwise erase the template every time a width was nudged. Carry it
+        // across whenever the file being replaced had it and the value is still
+        // at its default — once `editor` is actually set, the real key says
+        // what the comment was there to say.
+        if self.editor.trim().is_empty()
+            && std::fs::read_to_string(path).is_ok_and(|old| has_editor_template(&old))
+        {
+            body = format!("{EDITOR_TEMPLATE}{body}");
+        }
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, body).with_context(|| format!("could not write {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
@@ -212,6 +334,174 @@ impl Prefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The precedence: file, then environment, then vim.
+    #[test]
+    fn the_editor_falls_back_from_prefs_to_env_to_vim() {
+        let mut p = Prefs::default();
+        assert_eq!(editor_command(&p, None), "vim", "the last resort");
+        assert_eq!(
+            editor_command(&p, Some("nano")),
+            "nano",
+            "$EDITOR beats the built-in default"
+        );
+
+        p.editor = "hx".to_string();
+        assert_eq!(
+            editor_command(&p, Some("nano")),
+            "hx",
+            "the file beats the environment: it is the myd-specific answer"
+        );
+    }
+
+    /// A key left empty is a half-finished edit, not a request to run "".
+    #[test]
+    fn a_blank_editor_setting_is_treated_as_unset() {
+        let p = Prefs {
+            editor: "   ".to_string(),
+            ..Prefs::default()
+        };
+        assert_eq!(editor_command(&p, Some("nano")), "nano");
+        assert_eq!(editor_command(&p, None), "vim");
+    }
+
+    /// An editor with arguments survives, since that is how most need running.
+    #[test]
+    fn the_editor_setting_keeps_its_arguments() {
+        let p = Prefs {
+            editor: "code -w".to_string(),
+            ..Prefs::default()
+        };
+        assert_eq!(editor_command(&p, None), "code -w");
+    }
+
+    /// Seeding writes the template once and never again — the thing that would
+    /// otherwise grow the file by a paragraph on every launch.
+    #[test]
+    fn seeding_the_editor_template_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+
+        seed_editor_template_at(&path);
+        let once = std::fs::read_to_string(&path).unwrap();
+        assert!(once.contains("# editor ="), "the template must be written");
+
+        for _ in 0..5 {
+            seed_editor_template_at(&path);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            once,
+            "a later launch must not add a second copy"
+        );
+        assert_eq!(once.matches("# editor =").count(), 1);
+    }
+
+    /// And it leaves an existing file's settings intact.
+    #[test]
+    fn seeding_preserves_what_is_already_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        std::fs::write(&path, "info_panel_pct = 45\n").unwrap();
+
+        seed_editor_template_at(&path);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("# editor ="), "template added");
+        assert!(body.contains("info_panel_pct = 45"), "and nothing lost");
+        assert_eq!(
+            Prefs::load_from(&path).info_panel_pct,
+            45,
+            "and the file still parses"
+        );
+    }
+
+    /// Someone who set the key does not also get the comment telling them to.
+    #[test]
+    fn seeding_does_nothing_once_the_key_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        std::fs::write(&path, "editor = \"hx\"\n").unwrap();
+
+        seed_editor_template_at(&path);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "editor = \"hx\"\n",
+            "a set key already says what the comment would"
+        );
+    }
+
+    /// Someone who deleted the comment on purpose does not get it back.
+    #[test]
+    fn seeding_does_not_fight_a_deliberate_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+
+        seed_editor_template_at(&path);
+        // Delete it, as a user tidying the file would.
+        std::fs::write(&path, "info_panel_pct = 30\n").unwrap();
+        seed_editor_template_at(&path);
+
+        // It comes back once — the file no longer mentions the setting at all,
+        // so this is the same case as a fresh file. What must never happen is
+        // two copies, which the idempotence test above pins.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("# editor =").count(), 1);
+    }
+
+    /// A malformed file is left alone here too, matching `load_from`.
+    #[test]
+    fn seeding_leaves_a_malformed_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        std::fs::write(&path, "info_panel_pct = = 40\n").unwrap();
+
+        seed_editor_template_at(&path);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "info_panel_pct = = 40\n",
+            "the file the user is about to fix must not also be rewritten"
+        );
+    }
+
+    /// Saving must not destroy the comment a previous launch wrote.
+    #[test]
+    fn saving_preserves_the_editor_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        seed_editor_template_at(&path);
+
+        let mut prefs = Prefs::load_from(&path);
+        prefs.info_panel_pct = 42;
+        prefs.save_to(&path).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("# editor ="),
+            "serialising the struct would drop the comment:\n{body}"
+        );
+        assert_eq!(body.matches("# editor =").count(), 1, "and not double it");
+        assert_eq!(Prefs::load_from(&path).info_panel_pct, 42);
+    }
+
+    /// Once the key is really set, the comment is not carried along beside it.
+    #[test]
+    fn saving_a_set_editor_drops_the_now_redundant_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        seed_editor_template_at(&path);
+
+        let mut prefs = Prefs::load_from(&path);
+        prefs.editor = "hx".to_string();
+        prefs.save_to(&path).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("editor = \"hx\""), "the real key:\n{body}");
+        assert!(
+            !body.contains("# editor ="),
+            "the comment told them to set it; they have:\n{body}"
+        );
+        assert_eq!(Prefs::load_from(&path).editor, "hx");
+    }
 
     #[test]
     fn a_missing_file_gives_the_defaults() {

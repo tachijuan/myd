@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.5.0" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.6.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -460,6 +460,26 @@ The same as \fBq\fR, including the confirmation.
 .B Ctrl+o
 Go back to the parent directory.
 .TP
+.B e
+Edit the tagged files, or the selected one, in your editor. myd suspends,
+hands the terminal over, and takes it back when the editor exits \(em so a
+terminal editor behaves exactly as it would from a shell.
+.IP
+The editor is the \fBeditor\fR setting in \fBprefs.toml\fR if it is set,
+otherwise \fB$EDITOR\fR, otherwise \fBvim\fR. The setting wins over the
+environment on purpose: \fB$EDITOR\fR is machine\-wide, and the preference
+exists to say "in myd, use this one". Either may carry arguments, as in
+\fBcode \-w\fR.
+.IP
+Also bound inside the preview pane, where it edits the file being previewed
+\(em reading a file and then wanting to change it is the ordinary next step.
+The pane is closed first, since its contents describe the file as it was
+before the editor ran.
+.IP
+Directories are refused: handing one to vim opens its own file browser inside
+this one. Remote and in\-archive entries are refused for the same reason
+\fBO\fR refuses them.
+.TP
 .B o
 Open the selected file or directory with the system's default application \(em
 .BR open (1)
@@ -840,6 +860,10 @@ Besides the transfer tunables above, myd reads:
 Searched to resolve the program named in the \fBO\fR dialog, when that program
 is given as a bare name rather than a path.
 .TP
+.B EDITOR
+The editor \fBe\fR runs, when \fBprefs.toml\fR does not name one. Falls back
+to \fBvim\fR.
+.TP
 .B MYD_PREFS
 Names the preferences file outright, ahead of the usual lookup. Preferences
 otherwise live in \fB$XDG_CONFIG_HOME/myd/prefs.toml\fR, falling back to
@@ -856,6 +880,17 @@ lives in \fB$XDG_CONFIG_HOME/myd/apps.toml\fR, falling back to
 The preferences file is TOML and is meant to be edited by hand. Every setting
 has a default, so a file that omits one \(em or one written by an older version
 \(em still loads.
+.TP
+.B editor
+The program \fBe\fR opens files with, as a command line \(em arguments
+included. Unset by default, in which case \fB$EDITOR\fR is used, and
+\fBvim\fR when that is unset too.
+.IP
+myd writes this key commented out into a fresh preferences file, so the
+setting is discoverable by opening the file rather than only by reading this
+page. That happens once: a launch that finds the comment, or a real
+\fBeditor\fR key, leaves the file alone. Deleting the comment is respected
+until the file next mentions neither.
 .TP
 .B info_panel_pct
 Info panel width, as a percentage of the panel it sits in. 15 to 60, default 30.

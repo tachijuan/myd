@@ -24,6 +24,12 @@ async fn run() -> Result<()> {
     // (see `trace::trace_path`) because the TUI owns the terminal.
     myd::trace::init();
 
+    // Put the commented-out `editor` setting in prefs.toml if it is not already
+    // there. `editor` has no key that toggles it, so without this the only way
+    // to find it is the manual; the check inside makes this a no-op on every
+    // launch after the first.
+    myd::prefs::seed_editor_template();
+
     let cli = Cli::parse();
 
     // A path that cannot be opened is reported here rather than swapped for the
