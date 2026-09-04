@@ -2942,8 +2942,9 @@ async fn test_n_creates_directory_in_current_pane() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    // N -> type a name -> Enter.
-    app.handle_key_for_test(char_key('N'));
+    // gn -> type a name -> Enter.
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('n'));
     for c in "newdir".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -2966,7 +2967,8 @@ async fn test_n_creates_inside_directory_under_cursor() {
 
     // Cursor onto "parent" (a directory), then create inside it.
     app.handle_key_for_test(char_key('j'));
-    app.handle_key_for_test(char_key('N'));
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('n'));
     for c in "child".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -3182,11 +3184,12 @@ async fn test_n_and_p_step_through_matches() {
     app.handle_key_for_test(char_key('n'));
     assert_eq!(cursor_name(&app), "a.log", "n wraps to the top");
 
-    // p walks back up (wrapping to the bottom first).
-    app.handle_key_for_test(char_key('p'));
-    assert_eq!(cursor_name(&app), "c.log", "p wraps to the bottom");
-    app.handle_key_for_test(char_key('p'));
-    assert_eq!(cursor_name(&app), "b.log", "p -> previous match");
+    // N walks back up (wrapping to the bottom first). It was `p`, which is
+    // now Paste — n/N is the vim pairing, and `p` pastes as it does in vim.
+    app.handle_key_for_test(char_key('N'));
+    assert_eq!(cursor_name(&app), "c.log", "N wraps to the bottom");
+    app.handle_key_for_test(char_key('N'));
+    assert_eq!(cursor_name(&app), "b.log", "N -> previous match");
 }
 
 #[tokio::test]
@@ -3198,11 +3201,11 @@ async fn test_n_is_noop_without_prior_search() {
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
-    // No search yet: n / p must not move the cursor or panic.
+    // No search yet: n / N must not move the cursor or panic.
     let before = cursor_name(&app);
     app.handle_key_for_test(char_key('n'));
-    app.handle_key_for_test(char_key('p'));
-    assert_eq!(cursor_name(&app), before, "n/p do nothing before a search");
+    app.handle_key_for_test(char_key('N'));
+    assert_eq!(cursor_name(&app), before, "n/N do nothing before a search");
 }
 
 #[tokio::test]
@@ -3226,7 +3229,8 @@ async fn test_create_dir_preserves_size_cache() {
 
     // Create a directory. The old code called refresh(), which clears the cache
     // and rescans the whole tree; the fast path keeps the cache intact.
-    app.handle_key_for_test(char_key('N'));
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('n'));
     for c in "fresh".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -13649,7 +13653,8 @@ async fn a_directory_created_in_a_subdirectory_appears_in_the_parent_view() {
     settle(&mut app).await;
 
     // Make a directory while drilled in.
-    app.handle_key_for_test(char_key('N'));
+    app.handle_key_for_test(char_key('g'));
+    app.handle_key_for_test(char_key('n'));
     for c in "fresh".chars() {
         app.handle_key_for_test(char_key(c));
     }
@@ -15085,11 +15090,31 @@ fn archive_fixture(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Move the cursor onto the entry named `name`, or panic saying what was there.
+/// Walk the cursor onto the named entry.
+///
+/// Steps down and wraps at the bottom, so the caller does not have to know the
+/// sort order to visit two entries — walking down only meant that reaching `b`
+/// after `c` was impossible, and the test failed on its fixture's alphabet
+/// rather than on anything it was testing.
 fn cursor_onto(app: &mut myd::app::FileBrowser, name: &str) {
-    for _ in 0..40 {
-        if app.selected_name_for_test().as_deref() == Some(name) {
+    let mut seen_repeat = 0;
+    let mut last: Option<String> = None;
+    for _ in 0..200 {
+        let current = app.selected_name_for_test();
+        if current.as_deref() == Some(name) {
             return;
         }
+        // At the bottom the cursor stops moving; jump back to the top and keep
+        // going, but only once — a second wrap means the entry is not there.
+        if current == last {
+            seen_repeat += 1;
+            if seen_repeat > 1 {
+                break;
+            }
+            app.handle_key_for_test(char_key('g'));
+            app.handle_key_for_test(char_key('g'));
+        }
+        last = current;
         app.handle_key_for_test(char_key('j'));
     }
     panic!("never reached {name}");
@@ -15152,21 +15177,50 @@ async fn mutations_inside_an_archive_are_refused_with_a_reason() {
     app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
     settle(&mut app).await;
 
-    for (k, expected) in [
-        ('D', "delete"),
-        ('R', "rename"),
-        ('N', "create directories"),
+    // Key sequences rather than single keys: creating a directory is the `gn`
+    // chord since `N` became search-prev, and a chord is two keystrokes.
+    for (keys, expected) in [
+        ("D", "delete"),
+        ("R", "rename"),
+        ("gn", "create directories"),
+        // The clipboard's mutating half. A cut has to remove its sources, which
+        // an archive cannot do, so `x` is refused where `y` is allowed. `j`
+        // first: on the archive root a different guard fires (the root has no
+        // name to paste under), and this is testing the read-only one.
+        ("jx", "cut files out of"),
     ] {
-        app.handle_key_for_test(char_key(k));
-        assert_eq!(app.modal_kind_for_test(), "confirm", "{k} was not refused");
+        for c in keys.chars() {
+            app.handle_key_for_test(char_key(c));
+        }
+        assert_eq!(
+            app.modal_kind_for_test(),
+            "confirm",
+            "{keys} was not refused"
+        );
         let msg = app.modal_message_for_test().unwrap_or_default();
         assert!(
             msg.contains(expected) && msg.contains("archive"),
-            "{k} refused with the wrong message: {msg:?}"
+            "{keys} refused with the wrong message: {msg:?}"
         );
         // Dismiss before the next one.
         app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
     }
+
+    // And a paste into an archive is refused too — the yank itself is allowed,
+    // since copying *out* of an archive is the ordinary way to use one.
+    app.handle_key_for_test(char_key('j'));
+    app.handle_key_for_test(char_key('y'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "none",
+        "yanking inside an archive is reading, and must be allowed"
+    );
+    app.handle_key_for_test(char_key('p'));
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("paste files into") && msg.contains("archive"),
+        "pasting into an archive refused with the wrong message: {msg:?}"
+    );
 }
 
 #[tokio::test]
@@ -20336,4 +20390,402 @@ async fn treemap_keys_do_not_navigate_inside_an_archive() {
             "'{k}' in the treemap changed the pane's directory"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Yank / cut / paste, and undo.
+//
+// The unit tests in `myd::clipboard` cover naming and the guards; these drive
+// the real keys through the real app and check the files on disk afterwards,
+// which is the only way to catch a binding that resolves to nothing or a paste
+// that reports success while writing nowhere.
+
+/// Drive ticks until a paste's background copy has finished.
+///
+/// A copy-paste goes through the same spawned batch `c` uses, so the files are
+/// not on disk when the keystroke returns — asserting straight after races the
+/// task and fails whenever it loses.
+async fn settle_paste(app: &mut FileBrowser) {
+    for _ in 0..600 {
+        app.resolve_loading_for_test();
+        app.tick_for_test();
+        if !app.is_operation_running_for_test() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    panic!("the paste never finished");
+}
+
+/// `y` then `p` copies, leaving the original where it was.
+#[tokio::test]
+async fn yank_and_paste_copies_into_the_cursors_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+    std::fs::write(dir.path().join("report.txt"), b"contents").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "report.txt");
+    app.handle_key_for_test(char_key('y'));
+    cursor_onto(&mut app, "dest");
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+
+    assert!(
+        dir.path().join("dest/report.txt").is_file(),
+        "the paste must land in the directory under the cursor"
+    );
+    assert!(
+        dir.path().join("report.txt").is_file(),
+        "a yank copies: the original stays"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("dest/report.txt")).unwrap(),
+        b"contents",
+        "and the contents come with it"
+    );
+}
+
+/// `x` then `p` moves, and the buffer empties so a second `p` does nothing.
+#[tokio::test]
+async fn cut_and_paste_moves_and_spends_the_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+    std::fs::write(dir.path().join("notes.md"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "notes.md");
+    app.handle_key_for_test(char_key('x'));
+    cursor_onto(&mut app, "dest");
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+
+    assert!(dir.path().join("dest/notes.md").is_file(), "moved in");
+    assert!(
+        !dir.path().join("notes.md").exists(),
+        "a cut removes the original, or it is a copy wearing the wrong name"
+    );
+
+    // A spent buffer must not paste again — that would silently duplicate.
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a second paste has nothing to paste and must say so"
+    );
+}
+
+/// Pasting a yank back where it came from duplicates rather than colliding.
+#[tokio::test]
+async fn pasting_into_the_source_directory_makes_a_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("report.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "report.txt");
+    app.handle_key_for_test(char_key('y'));
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+
+    assert!(
+        dir.path().join("report copy.txt").is_file(),
+        "a duplicate is the point; the extension must survive the suffix"
+    );
+    assert!(dir.path().join("report.txt").is_file(), "and the original");
+}
+
+/// Undo after a copy-paste deletes what the paste wrote, and nothing else.
+#[tokio::test]
+async fn undo_removes_a_pasted_copy_but_not_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+    std::fs::write(dir.path().join("report.txt"), b"x").unwrap();
+    // A file already in the destination, to prove undo deletes only the paste.
+    std::fs::write(dir.path().join("dest/keep.txt"), b"keep").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "report.txt");
+    app.handle_key_for_test(char_key('y'));
+    cursor_onto(&mut app, "dest");
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+    assert!(dir.path().join("dest/report.txt").is_file());
+
+    // Undo asks first, because it deletes.
+    app.handle_key_for_test(char_key('u'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "an undo that deletes files must ask"
+    );
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(msg.contains("delete"), "and must say it deletes: {msg:?}");
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_paste(&mut app).await;
+
+    assert!(
+        !dir.path().join("dest/report.txt").exists(),
+        "undo must remove the pasted copy"
+    );
+    assert!(
+        dir.path().join("report.txt").is_file(),
+        "and must never touch the original"
+    );
+    assert!(
+        dir.path().join("dest/keep.txt").is_file(),
+        "nor anything that was already there"
+    );
+}
+
+/// Undo after a cut-paste puts the file back where it started.
+#[tokio::test]
+async fn undo_returns_a_moved_file_to_its_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+    std::fs::write(dir.path().join("notes.md"), b"body").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "notes.md");
+    app.handle_key_for_test(char_key('x'));
+    cursor_onto(&mut app, "dest");
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+    assert!(dir.path().join("dest/notes.md").is_file());
+
+    app.handle_key_for_test(char_key('u'));
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        !msg.contains("delete"),
+        "putting a move back deletes nothing, and must not say it does: {msg:?}"
+    );
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle_all(&mut app).await;
+
+    assert!(
+        dir.path().join("notes.md").is_file(),
+        "the file must come back to where it was"
+    );
+    assert!(
+        !dir.path().join("dest/notes.md").exists(),
+        "and leave the destination"
+    );
+    assert_eq!(std::fs::read(dir.path().join("notes.md")).unwrap(), b"body");
+}
+
+/// Declining the undo prompt changes nothing and keeps the undo available.
+#[tokio::test]
+async fn declining_an_undo_leaves_it_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "a.txt");
+    app.handle_key_for_test(char_key('y'));
+    cursor_onto(&mut app, "dest");
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+
+    app.handle_key_for_test(char_key('u'));
+    app.handle_key_for_test(char_key('n')); // decline
+    settle_all(&mut app).await;
+    assert!(
+        dir.path().join("dest/a.txt").is_file(),
+        "declining must not delete anything"
+    );
+
+    // Still offered, so the decline was a pause rather than a discard.
+    app.handle_key_for_test(char_key('u'));
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "the undo must still be available after declining once"
+    );
+}
+
+/// Tagged files are yanked as a batch.
+#[tokio::test]
+async fn a_tagged_batch_is_yanked_and_pasted_together() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+    for n in ["one.txt", "two.txt", "three.txt"] {
+        std::fs::write(dir.path().join(n), b"x").unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    // Sorted order: `cursor_onto` only walks down, so visiting out of order
+    // steps past an entry and never comes back to it.
+    for n in ["one.txt", "three.txt", "two.txt"] {
+        cursor_onto(&mut app, n);
+        app.handle_key_for_test(char_key('t'));
+    }
+    app.handle_key_for_test(char_key('y'));
+    cursor_onto(&mut app, "dest");
+    app.handle_key_for_test(char_key('p'));
+    settle_paste(&mut app).await;
+
+    for n in ["one.txt", "two.txt", "three.txt"] {
+        assert!(
+            dir.path().join("dest").join(n).is_file(),
+            "{n} must be in the batch"
+        );
+    }
+}
+
+/// The armed buffer is visible, and Esc disarms it.
+#[tokio::test]
+async fn the_clipboard_badge_shows_what_is_held_and_esc_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("report.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let before = app_screen_text(&mut app, 100, 20);
+    assert!(
+        !before.contains("YANK"),
+        "nothing is armed yet, so no badge:\n{before}"
+    );
+
+    cursor_onto(&mut app, "report.txt");
+    app.handle_key_for_test(char_key('y'));
+    let armed = app_screen_text(&mut app, 100, 20);
+    assert!(
+        armed.contains("YANK"),
+        "an armed clipboard changes what p does, so it must be visible:\n{armed}"
+    );
+    assert!(
+        armed.contains("report.txt"),
+        "and naming the one entry saves looking for it:\n{armed}"
+    );
+    assert!(
+        armed.contains("p:paste"),
+        "the key that acts on it belongs in the footer while it is live:\n{armed}"
+    );
+
+    // Esc disarms without quitting.
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    let cleared = app_screen_text(&mut app, 100, 20);
+    assert!(
+        !cleared.contains("YANK"),
+        "Esc must clear the buffer:\n{cleared}"
+    );
+}
+
+/// A cut shows a different badge from a yank — they do different things.
+#[tokio::test]
+async fn a_cut_badge_reads_differently_from_a_yank() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["a.txt", "b.txt"] {
+        std::fs::write(dir.path().join(n), b"x").unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "a.txt");
+    app.handle_key_for_test(char_key('t'));
+    cursor_onto(&mut app, "b.txt");
+    app.handle_key_for_test(char_key('t'));
+    app.handle_key_for_test(char_key('x'));
+
+    let text = app_screen_text(&mut app, 100, 20);
+    assert!(
+        text.contains("CUT 2 items"),
+        "a batch is counted, and a cut must not read as a yank:\n{text}"
+    );
+}
+
+/// A directory cannot be pasted inside itself.
+#[tokio::test]
+async fn pasting_a_directory_into_itself_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("outer/inner")).unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    cursor_onto(&mut app, "outer");
+    app.handle_key_for_test(char_key('x'));
+    // Expand and descend into its own child.
+    app.handle_key_for_test(char_key('l'));
+    settle(&mut app).await;
+    cursor_onto(&mut app, "inner");
+    app.handle_key_for_test(char_key('p'));
+
+    assert_eq!(
+        app.modal_kind_for_test(),
+        "confirm",
+        "a directory pasted into its own child must be refused"
+    );
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains("inside itself"),
+        "and the reason has to be the actual one: {msg:?}"
+    );
+}
+
+/// `p` with nothing armed explains itself rather than doing nothing.
+///
+/// `p` used to search backwards, so this is the exact keystroke a long-time
+/// user makes out of habit — silence would read as a broken key.
+#[tokio::test]
+async fn paste_with_an_empty_buffer_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('p'));
+    assert_eq!(app.modal_kind_for_test(), "confirm");
+    let msg = app.modal_message_for_test().unwrap_or_default();
+    assert!(
+        msg.contains('y') && msg.contains('x'),
+        "and it must name the keys that fill the buffer: {msg:?}"
+    );
+}
+
+/// Esc still backs out of a filter when no clipboard is armed.
+#[tokio::test]
+async fn esc_still_clears_a_filter_when_nothing_is_yanked() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["a.log", "b.txt"] {
+        std::fs::write(dir.path().join(n), b"x").unwrap();
+    }
+
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    app.handle_key_for_test(char_key('f'));
+    for c in "log".chars() {
+        app.handle_key_for_test(char_key(c));
+    }
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Enter));
+    settle(&mut app).await;
+    let filtered = app_screen_text(&mut app, 100, 20);
+    assert!(filtered.contains("filter"), "filter is on:\n{filtered}");
+
+    app.handle_key_for_test(key(crossterm::event::KeyCode::Esc));
+    settle(&mut app).await;
+    let cleared = app_screen_text(&mut app, 100, 20);
+    assert!(
+        !cleared.contains("⧉ filter"),
+        "Esc must still take the filter off when no yank is armed:\n{cleared}"
+    );
 }

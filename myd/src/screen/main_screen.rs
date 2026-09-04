@@ -97,6 +97,13 @@ pub struct MainScreenState {
     /// state — the app would look like it had ignored the key and then behave
     /// oddly on the next one. Showing it makes the wait explainable.
     pub pending_chord: Option<char>,
+    /// The armed yank/cut badge, set by the app each frame like `active`.
+    ///
+    /// An armed clipboard is invisible state that changes what `p` does, so it
+    /// has to be on screen — the same reason `pending_chord` is. Rendered as a
+    /// badge beside the filter badge rather than as a keymap entry: it says
+    /// what is held, which the keymap cannot.
+    pub clip_badge: Option<String>,
     /// What this panel's footer should show, set by the app each frame like
     /// `active`.
     ///
@@ -209,6 +216,7 @@ impl MainScreenState {
             tree_viewport: 0,
             sort_area: None,
             pending_chord: None,
+            clip_badge: None,
             footer: FooterMode::Own,
             footer_rect: None,
         }
@@ -238,6 +246,7 @@ impl MainScreenState {
             tree_viewport: 0,
             sort_area: None,
             pending_chord: None,
+            clip_badge: None,
             footer: FooterMode::Own,
             footer_rect: None,
         }
@@ -1620,10 +1629,34 @@ impl MainScreenState {
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
+                // The armed clipboard, if any. Before the keymap and after the
+                // filter, so the two badges group together on the left and the
+                // keys stay where the eye already looks for them.
+                //
+                // Reversed rather than coloured like the filter badge: this one
+                // says an operation is half-done, and it has to stand out from
+                // the yellow keymap it sits beside.
+                if let Some(badge) = &self.clip_badge {
+                    spans.push(Span::styled(
+                        badge.clone(),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Rgb(120, 220, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
                 // A pending chord is handled by the early return above, which
                 // takes the whole line — the keys here are not live while `g`
                 // waits, so showing them alongside it was the confusing part.
-                let footer = " [TREE]  j/k:move  l/h:expand/collapse  t:tag  V:visual  U:untag  f:filter  c:copy  ?:help  q:quit ";
+                //
+                // `p:paste` earns its place only while something is armed;
+                // otherwise the key does nothing and the room goes to the keys
+                // that always work.
+                let footer = if self.clip_badge.is_some() {
+                    " [TREE]  j/k:move  p:paste  Esc:clear  t:tag  f:filter  ?:help  q:quit "
+                } else {
+                    " [TREE]  j/k:move  l/h:expand/collapse  t:tag  V:visual  U:untag  f:filter  y:yank  ?:help  q:quit "
+                };
                 spans.push(Span::styled(
                     footer,
                     Style::default()
@@ -1658,11 +1691,12 @@ fn chord_footer(c: char, width: usize) -> (String, String) {
     // which still says which keys are live, and at least the prefix badge
     // survives to show the app is mid-sequence.
     const FULL: &str =
-        " g:top  u:parent  d:go to…  s:sort  r:rename tagged  t:untag all  z:archive  x:cancel transfers  Esc:cancel ";
+        " g:top  u:parent  d:go to…  s:sort  r:rename tagged  t:untag all  z:archive  n:new dir  x:cancel transfers  Esc:cancel ";
     const MEDIUM: &str =
-        " g:top  u:parent  d:go to…  s:sort  r:rename  t:untag  z:archive  x:cancel  Esc:back ";
-    const SHORT: &str = " g:top  u:parent  d:go to  s:sort  r:rename  t:untag  z:archive  x:cancel ";
-    const TERSE: &str = " g u d s r t z x ";
+        " g:top  u:parent  d:go to…  s:sort  r:rename  t:untag  z:archive  n:new dir  x:cancel  Esc:back ";
+    const SHORT: &str =
+        " g:top  u:parent  d:go to  s:sort  r:rename  t:untag  z:archive  n:new  x:cancel ";
+    const TERSE: &str = " g u d s r t z n x ";
     let budget = width.saturating_sub(prefix.chars().count());
     let keys = if budget >= FULL.chars().count() {
         FULL

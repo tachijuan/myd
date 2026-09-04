@@ -1,4 +1,4 @@
-.TH "MYD" "1" "August 2026" "myd 1.4.2" "User Commands"
+.TH "MYD" "1" "August 2026" "myd 1.5.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -268,8 +268,10 @@ Unlike the search and the filter, this pattern is case\-sensitive \(em changing
 a name's case is a common reason to use it. See \fBPATTERNS\fR for the syntax,
 and for when a capture group needs \fB${1}\fR rather than \fB$1\fR.
 .TP
-.B N
-Create a new directory in the current location.
+.B gn
+Create a new directory in the current location. This was the bare \fBN\fR
+before \fBp\fR became paste; \fBN\fR now completes the \fBn\fR/\fBN\fR search
+pair, as in vi.
 .TP
 .B c
 Copy the tagged files, or the selected one, into the other panel's directory.
@@ -289,6 +291,41 @@ reported in the transfer panel exactly like a copy.
 When a name is already taken at the destination, myd asks what to do: overwrite
 it, skip that file and continue, or cancel the whole move. Cancelling abandons
 every remaining file, including ones that would not have collided.
+.TP
+.B y
+Yank: hold the tagged files, or the selected one, for a later \fBp\fR. Nothing
+is copied yet and nothing on disk changes \(em the selection is only recorded,
+so a yank can be made and then abandoned freely.
+.TP
+.B x
+Cut: hold the selection the same way, but remove the originals when it is
+pasted. Refused inside an archive, which cannot have entries removed from it.
+.TP
+.B p
+Paste what is held into the directory under the cursor. Unlike \fBc\fR and
+\fBm\fR, the destination is chosen \fIafter\fR the sources, by navigating to
+it \(em which is what makes copying within a single pane possible. Either
+endpoint being remote sends the work through the transfer queue, exactly as a
+copy does.
+.IP
+A name already taken at the destination is suffixed rather than confirmed:
+\fBreport.txt\fR lands beside an existing one as \fBreport copy.txt\fR, then
+\fBreport copy 2.txt\fR. Pasting a yank back into the directory it came from is
+therefore how a file is duplicated. A cut that would land exactly where it
+started does nothing rather than renaming.
+.IP
+A held set is shown as a badge in the footer \(em \fBYANK report.txt\fR or
+\fBCUT 3 items\fR \(em since it changes what \fBp\fR does and would otherwise
+be invisible. \fBEsc\fR clears it.
+.TP
+.B u
+Undo the last paste. A pasted copy is deleted; a pasted move is put back where
+it came from. myd asks first, and the question says which of the two it is
+about to do, because undoing a copy deletes files and undoing a move does not.
+.IP
+One step, not a history: this reverses the paste just made, which is the mistake
+that actually happens \(em the right files in the wrong place. It is not a
+general undo, and it does not cover \fBD\fR, \fBR\fR or \fBgr\fR.
 .TP
 .B r
 Rescan: clear the size cache and re-read sizes from disk. Sizes are otherwise
@@ -373,7 +410,7 @@ Entries with no reported time show a dash.
 .TP
 .B /
 Search for a file or directory by name. The pattern is a case-insensitive
-regular expression (see \fBPATTERNS\fR); \fBn\fR and \fBp\fR step to the next
+regular expression (see \fBPATTERNS\fR); \fBn\fR and \fBN\fR step to the next
 and previous match, wrapping at the ends.
 .TP
 .B f

@@ -59,6 +59,16 @@ pub enum Action {
     /// Move the active panel's selection into the other panel's directory.
     /// Within one backend this is a rename; across backends a copy then delete.
     Move,
+    /// Hold the selection for a later paste, leaving the originals in place.
+    Yank,
+    /// Hold the selection for a later paste that removes the originals.
+    Cut,
+    /// Carry out the held yank or cut in the directory under the cursor.
+    Paste,
+    /// Empty the yank/cut buffer without pasting it.
+    ClearClipboard,
+    /// Reverse the last completed paste.
+    Undo,
     /// Toggle a tag on the file under the cursor.
     ToggleTag,
     /// Toggle visual (range-tag) mode.
@@ -197,13 +207,16 @@ impl KeyBindingHandler {
     /// The footer's pending-chord hint is built from this, so a chord added to
     /// `resolve_chord` without a hint is a test failure rather than a key the
     /// user has no way to discover.
-    pub const G_CHORD_KEYS: &'static [char] = &['g', 'u', 'd', 's', 'r', 't', 'x', 'z'];
+    pub const G_CHORD_KEYS: &'static [char] =
+        &['g', 'u', 'd', 's', 'r', 't', 'x', 'z', 'n'];
 
     /// Resolve a chord (two-character sequence, only g-prefix).
     fn resolve_chord(&self, combined: &str) -> Option<Action> {
         match combined {
             "gg" => Some(Action::ToTop),
             "gu" => Some(Action::GoParent),
+            // Was the bare `N`, which now completes the n/N search pair.
+            "gn" => Some(Action::CreateDir),
             // One picker for every destination. `gr` (connect) and `gs` (saved
             // hosts) used to sit alongside this: `gd` now lists directories and
             // hosts together, `/` searches the lot, and the path field takes an
@@ -283,15 +296,24 @@ impl KeyBindingHandler {
             KeyCode::Char('v') => Some(Action::ToggleView),
             KeyCode::Char('c') => Some(Action::Copy),
             KeyCode::Char('m') => Some(Action::Move),
+            // The vim register keys. `c`/`m` act on the other pane immediately;
+            // these hold a selection so the destination can be navigated to,
+            // which is the only way to copy within a single pane.
+            KeyCode::Char('y') => Some(Action::Yank),
+            KeyCode::Char('x') => Some(Action::Cut),
+            KeyCode::Char('p') => Some(Action::Paste),
+            KeyCode::Char('u') => Some(Action::Undo),
             KeyCode::Char('|') => Some(Action::ToggleSplit),
             KeyCode::Tab => Some(Action::SwitchPanel),
             KeyCode::Char('t') => Some(Action::ToggleTag),
             KeyCode::Char('V') => Some(Action::VisualMode),
             KeyCode::Char('U') => Some(Action::UntagAll),
             KeyCode::Char('f') => Some(Action::Filter),
-            KeyCode::Char('N') => Some(Action::CreateDir),
+            // The vim search pair. `N` was new-directory, which moved to `gn`
+            // when `p` became Paste: n/N is the pairing every vim user already
+            // has, and creating a directory is the rarer of the two.
+            KeyCode::Char('N') => Some(Action::SearchPrev),
             KeyCode::Char('n') => Some(Action::SearchNext),
-            KeyCode::Char('p') => Some(Action::SearchPrev),
             // Space opens and closes the preview pane. It was the one unbound
             // key that reads as "show me this", and it is not an accept key in
             // any dialog, so a modal can never mistake it for one.
@@ -310,11 +332,14 @@ impl KeyBindingHandler {
             KeyCode::Char('?') => Some(Action::Help),
             KeyCode::Char('\n') => Some(Action::Confirm),
             KeyCode::Enter => Some(Action::Confirm),
-            KeyCode::Esc => Some(Action::Quit),
+            // Esc is not just Quit: with a clipboard armed it disarms it, and
+            // only then falls through to the same backing-out chain `q` walks.
+            // `q` stays a pure quit — reaching for it to clear a yank would be
+            // a surprising way to exit.
+            KeyCode::Esc => Some(Action::ClearClipboard),
             KeyCode::F(1) => Some(Action::Help),
             KeyCode::Down => Some(Action::CursorDown),
             KeyCode::Up => Some(Action::CursorUp),
-            KeyCode::Char('u') => Some(Action::GoParent),
             KeyCode::Left => Some(Action::Collapse),
             KeyCode::Right => Some(Action::Expand),
             KeyCode::Home => Some(Action::ToTop),

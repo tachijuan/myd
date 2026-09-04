@@ -117,15 +117,16 @@ round trip per directory, so myd declines to guess:
 - **Cached sizes** — drilling into a subdirectory reuses the sizes already computed instead of rescanning the disk; press `r` for a manual rescan.
 - **Tag and act on multiple files** — tag files with `t`, sweep a range in visual mode (`V`), then copy (`c`), move (`m`), delete (`D`) or bulk-rename (`gr`) every tagged file at once. Tagging works in the treemap as well as the tree, and both share one set of tags, so switching views with `v` never changes what is staged. Tagged rows are highlighted and tagged tiles carry a `▶` marker and a green outline. Untag one with `t`, all with `U` or `gt`.
 - **Patterned rename** — `gr` renames every tagged file by regex, with `$1` for the first capture group and `##` for a sequence number (`#` per digit, so `##` gives `01`, `02`). The dialog previews the pattern against the first tagged file before it is applied, and files the pattern doesn't match are skipped rather than treated as failures.
-- **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `p`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
-- **Create directories** — make a new directory in the current location with `N`.
+- **Regex search & filter** — search names with `/` (regex, case-insensitive) and step through matches with `n` / `N`; `f` filters the whole tree to a regex, hiding everything that doesn't match. A malformed pattern is reported rather than ignored.
+- **Create directories** — make a new directory in the current location with `gn`.
+- **Yank, cut and paste** — `y` holds the tagged files (or the one under the cursor), `x` holds them to be moved, and `p` puts them wherever you have navigated to. The destination is chosen *after* the sources, so this is how you copy within a single pane — no split required. A held set shows as a badge in the footer (`YANK report.txt`, `CUT 3 items`) so it is never invisible state, `Esc` clears it, and `u` undoes the last paste after asking. A name already taken is suffixed rather than confirmed, which makes pasting back into the source directory the way to duplicate a file.
 - **Info panel** — optional sidebar (toggle with `Ctrl+p`) displaying name, type, size, permissions, owner/group, and timestamps for the selected item. `Tab` moves focus into it to edit permissions, owner and group — over the tagged files, or recursively through a directory — and `<` / `>` resize it. When there is room, the lower part previews the selected file, with `+` / `-` moving the split between the two.
 - **File preview** — press `space` to open a pane over most of the screen showing what is actually *in* the selected file, and `space` again to close it. Text, markdown and around a hundred programming languages are syntax highlighted. The pane takes focus, so vi motions act on it rather than on the tree: `j`/`k` by a line, `Ctrl+F`/`Ctrl+B` by a page, `Ctrl+D`/`Ctrl+U` by half of one, `g`/`G` to the start and end. `/` searches within the file (regex, case-insensitive) and `n`/`p` step through the matches — `N`/`P` go the other way — with the current match highlighted and the count shown in the footer. `Esc` or `q` hands focus back to the tree without closing the pane, so you can move the cursor and watch the preview follow; `Tab` moves focus in and out. Binary files are reported rather than dumped, and a file too large to read in full is shown truncated and labelled as such. Works on remote panels: the file is read from the server, not from a same-named path on your own machine.
 - **Image and PDF preview** — if [`timg`](https://timg.sh/) or [`chafa`](https://hpjansson.org/chafa/) is on your `PATH`, the preview pane draws images (PNG, JPEG, GIF, WebP, SVG, TIFF, …); `timg` is preferred where both are installed. A `timg` built with poppler also renders **PDFs** — `chafa` has no PDF loader, so a PDF on a chafa-only machine says so rather than failing obscurely. Neither tool is a dependency: without them the pane shows the file's details instead.
 - **High-resolution images where the terminal allows** — in a terminal that implements the kitty graphics protocol (kitty, ghostty, Konsole 22.04+), iTerm2's inline images (iTerm2, WezTerm, mintty) or **sixel**, the image is handed over as real pixel data instead of being approximated with block characters. myd asks the terminal directly at startup what it supports, falling back to environment variables when there is nothing to ask. Detection is deliberately conservative, because a terminal that does not understand the sequence *prints* it — anything unrecognized falls back to blocks, which work everywhere. Override with `MYD_PREVIEW_GRAPHICS=kitty|iterm2|sixel|blocks`.
 - **Works inside tmux** — tmux parses sixel itself, so sixel is preferred there and needs no configuration beyond telling tmux your terminal supports it. The kitty and iTerm2 protocols instead ride tmux's passthrough escape, which is off by default; see *Terminal graphics* below for the two settings involved. When myd has to fall back, the preview footer says which setting would change that rather than leaving you guessing.
 - **Page through a PDF** — with a multi-page document open, `j`/`k` turn pages rather than scrolling (a rendered page is drawn to fit and has nothing to scroll); `g`/`G` jump to the first and last page, and the footer shows `page 5/19`. The page count comes from `pdfinfo` when poppler-utils is installed; without it you can still page forward, just without a known end.
-- **Archive browsing** — press `space` on a `.zip`, `.tar.gz`, `.7z`, `.rar` (and the rest) to list what is inside it, with the path exactly as the archive stores it and the permissions where the format records them. Press `Enter` to go *in*: the archive becomes an ordinary-looking tree where tagging, filtering, searching, sorting, the treemap and the preview pane all work, and `c` extracts. Directory sizes inside an archive are real recursive totals, because every member's size is already in the index. Archives are read-only here, which the pane says in its title and footer — `D`, `R`, `N` and `m` refuse rather than half-working.
+- **Archive browsing** — press `space` on a `.zip`, `.tar.gz`, `.7z`, `.rar` (and the rest) to list what is inside it, with the path exactly as the archive stores it and the permissions where the format records them. Press `Enter` to go *in*: the archive becomes an ordinary-looking tree where tagging, filtering, searching, sorting, the treemap and the preview pane all work, and `c` extracts. Directory sizes inside an archive are real recursive totals, because every member's size is already in the index. Archives are read-only here, which the pane says in its title and footer — `D`, `R`, `gn`, `x` and `m` refuse rather than half-working.
 - **Sort modes** — cycle through *largest*, *smallest*, *dirs first*, *files first*, *newest* (mtime), *oldest* (mtime), and *recently accessed* (atime) with `s`, or pick one outright by its number: `5` is "sort by newest" on its own, and `gs` opens the numbered menu those digits come from (so `gs5` does the same thing the slower way, and clicking the `Sort:` indicator opens the same menu).
 - **Toggle hidden files** — show or hide dotfiles with `H`.
 - **Symlink support** — symlinked directories are traversable like real ones, both locally and over SFTP. Links are shown with a 🔗 icon, a distinct cyan italic name, and a trailing `@` (`@/` when the target is a directory) so they stay distinguishable without color.
@@ -134,7 +135,7 @@ round trip per directory, so myd declines to guess:
 - **Dual-panel mode** — view two independent directory trees side by side. Start split with `--dual` (or by passing two paths), switch the active panel with `Tab`, and copy (`c`) or move (`m`) tagged/selected files into the other panel's directory. Toggle the split on and off any time with `|`.
 - **Persistent view preferences** — your chosen view (tree or treemap) and info-panel visibility stay put as you move between directories.
 - **Progress overlays** — directory scans show a live files / directories / size count, and large copy or delete operations show an item-by-item progress bar.
-- **Remote browsing over SFTP** — connect from the `gd` picker (pick a saved host, or type an `sftp://` URL into its path field) or launch with `myd sftp://[user@]host[:port][/path]`, and browse it in the active panel. A remote pane titles itself `SFTP (path)` in violet rather than `File Tree` in the ordinary colour, so on a split you can tell at a glance which machine a pane is showing. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Remote trees are fully manageable: create directories (`N`), rename (`R`), delete (`D`) and move (`m`) all act on the server. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
+- **Remote browsing over SFTP** — connect from the `gd` picker (pick a saved host, or type an `sftp://` URL into its path field) or launch with `myd sftp://[user@]host[:port][/path]`, and browse it in the active panel. A remote pane titles itself `SFTP (path)` in violet rather than `File Tree` in the ordinary colour, so on a split you can tell at a glance which machine a pane is showing. Pair it with dual-panel mode (`|`) to put a remote and a local tree side by side for copying. Remote trees are fully manageable: create directories (`gn`), rename (`R`), delete (`D`) and move (`m`) all act on the server. Authentication uses your existing SSH setup — `ssh-agent`, `~/.ssh` keys (with a passphrase prompt for encrypted keys), and a password fallback — and honors `~/.ssh/config` aliases and `known_hosts`. No credentials are stored. Other protocols can be added without touching the UI.
 - **Waiting happens in one pane, not the whole window** — a connection attempt, a move, a copy, or an archive being indexed shows its spinner *inside the pane doing the work*, and the other pane stays fully usable: `Tab` over to it and keep browsing while a slow host is still answering. `q` or `Esc` on the waiting pane abandons that operation and puts back what it was showing. Only a question that has to be answered — a password prompt, an overwrite confirmation — takes the whole window. And if you have moved to the other pane, a connection landing opens quietly in its own pane rather than pulling the keyboard back mid-keystroke.
 - **Saved hosts** — kept in the same `gd` picker as your directories, most recently connected first, with vi navigation (`j`/`k`/`g`/`G`), `/` to search, and `a`/`e`/`d` to add, edit and delete entries. Saved to `~/.config/myd/hosts.toml`, which you can edit by hand. **Passwords are never stored** — an entry holds only where to connect and as whom, and authentication still goes through `ssh-agent`, your `~/.ssh` keys, or a prompt.
 - **Shallow traversal** — press `S` to browse without measuring directory sizes, or start that way with `--shallow` (`-s`), which applies to both panes of a split. The recursive walk is the slowest thing myd does, and over a large archive or a network mount it is rarely worth waiting for just to look around; unmeasured directories show a dash and sort last, exactly as remote ones do. Turning measuring back on asks first, and the choice is remembered per directory — `S` in the `gd` picker sets it for a saved directory without opening it. That preference decides how a directory *opens* when you go to it; it doesn't override the pane you're already in, so climbing out with `h` keeps whichever mode you're browsing in. The flag combines with `-d`, carrying through the picker to whatever you choose from it, and the picker's path field names the mode a path will open in — `shallow` or `full` — so which traversal you'll get is visible before `Enter`.
@@ -294,7 +295,7 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 | `D`       | Delete tagged / selected (`y` / `n` / `a` to stop asking) |
 | `R`       | Rename                                  |
 | `gr`      | Rename every tagged file by regex (`##` numbers them) |
-| `N`       | Create a new directory here            |
+| `gn`      | Create a new directory here            |
 | `S`       | Browse without measuring directories    |
 | `o`       | Open with the system default app        |
 | `O`       | Open with a program you name             |
@@ -310,10 +311,15 @@ myd --dual sftp://prod                # split: remote left, current directory ri
 | `gt`      | Untag everything (the same, as a `g` chord)    |
 | `c`       | Copy tagged / selected files                   |
 | `m`       | Move tagged / selected files to the other panel |
+| `y`       | Yank — hold the selection for a later paste    |
+| `x`       | Cut — hold it, and remove it when pasted       |
+| `p`       | Paste what is held into the directory under the cursor |
+| `Esc`     | Clear the yank / cut buffer                    |
+| `u`       | Undo the last paste (asks first)               |
 | `D`       | Delete tagged / selected files                 |
 | `gr`      | Rename every tagged file by regex (`##` numbers them) |
 
-Tagged files are highlighted; `c`, `m`, `D` and `gr` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
+Tagged files are highlighted; `c`, `m`, `y`, `x`, `D` and `gr` operate on the whole tagged set (or the file under the cursor when nothing is tagged).
 
 **Editing text fields.** Every dialog that takes typed input — rename, filter, search, new directory, open-with, the attribute editor, the archive name — accepts the readline keys you already use at a shell prompt: `Ctrl+A`/`Ctrl+E` for start and end, `Ctrl+B`/`Ctrl+F` by character, `Alt+B`/`Alt+F` by word, `Ctrl+W` to kill the previous word, `Ctrl+U` the line, `Ctrl+K` to the end, and `Ctrl+D` to delete forward. `Tab` moves focus and never accepts.
 
@@ -325,7 +331,7 @@ Tagged files are highlighted; `c`, `m`, `D` and `gr` operate on the whole tagged
 |-----------|--------------------------------------------|
 | `/`       | Search names by regex (case-insensitive)   |
 | `n`       | Jump to the next match (down the tree)     |
-| `p`       | Jump to the previous match (up the tree)   |
+| `N`       | Jump to the previous match (up the tree)   |
 | `f`       | Filter the tree by regex                   |
 
 Search wraps around at the ends. Filtering hides non-matching entries at every level of the tree; an empty pattern (or `Esc`) clears it. While a filter is active the title bar reads `FILTERED` and the footer shows the pattern, so a masked view is never mistaken for the real contents. Both are case-insensitive, and a pattern that isn't valid regex is reported instead of being silently ignored.
@@ -377,6 +383,24 @@ focus; `Esc` or `q` hands focus back to the tree while leaving the pane open.
 
 A copy where one panel is remote runs as a background **transfer** instead of a blocking copy — see below.
 
+### Yank, cut & paste
+
+| Key       | Action                                          |
+|-----------|-------------------------------------------------|
+| `y`       | Yank — hold the selection for a later paste      |
+| `x`       | Cut — hold it, and remove it when pasted         |
+| `p`       | Paste what is held into the directory under the cursor |
+| `Esc`     | Clear the yank / cut buffer                      |
+| `u`       | Undo the last paste                              |
+
+`c` and `m` act on the other panel immediately, which is fewer keystrokes when the destination is already on screen. `y`/`x` and `p` work the other way round: they hold a selection so you can go and find the destination, which is the only way to copy from one directory to another **within a single pane**.
+
+Yanking changes nothing on disk — it only records what `p` should act on, so a yank can be made and abandoned freely. While something is held, the footer shows a badge naming it (`YANK report.txt`) or counting it (`CUT 3 items`), because a buffer that changes what `p` does should not be invisible.
+
+A name already taken at the destination is **suffixed rather than confirmed**: `report.txt` lands beside an existing one as `report copy.txt`, then `report copy 2.txt`. Pasting a yank back into the directory it came from is therefore how you duplicate a file. A cut that would land exactly where it started does nothing instead of renaming.
+
+`u` reverses the last paste: a pasted copy is deleted, a pasted move is put back. It asks first, and the question says which of the two it is about to do — undoing a copy deletes files and undoing a move does not, and those deserve different answers. It is one step rather than a history: it covers the mistake that actually happens, which is the right files in the wrong place. It does not cover `D`, `R` or `gr`.
+
 ### Remote & transfers
 
 | Key       | Action                                          |
@@ -389,7 +413,7 @@ Inside the picker: `j`/`k`/`g`/`G` navigate, `Enter` opens a directory or connec
 
 The transfer panel appears once you start a copy and lists queued, active, and finished transfers with per-transfer progress, rate, and ETA. Up to 16 transfers run at once; the rest wait their turn. Within a directory copy, files and subdirectories are also transferred concurrently, so a deep tree of small files is not paced by round-trip latency. The interface stays interactive throughout, so you can keep browsing and queue more. Toggle the panel any time with `Ctrl+t`.
 
-Creating directories (`N`), renaming (`R`), deleting (`D`) and moving (`m`) all work on remote panels too, routed through the same backend the panel is browsing. Permissions and ownership can be changed on a remote panel too, through the info panel: SFTP carries both. The info panel otherwise shows what the directory listing provides — size, permissions, and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes cannot be measured cheaply because a `du`-style walk would be one round trip per directory. Such directories therefore show a dash (`—`) with an empty size bar and sort as *unknown* (grouped last) rather than as small — reporting the directory inode's own ~4 KB would deceive both the eye and the sort order.
+Creating directories (`gn`), renaming (`R`), deleting (`D`) and moving (`m`) all work on remote panels too, routed through the same backend the panel is browsing. Permissions and ownership can be changed on a remote panel too, through the info panel: SFTP carries both. The info panel otherwise shows what the directory listing provides — size, permissions, and timestamps — since owner, group, and creation time aren't part of it, and remote directory sizes cannot be measured cheaply because a `du`-style walk would be one round trip per directory. Such directories therefore show a dash (`—`) with an empty size bar and sort as *unknown* (grouped last) rather than as small — reporting the directory inode's own ~4 KB would deceive both the eye and the sort order.
 
 ### Screen-level
 
@@ -528,7 +552,7 @@ Large copies and deletes show a progress overlay with an item-by-item count and 
 
 ## Search & Filter
 
-Press **`/`** to search entry names with a regular expression (case-insensitive). The cursor jumps to the first match; **`n`** and **`p`** then step to the next and previous matches, wrapping around at the ends.
+Press **`/`** to search entry names with a regular expression (case-insensitive). The cursor jumps to the first match; **`n`** and **`N`** then step to the next and previous matches, wrapping around at the ends.
 
 Press **`f`** to *filter* the tree: enter a regex and only entries whose names match remain visible, at every level. A directory is kept when something beneath it matches, so matching files stay reachable. Filtering is a view mask — the tree data is untouched — and an empty pattern (or `Esc`) restores the full listing. An active filter is always visible: the title bar reads `FILTERED` and shows how many entries are shown rather than how many exist, and the footer carries the pattern.
 

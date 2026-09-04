@@ -125,6 +125,8 @@ pub enum ModalTarget {
     CopyDest { srcs: Vec<PathBuf> },
     /// Per-file overwrite confirmation while draining `pending_copies`.
     CopyOverwrite { src: PathBuf, dest: PathBuf },
+    /// Confirmation for reversing the last paste.
+    Undo(crate::clipboard::UndoEntry),
     /// Per-file overwrite confirmation for a queued cross-backend transfer.
     ///
     /// Carries `is_dir` rather than the destination path: the batch already
@@ -410,6 +412,21 @@ pub struct FileBrowser {
     /// How many times the terminal bell has been rung. Tests cannot hear it, so
     /// they count it instead.
     bells_rung: usize,
+    /// The pending yank or cut, if `y` or `x` has armed one.
+    ///
+    /// One buffer for the whole app rather than one per pane: yanking in one
+    /// pane and pasting in the other is the ordinary case, and a per-pane
+    /// buffer would make that impossible while looking like it should work.
+    clipboard: Option<crate::clipboard::Clipboard>,
+    /// The last completed paste, for `u`.
+    ///
+    /// A single entry, not a stack. Undo here reverses file operations, and a
+    /// deep history invites walking back through several of them — each step
+    /// deleting or moving real files — on a mental model of what happened that
+    /// gets less reliable the further back it goes. One step covers the
+    /// mistake people actually make: the paste they just did, in the wrong
+    /// place.
+    undo: Option<crate::clipboard::UndoEntry>,
 }
 
 /// A preview load running in the background.
@@ -636,6 +653,8 @@ impl FileBrowser {
             last_open_command: None,
             apps: crate::apps::AppCatalog::load(),
             bells_rung: 0,
+            clipboard: None,
+            undo: None,
         }
     }
 
@@ -983,6 +1002,10 @@ impl FileBrowser {
         }
         // Read once here for the same reason `pending_chord` is: the panels are
         // borrowed mutably below, so `self` cannot be consulted inside the loop.
+        // Computed once per frame beside `pending_chord`, for the same reason:
+        // `self` is borrowed mutably in the loop below and cannot be consulted
+        // from inside it.
+        let clip_badge = self.clipboard.as_ref().map(|c| c.badge());
         let transfer_focused = self.transfer_focused;
         let info_focused = self.info_focused;
 
@@ -1003,6 +1026,7 @@ impl FileBrowser {
                     state.info_active = info_focused && i == active;
                     state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                     state.pending_chord = pending_chord;
+                    state.clip_badge = clip_badge.clone();
                     // There is one keyboard, so exactly one set of keys is on
                     // screen: the focused pane's. Every other panel stays
                     // quiet.
@@ -1042,6 +1066,7 @@ impl FileBrowser {
                 state.info_active = info_focused;
                 state.pending_ghosts = ghosts_for_panel(&pending, backend, state.root_path());
                 state.pending_chord = pending_chord;
+                    state.clip_badge = clip_badge.clone();
                 // The sole panel, so it is the one that speaks for the sidebar.
                 state.footer = if transfer_focused {
                     FooterMode::Transfers
@@ -1547,6 +1572,15 @@ impl FileBrowser {
                     }
                 }
                 self.prompt_next_transfer();
+            }
+            // Undo is a plain yes/no: the prompt has already said what it will
+            // do, and "no" simply keeps the entry so `u` can be pressed again.
+            Some(ModalTarget::Undo(entry)) => {
+                if result {
+                    self.perform_undo(entry);
+                } else {
+                    self.undo = Some(entry);
+                }
             }
             Some(ModalTarget::MoveOverwrite { src, dest, is_dir }) => {
                 match answer {
@@ -4580,6 +4614,34 @@ impl FileBrowser {
                 self.start_move();
                 true
             }
+            Action::Yank => {
+                self.yank_selection(crate::clipboard::ClipMode::Copy);
+                true
+            }
+            Action::Cut => {
+                self.yank_selection(crate::clipboard::ClipMode::Cut);
+                true
+            }
+            Action::Paste => {
+                self.paste_clipboard();
+                true
+            }
+            // Esc. Disarms the clipboard if it is armed; otherwise it means
+            // what it always meant, so Esc keeps backing out of a filter, a
+            // picker or a scan exactly as before.
+            Action::ClearClipboard => {
+                if self.clipboard.take().is_some() {
+                    true
+                } else {
+                    // The inner dispatch, not the traced wrapper: Esc is one
+                    // action and should appear once in the trace log.
+                    self.dispatch_action_inner(Action::Quit)
+                }
+            }
+            Action::Undo => {
+                self.start_undo();
+                true
+            }
             Action::ToggleTag => self.active_panel_mut().current_screen_mut().toggle_tag(),
             Action::UntagAll => self.active_panel_mut().current_screen_mut().untag_all(),
             Action::VisualMode => {
@@ -5203,6 +5265,11 @@ impl FileBrowser {
                     | Action::SetSort(_)
                     | Action::PatternRename
                     | Action::CreateArchive
+                    | Action::Yank
+                    | Action::Cut
+                    | Action::Paste
+                    | Action::ClearClipboard
+                    | Action::Undo
                     | Action::Bell => unreachable!(),
                     Action::None => true,
                 }
@@ -5490,7 +5557,8 @@ impl FileBrowser {
                             ModalTarget::Delete { .. }
                             | ModalTarget::CopyOverwrite { .. }
                             | ModalTarget::TransferOverwrite { .. }
-                            | ModalTarget::MoveOverwrite { .. } => {}
+                            | ModalTarget::MoveOverwrite { .. }
+                            | ModalTarget::Undo(_) => {}
                         }
                     }
                 }
@@ -6585,6 +6653,275 @@ impl FileBrowser {
     /// Copy the active panel's tagged files (or the single cursor selection when
     /// nothing is tagged). In dual mode the destination is the other panel's
     /// directory; in single-panel mode the user is prompted for one.
+    /// Arm the yank/cut buffer from the tag set, or the cursor.
+    ///
+    /// The same selection rule as `c` and `m`: tags win, the cursor is the
+    /// fallback. Arming does no I/O and touches no files — it only records
+    /// what `p` should act on, which is why a cut can be armed inside a
+    /// read-only archive and only the paste refuses.
+    fn yank_selection(&mut self, mode: crate::clipboard::ClipMode) {
+        let mut paths = self.active_panel().current_screen().tagged_paths();
+        if paths.is_empty() {
+            if let Some(p) = self.active_panel().selected_resolved_path() {
+                paths.push(p);
+            }
+        }
+        if paths.is_empty() {
+            self.clipboard = None;
+            return;
+        }
+
+        // The archive root has no name to paste under — `file_name()` on "/" is
+        // `None` — so it would be silently skipped at the far end. Same
+        // reasoning as `start_copy`'s guard.
+        if self.active_backend_is_read_only() && paths.iter().any(|p| p.parent().is_none()) {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Cannot yank the archive root from inside it. Leave the archive (h) \
+                 and yank the file itself, or yank the entries within it.",
+            ));
+            return;
+        }
+
+        // A cut has to remove its sources, which an archive cannot do. Refusing
+        // at `x` rather than at `p` means the user finds out while the files are
+        // still in front of them, not after navigating somewhere else.
+        if mode == crate::clipboard::ClipMode::Cut && self.refuse_if_read_only("cut files out of") {
+            return;
+        }
+
+        let source = self.active;
+        let is_dir: Vec<bool> = if let Screen::Main(state) = self.panels[source].current_screen() {
+            paths
+                .iter()
+                .map(|p| state.is_dir_of(p).unwrap_or(false))
+                .collect()
+        } else {
+            vec![false; paths.len()]
+        };
+
+        self.clipboard = Some(crate::clipboard::Clipboard::new(
+            mode,
+            paths,
+            self.panels[source].backend,
+            is_dir,
+        ));
+    }
+
+    /// Carry out the armed yank or cut in the active pane's directory.
+    fn paste_clipboard(&mut self) {
+        let Some(clip) = self.clipboard.clone() else {
+            // Nothing armed. Say so rather than doing nothing: `p` used to
+            // search backwards, so an unarmed `p` is exactly the keystroke a
+            // long-time user makes by habit.
+            self.modal = Modal::Confirm(ConfirmDialog::notice(
+                "Nothing to paste. Yank with y (copy) or x (cut) first.",
+            ));
+            return;
+        };
+
+        if self.refuse_if_read_only("paste files into") {
+            return;
+        }
+        let Some(dest_dir) = self.active_panel().dest_dir() else {
+            return;
+        };
+
+        // A directory cannot be pasted into itself or its own descendant. The
+        // rename would fail, but a cross-backend cut is a copy then a delete,
+        // which would recurse into what it is writing.
+        if let Some(bad) = clip
+            .paths
+            .iter()
+            .find(|src| crate::clipboard::is_descendant_of(&dest_dir, src))
+        {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                "Cannot paste '{}' inside itself.",
+                bad.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| bad.display().to_string())
+            )));
+            return;
+        }
+
+        // A cut that lands where it started is a no-op, and carrying it out
+        // would rename each entry to a " copy" name for no reason.
+        if clip.mode == crate::clipboard::ClipMode::Cut && clip.would_land_on_itself(&dest_dir) {
+            self.clipboard = None;
+            return;
+        }
+
+        let dest_panel = self.active;
+        let dest_backend = self.panels[dest_panel].backend;
+
+        // Either endpoint remote makes this a transfer, through the queue and
+        // the sidebar rather than the modal overlay — the same rule `c` uses.
+        if copy_needs_transfer_queue(clip.backend, dest_backend) {
+            let src_panel = self
+                .panels
+                .iter()
+                .position(|p| p.backend == clip.backend)
+                .unwrap_or(dest_panel);
+            self.begin_transfer_batch(
+                clip.paths.clone(),
+                clip.is_dir.clone(),
+                clip.backend,
+                dest_dir,
+                dest_backend,
+                src_panel,
+                Some(dest_panel),
+            );
+            // A remote cut cannot record an undo: the queue reports completion
+            // later and asynchronously, so there is no point here at which the
+            // move is known to have happened.
+            self.clipboard = None;
+            return;
+        }
+
+        match clip.mode {
+            crate::clipboard::ClipMode::Copy => self.paste_copy(&clip, &dest_dir),
+            crate::clipboard::ClipMode::Cut => self.paste_move(&clip, &dest_dir),
+        }
+    }
+
+    /// A local paste that copies, resolving name collisions by suffixing.
+    ///
+    /// Unlike `c`, this never prompts to overwrite. Pasting into the directory
+    /// you yanked from is how you duplicate a file, so the collision is usually
+    /// the intent rather than an accident — and a prompt per entry on a
+    /// twenty-file paste is worse than a name that says what happened.
+    fn paste_copy(&mut self, clip: &crate::clipboard::Clipboard, dest_dir: &Path) {
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for src in &clip.paths {
+            // Each destination counts as taken for the ones after it, so two
+            // sources with the same basename cannot both claim one name.
+            let claimed: Vec<PathBuf> = pairs.iter().map(|(_, d)| d.clone()).collect();
+            let Some(dest) = crate::clipboard::paste_destination(src, dest_dir, |c| {
+                c.exists() || claimed.iter().any(|d| d == c)
+            }) else {
+                continue;
+            };
+            pairs.push((src.clone(), dest));
+        }
+        if pairs.is_empty() {
+            return;
+        }
+
+        self.approved_copies = pairs.clone();
+        self.pending_copies.clear();
+        self.copy_dest_panel = self.active;
+        self.undo = Some(crate::clipboard::UndoEntry::Copied {
+            dests: pairs.into_iter().map(|(_, d)| d).collect(),
+        });
+        self.spawn_copy_batch();
+    }
+
+    /// A local paste that moves, then empties the buffer.
+    fn paste_move(&mut self, clip: &crate::clipboard::Clipboard, dest_dir: &Path) {
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for src in &clip.paths {
+            let claimed: Vec<PathBuf> = pairs.iter().map(|(_, d)| d.clone()).collect();
+            let Some(dest) = crate::clipboard::paste_destination(src, dest_dir, |c| {
+                c.exists() || claimed.iter().any(|d| d == c)
+            }) else {
+                continue;
+            };
+            pairs.push((src.clone(), dest));
+        }
+        if pairs.is_empty() {
+            return;
+        }
+
+        // Undo restores each entry to where it was, so the pairs are recorded
+        // reversed: the destination is what will need moving back.
+        self.undo = Some(crate::clipboard::UndoEntry::Moved {
+            pairs: pairs.iter().map(|(s, d)| (s.clone(), d.clone())).collect(),
+        });
+
+        let mut failed: Vec<String> = Vec::new();
+        for (src, dest) in &pairs {
+            if let Err(e) = std::fs::rename(src, dest) {
+                failed.push(format!("{}: {e}", short_name(src)));
+            }
+        }
+
+        // A cut is spent once pasted, whether or not every entry made it. What
+        // is left behind is visible in the pane; keeping the buffer armed after
+        // a partial failure would invite a second paste that half-repeats the
+        // first.
+        self.clipboard = None;
+        if !failed.is_empty() {
+            self.undo = None;
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                "Could not move {} of {} items:\n{}",
+                failed.len(),
+                pairs.len(),
+                failed.join("\n")
+            )));
+        }
+        for panel in &mut self.panels {
+            panel.current_screen_mut().refresh();
+        }
+    }
+
+    /// Ask before reversing the last paste.
+    ///
+    /// Undoing a copy deletes files, so it is confirmed rather than done on the
+    /// keystroke — `u` is one key away from `y`, and an accidental undo that
+    /// silently deleted a directory tree would be unrecoverable.
+    fn start_undo(&mut self) {
+        let Some(entry) = self.undo.clone() else {
+            self.modal = Modal::Confirm(ConfirmDialog::notice("Nothing to undo."));
+            return;
+        };
+        if entry.is_empty() {
+            self.undo = None;
+            return;
+        }
+        let prompt = entry.prompt();
+        self.modal_target = Some(ModalTarget::Undo(entry));
+        self.modal = Modal::Confirm(ConfirmDialog::new(prompt));
+    }
+
+    /// Carry out a confirmed undo.
+    fn perform_undo(&mut self, entry: crate::clipboard::UndoEntry) {
+        let mut failed: Vec<String> = Vec::new();
+        match &entry {
+            crate::clipboard::UndoEntry::Copied { dests } => {
+                for dest in dests {
+                    let r = if dest.is_dir() {
+                        std::fs::remove_dir_all(dest)
+                    } else {
+                        std::fs::remove_file(dest)
+                    };
+                    if let Err(e) = r {
+                        failed.push(format!("{}: {e}", short_name(dest)));
+                    }
+                }
+            }
+            crate::clipboard::UndoEntry::Moved { pairs } => {
+                for (orig, moved) in pairs {
+                    if let Err(e) = std::fs::rename(moved, orig) {
+                        failed.push(format!("{}: {e}", short_name(moved)));
+                    }
+                }
+            }
+        }
+
+        // Spent either way: a partial undo cannot be retried coherently, since
+        // repeating it would act on entries that were already put back.
+        self.undo = None;
+        if !failed.is_empty() {
+            self.modal = Modal::Confirm(ConfirmDialog::notice(format!(
+                "Could not undo {} item(s):\n{}",
+                failed.len(),
+                failed.join("\n")
+            )));
+        }
+        for panel in &mut self.panels {
+            panel.current_screen_mut().refresh();
+        }
+    }
+
     fn start_copy(&mut self) {
         // The tag set is the source of truth; fall back to the cursor selection.
         let mut srcs = self.active_panel().current_screen().tagged_paths();
@@ -7397,6 +7734,13 @@ fn credential_prompt(need: &crate::vfs::sftp::AuthNeed) -> String {
 /// write the *local* disk under paths that name files on a server — silently
 /// touching the wrong machine. Shared by the dual-panel and single-panel copy
 /// paths, which previously disagreed: only the former checked.
+/// A path's final component, for a message that names what failed.
+fn short_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
 pub fn copy_needs_transfer_queue(
     src: crate::vfs::BackendId,
     dest: crate::vfs::BackendId,
