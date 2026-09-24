@@ -7792,6 +7792,244 @@ async fn help_without_overflow_shows_no_scroll_hint() {
     assert!(text.contains("Cancel the selected transfer"));
 }
 
+// ---------------------------------------------------------------------------
+// Help columns: a wide terminal lays the bindings out side by side rather than
+// leaving two thirds of the screen blank.
+// ---------------------------------------------------------------------------
+
+/// Open help over a throwaway tree, ready to render.
+async fn help_app() -> (tempfile::TempDir, FileBrowser) {
+    let dir = create_test_structure();
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+    app.handle_key_for_test(char_key('?'));
+    assert!(app.is_help_open());
+    (dir, app)
+}
+
+/// Width of the help box's *content*, measured off its double-line bottom
+/// border — the drawn width less the two border columns.
+///
+/// The bottom border is the unambiguous one to measure: the title sits on the
+/// top border, and the panels drawn behind the overlay have borders of their
+/// own, so anything looser than "the run of ═ between ╚ and ╝" picks up the
+/// tree's box instead.
+fn help_box_width(text: &str) -> usize {
+    let bottom = text
+        .lines()
+        .find(|l| l.contains('╚'))
+        .expect("the help overlay should have a bottom border");
+    // Counted in characters, not bytes: the box-drawing glyphs are three bytes
+    // each in UTF-8, so `str::find` would report a width three times too wide.
+    let chars: Vec<char> = bottom.chars().collect();
+    let start = chars
+        .iter()
+        .position(|c| *c == '╚')
+        .expect("the bottom border should start");
+    let end = chars
+        .iter()
+        .position(|c| *c == '╝')
+        .expect("the bottom border should be closed");
+    (end - start + 1) - 2
+}
+
+/// The `of N` from the overlay's scroll indicator: how many rows it believes
+/// there are to scroll through.
+fn help_scroll_total(text: &str) -> usize {
+    text.lines()
+        .find(|l| l.contains(" of "))
+        .and_then(|l| l.split(" of ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .expect("the title should carry a scroll indicator")
+}
+
+/// The end of the `A-B` range in the overlay's scroll indicator.
+fn help_scroll_shown_end(text: &str) -> usize {
+    text.lines()
+        .find(|l| l.contains(" of "))
+        .and_then(|l| l.split('\u{2014}').nth(1))
+        .and_then(|rest| rest.split(" of ").next())
+        .and_then(|range| range.trim().split('-').nth(1))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("the title should carry a range")
+}
+
+/// A narrow terminal keeps the single 70-column box it always had.
+#[tokio::test]
+async fn help_on_a_narrow_terminal_stays_one_column() {
+    let (_dir, mut app) = help_app().await;
+
+    let text = help_text(&mut app, 80, 40);
+    assert_eq!(
+        help_box_width(&text),
+        70,
+        "80 columns has room for one 70-wide column of bindings only:\n{}",
+        text
+    );
+    // The first section is at the top, and the last is nowhere near it.
+    assert!(text.contains("Navigation:"));
+    assert!(
+        !text.contains("Dialogs:"),
+        "one column cannot reach the last section in 40 rows"
+    );
+}
+
+/// A wide terminal splits the bindings into columns, so sections that were far
+/// below the fold come into view without scrolling.
+#[tokio::test]
+async fn help_uses_columns_when_there_is_width_for_them() {
+    let (_dir, mut app) = help_app().await;
+
+    let one = help_text(&mut app, 80, 40);
+    let two = help_text(&mut app, 145, 40);
+    let three = help_text(&mut app, 215, 40);
+
+    assert_eq!(help_box_width(&one), 70, "80 wide: one column");
+    assert_eq!(help_box_width(&two), 140, "145 wide: two columns");
+    assert_eq!(help_box_width(&three), 210, "215 wide: three columns");
+
+    // Three columns bring the tail of the list onto the same screen as its
+    // head — the whole point of the layout.
+    assert!(
+        three.contains("Navigation:") && three.contains("Dialogs:"),
+        "three columns should show the first and last sections together:\n{}",
+        three
+    );
+    assert!(
+        !one.contains("Dialogs:"),
+        "one column at the same height should not"
+    );
+}
+
+/// Columns are cut at section boundaries, so a heading always has its bindings
+/// beneath it rather than being stranded at the foot of a column.
+#[tokio::test]
+async fn help_columns_never_split_a_section() {
+    let (_dir, mut app) = help_app().await;
+
+    // Tall enough that nothing is clipped by the terminal, so any heading
+    // without items under it is the layout's doing, not the viewport's.
+    let text = help_text(&mut app, 215, HELP_TALL_ENOUGH);
+    let lines: Vec<&str> = text.lines().collect();
+
+    // Every heading in the overlay, with the row it sits on.
+    let headings = [
+        "Navigation:",
+        "Tree:",
+        "Treemap:",
+        "View:",
+        "Archives:",
+        "Preview:",
+        "Tagging & selection:",
+        "Actions:",
+        "Panels:",
+        "Transfers:",
+        "Mouse:",
+        "Exit:",
+        "Dialogs:",
+    ];
+    for heading in headings {
+        let row = lines
+            .iter()
+            .position(|l| l.contains(heading))
+            .unwrap_or_else(|| panic!("{} should be on screen:\n{}", heading, text));
+        // The column a heading starts in also holds its first binding, one row
+        // down at the same horizontal offset.
+        let col = lines[row].find(heading).unwrap();
+        let below = lines
+            .get(row + 1)
+            .unwrap_or_else(|| panic!("{} is the last row of the overlay", heading));
+        assert!(
+            below.len() > col && below[col..].trim_start().chars().next().is_some(),
+            "{} has nothing under it — its section was split across columns:\n{}",
+            heading,
+            text
+        );
+    }
+}
+
+/// Columns scroll as one list: the offset applies to all of them, so a wide
+/// terminal still reaches everything and still clamps at the ends.
+#[tokio::test]
+async fn help_columns_scroll_together() {
+    let (_dir, mut app) = help_app().await;
+
+    // 215x24: three columns, but only 22 content rows — still short of the
+    // tallest column, so it scrolls.
+    let top = help_text(&mut app, 215, 24);
+    assert!(
+        top.contains("to scroll"),
+        "a short terminal should still advertise scrolling:\n{}",
+        top
+    );
+
+    app.handle_key_for_test(char_key('j'));
+    let moved = help_text(&mut app, 215, 24);
+    assert!(app.is_help_open(), "j must scroll, not dismiss");
+    assert_ne!(top, moved, "j should move every column");
+
+    // G reaches the bottom of the tallest column, and further j's do nothing.
+    app.handle_key_for_test(char_key('G'));
+    let bottom = help_text(&mut app, 215, 24);
+    for _ in 0..20 {
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert_eq!(
+        bottom,
+        help_text(&mut app, 215, 24),
+        "scrolling past the end should clamp"
+    );
+
+    // Scrolling far enough reaches the end of every column. The columns are
+    // different heights, so the short ones run out before the tallest does —
+    // what matters is that nothing is left permanently below the fold.
+    let mut seen_last = false;
+    app.handle_key_for_test(char_key('g'));
+    for _ in 0..200 {
+        if help_text(&mut app, 215, 24).contains("Backspace") {
+            seen_last = true;
+            break;
+        }
+        app.handle_key_for_test(char_key('j'));
+    }
+    assert!(
+        seen_last,
+        "the last binding in the list must be reachable by scrolling"
+    );
+}
+
+/// The scroll indicator counts the tallest column, not every line in the list.
+///
+/// Summing the columns would claim ~176 rows to scroll through when three
+/// columns only have ~71, and the count would never reach its own total.
+#[tokio::test]
+async fn help_scroll_indicator_counts_the_tallest_column() {
+    let (_dir, mut app) = help_app().await;
+
+    let one = help_text(&mut app, 80, 24);
+    let three = help_text(&mut app, 215, 24);
+
+    let one_total = help_scroll_total(&one);
+    let three_total = help_scroll_total(&three);
+    assert!(
+        three_total < one_total,
+        "three columns should have less to scroll than one ({} vs {})",
+        three_total,
+        one_total
+    );
+
+    // Scrolling to the bottom reaches that total exactly, rather than stopping
+    // short of a count that counted lines the layout never stacks.
+    app.handle_key_for_test(char_key('G'));
+    let bottom = help_text(&mut app, 215, 24);
+    let shown_end = help_scroll_shown_end(&bottom);
+    assert_eq!(
+        shown_end, three_total,
+        "the bottom of the list should be the last row of the tallest column"
+    );
+}
+
 /// Exactly one pane may look focused at a time.
 ///
 /// `state.active` used to mean "is the active panel index" and never consulted

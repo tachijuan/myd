@@ -1,4 +1,4 @@
-.TH "MYD" "1" "September 2026" "myd 1.7.0" "User Commands"
+.TH "MYD" "1" "September 2026" "myd 1.8.0" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -437,9 +437,12 @@ for "names ending in p" is \fBp$\fR, or \fB.*p$\fR. See \fBPATTERNS\fR below for
 the syntax accepted, and the two constructs that are not.
 .TP
 .B ? / F1
-Show or hide the key reference. It is taller than a typical terminal, so
-\fBj\fR / \fBk\fR, the arrow keys, PageUp/PageDown, \fBg\fR / \fBG\fR and the
-mouse wheel scroll it; the title bar shows your position in the list.
+Show or hide the key reference. It lays itself out in up to three columns,
+picking the number that fits the width of your terminal, so a wide window shows
+far more of it at once. When it is still taller than the window \fBj\fR /
+\fBk\fR, the arrow keys, PageUp/PageDown, \fBg\fR / \fBG\fR and the mouse
+wheel scroll it \(em every column together \(em and the title bar shows your
+position in the list.
 .SS Screen Level
 .TP
 .B q
