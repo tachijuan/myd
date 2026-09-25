@@ -6366,10 +6366,142 @@ async fn clicking_a_panel_focuses_it() {
     assert_eq!(app.active_panel_index(), 0);
 }
 
-/// The wheel scrolls without needing a click first.
+/// A directory with more entries than any test viewport, so the wheel has
+/// somewhere to scroll to.
+fn scrollable_fixture(n: usize) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::with_prefix("wheel-scroll-test").unwrap();
+    for i in 0..n {
+        // Descending sizes so the default Largest sort gives a stable order.
+        write_string(
+            &dir.path().join(format!("f{:03}.txt", i)),
+            &"x".repeat((n - i) * 4),
+        );
+    }
+    dir
+}
+
+/// An app over `scrollable_fixture`, drawn once so the tree records its
+/// viewport height — the wheel needs it to know how far a tick goes.
+async fn scrolling_app(rows: u16) -> (tempfile::TempDir, FileBrowser) {
+    let dir = scrollable_fixture(80);
+    let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
+    settle(&mut app).await;
+
+    let backend = ratatui::backend::TestBackend::new(100, rows);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    (dir, app)
+}
+
+/// The wheel scrolls the window, the way a browser does, and does not need a
+/// click first.
+///
+/// It used to move the cursor and let the render-time clamp drag the view
+/// along, so a tick in the middle of the window changed nothing on screen until
+/// the cursor had crossed an entire screenful.
 #[tokio::test]
-async fn scrolling_moves_the_cursor() {
-    let dir = create_test_structure();
+async fn the_wheel_scrolls_the_viewport() {
+    let (_dir, mut app) = scrolling_app(30).await;
+
+    assert_eq!(app.tree_scroll_for_test(), Some(0));
+
+    // Park the cursor in the middle of the window first. At the very top every
+    // downward tick would legitimately push it, which is not what this test is
+    // about.
+    for _ in 0..10 {
+        app.handle_key_for_test(char_key('j'));
+    }
+    let cursor = app.selected_line_index_for_test().unwrap();
+
+    // Three ticks down move the window three rows, immediately.
+    app.scroll_by_for_test(3);
+    assert_eq!(
+        app.tree_scroll_for_test(),
+        Some(3),
+        "the wheel should move the viewport, not wait for the cursor"
+    );
+    // The cursor is still inside the window, so it has not been touched.
+    assert_eq!(
+        app.selected_line_index_for_test(),
+        Some(cursor),
+        "the cursor should hold still while the content slides under it"
+    );
+
+    // And back up.
+    app.scroll_by_for_test(-2);
+    assert_eq!(app.tree_scroll_for_test(), Some(1));
+}
+
+/// Scrolling stops at the ends rather than running off either one.
+#[tokio::test]
+async fn the_wheel_clamps_at_both_ends() {
+    let (_dir, mut app) = scrolling_app(30).await;
+
+    // Up from the top is a no-op, not an underflow.
+    app.scroll_by_for_test(-10);
+    assert_eq!(app.tree_scroll_for_test(), Some(0));
+
+    // Down past the end stops where the last line sits on the bottom row,
+    // leaving no blank rows below content that could fill them.
+    app.scroll_by_for_test(500);
+    let max = app.tree_scroll_for_test().unwrap();
+    app.scroll_by_for_test(10);
+    assert_eq!(
+        app.tree_scroll_for_test(),
+        Some(max),
+        "scrolling past the end should clamp"
+    );
+    assert!(max > 0, "the fixture should have had somewhere to scroll");
+}
+
+/// The cursor is dragged along only once the window would leave it behind.
+///
+/// It has to stay on a visible row: the render clamps the offset back to the
+/// cursor, so an offset that stranded it off-screen would spring back on the
+/// very next frame.
+#[tokio::test]
+async fn the_wheel_pushes_the_cursor_only_when_it_would_fall_out_of_view() {
+    let (_dir, mut app) = scrolling_app(30).await;
+
+    // Again from the middle of the window, so a small scroll has slack on both
+    // sides of the cursor.
+    for _ in 0..10 {
+        app.handle_key_for_test(char_key('j'));
+    }
+    let start = app.selected_line_index_for_test().unwrap();
+
+    // A small scroll leaves the cursor alone.
+    app.scroll_by_for_test(2);
+    assert_eq!(app.selected_line_index_for_test(), Some(start));
+
+    // A large one pushes it to the top edge of the new window, and no further.
+    app.scroll_by_for_test(40);
+    let scroll = app.tree_scroll_for_test().unwrap();
+    let cursor = app.selected_line_index_for_test().unwrap();
+    assert_eq!(
+        cursor, scroll,
+        "the cursor should be dragged to the first visible row, not beyond it"
+    );
+
+    // Scrolling back up parks it on the last visible row instead.
+    app.scroll_by_for_test(-40);
+    let scroll = app.tree_scroll_for_test().unwrap();
+    let cursor = app.selected_line_index_for_test().unwrap();
+    assert!(
+        cursor >= scroll,
+        "cursor {} should not be above the window at {}",
+        cursor,
+        scroll
+    );
+}
+
+/// An empty directory has nothing to scroll and must not underflow.
+///
+/// `bottom` is computed from the viewport, so with no lines at all the cursor
+/// clamp has to cope with a window that points past the end of the content.
+#[tokio::test]
+async fn the_wheel_on_an_empty_directory_does_nothing() {
+    let dir = tempfile::TempDir::with_prefix("wheel-empty-test").unwrap();
     let mut app = FileBrowser::new(Some(dir.path().to_path_buf()), None, false);
     settle(&mut app).await;
 
@@ -6377,12 +6509,36 @@ async fn scrolling_moves_the_cursor() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render_for_test(f)).unwrap();
 
-    let start = app.selected_line_index_for_test().unwrap();
-    app.scroll_by_for_test(3);
-    assert_eq!(app.selected_line_index_for_test(), Some(start + 3));
+    app.scroll_by_for_test(10);
+    assert_eq!(app.tree_scroll_for_test(), Some(0));
+    app.scroll_by_for_test(-10);
+    assert_eq!(app.tree_scroll_for_test(), Some(0));
 
-    app.scroll_by_for_test(-2);
-    assert_eq!(app.selected_line_index_for_test(), Some(start + 1));
+    // And it still draws, rather than panicking on the clamp.
+    term.draw(|f| app.render_for_test(f)).unwrap();
+}
+
+/// The offset the wheel leaves behind survives the next render.
+///
+/// This is the failure the old implementation was written to avoid: moving the
+/// viewport without moving the cursor let `clamp_scroll` drag the view straight
+/// back, so the screen appeared to ignore the wheel.
+#[tokio::test]
+async fn a_wheel_scroll_survives_the_next_frame() {
+    let (_dir, mut app) = scrolling_app(30).await;
+
+    app.scroll_by_for_test(20);
+    let after_scroll = app.tree_scroll_for_test().unwrap();
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+
+    assert_eq!(
+        app.tree_scroll_for_test(),
+        Some(after_scroll),
+        "the render must not pull the view back to the cursor"
+    );
 }
 
 /// Ctrl+N releases the mouse so terminal text selection works, and re-grabs it.

@@ -273,6 +273,29 @@ pub trait ScreenState {
 
 // Delegate Screen -> state.
 impl Screen {
+    /// Scroll for one mouse wheel tick.
+    ///
+    /// The main screen slides its viewport; the picker is a short list with no
+    /// offset of its own, so there the wheel still walks the cursor.
+    pub fn wheel_scroll(&mut self, delta: i32) -> bool {
+        match self {
+            Screen::DirPicker(s) => {
+                if delta > 0 {
+                    for _ in 0..delta {
+                        s.cursor_down();
+                    }
+                } else {
+                    for _ in 0..(-delta) {
+                        s.cursor_up();
+                    }
+                }
+                true
+            }
+            Screen::Main(s) => s.wheel_scroll(delta),
+            Screen::Loading(_) => true,
+        }
+    }
+
     pub fn cursor_down(&mut self) -> bool {
         match self {
             Screen::DirPicker(s) => s.cursor_down(),

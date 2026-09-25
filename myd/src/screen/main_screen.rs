@@ -390,6 +390,56 @@ impl MainScreenState {
         }
     }
 
+    /// Scroll the view by `delta` rows for a mouse wheel tick.
+    ///
+    /// The wheel moves the *viewport*, the way a browser does: the content
+    /// slides under a cursor that stays where it was put. It used to move the
+    /// cursor instead, which meant the content only moved once the cursor had
+    /// been pushed all the way to an edge — a whole window of scrolling before
+    /// anything appeared to happen.
+    ///
+    /// The cursor is dragged along only when the viewport would otherwise leave
+    /// it behind, so it stays on a visible row. That much is not optional: the
+    /// render's [`FileTree::clamp_scroll`] pulls the offset back to the cursor,
+    /// so an offset that strands the cursor off-screen is undone on the very
+    /// next frame and the view springs back.
+    ///
+    /// The treemap has no scroll offset — it is a 2D layout that always fits
+    /// its area — so there the wheel keeps moving the cursor.
+    pub fn wheel_scroll(&mut self, delta: i32) -> bool {
+        if self.focus == FocusTarget::Treemap {
+            if delta > 0 {
+                for _ in 0..delta {
+                    self.treemap.cursor_down();
+                }
+            } else {
+                for _ in 0..(-delta) {
+                    self.treemap.cursor_up();
+                }
+            }
+            return true;
+        }
+
+        let visible = self.viewport();
+        // Never scroll past the last line, and never leave blank rows below
+        // content that could fill them — the same bound clamp_scroll applies.
+        let max_scroll = self.tree.lines.len().saturating_sub(visible);
+        let scroll = (self.tree.scroll as isize + delta as isize).clamp(0, max_scroll as isize);
+        self.tree.scroll = scroll as usize;
+
+        // Keep the cursor inside the window, moving it the least distance that
+        // achieves that. Through set_cursor so visual mode still tags the range
+        // the cursor crosses.
+        let top = self.tree.scroll;
+        let bottom = (top + visible).saturating_sub(1);
+        if self.tree.cursor < top {
+            self.tree.set_cursor(top);
+        } else if self.tree.cursor > bottom {
+            self.tree.set_cursor(bottom);
+        }
+        true
+    }
+
     pub fn cursor_down(&mut self) -> bool {
         match self.focus {
             FocusTarget::Tree => self.tree.cursor_down(),

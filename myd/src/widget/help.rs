@@ -263,7 +263,7 @@ static CATEGORIES: &[HelpCategory] = &[
     HelpCategory {
         title: "Mouse",
         items: &[
-            ("Wheel", "Scroll the focused view"),
+            ("Wheel", "Scroll the focused view (moves the window)"),
             ("Left click", "Focus a panel and select a row / tile"),
             ("Double click", "Open (same as Enter)"),
             ("Right click", "Select and open (enter a directory)"),

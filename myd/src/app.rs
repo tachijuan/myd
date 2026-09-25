@@ -1874,6 +1874,17 @@ impl FileBrowser {
         self.scroll_by(delta);
     }
 
+    /// The active panel's tree viewport offset (for tests).
+    ///
+    /// The wheel moves this rather than the cursor, so it is what a scrolling
+    /// test has to look at.
+    pub fn tree_scroll_for_test(&self) -> Option<usize> {
+        match self.panels[self.active].current_screen() {
+            Screen::Main(state) => Some(state.tree.scroll),
+            _ => None,
+        }
+    }
+
     /// How many browser panels are drawing themselves as focused (for tests).
     ///
     /// Must always be 0 (sidebar focused) or 1 — never two at once.
@@ -4360,25 +4371,17 @@ impl FileBrowser {
         result
     }
 
-    /// Scroll the view under the pointer by `delta` rows.
+    /// Scroll the focused view by `delta` rows.
     ///
-    /// The wheel moves the *cursor*, not the viewport, so it stays consistent
-    /// with `j`/`k`: within the window the cursor travels and the content holds
-    /// still, and the view scrolls once the cursor reaches an edge. Moving the
-    /// viewport independently would let the cursor drift off-screen, and the
-    /// render-time clamp would immediately drag the view back — the two would
-    /// fight each other.
+    /// The wheel moves the *viewport*, as a browser does, and the screen drags
+    /// its cursor along only far enough to keep it on a visible row. It used to
+    /// move the cursor and let the render-time clamp push the view, which meant
+    /// a wheel tick near the middle of the window moved nothing visible until
+    /// the cursor had crossed an entire screen.
     fn scroll_by(&mut self, delta: i32) {
-        let screen = self.active_panel_mut().current_screen_mut();
-        if delta > 0 {
-            for _ in 0..delta {
-                screen.cursor_down();
-            }
-        } else {
-            for _ in 0..(-delta) {
-                screen.cursor_up();
-            }
-        }
+        self.active_panel_mut()
+            .current_screen_mut()
+            .wheel_scroll(delta);
     }
 
     /// Release or re-grab the mouse, so terminal text selection can be used.

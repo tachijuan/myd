@@ -1,4 +1,4 @@
-.TH "MYD" "1" "September 2026" "myd 1.8.0" "User Commands"
+.TH "MYD" "1" "September 2026" "myd 1.8.1" "User Commands"
 .SH NAME
 myd \- vi-like terminal file browser
 .SH SYNOPSIS
@@ -798,8 +798,11 @@ Authentication goes through the same ladder as always: ssh-agent, then
 A malformed file is reported and ignored rather than overwritten, so a typo can
 be corrected by hand instead of costing the whole list.
 .SH MOUSE
-The wheel scrolls the focused view; a left click focuses a panel and selects a
-row or treemap tile; a right click selects and opens. Mouse capture takes over
+The wheel scrolls the focused view, moving the window rather than the cursor:
+the content slides and the selection stays on the file it was on, the way a
+browser scrolls. It carries the cursor along only when the window would
+otherwise leave it behind. A left click focuses a panel and selects a row or
+treemap tile; a right click selects and opens. Mouse capture takes over
 the terminal's own click-drag selection, so \fBCtrl+N\fR releases and re-grabs
 it. Most terminals also honour Shift+drag while captured.
 .PP
